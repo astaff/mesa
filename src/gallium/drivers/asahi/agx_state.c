@@ -6542,6 +6542,22 @@ agx_index_buffer_direct_ptr(struct agx_batch *batch,
    if (!info->has_user_indices) {
       uint64_t base = agx_index_buffer_rsrc_ptr(batch, info, extent);
 
+      /* G17P fetches indices from a dword-aligned address: the low two bits
+       * of the index list pointer are dropped, so a u16 draw starting at an
+       * odd index (or a u8 draw at index % 4 != 0) reads from the preceding
+       * aligned address. Copy such ranges to an aligned pool upload.
+       */
+      if (agx_device(batch->ctx->base.screen)->chip == AGX_CHIP_G17P &&
+          ((base + offset) & 3)) {
+         struct agx_resource *rsrc = agx_resource(info->index.resource);
+         const uint8_t *cpu = (const uint8_t *)agx_bo_map(rsrc->bo) +
+                              rsrc->layout.level_offsets_B[0];
+
+         *extent = ALIGN_POT(max_extent, 4);
+         return agx_pool_upload_aligned(&batch->pool, cpu + offset,
+                                        max_extent, 64);
+      }
+
       *extent = ALIGN_POT(MIN2(*extent - offset, max_extent), 4);
       return base + offset;
    } else {
