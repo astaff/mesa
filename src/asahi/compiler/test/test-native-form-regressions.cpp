@@ -1,6 +1,7 @@
 #include "agx_test.h"
 #include "agx3_alu_core.h"
 #include "agx3_pack.h"
+#include "agx_nir.h"
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -67,5 +68,44 @@ TEST(NativeForms, NegatedSqrtStepReachesPacker)
       EXPECT_TRUE(agx3_pack_binary(b->shader, &bytes));
       EXPECT_GT(bytes.size, 4u);
       ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, HalfModifiedMultiplyAndSelect)
+{
+   for (bool select : {false, true}) {
+      SCOPED_TRACE(select);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "half modified operands");
+      nir_def *input = agx_test_load_preamble(&b, 4, 32, 4);
+      nir_def *x = nir_f2f16(&b, nir_channel(&b, input, 0));
+      nir_def *result;
+      if (select) {
+         nir_def *cmp = agx_test_load_preamble(&b, 2, 16, 12);
+         x = nir_channel(&b, cmp, 0);
+         nir_def *y = nir_channel(&b, cmp, 1);
+         result = nir_bcsel(&b, nir_flt(&b, x, nir_fneg(&b, y)),
+                           nir_channel(&b, input, 2),
+                           nir_channel(&b, input, 3));
+      } else {
+         result = nir_f2f32(
+            &b, nir_fmul(&b, nir_fabs(&b, x), nir_imm_floatN_t(&b, 0.5, 16)));
+      }
+      agx_test_store_local_pixel_agx(
+         &b, nir_vec4(&b, nir_channel(&b, input, 0), result, result, result),
+         nir_imm_intN_t(&b, 0xff, 16), nir_undef(&b, 2, 16), 0, 0xf,
+         PIPE_FORMAT_R8_UNORM);
+      b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+      key.fs.nr_samples = 1;
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      free(part.binary);
    }
 }
