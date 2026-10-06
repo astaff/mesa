@@ -109,3 +109,36 @@ TEST(NativeForms, HalfModifiedMultiplyAndSelect)
       free(part.binary);
    }
 }
+
+TEST(NativeForms, VertexImageLoadRegisterLod)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "vertex image load register LOD");
+   nir_def *id = nir_load_vertex_id(&b);
+   nir_def *coord = nir_vec4(&b, id, id, id, nir_imm_int(&b, 0));
+   nir_def *value = nir_image_load(
+      &b, 4, 32, nir_imm_intN_t(&b, 3, 16), coord, nir_imm_int(&b, 0),
+      agx_test_load_preamble(&b, 1, 16, 0));
+   nir_intrinsic_instr *load = nir_def_as_intrinsic(value);
+   nir_intrinsic_set_image_dim(load, GLSL_SAMPLER_DIM_3D);
+   nir_intrinsic_set_format(load, PIPE_FORMAT_R32G32B32A32_UINT);
+   nir_intrinsic_set_dest_type(load, nir_type_uint32);
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_store_uvs_agx(&b, nir_imm_float(&b, c == 3 ? 1.0f : 0.0f),
+                       nir_imm_intN_t(&b, c, 16));
+      nir_store_uvs_agx(&b, nir_channel(&b, value, c),
+                       nir_imm_intN_t(&b, 4 + c, 16));
+   }
+   b.shader->info.outputs_written = VARYING_BIT_POS |
+                                   BITFIELD64_BIT(VARYING_SLOT_VAR0);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.no_preamble = true;
+   key.reserved_preamble = 64;
+   agx_preprocess_nir(b.shader);
+   agx_shader_part part = {};
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+   EXPECT_GT(part.info.main_size, 0u);
+   free(part.binary);
+}
