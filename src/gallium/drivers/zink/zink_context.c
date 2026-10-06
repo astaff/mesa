@@ -3159,14 +3159,15 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
             ctx->dynamic_fb.attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
          else
             ctx->dynamic_fb.attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-         if (use_tc_info) {
-            if (very_legal_and_conformant_msaa_opt ||
-                /* don't invalidate cbufs without resolve */
-                (ctx->dynamic_fb.tc_info.has_resolve && ctx->dynamic_fb.tc_info.cbuf_invalidate & BITFIELD_BIT(i)))
-               ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            else
-               ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-         }
+         /* Blitter passes have no threaded-context discard information.
+          * Their destination must not inherit a previous pass's storeOp.
+          */
+         if (use_tc_info && (very_legal_and_conformant_msaa_opt ||
+             /* don't invalidate cbufs without resolve */
+             (ctx->dynamic_fb.tc_info.has_resolve && ctx->dynamic_fb.tc_info.cbuf_invalidate & BITFIELD_BIT(i))))
+            ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+         else
+            ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
          if (ctx->dynamic_fb.attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
             attachment_shadow_mask |= BITFIELD_BIT(i);
             if (res->base.b.nr_samples > 1 && zink_debug & ZINK_DEBUG_PERFINFO)
@@ -3192,12 +3193,11 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
          else
             ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 
-         if (use_tc_info) {
-            if ((very_legal_and_conformant_msaa_opt && !ctx->fb_state.nr_cbufs) || ctx->dynamic_fb.tc_info.zsbuf_invalidate)
-               ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            else
-               ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-         }
+         if (use_tc_info && ((very_legal_and_conformant_msaa_opt && !ctx->fb_state.nr_cbufs) ||
+                            ctx->dynamic_fb.tc_info.zsbuf_invalidate))
+            ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+         else
+            ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
          if (res->base.b.nr_samples > 1 && zink_debug & ZINK_DEBUG_PERFINFO) {
             if (ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
