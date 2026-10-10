@@ -409,8 +409,67 @@ should_peel_initial_break(nir_loop *loop)
  * nir_opt_dead_cf() can later remove the outer IF statement, again.
  *
  */
+#include <stdio.h>
+#include <stdlib.h>
+static nir_loop *
+innermost_loop_of_block(nir_block *block)
+{
+   nir_cf_node *node = block->cf_node.parent;
+   while (node && node->type != nir_cf_node_loop)
+      node = node->parent;
+   return node ? nir_cf_node_as_loop(node) : NULL;
+}
+
+/* Rotation of a counted loop into guarded do-while form is allowed without
+ * the constant-phi heuristic when duplicating the pre-break work is cheap and
+ * the loop has no other exit, so the rotated loop can never be peeled again by
+ * this path (it is invoked once per compile).
+ */
 static bool
-opt_loop_peel_initial_break(nir_loop *loop)
+rotate_counted_loop_ok(nir_loop *loop, nir_block *header_block,
+                       nir_cf_node *if_node)
+{
+   unsigned header_instrs = 0;
+   nir_foreach_instr(instr, header_block) {
+      /* Reorderable intrinsics (e.g. speculatable constant loads of the
+       * trip count) have no side effects and may be duplicated.
+       */
+      const bool reorderable_intrinsic =
+         instr->type == nir_instr_type_intrinsic &&
+         nir_intrinsic_can_reorder(nir_instr_as_intrinsic(instr));
+      if (instr->type != nir_instr_type_alu &&
+          instr->type != nir_instr_type_load_const &&
+          instr->type != nir_instr_type_phi &&
+          instr->type != nir_instr_type_undef && !reorderable_intrinsic) {
+         return false;
+      }
+      if (instr->type != nir_instr_type_phi && ++header_instrs > 8) {
+         return false;
+      }
+   }
+
+   if (!nir_block_contains_work(nir_cf_node_cf_tree_next(if_node))) {
+      return false;
+   }
+
+   unsigned breaks = 0;
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_instr *last = nir_block_last_instr(block);
+      if (!last || last->type != nir_instr_type_jump ||
+          innermost_loop_of_block(block) != loop)
+         continue;
+      nir_jump_type type = nir_instr_as_jump(last)->type;
+      if (type == nir_jump_break)
+         breaks++;
+      else {
+         return false;
+      }
+   }
+   return breaks == 1;
+}
+
+static bool
+opt_loop_peel_initial_break(nir_loop *loop, bool rotate_counted)
 {
    nir_block *header_block = nir_loop_first_block(loop);
    nir_block *prev_block = nir_cf_node_cf_tree_prev(&loop->cf_node);
@@ -423,27 +482,34 @@ opt_loop_peel_initial_break(nir_loop *loop)
       return false;
 
    /* The loop must have exactly one continue block. */
-   if (nir_block_num_preds(header_block) != 2)
+   if (nir_block_num_preds(header_block) != 2) {
       return false;
+   }
 
    nir_cf_node *if_node = nir_cf_node_next(&header_block->cf_node);
-   if (!if_node || if_node->type != nir_cf_node_if)
+   if (!if_node || if_node->type != nir_cf_node_if) {
       return false;
+   }
 
    nir_if *nif = nir_cf_node_as_if(if_node);
    nir_block *last_then = nir_if_last_then_block(nif);
    if (!nir_block_ends_in_break(last_then) ||
        !is_block_empty(nir_if_first_else_block(nif)) ||
-       !nir_is_trivial_loop_if(nif, last_then))
+       !nir_is_trivial_loop_if(nif, last_then)) {
       return false;
+   }
 
    /* If do_work_2() ends in a break or other kind of jump then we can't move
     * it to the top of the loop ahead of do_work_1().
     */
-   if (nir_block_ends_in_jump(nir_loop_last_block(loop)))
+   if (nir_block_ends_in_jump(nir_loop_last_block(loop))) {
       return false;
+   }
 
-   if (!should_peel_initial_break(loop))
+   if (rotate_counted) {
+      if (!rotate_counted_loop_ok(loop, header_block, if_node))
+         return false;
+   } else if (!should_peel_initial_break(loop))
       return false;
 
    /* Even though this if statement has a jump on one side, we may still have
@@ -740,12 +806,61 @@ opt_loop_cf_list(nir_builder *b, struct exec_list *cf_list,
          assert(!nir_loop_has_continue_construct(loop));
          progress |= opt_loop_cf_list(b, &loop->body, loop);
          progress |= opt_loop_last_block(nir_loop_last_block(loop), true, false);
-         progress |= opt_loop_peel_initial_break(loop);
+         progress |= opt_loop_peel_initial_break(loop, false);
          break;
       }
 
       case nir_cf_node_function:
          UNREACHABLE("Invalid cf type");
+      }
+   }
+
+   return progress;
+}
+
+static bool
+rotate_loops_cf_list(struct exec_list *cf_list, bool uniform_only)
+{
+   bool progress = false;
+   foreach_list_typed_safe(nir_cf_node, cf_node, node, cf_list) {
+      if (cf_node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(cf_node);
+         progress |= rotate_loops_cf_list(&nif->then_list, uniform_only);
+         progress |= rotate_loops_cf_list(&nif->else_list, uniform_only);
+      } else if (cf_node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(cf_node);
+         if (nir_loop_has_continue_construct(loop))
+            continue;
+         progress |= rotate_loops_cf_list(&loop->body, uniform_only);
+         /* uniform_only: the caller ran nir_divergence_analysis. A loop whose
+          * exit differs between invocations (a grid-stride loop) keeps its
+          * top test. On G17P, rotating the crossos bw_copy kernel's two such
+          * loops grew it from 46 to 60 instructions and 23 to 39 GPR halves. */
+         if (uniform_only && nir_loop_is_divergent(loop))
+            continue;
+         progress |= opt_loop_peel_initial_break(loop, true);
+      }
+   }
+   return progress;
+}
+
+/**
+ * Rotate single-exit counted loops whose first statement is the break test
+ * into a guarded do-while (test at the bottom), without requiring a constant
+ * loop-carried phi. Intended to run once per compile.
+ */
+bool
+nir_opt_loop_rotate(nir_shader *shader, bool uniform_only)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, shader) {
+      if (rotate_loops_cf_list(&impl->body, uniform_only)) {
+         nir_progress(true, impl, nir_metadata_none);
+         nir_lower_reg_intrinsics_to_ssa_impl(impl);
+         progress = true;
+      } else {
+         nir_no_progress(impl);
       }
    }
 

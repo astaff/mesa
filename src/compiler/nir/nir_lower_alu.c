@@ -166,61 +166,103 @@ lower_alu_instr(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
           !nir_alu_instr_is_signed_zero_preserve(instr))
          break;
 
+      nir_def *s0 = nir_ssa_for_alu_src(b, instr, 0);
+      nir_def *s1 = nir_ssa_for_alu_src(b, instr, 1);
+
       bool max = instr->op == nir_op_fmax;
 
       /* Lower the fmin/fmax to a no_signed_zero fmin/fmax. This ensures that
        * nir_lower_alu is idempotent, and allows the backend to implement
        * soundly the no_signed_zero subset of fmin/fmax.
        */
+      b->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
+      nir_def *fminmax = max ? nir_fmax(b, s0, s1) : nir_fmin(b, s0, s1);
+      b->fp_math_ctrl = instr->fp_math_ctrl;
 
       /* If we have a constant source, we can usually optimize */
-      if (instr->def.num_components == 1 && instr->def.bit_size == 32) {
+      if (s0->num_components == 1 && s0->bit_size == 32) {
          for (unsigned i = 0; i < 2 && lowered == NULL; ++i) {
             if (!nir_src_is_const(instr->src[i].src))
                continue;
 
-            uint32_t x = nir_alu_src_as_uint(instr->src[i]);
+            uint32_t raw = nir_alu_src_as_uint(instr->src[i]);
+            uint32_t x = raw;
+            /* Under explicit FTZ a subnormal constant can be a signed-zero
+             * operand.  It must not take the nonzero shortcut below, which
+             * drops the caller's signed-zero preservation.
+             */
+            if (nir_is_denorm_flush_to_zero(
+                   b->shader->info.float_controls_execution_mode, 32) &&
+                (x & 0x7f800000u) == 0)
+               x &= 0x80000000u;
+
             bool pos_zero = x == fui(+0.0);
             bool neg_zero = x == fui(-0.0);
+            nir_def *zero = x == raw ? (i == 0 ? s0 : s1)
+                                    : nir_imm_int(b, x);
+            nir_def *other = i == 0 ? s1 : s0;
 
             if (!pos_zero && !neg_zero) {
-               /* The lowering is only required when both sources are zero, so
-                * if we have a nonzero constant source, skip and do not remove
-                * the preserve_sz bit so other passes can take this
-                * into account.
-                */
-               return false;
-            } else {
-               nir_def *s0 = nir_ssa_for_alu_src(b, instr, 0);
-               nir_def *s1 = nir_ssa_for_alu_src(b, instr, 1);
-               nir_def *zero = i == 0 ? s0 : s1;
-               nir_def *other = i == 0 ? s1 : s0;
-
-               if (pos_zero && max) {
-                  b->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
-                  /* max(x, +0.0) = +0.0 < x ? x : +0.0 */
-                  lowered = nir_bcsel(b, nir_flt(b, zero, other), other, zero);
-               } else if (neg_zero && !max) {
-                  b->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
-                  /* min(x, -0.0) = x < -0.0 ? x : -0.0 */
-                  lowered = nir_bcsel(b, nir_flt(b, other, zero), other, zero);
+               /* A nonzero constant can still select the other operand's
+                * signed zero.  Keep that sign before the no-signed-zero
+                * inner operation is allowed to change it. */
+               bool nan = (x & 0x7f800000u) == 0x7f800000u &&
+                          (x & 0x007fffffu) != 0;
+               bool can_select_zero = max ? (x & 0x80000000u) != 0
+                                          : (x & 0x80000000u) == 0;
+               if (can_select_zero || nan) {
+                  nir_def *canonical = nir_fcanonicalize(b, other);
+                  lowered = nir_bcsel(b,
+                     nir_feq(b, other, nir_imm_float(b, 0.0)),
+                     canonical, fminmax);
+               } else {
+                  lowered = fminmax;
                }
+            } else if (pos_zero && max) {
+               b->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
+               /* max(x, +0.0) = +0.0 < x ? x : +0.0 */
+               lowered = nir_bcsel(b, nir_flt(b, zero, other), other, zero);
+            } else if (neg_zero && !max) {
+               b->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
+               /* min(x, -0.0) = x < -0.0 ? x : -0.0 */
+               lowered = nir_bcsel(b, nir_flt(b, other, zero), other, zero);
+            } else {
+               /* min(x, +0) and max(x, -0) need the original zero's sign
+                * when the other operand is nonzero and zero is selected.
+                * The generic no-signed-zero min/max below may replace -0
+                * with +0 before that selection.  Use an ordered comparison
+                * for the non-tie case; NaNs also select the numeric zero.
+                * On a zero tie, integer min/max chooses the IEEE zero sign.
+                */
+               nir_def *cmp = max ? nir_flt(b, zero, other)
+                                  : nir_flt(b, other, zero);
+               nir_def *non_tie = nir_bcsel(b, cmp, other, zero);
+               nir_def *tie = max ? nir_imax(b, zero, other)
+                                  : nir_imin(b, zero, other);
+               tie = nir_fcanonicalize(b, tie);
+               lowered = nir_bcsel(b, nir_feq(b, zero, other), tie, non_tie);
             }
          }
       }
 
+      b->fp_math_ctrl = instr->fp_math_ctrl;
+
       /* Fallback on the emulation */
       if (!lowered) {
-         nir_def *s0 = nir_ssa_for_alu_src(b, instr, 0);
-         nir_def *s1 = nir_ssa_for_alu_src(b, instr, 1);
-
-         b->fp_math_ctrl &= ~nir_fp_preserve_signed_zero;
-         nir_def *fminmax = max ? nir_fmax(b, s0, s1) : nir_fmin(b, s0, s1);
-         b->fp_math_ctrl = instr->fp_math_ctrl;
-
          nir_def *iminmax = max ? nir_imax(b, s0, s1) : nir_imin(b, s0, s1);
          iminmax = nir_fcanonicalize(b, iminmax);
-         lowered = nir_bcsel(b, nir_feq(b, s0, s1), iminmax, fminmax);
+
+         /* The inner operation may also select a zero when its operands
+          * differ.  Its NSZ flag permits changing that zero's sign, so
+          * recover the original zero operand before exposing the result.
+          * The equal-input case still uses integer min/max for +/-0 ties.
+          */
+         nir_def *zero = nir_imm_floatN_t(b, 0.0, s0->bit_size);
+         nir_def *zero_src = nir_bcsel(b, nir_feq(b, s0, zero), s0, s1);
+         zero_src = nir_fcanonicalize(b, zero_src);
+         nir_def *non_tie = nir_bcsel(b, nir_feq(b, fminmax, zero),
+                                     zero_src, fminmax);
+         lowered = nir_bcsel(b, nir_feq(b, s0, s1), iminmax, non_tie);
       }
 
       break;

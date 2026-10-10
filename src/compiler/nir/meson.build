@@ -447,6 +447,7 @@ if with_tests and not with_nir_headers_only
           'tests/loop_analyze_tests.cpp',
           'tests/loop_unroll_tests.cpp',
           'tests/lower_alu_width_tests.cpp',
+          'tests/lower_blend_tests.cpp',
           'tests/lower_discard_if_tests.cpp',
           'tests/minimize_call_live_states_test.cpp',
           'tests/mod_analysis_tests.cpp',

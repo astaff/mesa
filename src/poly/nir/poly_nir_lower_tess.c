@@ -75,8 +75,11 @@ lower_tes_load(nir_builder *b, nir_intrinsic_instr *intr)
    if (nir_intrinsic_has_component(intr))
       addr = nir_iadd_imm(b, addr, nir_intrinsic_component(intr) * 4);
 
-   return nir_load_global_constant(b, intr->def.num_components,
-                                   intr->def.bit_size, addr, .align_mul = 4);
+   /* Tessellation buffers have one raw word per component, including narrow
+    * interfaces. */
+   nir_def *value = nir_load_global_constant(b, intr->def.num_components, 32,
+                                             addr, .align_mul = 4);
+   return nir_u2uN(b, value, intr->def.bit_size);
 }
 
 static nir_def *
@@ -102,6 +105,29 @@ lower_tcs_impl(nir_builder *b, nir_intrinsic_instr *intr,
        * a patch fits in a subgroup. */
       nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
 
+      if (!can_ignore_shader_out_barriers) {
+         /* A patch fits in a subgroup, so a pure execution rendezvous is
+          * redundant.  Memory barriers still order the global TCS output
+          * buffer between the control-point and patch-constant phases. */
+         if (nir_intrinsic_memory_scope(intr) == SCOPE_NONE)
+            return NIR_LOWER_INSTR_PROGRESS_REPLACE;
+
+         /* Skip barriers that don't handle shader outputs */
+         if (!(modes & nir_var_shader_out))
+            return NULL;
+
+         /* Output loads/stores below become global accesses.  Their barriers
+          * must follow that address-space change while preserving scopes,
+          * acquire/release semantics and ordering for any other memory
+          * modes. */
+         nir_barrier(b, .execution_scope = nir_intrinsic_execution_scope(intr),
+                     .memory_scope = nir_intrinsic_memory_scope(intr),
+                     .memory_semantics = nir_intrinsic_memory_semantics(intr),
+                     .memory_modes =
+                        (modes & ~nir_var_shader_out) | nir_var_mem_global);
+         return NIR_LOWER_INSTR_PROGRESS_REPLACE;
+      }
+
       /* Skip barriers that don't handle shader outputs */
       if (!(modes & nir_var_shader_out))
          return NULL;
@@ -110,22 +136,13 @@ lower_tcs_impl(nir_builder *b, nir_intrinsic_instr *intr,
 
       /* A barrier that only targeted shader outputs can be dropped entirely by
        * drivers that don't need it. */
-      if (can_ignore_shader_out_barriers && !modes)
+      if (!modes)
          return NIR_LOWER_INSTR_PROGRESS_REPLACE;
 
-      /* Keep the original scopes while the barrier still targets other modes;
-       * otherwise a subgroup scope suffices since a patch fits in a subgroup.
-       * Drivers that can't ignore the shader-output barrier must preserve it
-       * against the lowered global memory. */
-      mesa_scope execution_scope =
-         modes ? nir_intrinsic_execution_scope(intr) : SCOPE_SUBGROUP;
-      mesa_scope memory_scope =
-         modes ? nir_intrinsic_memory_scope(intr) : SCOPE_SUBGROUP;
-      if (!can_ignore_shader_out_barriers)
-         modes |= nir_var_mem_global;
-
-      nir_barrier(b, .execution_scope = execution_scope,
-                  .memory_scope = memory_scope,
+      /* Keep the original scopes while the barrier still targets other modes.
+       */
+      nir_barrier(b, .execution_scope = nir_intrinsic_execution_scope(intr),
+                  .memory_scope = nir_intrinsic_memory_scope(intr),
                   .memory_semantics = nir_intrinsic_memory_semantics(intr),
                   .memory_modes = modes);
       return NIR_LOWER_INSTR_PROGRESS_REPLACE;
@@ -138,7 +155,10 @@ lower_tcs_impl(nir_builder *b, nir_intrinsic_instr *intr,
       return nir_channel(b, nir_load_workgroup_id(b), 1);
 
    case nir_intrinsic_load_invocation_id:
-      if (b->shader->info.tess.tcs_vertices_out == 1)
+      /* A DXBC hull shader may have one output control point but wider
+       * fork/join phases. In that case the workgroup still needs distinct
+       * phase invocation IDs even though the control-point phase is scalar. */
+      if (b->shader->info.workgroup_size[0] == 1)
          return nir_imm_int(b, 0);
       else
          return nir_channel(b, nir_load_local_invocation_id(b), 0);
@@ -159,14 +179,16 @@ lower_tcs_impl(nir_builder *b, nir_intrinsic_instr *intr,
 
    case nir_intrinsic_load_output: {
       nir_def *addr = tcs_out_addr(b, intr, nir_undef(b, 1, 32));
-      return nir_load_global(b, intr->def.num_components, intr->def.bit_size,
-                             addr, .align_mul = 4);
+      nir_def *value = nir_load_global(b, intr->def.num_components, 32, addr,
+                                       .align_mul = 4);
+      return nir_u2uN(b, value, intr->def.bit_size);
    }
 
    case nir_intrinsic_load_per_vertex_output: {
       nir_def *addr = tcs_out_addr(b, intr, intr->src[0].ssa);
-      return nir_load_global(b, intr->def.num_components, intr->def.bit_size,
-                             addr, .align_mul = 4);
+      nir_def *value = nir_load_global(b, intr->def.num_components, 32, addr,
+                                       .align_mul = 4);
+      return nir_u2uN(b, value, intr->def.bit_size);
    }
 
    case nir_intrinsic_store_output: {
@@ -175,14 +197,14 @@ lower_tcs_impl(nir_builder *b, nir_intrinsic_instr *intr,
              nir_intrinsic_io_semantics(intr).location !=
                 VARYING_SLOT_TESS_LEVEL_INNER);
 
-      nir_store_global(b, intr->src[0].ssa,
+      nir_store_global(b, nir_u2u32(b, intr->src[0].ssa),
                        tcs_out_addr(b, intr, nir_undef(b, 1, 32)),
                        .write_mask = nir_intrinsic_write_mask(intr));
       return NIR_LOWER_INSTR_PROGRESS_REPLACE;
    }
 
    case nir_intrinsic_store_per_vertex_output: {
-      nir_store_global(b, intr->src[0].ssa,
+      nir_store_global(b, nir_u2u32(b, intr->src[0].ssa),
                        tcs_out_addr(b, intr, intr->src[1].ssa),
                        .write_mask = nir_intrinsic_write_mask(intr));
       return NIR_LOWER_INSTR_PROGRESS_REPLACE;

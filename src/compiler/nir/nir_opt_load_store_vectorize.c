@@ -386,20 +386,36 @@ parse_alu(struct vectorize_ctx *ctx, nir_scalar *def, nir_op op, uint64_t *c, bo
    if (!nir_scalar_is_alu(*def) || get_effective_alu_op(*def) != op)
       return false;
 
-   if (require_nuw && !nir_is_scalar_nuw(ctx->shader, &ctx->uub_ht, *def))
-      return false;
-
    nir_scalar src0 = nir_scalar_chase_alu_src(*def, 0);
    nir_scalar src1 = nir_scalar_chase_alu_src(*def, 1);
+   nir_scalar variable;
+   uint64_t constant;
    if (op != nir_op_ishl && nir_scalar_is_const(src0)) {
-      *c = nir_scalar_as_uint(src0);
-      *def = src1;
+      constant = nir_scalar_as_uint(src0);
+      variable = src1;
    } else if (nir_scalar_is_const(src1)) {
-      *c = nir_scalar_as_uint(src1);
-      *def = src0;
+      constant = nir_scalar_as_uint(src1);
+      variable = src0;
    } else {
       return false;
    }
+
+   if (require_nuw && !nir_is_scalar_nuw(ctx->shader, &ctx->uub_ht, *def)) {
+      if (op != nir_op_iadd)
+         return false;
+
+      /* Widening an unsigned address must preserve narrow arithmetic wrap.
+       * A value with k known zero low bits is at most UINT_MAX - (2^k - 1),
+       * so adding a constant below 2^k cannot wrap.  Keep this proof local:
+       * other components of a vector ALU may have different alignment.
+       */
+      unsigned zeros = nir_def_num_lsb_zero(&ctx->numlsb_ht, variable);
+      if (constant > BITFIELD64_MASK(zeros))
+         return false;
+   }
+
+   *c = constant;
+   *def = variable;
    return true;
 }
 

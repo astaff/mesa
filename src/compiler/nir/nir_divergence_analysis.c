@@ -370,7 +370,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_abort_buffer_address:
    case nir_intrinsic_load_abort_buffer_size:
    case nir_intrinsic_load_samples_log2_agx:
+   case nir_intrinsic_load_sample_positions_agx:
    case nir_intrinsic_load_active_subgroup_count_agx:
+   case nir_intrinsic_load_depth_never_agx:
    case nir_intrinsic_load_root_agx:
    case nir_intrinsic_load_descriptor_set_agx:
    case nir_intrinsic_load_sm_count_nv:
@@ -1121,6 +1123,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_coefficients_agx:
    case nir_intrinsic_load_active_subgroup_invocation_agx:
    case nir_intrinsic_load_sample_mask:
+   case nir_intrinsic_load_active_samples_agx:
    case nir_intrinsic_quad_ballot_agx:
    case nir_intrinsic_load_agx:
    case nir_intrinsic_load_shared_lock_nv:
