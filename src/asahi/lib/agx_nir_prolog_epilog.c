@@ -1187,7 +1187,6 @@ agx_nir_fs_colour_outputs_unit_range(nir_shader *s)
             }
             u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
                double lo, hi;
-               nir_scalar chan = nir_scalar_chase_movs(nir_get_scalar(vec, c));
                any = true;
                /* Margin covers f16/f32 rounding of each bounded step. */
                if (!unit_bound(s, ht, nir_get_scalar(vec, c), &lo, &hi, 0) ||

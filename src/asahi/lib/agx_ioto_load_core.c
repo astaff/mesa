@@ -494,7 +494,6 @@ agx_ioto_load_finish_round(struct agx_ioto_load_core *core, bool complete_round,
 
    if (complete_round) {
       core->copy_suffix_offset = core->sink.length;
-      const size_t copies_start = core->sink.length;
       for (size_t i = 0; i < core->load_count; ++i) {
          const struct agx_ioto_inflight_load *load = &workspace.loads[i];
          uint8_t mask = load->lane_mask;
