@@ -9038,8 +9038,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * dependency. Keep that wait on its qualified carrier, while
              * the publication owns an independent completion event.
              */
-            if (retire && !agx3_retire_slots_noop(emission, enc, retire))
-               AGX3_REFUSE(I);
+            if (retire) {
+               /* The mask covers this publication's source producers. An
+                * unrelated r0 generation can still be pending, so carry
+                * the wait on the first coordinate instead of modifying r0. */
+               uint8_t bytes[AGX3_ALU_MAX_LENGTH], len = 0;
+               if (!agx3_alu_band_identity_wait(enc, I->src[0].value, retire,
+                                               bytes, &len) ||
+                   !agx3_append(emission, bytes, len))
+                  AGX3_REFUSE(I);
+            }
             outstanding &= (uint16_t)~retire;
             outstanding |= (uint16_t)(1u << (slot - 1));
             agx3_staging_forget(&staging_banks, retire);

@@ -142,3 +142,47 @@ TEST(NativeForms, VertexImageLoadRegisterLod)
    EXPECT_GT(part.info.main_size, 0u);
    free(part.binary);
 }
+
+TEST(NativeForms, TexturePublicationWaitPreservesUnrelatedResult)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 31;
+   agx_index coords = agx_register(10, AGX_SIZE_32);
+   coords.channels_m1 = 1;
+   agx_device_load_to(b, agx_register(0, AGX_SIZE_32),
+                     agx_register(28, AGX_SIZE_64), agx_immediate(0),
+                     AGX_FORMAT_I32, 1, 0, false);
+   agx_device_load_to(b, coords, agx_register(28, AGX_SIZE_64),
+                     agx_immediate(4), AGX_FORMAT_I32, 3, 0, false);
+   agx_publish_texture_agx3(b, coords, agx_null(), 1);
+   agx_index resource = coords;
+   resource.type = AGX_INDEX_RESOURCE;
+   resource.value = 1;
+   agx_index result = agx_register(20, AGX_SIZE_32);
+   result.channels_m1 = 3;
+   agx_texture_sample_to(b, result, resource, agx_immediate(0),
+                        agx_immediate(0), agx_register(24, AGX_SIZE_64),
+                        agx_register(26, AGX_SIZE_64), agx_null(), AGX_DIM_2D,
+                        AGX_LOD_MODE_LOD_MIN, 15, false, false, false,
+                        AGX_GATHER_NONE, false);
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   uint8_t carrier[AGX3_ALU_MAX_LENGTH], len = 0;
+   ASSERT_TRUE(agx3_alu_band_identity_wait(AGX_ISA_ENCODING_AGX3B, 10,
+                                         2, carrier, &len));
+   const uint8_t *bytes = (const uint8_t *)binary.data;
+   bool found = false;
+   for (unsigned i = 0; i + len <= binary.size; ++i)
+      found |= memcmp(bytes + i, carrier, len) == 0;
+   EXPECT_TRUE(found);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
