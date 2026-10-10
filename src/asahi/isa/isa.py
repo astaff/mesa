@@ -317,5 +317,15 @@ class ISA:
                         ensure(ins.name not in self.instrs, f'Multiple instructions named {ins.name}')
                         self.instrs[ins.name] = ins
 
+def load_isa(xmlfile):
+    return ISA(ET.parse(xmlfile).getroot())
+
+def isa_prefix_for_file(xmlfile):
+    return os.path.splitext(os.path.basename(xmlfile))[0].lower()
+
+# Python disassembler users import this module while carrying their own command
+# line arguments, so the library default must not inspect sys.argv. Generators
+# select their XML explicitly after import.
 xmlfile = os.path.join(os.path.dirname(__file__), 'AGX2.xml')
-isa = ISA(ET.parse(xmlfile).getroot())
+isa = load_isa(xmlfile)
+isa_prefix = isa_prefix_for_file(xmlfile)

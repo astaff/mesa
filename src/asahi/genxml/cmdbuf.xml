@@ -204,6 +204,15 @@
   <enum name="Sample Count">
     <value name="2" value="0"/>
     <value name="4" value="1"/>
+    <value name="8" value="2"/>
+  </enum>
+
+  <!-- SamplerGen5 / HAL300.  Values are proven by the G17X sampler
+       constructor and the public Metal reduction-mode enumeration. -->
+  <enum name="Sampler reduction mode">
+    <value name="Weighted average" value="0"/>
+    <value name="Minimum" value="1"/>
+    <value name="Maximum" value="2"/>
   </enum>
 
   <enum name="Image Mode">
@@ -304,9 +313,24 @@
     <field name="Compression" size="2" start="106" type="hex"/> <!-- 0 for uncompressed -->
     <field name="sRGB" size="1" start="108" type="bool"/>
     <field name="sRGB 2-channel" size="1" start="109" type="bool"/>
-    <field name="Stride" size="18" start="110" type="hex" modifier="shr(4)"/>
+    <field name="Stride" size="16" start="110" type="hex" modifier="shr(4)"/>
+    <!-- Stride is SIXTEEN bits, word1[61:46]. Apple's
+         AGX::TextureGen4&lt;&gt;::encodeImageReadState masks it with
+         0x3fffc00000000000, transcribed instruction by instruction and checked
+         against a live descriptor. Declaring 18 let a stride needing 17 bits
+         run past the field and clobber "Page-aligned layers" (126) and
+         "Extended" (127) instead of tripping util_bitpack_uint's range assert.
+         Nothing hk builds reaches it today (the widest stride any path
+         produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
+         which is 16383 after the shift), so this is a latent overrun; the
+         declared width is what makes the guard real. -->
     <!-- Note that 3D/arrays cannot be linear. -->
-    <field name="Depth" size="14" start="110" type="uint" modifier="minus(1)"/>
+    <field name="Depth" size="16" start="110" type="uint" modifier="minus(1)"/>
+    <!-- Sixteen bits, unioned with Stride, and it doubles as the array
+         length: Apple writes arrayLength minus 1 here when arrayLength is at
+         least 2, and depth minus 1 otherwise. Widening from 14 changes no byte
+         for any depth or layer count the limits allow (the two new bits are
+         zero below 16384); it only stops truncating above that. -->
     <field name="Page-aligned layers" size="1" start="126" type="bool"/>
 
     <!-- Read the next word (set for compression or linear 2D arrays) -->
@@ -322,6 +346,171 @@
     <!-- Buffer texture metadata  -->
     <field name="Buffer size (sw)" size="32" start="128" type="uint"/>
     <field name="Buffer offset (sw)" size="32" start="160" type="uint"/>
+  </struct>
+
+  <!-- G15/G16/G17P texture heap element. Only fields grounded by the
+       cross-generation encoder diff are named; the two word-3 selectors are
+       deliberately left semantically unknown. -->
+  <struct name="Texture Gen9" size="32">
+    <field name="Dimension" size="4" start="0" type="Texture dimension"/>
+    <field name="Layout" size="2" start="4" type="Layout"/>
+    <field name="Channels" size="7" start="6" type="Channels"/>
+    <field name="Type" size="3" start="13" type="Texture Type"/>
+    <field name="Swizzle R" size="3" start="16" type="Channel"/>
+    <field name="Swizzle G" size="3" start="19" type="Channel"/>
+    <field name="Swizzle B" size="3" start="22" type="Channel"/>
+    <field name="Swizzle A" size="3" start="25" type="Channel"/>
+    <field name="Width" size="14" start="28" type="uint" modifier="minus(1)"/>
+    <field name="Height" size="14" start="42" type="uint" modifier="minus(1)"/>
+    <field name="Samples" size="2" start="56" type="Sample Count"/>
+    <field name="Has levels" size="1" start="58" type="bool"/>
+    <field name="Compressed" size="1" start="59" type="bool"/>
+    <field name="State control" size="4" start="60" type="hex"/>
+    <field name="Address" size="44" start="64" type="address" modifier="shr(4)"/>
+    <field name="sRGB" size="1" start="108" type="bool"/>
+    <field name="sRGB 2-channel" size="1" start="109" type="bool"/>
+    <field name="Stride" size="16" start="110" type="hex" modifier="shr(4)"/>
+    <!-- Stride is SIXTEEN bits, word1[61:46]. Apple's
+         AGX::TextureGen4&lt;&gt;::encodeImageReadState masks it with
+         0x3fffc00000000000, transcribed instruction by instruction and checked
+         against a live descriptor. Declaring 18 let a stride needing 17 bits
+         run past the field and clobber "Page-aligned layers" (126) and
+         "Extended" (127) instead of tripping util_bitpack_uint's range assert.
+         Nothing hk builds reaches it today (the widest stride any path
+         produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
+         which is 16383 after the shift), so this is a latent overrun; the
+         declared width is what makes the guard real. -->
+    <field name="Depth" size="16" start="110" type="uint" modifier="minus(1)"/>
+    <!-- Sixteen bits, unioned with Stride, and it doubles as the array
+         length: Apple writes arrayLength minus 1 here when arrayLength is at
+         least 2, and depth minus 1 otherwise. Widening from 14 changes no byte
+         for any depth or layer count the limits allow (the two new bits are
+         zero below 16384); it only stops truncating above that. -->
+    <field name="Page-aligned layers" size="1" start="126" type="bool"/>
+    <field name="Extended" size="1" start="127" type="bool"/>
+    <field name="Acceleration buffer" size="44" start="128" type="address" modifier="shr(4)"/>
+    <field name="Depth (linear)" size="11" start="128" type="uint" modifier="minus(1)"/>
+    <field name="Layer stride (linear)" size="27" start="139" type="uint" modifier="shr(7)"/>
+    <field name="First level" size="4" start="172" type="uint"/>
+    <field name="Last level" size="4" start="176" type="uint"/>
+    <field name="Unk word 3 bits 0-1" size="2" start="192" type="hex"/>
+    <field name="Unk word 3 bits 8-10" size="3" start="200" type="hex"/>
+  </struct>
+
+  <!-- HAL300 / M5 live-measured texture heap element. -->
+  <struct name="Texture Gen10" size="32">
+    <field name="Dimension" size="4" start="0" type="Texture dimension"/>
+    <field name="Layout" size="2" start="4" type="Layout"/>
+    <field name="Channels" size="7" start="6" type="Channels"/>
+    <field name="Type" size="3" start="13" type="Texture Type"/>
+    <field name="Swizzle R" size="3" start="16" type="Channel"/>
+    <field name="Swizzle G" size="3" start="19" type="Channel"/>
+    <field name="Swizzle B" size="3" start="22" type="Channel"/>
+    <field name="Swizzle A" size="3" start="25" type="Channel"/>
+    <field name="Width" size="15" start="28" type="uint" modifier="minus(1)"/>
+    <field name="Height" size="15" start="43" type="uint" modifier="minus(1)"/>
+    <field name="Samples" size="2" start="58" type="Sample Count"/>
+    <field name="Unk mipmapped" size="1" start="60" type="bool"/>
+    <field name="Compressed" size="1" start="61" type="bool"/>
+    <field name="Image mode enable" size="1" start="62" type="bool"/>
+    <field name="Image mode" size="2" start="64" type="Image Mode"/>
+    <field name="Address" size="44" start="64" type="address" modifier="shr(4)"/>
+    <field name="sRGB" size="1" start="108" type="bool"/>
+    <field name="sRGB 2-channel" size="1" start="109" type="bool"/>
+    <field name="Stride" size="16" start="110" type="hex" modifier="shr(4)"/>
+    <!-- Stride is SIXTEEN bits, word1[61:46]. Apple's
+         AGX::TextureGen4&lt;&gt;::encodeImageReadState masks it with
+         0x3fffc00000000000, transcribed instruction by instruction and checked
+         against a live descriptor. Declaring 18 let a stride needing 17 bits
+         run past the field and clobber "Page-aligned layers" (126) and
+         "Extended" (127) instead of tripping util_bitpack_uint's range assert.
+         Nothing hk builds reaches it today (the widest stride any path
+         produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
+         which is 16383 after the shift), so this is a latent overrun; the
+         declared width is what makes the guard real. -->
+    <field name="Depth" size="16" start="110" type="uint" modifier="minus(1)"/>
+    <!-- Sixteen bits, unioned with Stride, and it doubles as the array
+         length: Apple writes arrayLength minus 1 here when arrayLength is at
+         least 2, and depth minus 1 otherwise. Widening from 14 changes no byte
+         for any depth or layer count the limits allow (the two new bits are
+         zero below 16384); it only stops truncating above that. -->
+    <field name="Page-aligned layers" size="1" start="126" type="bool"/>
+    <field name="Extended" size="1" start="127" type="bool"/>
+    <field name="Acceleration buffer" size="44" start="128" type="address" modifier="shr(4)"/>
+    <field name="Depth (linear)" size="11" start="128" type="uint" modifier="minus(1)"/>
+    <field name="Layer stride (linear)" size="28" start="139" type="uint" modifier="shr(7)"/>
+    <field name="First level" size="4" start="172" type="uint"/>
+    <field name="Last level" size="4" start="176" type="uint"/>
+    <field name="Unk word 3 bits 0-1" size="2" start="192" type="hex"/>
+    <field name="Unk word 3 bits 8-10" size="3" start="200" type="hex"/>
+  </struct>
+
+  <!-- PBEStateEncoderGen9, byte-identical on G15 and HAL200. -->
+  <struct name="PBE Gen9" size="32">
+    <field name="Dimension" size="4" start="0" type="Texture dimension"/>
+    <field name="Layout" size="2" start="4" type="Layout"/>
+    <field name="Channels" size="7" start="6" type="Channels"/>
+    <field name="Type" size="3" start="13" type="Texture Type"/>
+    <field name="Swizzle R" size="2" start="16" type="Channel"/>
+    <field name="Swizzle G" size="2" start="18" type="Channel"/>
+    <field name="Swizzle B" size="2" start="20" type="Channel"/>
+    <field name="Swizzle A" size="2" start="22" type="Channel"/>
+    <field name="Width" size="14" start="24" type="uint" modifier="minus(1)"/>
+    <field name="Height" size="14" start="38" type="uint" modifier="minus(1)"/>
+    <field name="Unk 52" size="1" start="52" type="bool"/>
+    <field name="Unk linear" size="1" start="53" type="bool"/>
+    <field name="Rotation" size="2" start="54" type="hex"/>
+    <field name="Samples" size="2" start="56" type="Sample Count"/>
+    <field name="Unk mipmapped" size="1" start="58" type="bool"/>
+    <field name="Compressed" size="1" start="59" type="bool"/>
+    <field name="Image mode enable" size="1" start="60" type="bool"/>
+    <field name="Image mode" size="2" start="61" type="Image Mode"/>
+    <field name="Buffer" size="44" start="64" type="address" modifier="shr(4)"/>
+    <field name="Stride" size="21" start="104" type="hex"/>
+    <field name="Layers" size="16" start="108" type="uint" modifier="minus(1)"/>
+    <field name="Page-aligned layers" size="1" start="124" type="bool"/>
+    <field name="Gamma" size="2" start="125" type="hex"/>
+    <field name="Extended" size="1" start="127" type="bool"/>
+    <field name="Acceleration buffer" size="44" start="128" type="address" modifier="shr(4)"/>
+    <field name="Depth (linear)" size="11" start="128" type="uint" modifier="minus(1)"/>
+    <field name="Layer stride (linear)" size="27" start="139" type="uint" modifier="shr(7)"/>
+    <field name="Level" size="4" start="172" type="uint"/>
+    <field name="Levels" size="4" start="176" type="uint" modifier="minus(1)"/>
+    <field name="Reserved word 3" size="64" start="192" type="hex" exact="0"/>
+  </struct>
+
+  <!-- PBEStateEncoderGen10 on HAL300 / M5. -->
+  <struct name="PBE Gen10" size="32">
+    <field name="Dimension" size="4" start="0" type="Texture dimension"/>
+    <field name="Layout" size="2" start="4" type="Layout"/>
+    <field name="Channels" size="7" start="6" type="Channels"/>
+    <field name="Type" size="3" start="13" type="Texture Type"/>
+    <field name="Swizzle R" size="2" start="16" type="Channel"/>
+    <field name="Swizzle G" size="2" start="18" type="Channel"/>
+    <field name="Swizzle B" size="2" start="20" type="Channel"/>
+    <field name="Swizzle A" size="2" start="22" type="Channel"/>
+    <field name="Width" size="15" start="24" type="uint" modifier="minus(1)"/>
+    <field name="Height" size="15" start="39" type="uint" modifier="minus(1)"/>
+    <field name="Unk 54" size="1" start="54" type="bool"/>
+    <field name="Unk linear" size="1" start="55" type="bool"/>
+    <field name="Rotation" size="2" start="56" type="hex"/>
+    <field name="Samples" size="2" start="58" type="Sample Count"/>
+    <field name="Unk mipmapped" size="1" start="60" type="bool"/>
+    <field name="Compressed" size="1" start="61" type="bool"/>
+    <field name="Image mode enable" size="1" start="62" type="bool"/>
+    <field name="Image mode" size="2" start="64" type="Image Mode"/>
+    <field name="Buffer" size="44" start="64" type="address" modifier="shr(4)"/>
+    <field name="Stride" size="21" start="104" type="hex"/>
+    <field name="Layers" size="16" start="108" type="uint" modifier="minus(1)"/>
+    <field name="Page-aligned layers" size="1" start="124" type="bool"/>
+    <field name="Gamma" size="2" start="125" type="hex"/>
+    <field name="Extended" size="1" start="127" type="bool"/>
+    <field name="Acceleration buffer" size="44" start="128" type="address" modifier="shr(4)"/>
+    <field name="Depth (linear)" size="11" start="128" type="uint" modifier="minus(1)"/>
+    <field name="Layer stride (linear)" size="28" start="139" type="uint" modifier="shr(7)"/>
+    <field name="Level" size="4" start="172" type="uint"/>
+    <field name="Levels" size="4" start="176" type="uint" modifier="minus(1)"/>
+    <field name="Reserved word 3" size="64" start="192" type="hex" exact="0"/>
   </struct>
 
   <enum name="Wrap">
@@ -367,6 +556,43 @@
     <field name="Compare enable" size="1" start="42" type="bool"/>
     <field name="Border colour" size="2" start="55" type="Border colour"/>
     <field name="Seamful cube maps" size="1" start="57" type="bool"/>
+  </struct>
+
+  <struct name="Sampler HAL200" size="8">
+    <field name="Minimum LOD" size="10" start="0" type="lod"/>
+    <field name="Maximum LOD" size="10" start="10" type="lod"/>
+    <field name="Maximum anisotropy" size="3" start="20" type="uint" modifier="log2"/>
+    <field name="Magnify" size="2" start="23" type="Filter"/>
+    <field name="Minify" size="2" start="25" type="Filter"/>
+    <field name="Mip filter" size="2" start="27" type="Mip filter"/>
+    <field name="Wrap S" size="3" start="29" type="Wrap"/>
+    <field name="Wrap T" size="3" start="32" type="Wrap"/>
+    <field name="Wrap R" size="3" start="35" type="Wrap"/>
+    <field name="Pixel coordinates" size="1" start="38" type="bool"/>
+    <field name="Compare func" size="3" start="39" type="Compare func"/>
+    <field name="Compare enable" size="1" start="42" type="bool"/>
+    <field name="LOD bias" size="11" start="43" type="slod"/>
+    <field name="Border colour" size="2" start="61" type="Border colour"/>
+    <field name="Seamful cube maps" size="1" start="63" type="bool"/>
+  </struct>
+
+  <struct name="Sampler Gen5" size="8">
+    <field name="Minimum LOD" size="10" start="0" type="lod15"/>
+    <field name="Maximum LOD" size="10" start="10" type="lod15"/>
+    <field name="Maximum anisotropy" size="3" start="20" type="uint" modifier="log2"/>
+    <field name="Magnify" size="2" start="23" type="Filter"/>
+    <field name="Minify" size="2" start="25" type="Filter"/>
+    <field name="Mip filter" size="2" start="27" type="Mip filter"/>
+    <field name="Wrap S" size="3" start="29" type="Wrap"/>
+    <field name="Wrap T" size="3" start="32" type="Wrap"/>
+    <field name="Wrap R" size="3" start="35" type="Wrap"/>
+    <field name="Pixel coordinates" size="1" start="38" type="bool"/>
+    <field name="Compare func" size="3" start="39" type="Compare func"/>
+    <field name="Reduction mode" size="2" start="39" type="Sampler reduction mode"/>
+    <field name="Compare mode" size="1" start="42" type="bool"/>
+    <field name="LOD bias" size="11" start="43" type="slod"/>
+    <field name="Border colour" size="2" start="61" type="Border colour"/>
+    <field name="Seamful cube maps" size="1" start="63" type="bool"/>
   </struct>
 
   <struct name="Border" size="16">
@@ -1002,6 +1228,11 @@
     <value name="Stream Terminate" value="2"/>
     <value name="Barrier" value="3"/>
     <value name="Stream Return" value="4"/>
+    <!-- Values 5 and 6 are emitted by every inspected Apple generation.
+         Only the bounded link-padding use of value 5 is decoded below;
+         value 6 remains semantically unknown. -->
+    <value name="Unknown 5" value="5"/>
+    <value name="Unknown 6" value="6"/>
   </enum>
 
   <enum name="CDM Mode">
@@ -1030,6 +1261,19 @@
 
   <struct name="CDM Launch Word 1" size="4">
     <field name="Pipeline" size="26" start="6" type="address" modifier="shr(6)"/>
+  </struct>
+
+  <!-- G15/HAL200/HAL300 launch header.  The pipeline VA is 48-bit and
+       64-byte aligned: bits 47:38 occupy word 1 bits 31:22 and bits 37:6
+       occupy all of word 2.  The remaining template fields are preserved
+       without assigning semantics that the recovered corpus does not prove. -->
+  <struct name="CDM Launch AGX3" size="16">
+    <field name="Word 0 payload" size="29" start="0:0" type="hex"/>
+    <field name="Block Type" size="3" start="0:29" type="CDM Block Type" exact="Launch"/>
+    <field name="Word 1 payload" size="22" start="1:0" type="hex"/>
+    <field name="Pipeline hi" size="10" start="1:22" type="hex"/>
+    <field name="Pipeline lo" size="32" start="2:0" type="hex"/>
+    <field name="Opaque word 3" size="32" start="3:0" type="hex"/>
   </struct>
 
   <struct name="CDM Unk G14X" size="8">
@@ -1088,12 +1332,28 @@
     <field name="Target lo" size="32" start="32" type="hex"/>
   </struct>
 
+  <!-- AGX3 widens the CDM link target from 40 to 48 bits. -->
+  <struct name="CDM Stream Link AGX3" size="8">
+    <field name="Target hi" size="16" start="0" type="hex"/>
+    <field name="With return" size="1" start="28" type="bool"/>
+    <field name="Block Type" size="3" start="29" type="CDM Block Type" exact="Stream Link"/>
+    <field name="Target lo" size="32" start="32" type="hex"/>
+  </struct>
+
   <struct name="CDM Stream Terminate" size="8">
     <field name="Block Type" size="3" start="29" type="CDM Block Type" exact="Stream Terminate"/>
   </struct>
 
   <struct name="CDM Stream Return" size="8">
     <field name="Block Type" size="3" start="29" type="CDM Block Type" exact="Stream Return"/>
+  </struct>
+
+  <!-- ComputeControlFlowEmitterGen1::emitLink surrounds a link with this
+       four-byte type-5 token.  The low three bits carry the bounded padding
+       count; all other payload bits are zero in the pinned AGX3 emitters. -->
+  <struct name="CDM Link Padding AGX3" size="4">
+    <field name="Count" size="3" start="0" type="uint"/>
+    <field name="Block Type" size="3" start="29" type="CDM Block Type" exact="Unknown 5"/>
   </struct>
   <!-- CDM commands end -->
 
