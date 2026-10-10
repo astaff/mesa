@@ -1826,7 +1826,15 @@ wsi_wl_surface_get_min_image_count(struct wsi_wl_display *display,
                                    const VkSurfacePresentModeKHR *present_mode)
 {
    if (present_mode) {
-      return present_mode->presentMode == VK_PRESENT_MODE_MAILBOX_KHR ?
+      /* IMMEDIATE only tears when the compositor honours the async
+       * tearing hint. Otherwise (a composited surface, or a direct-scanout
+       * plane without async page flips) the compositor keeps one image on
+       * screen and one queued for the next flip, exactly as for MAILBOX, and
+       * with three images the application gets one image back per refresh:
+       * IMMEDIATE silently degrades to the display rate. Give it the MAILBOX
+       * count so it never waits on the display. */
+      return present_mode->presentMode == VK_PRESENT_MODE_MAILBOX_KHR ||
+             present_mode->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ?
              WSI_WL_BUMPED_NUM_IMAGES : WSI_WL_DEFAULT_NUM_IMAGES;
    }
 
@@ -2557,8 +2565,10 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
 fail:
    loader_wayland_surface_destroy(&wsi_wl_surface->wayland_surface);
 
-   if (wsi_wl_surface->display)
+   if (wsi_wl_surface->display) {
       wsi_wl_display_destroy(wsi_wl_surface->display);
+      wsi_wl_surface->display = NULL;
+   }
    return result;
 }
 
@@ -3284,10 +3294,17 @@ set_timestamp(struct wsi_wl_swapchain *chain,
       chain->present_ids.last_target_time = target;
       *timestamp = target;
 
-      /* Take back 500 us as a safety margin, to ensure we don't miss our
-       * target due to round-off error.
+      /* Timestamps are only sent along with a FIFO barrier, and the barrier
+       * already keeps this update from replacing the previous one before
+       * that one is presented at the refresh before the target. All the
+       * timestamp has to add is the throttling for an occluded surface, so
+       * ask for no later than that previous refresh. Asking for the target
+       * itself (minus a 500 us margin) made a compositor that picks the
+       * content for a refresh well before that refresh, as Hyprland does,
+       * hold back nearly every frame by one refresh; the display-error
+       * correction then skipped refreshes to catch up.
        */
-      timespec_from_nsec(&target_ts, target - 500000);
+      timespec_from_nsec(&target_ts, target - refresh);
    }
 
    wp_commit_timer_v1_set_timestamp(chain->commit_timer,
@@ -3353,6 +3370,30 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
       queue_dispatched = true;
    }
 
+   struct wsi_wl_present_id *id = NULL;
+   if (present_id > 0 || (mode_fifo && chain->commit_timer) ||
+       util_perfetto_is_tracing_enabled() || chain->timing_request.serial) {
+      id = vk_zalloc(chain->wsi_wl_surface->display->wsi_wl->alloc,
+                     sizeof(*id), sizeof(uintptr_t),
+                     VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!id) {
+         /* Common WSI has already enqueued the semaphore waits and any blit.
+          * An OOM return would require leaving that synchronization untouched;
+          * since it cannot be rolled back, the specification requires device
+          * loss instead. */
+         VK_FROM_HANDLE(vk_device, device, wsi_chain->device);
+         return vk_device_set_lost(
+            device, "Wayland present tracking allocation failed after enqueue");
+      }
+
+      id->chain = chain;
+      id->present_id = present_id;
+      id->alloc = chain->wsi_wl_surface->display->wsi_wl->alloc;
+      id->timing_serial = chain->timing_request.serial;
+      id->img = &chain->images[image_index].base;
+      id->user_target_time = chain->timing_request.time != 0;
+   }
+
    if (chain->base.image_info.explicit_sync) {
       struct wsi_wl_image *image = &chain->images[image_index];
       /* Incremented by signal in base queue_present. */
@@ -3394,18 +3435,7 @@ wsi_wl_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
 			0, 0, INT32_MAX, INT32_MAX);
    }
 
-   if (present_id > 0 || (mode_fifo && chain->commit_timer) ||
-       util_perfetto_is_tracing_enabled() || chain->timing_request.serial) {
-      struct wsi_wl_present_id *id =
-         vk_zalloc(chain->wsi_wl_surface->display->wsi_wl->alloc, sizeof(*id), sizeof(uintptr_t),
-                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-      id->chain = chain;
-      id->present_id = present_id;
-      id->alloc = chain->wsi_wl_surface->display->wsi_wl->alloc;
-      id->timing_serial = chain->timing_request.serial;
-      id->img = &chain->images[image_index].base;
-      id->user_target_time = chain->timing_request.time != 0;
-
+   if (id) {
       mtx_lock(&chain->present_ids.lock);
 
       if (mode_fifo && chain->fifo && chain->commit_timer)
@@ -3867,8 +3897,11 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       /* With proper FIFO, we return a lower minImageCount to make FIFO viable without requiring the use of KHR_present_wait.
        * The image count for MAILBOX should be bumped for performance reasons in this case.
        * This matches strategy for X11. */
+      /* Size for the mode actually used, including a MESA_VK_WSI_PRESENT_MODE
+       * override. */
       const VkSurfacePresentModeKHR mode =
-            { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR, NULL, pCreateInfo->presentMode };
+            { VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR, NULL,
+              wsi_swapchain_get_present_mode(wsi_device, pCreateInfo) };
 
       uint32_t min_images = wsi_wl_surface_get_min_image_count(wsi_wl_surface->display, &mode);
       bool requires_image_count_bump = min_images == WSI_WL_BUMPED_NUM_IMAGES;
@@ -4004,17 +4037,25 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
       wl_display_create_queue_with_name(chain->wsi_wl_surface->display->wl_display,
                                         queue_name);
    vk_free(pAllocator, queue_name);
+   if (!chain->present_ids.queue) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail_free_wl_chain;
+   }
 
    if (chain->wsi_wl_surface->display->wp_presentation_notwrapped) {
       chain->present_ids.frame_fallback = false;
-      loader_wayland_wrap_presentation(&chain->present_ids.wayland_presentation,
-                                       chain->wsi_wl_surface->display->wp_presentation_notwrapped,
-                                       chain->present_ids.queue,
-                                       chain->wsi_wl_surface->display->presentation_clock_id,
-                                       &chain->wsi_wl_surface->wayland_surface,
-                                       presentation_handle_presented,
-                                       presentation_handle_discarded,
-                                       presentation_handle_teardown);
+      if (!loader_wayland_wrap_presentation(
+             &chain->present_ids.wayland_presentation,
+             chain->wsi_wl_surface->display->wp_presentation_notwrapped,
+             chain->present_ids.queue,
+             chain->wsi_wl_surface->display->presentation_clock_id,
+             &chain->wsi_wl_surface->wayland_surface,
+             presentation_handle_presented,
+             presentation_handle_discarded,
+             presentation_handle_teardown)) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_free_wl_chain;
+      }
    } else {
       /* Fallback to frame callbacks when presentation protocol is not available.
        * We already have a proxy for the surface, but need another since
@@ -4022,6 +4063,10 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
        * QueuePresentKHR frame callback's queue. */
       chain->present_ids.frame_fallback = true;
       chain->present_ids.surface = wl_proxy_create_wrapper(wsi_wl_surface->base.surface);
+      if (!chain->present_ids.surface) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_free_wl_chain;
+      }
       wl_proxy_set_queue((struct wl_proxy *) chain->present_ids.surface,
                          chain->present_ids.queue);
    }
@@ -4084,8 +4129,10 @@ fail_free_wl_images:
 fail_free_wl_chain:
    wsi_wl_swapchain_chain_free(chain, pAllocator);
 fail:
+   /* A rejected competing create never owned the surface. */
+   if (wsi_wl_surface->chain == chain)
+      wsi_wl_surface->chain = NULL;
    vk_free(pAllocator, chain);
-   wsi_wl_surface->chain = NULL;
 
    assert(result != VK_SUCCESS);
    return result;

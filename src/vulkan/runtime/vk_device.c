@@ -304,6 +304,8 @@ vk_device_init(struct vk_device *device,
       .null_storage_buffer_descriptor = device->enabled_features.nullDescriptor,
    };
 
+   simple_mtx_init(&device->shader_binary_validation.lock, mtx_plain);
+
    device->disable_lto = false;
 
    device->debug_output = stdout;
@@ -327,6 +329,11 @@ vk_device_finish(struct vk_device *device)
       device->sync->finalize(device->sync);
 
    vk_device_memory_report_finish(device);
+
+   for (unsigned i = 0; i < VK_SHADER_BINARY_VALIDATION_CACHE_MAX; ++i)
+      free(device->shader_binary_validation.entries[i].data);
+   simple_mtx_destroy(&device->shader_binary_validation.lock);
+
    vk_memory_trace_finish(device);
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR

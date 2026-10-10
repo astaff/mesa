@@ -39,6 +39,7 @@
 
 struct vk_meta_fill_buffer_key {
    enum vk_meta_object_key_type key_type;
+   uint32_t chunk_size;
 };
 
 struct vk_meta_copy_buffer_key {
@@ -49,6 +50,7 @@ struct vk_meta_copy_buffer_key {
 
 struct vk_meta_copy_image_view {
    VkImageViewType type;
+   bool depth_stencil_aspect_views;
 
    union {
       struct {
@@ -460,7 +462,8 @@ copy_create_src_image_view(struct vk_command_buffer *cmd,
     * set of aspects for the full image.
     */
    VkImageAspectFlags view_aspects =
-      aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ?
+      !view_info->depth_stencil_aspect_views &&
+      (aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) ?
       vk_format_aspects(format) : aspect;
 
    VkImageViewCreateInfo info = {
@@ -515,7 +518,8 @@ copy_create_dst_image_view(struct vk_command_buffer *cmd,
     * set of aspects for the full image.
     */
    VkImageAspectFlags view_aspects =
-      aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ?
+      !view_info->depth_stencil_aspect_views &&
+      (aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) ?
       vk_format_aspects(format) : aspect;
    const VkImageViewUsageCreateInfo usage = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
@@ -1060,8 +1064,21 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
 
    coords = nir_iadd(b, coords, img_offs);
 
-   nir_def *texel = nir_load_global(b,
-      comp_count, comp_sz, copy_img_buf_addr(b, buf_pfmt, coords),
+   /* Helper invocations just outside an unaligned rectangle can have negative
+    * copy-relative coordinates. The unsigned byte offset would then wrap and
+    * fault on hardware without soft faults. This shader has no derivatives;
+    * helpers may safely read the first source texel instead. Keep the address
+    * itself valid, even if the backend speculates the load.
+    */
+   nir_def *extent = nir_vec3(b,
+      load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.x),
+      load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.y),
+      load_info(b, struct vk_meta_copy_buffer_image_info, copy_id_range.end.z));
+   nir_def *in_bounds = nir_ball(b, nir_ult(b, coords, extent));
+   coords = nir_bcsel(b, in_bounds, coords, nir_imm_ivec3(b, 0, 0, 0));
+
+   nir_def *texel = nir_load_global(
+      b, comp_count, comp_sz, copy_img_buf_addr(b, buf_pfmt, coords),
       .align_mul = 1 << (ffs(blk_sz) - 1));
 
    /* We don't do compressed formats. The driver should select a non-compressed
@@ -1072,7 +1089,25 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
       copy_img_view_format_for_aspect(&key->img.view, key->img.aspect);
    nir_variable *out_var = frag_var(b, &key->img.view, key->img.aspect, 0);
 
-   texel = convert_texel(b, buf_fmt, iview_fmt, texel);
+   if (meta->use_masked_rgba8_buffer_unpack &&
+       buf_fmt == VK_FORMAT_R32_UINT &&
+       iview_fmt == VK_FORMAT_R8G8B8A8_UNORM) {
+      /* Keep the unpack in 32-bit ALU: each masked byte retains its original
+       * bit position, which the per-channel scale removes while normalizing.
+       */
+      nir_def *channel[4];
+      for (unsigned i = 0; i < ARRAY_SIZE(channel); ++i) {
+         const unsigned shift = i * 8;
+         const uint32_t mask = 0xffu << shift;
+         nir_def *masked = nir_iand(b, texel, nir_imm_int(b, mask));
+         channel[i] = nir_fmul_imm(
+            b, nir_u2f32(b, masked),
+            1.0f / (255.0f * (float)(1u << shift)));
+      }
+      texel = nir_vec4(b, channel[0], channel[1], channel[2], channel[3]);
+   } else {
+      texel = convert_texel(b, buf_fmt, iview_fmt, texel);
+   }
    write_frag(b, &key->img.view, key->img.aspect, out_var, texel);
    return b->shader;
 }
@@ -1220,6 +1255,9 @@ copy_buffer_image_prepare_gfx_push_const(
     */
    assert(buf_layout->image_stride_B <= UINT32_MAX);
 
+   const VkOffset3D source_offset =
+      vk_meta_buffer_to_image_gfx_source_offset(meta, img->image_type,
+                                                region->imageOffset);
    struct vk_meta_copy_buffer_image_info info = {
       .buf = {
          .row_stride = buf_layout->row_stride_B,
@@ -1230,11 +1268,21 @@ copy_buffer_image_prepare_gfx_push_const(
        * zero src offset
        */
       .img.offset = {
-         .x = -region->imageOffset.x,
-         .y = -region->imageOffset.y,
-         .z = 0,
+         .x = source_offset.x,
+         .y = source_offset.y,
+         .z = source_offset.z,
       },
    };
+
+   /* Bounds are copy-relative, like the shader's source coordinates. A
+    * graphics view may flatten 3D slices or array layers into its layer ID. */
+   const uint32_t layers = MAX2(region->imageExtent.depth,
+      vk_image_subresource_layer_count(img, &region->imageSubresource));
+   info.copy_id_range.end.x = region->imageExtent.width;
+   info.copy_id_range.end.y = key->img.view.type == VK_IMAGE_VIEW_TYPE_1D_ARRAY
+      ? layers : region->imageExtent.height;
+   info.copy_id_range.end.z = key->img.view.type == VK_IMAGE_VIEW_TYPE_1D_ARRAY
+      ? 1 : layers;
 
    disp->CmdPushConstants(vk_command_buffer_to_handle(cmd), pipeline_layout,
                           VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(info), &info);
@@ -1306,6 +1354,7 @@ img_copy_view_info(VkImageViewType view_type, VkImageAspectFlags aspects,
 {
    struct vk_meta_copy_image_view view = {
       .type = view_type,
+      .depth_stencil_aspect_views = img_props->depth_stencil_aspect_views,
    };
 
    assert(aspects &
@@ -2111,10 +2160,20 @@ static bool
 aspect_masks_valid(struct vk_image *src_img, struct vk_image *dst_img,
                    const VkImageCopy2 *region)
 {
+   /* Only multi-planar formats take plane aspects. A single-plane YCbCr
+    * format (G8B8G8R8_422_UNORM, B8G8R8G8_422_UNORM, ...) has YCbCr info but
+    * one plane, and is copied through VK_IMAGE_ASPECT_COLOR_BIT
+    * (VUID-vkCmdCopyImage-srcImage-08713 and -dstImage-08714 only apply to
+    * multi-planar formats).
+    */
    const struct vk_format_ycbcr_info *src_ycbcr_info =
-      vk_format_get_ycbcr_info(src_img->format);
+      vk_format_get_plane_count(src_img->format) > 1
+         ? vk_format_get_ycbcr_info(src_img->format)
+         : NULL;
    const struct vk_format_ycbcr_info *dst_ycbcr_info =
-      vk_format_get_ycbcr_info(dst_img->format);
+      vk_format_get_plane_count(dst_img->format) > 1
+         ? vk_format_get_ycbcr_info(dst_img->format)
+         : NULL;
 
    if (!src_ycbcr_info && !dst_ycbcr_info) {
       ASSERTED const VkImageAspectFlags valid_aspects =
@@ -2438,9 +2497,11 @@ get_copy_buffer_pipeline(struct vk_device *device, struct vk_meta_device *meta,
                                     pipeline_out);
 }
 
-static void
-copy_memory_region(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
-                   const VkDeviceMemoryCopyKHR *region)
+void
+vk_meta_copy_buffer_addresses(struct vk_command_buffer *cmd,
+                              struct vk_meta_device *meta,
+                              VkDeviceAddress src_addr,
+                              VkDeviceAddress dst_addr, VkDeviceSize size)
 {
    struct vk_device *dev = cmd->base.device;
    const struct vk_physical_device *pdev = dev->physical;
@@ -2450,16 +2511,6 @@ copy_memory_region(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
    struct vk_meta_copy_buffer_key key = {
       .key_type = VK_META_OBJECT_KEY_COPY_BUFFER,
    };
-
-   /*
-    * srcRange is the right size to use here due to
-    * VUID-VkDeviceMemoryCopyKHR-size-13016
-    * The size member of dstRange must be greater than or equal to the
-    * size member of srcRange
-    */
-   VkDeviceSize size = region->srcRange.size;
-   VkDeviceAddress src_addr = region->srcRange.address;
-   VkDeviceAddress dst_addr = region->dstRange.address;
 
    /* Combine the size and src/dst address to extract the alignment. */
    uint64_t align = src_addr | dst_addr | size;
@@ -2509,6 +2560,14 @@ copy_memory_region(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
       dst_addr += args.size;
       size -= args.size;
    }
+}
+
+static void
+copy_memory_region(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
+                   const VkDeviceMemoryCopyKHR *region)
+{
+   vk_meta_copy_buffer_addresses(cmd, meta, region->srcRange.address,
+                                region->dstRange.address, region->srcRange.size);
 }
 
 void
@@ -2601,21 +2660,24 @@ vk_meta_update_memory(struct vk_command_buffer *cmd,
 
 static nir_shader *
 build_fill_buffer_shader(const struct vk_meta_device *meta,
-                         UNUSED const void *key_data)
+                         const void *key_data)
 {
+   const struct vk_meta_fill_buffer_key *key = key_data;
    nir_builder builder = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, NULL, "vk-meta-fill-buffer");
    nir_builder *b = &builder;
 
-   b->shader->info.workgroup_size[0] = vk_meta_buffer_access_wg_size(meta, 4);
+   b->shader->info.workgroup_size[0] =
+      vk_meta_buffer_access_wg_size(meta, key->chunk_size);
    b->shader->info.workgroup_size[1] = 1;
    b->shader->info.workgroup_size[2] = 1;
 
    nir_def *global_id = nir_load_global_invocation_id(b, 32);
    nir_def *copy_id = nir_channel(b, global_id, 0);
-   nir_def *offset = nir_imul_imm(b, copy_id, 4);
+   nir_def *offset = nir_imul_imm(b, copy_id, key->chunk_size);
    nir_def *size = load_info(b, struct vk_meta_fill_buffer_info, size);
    nir_def *data = load_info(b, struct vk_meta_fill_buffer_info, data);
+   data = nir_replicate(b, data, key->chunk_size / 4);
 
    nir_push_if(b, nir_ult(b, offset, size));
 
@@ -2625,7 +2687,7 @@ build_fill_buffer_shader(const struct vk_meta_device *meta,
       load_info(b, struct vk_meta_fill_buffer_info, buf_addr);
 
    nir_store_global(b, data, nir_iadd(b, buf_addr, offset),
-                          .align_mul = 4);
+                          .align_mul = key->chunk_size);
 
    nir_pop_if(b, NULL);
 
@@ -2650,18 +2712,33 @@ get_fill_buffer_pipeline(struct vk_device *device, struct vk_meta_device *meta,
 }
 
 void
-vk_meta_fill_memory(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
-                    const VkDeviceAddressRangeKHR* dst_range,
-                    const VkAddressCommandFlagsKHR dstFlags,
-                    const uint32_t data)
+vk_meta_fill_buffer_addr(struct vk_command_buffer *cmd,
+                         struct vk_meta_device *meta,
+                         VkDeviceAddress addr, VkDeviceSize size,
+                         uint32_t data)
 {
    struct vk_device *dev = cmd->base.device;
    const struct vk_physical_device *pdev = dev->physical;
    const struct vk_device_dispatch_table *disp = &dev->dispatch_table;
    VkResult result;
 
+   /* The raw-address entry point is for complete 32-bit words only.  Refuse a
+    * malformed internal request instead of allowing a vector store to cross
+    * the driver's allocation. */
+   if ((addr | size) & 3 || size > UINT64_MAX - addr) {
+      vk_command_buffer_set_error(cmd, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+
+   if (size == 0)
+      return;
+
+   const uint32_t max_chunk = MAX2(meta->buffer_access.max_fill_chunk_size, 4);
+   assert(util_is_power_of_two_nonzero(max_chunk) && max_chunk <= 16);
+
    struct vk_meta_fill_buffer_key key = {
       .key_type = VK_META_OBJECT_KEY_FILL_BUFFER,
+      .chunk_size = MIN2(max_chunk, 1u << MIN2(4, ffsll(addr | size) - 1)),
    };
 
    VkPipelineLayout pipeline_layout;
@@ -2676,11 +2753,16 @@ vk_meta_fill_memory(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
    disp->CmdBindPipeline(vk_command_buffer_to_handle(cmd),
                          VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
 
-   VkDeviceAddress addr = dst_range->address;
-   VkDeviceSize size = dst_range->size;
-
-   const uint32_t optimal_wg_size = vk_meta_buffer_access_wg_size(meta, 4);
-   const uint32_t per_wg_copy_size = optimal_wg_size * 4;
+   /* From the Vulkan 1.3.290 spec:
+    *
+    *   "If VK_WHOLE_SIZE is used and the remaining size of the buffer is not a
+    *    multiple of 4, then the nearest smaller multiple is used."
+    *
+    * hence the mask to align the size on 4 bytes here.
+    */
+   const uint32_t optimal_wg_size =
+      vk_meta_buffer_access_wg_size(meta, key.chunk_size);
+   const uint32_t per_wg_copy_size = optimal_wg_size * key.chunk_size;
    uint32_t max_per_dispatch_size =
       pdev->properties.maxComputeWorkGroupCount[0] * per_wg_copy_size;
 
@@ -2701,4 +2783,13 @@ vk_meta_fill_memory(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
       addr += args.size;
       size -= args.size;
    }
+}
+
+void
+vk_meta_fill_memory(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
+                    const VkDeviceAddressRangeKHR *dst_range,
+                    const VkAddressCommandFlagsKHR dstFlags,
+                    const uint32_t data)
+{
+   vk_meta_fill_buffer_addr(cmd, meta, dst_range->address, dst_range->size, data);
 }

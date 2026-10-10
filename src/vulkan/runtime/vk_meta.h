@@ -89,6 +89,10 @@ struct vk_meta_copy_image_properties {
       };
    };
 
+   /* Keep depth/stencil aspects on internal color-format views when the
+    * driver uses the aspect to select separate backing planes. */
+   bool depth_stencil_aspect_views;
+
    /* Size of the image tile. Used to select the optimal workgroup size. */
    VkExtent3D tile_size;
 };
@@ -111,7 +115,20 @@ struct vk_meta_device {
    uint32_t max_bind_map_buffer_size_B;
    bool use_layered_rendering;
    bool use_gs_for_layer;
+   bool use_layer_output;
    bool use_stencil_export;
+   /* Bind each blit source as a combined image sampler rather than a separate
+    * sampled image and sampler.  A driver whose descriptor contents depend on
+    * the sampler -- for example one that must pick a filterable format for a
+    * scaled image -- cannot make that choice when the two arrive separately.
+    */
+   bool use_combined_blit_descriptors;
+   bool use_masked_rgba8_buffer_unpack;
+   /* A driver without layered rendering may split a 3D graphics copy into
+    * one attachment view per destination Z slice.  The fragment Layer value
+    * is then relative to that view, so it must not be rebased by the absolute
+    * destination Z when addressing the source buffer. */
+   bool use_view_relative_3d_layer;
 
    bool use_rect_list_pipeline;
 
@@ -123,6 +140,10 @@ struct vk_meta_device {
        * fast enough.
        */
       uint32_t optimal_wg_size[VK_META_BUFFER_CHUNK_SIZE_COUNT];
+
+      /* Maximum aligned fill chunk, in bytes. Zero retains scalar 32-bit
+       * fills; drivers may opt in to 8- or 16-byte vector stores. */
+      uint32_t max_fill_chunk_size;
    } buffer_access;
 
    VkResult (*cmd_bind_map_buffer)(struct vk_command_buffer *cmd,
@@ -140,6 +161,17 @@ struct vk_meta_device {
                            const struct vk_meta_rect *rect,
                            uint32_t layer_count);
 };
+
+static inline VkOffset3D
+vk_meta_buffer_to_image_gfx_source_offset(const struct vk_meta_device *meta,
+                                          VkImageType image_type,
+                                          VkOffset3D destination_offset)
+{
+   if (meta->use_view_relative_3d_layer && image_type == VK_IMAGE_TYPE_3D)
+      destination_offset.z = 0;
+
+   return destination_offset;
+}
 
 static inline uint32_t
 vk_meta_buffer_access_wg_size(const struct vk_meta_device *meta,
@@ -394,6 +426,12 @@ void vk_meta_copy_image_to_memory(
    const VkCopyDeviceMemoryImageInfoKHR *info,
    const struct vk_meta_copy_image_properties *img_props);
 
+void vk_meta_copy_buffer_addresses(struct vk_command_buffer *cmd,
+                                   struct vk_meta_device *meta,
+                                   VkDeviceAddress src_addr,
+                                   VkDeviceAddress dst_addr,
+                                   VkDeviceSize size);
+
 void vk_meta_copy_image_to_buffer(
    struct vk_command_buffer *cmd, struct vk_meta_device *meta,
    const VkCopyImageToBufferInfo2 *info,
@@ -434,6 +472,14 @@ void vk_meta_fill_memory(struct vk_command_buffer *cmd,
                          const VkDeviceAddressRangeKHR* dst_range,
                          const VkAddressCommandFlagsKHR dstFlags,
                          const uint32_t data);
+
+/* Fill a raw, naturally aligned device-address range.  This is the internal
+ * counterpart of vk_meta_fill_buffer() for driver-owned allocations which do
+ * not have a public VkBuffer wrapper. */
+void vk_meta_fill_buffer_addr(struct vk_command_buffer *cmd,
+                              struct vk_meta_device *meta,
+                              VkDeviceAddress address, VkDeviceSize size,
+                              uint32_t data);
 
 static inline enum glsl_sampler_dim
 vk_image_view_type_to_sampler_dim(VkImageViewType view_type)
