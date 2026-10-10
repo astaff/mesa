@@ -16,8 +16,6 @@
 #include "nir_intrinsics_indices.h"
 #include "shader_enums.h"
 
-#define AGX_TEXTURE_DESC_STRIDE 24
-
 /*
  * Lower all system values to uniform loads. This pass tries to compact ranges
  * of contiguous uploaded uniforms to reduce the draw-time overhead of uploading
@@ -44,6 +42,7 @@ struct table_state {
 
 struct state {
    mesa_shader_stage stage, hw_stage;
+   unsigned uniform_base;
 
    /* Array of nir_intrinsic_instr's to fix up at the end */
    struct util_dynarray loads;
@@ -117,10 +116,12 @@ load_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *bases)
 }
 
 static nir_def *
-load_texture_handle(nir_builder *b, nir_intrinsic_instr *intr, void *base)
+load_texture_handle(nir_builder *b, nir_intrinsic_instr *intr, void *base,
+                    unsigned texture_descriptor_size)
 {
    nir_def *offs_B =
-      nir_imul_imm(b, nir_u2u32(b, intr->src[0].ssa), AGX_TEXTURE_DESC_STRIDE);
+      nir_imul_imm(b, nir_u2u32(b, intr->src[0].ssa),
+                   texture_descriptor_size);
 
    nir_load_sysval_agx(b, 1, 64, .desc_set = stage_table(b),
                        .binding = (uintptr_t)base, .flags = ~0);
@@ -136,7 +137,7 @@ load_provoking_vtx(nir_builder *b)
 
 static nir_def *
 lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
-                bool lower_draw_params)
+                bool lower_draw_params, unsigned texture_descriptor_size)
 {
    struct agx_draw_uniforms *u = NULL;
    struct agx_stage_uniforms *s = NULL;
@@ -145,7 +146,8 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
    case nir_intrinsic_load_ubo:
       return load_ubo(b, intr, s->ubo_base);
    case nir_intrinsic_load_texture_handle_agx:
-      return load_texture_handle(b, intr, &s->texture_base);
+      return load_texture_handle(b, intr, &s->texture_base,
+                                 texture_descriptor_size);
    case nir_intrinsic_load_sampler_handle_agx:
       return load_sysval_indirect(b, 1, 16, stage_table(b), &s->sampler_handle,
                                   intr->src[0].ssa);
@@ -194,7 +196,7 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
       return load_sysval_root(b, 1, 16, &u->sprite_mask);
    case nir_intrinsic_load_shader_part_tests_zs_agx:
       return load_sysval_root(b, 1, 16, &u->no_epilog_discard);
-   case nir_intrinsic_load_clip_z_coeff:
+   case nir_intrinsic_load_clip_z_coeff_agx:
       return nir_f2f32(b, load_sysval_root(b, 1, 16, &u->clip_z_coeff));
    case nir_intrinsic_load_rasterization_stream:
       return nir_imm_int(b, 0);
@@ -237,10 +239,15 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 /* Step 1. Lower NIR sysvals */
+struct lower_sysvals_config {
+   bool lower_draw_params;
+   unsigned texture_descriptor_size;
+};
+
 static bool
 lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
 {
-   bool *lower_draw_params = data;
+   const struct lower_sysvals_config *config = data;
    b->cursor = nir_before_instr(instr);
    nir_def *old;
    nir_def *replacement = NULL;
@@ -248,7 +255,8 @@ lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
    if (instr->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       old = &intr->def;
-      replacement = lower_intrinsic(b, intr, *lower_draw_params);
+      replacement = lower_intrinsic(b, intr, config->lower_draw_params,
+                                    config->texture_descriptor_size);
    } else if (instr->type == nir_instr_type_tex) {
       nir_tex_instr *tex = nir_instr_as_tex(instr);
       old = &tex->def;
@@ -329,10 +337,11 @@ find_push_range_containing(struct agx_compiled_shader *shader, uint8_t table,
 
 static unsigned
 lay_out_table(struct agx_compiled_shader *shader, struct table_state *state,
-              unsigned table_index, unsigned uniform)
+              unsigned table_index, unsigned uniform, bool dword_ranges)
 {
+   const unsigned table_halfs = sizeof(state->pushed) * 8;
    unsigned start, end;
-   BITSET_FOREACH_RANGE(start, end, state->pushed, sizeof(state->pushed) * 8) {
+   BITSET_FOREACH_RANGE(start, end, state->pushed, table_halfs) {
       unsigned range_start = start;
 
       do {
@@ -348,8 +357,17 @@ lay_out_table(struct agx_compiled_shader *shader, struct table_state *state,
               ++range_end)
             ;
 
-         /* Now make the range with the given size (naturally aligned) */
-         uniform = ALIGN_POT(uniform, size);
+         /* Now make the range with the given size (naturally aligned).
+          *
+          * G17P's Ioto loader moves uniform dwords, so on that chip a range
+          * must also start at an even half and cover an even number of them.
+          * The natural alignment of a 16-bit run is one half, which put the
+          * run after a three-texture handle range at an odd uniform and had
+          * the draw refused ("a pushed uniform range is not dword aligned").
+          * Align the destination to a dword and pad the length to one; the
+          * extra half is a harmless copy of the neighbouring table byte pair.
+          */
+         uniform = ALIGN_POT(uniform, dword_ranges ? MAX2(size, 2) : size);
 
          assert((shader->push_range_count < ARRAY_SIZE(shader->push)) &&
                 "AGX_MAX_PUSH_RANGES must be an upper bound");
@@ -359,14 +377,22 @@ lay_out_table(struct agx_compiled_shader *shader, struct table_state *state,
           */
          range_start = ROUND_DOWN_TO(range_start, 4 / 2);
 
+         /* Every table is a packed struct of an even size, so padding the
+          * pushed run to a dword never reads past the uploaded table. */
+         unsigned pushed_end = range_end;
+         if (dword_ranges) {
+            pushed_end = ALIGN_POT(range_end, 2);
+            assert(pushed_end <= table_halfs);
+         }
+
          shader->push[shader->push_range_count++] = (struct agx_push_range){
             .uniform = uniform,
             .table = table_index,
             .offset = range_start * 2 /* bytes, not elements */,
-            .length = (range_end - range_start),
+            .length = (pushed_end - range_start),
          };
 
-         uniform += (range_end - range_start);
+         uniform += (pushed_end - range_start);
          range_start = range_end;
       } while (range_start < end);
    }
@@ -375,9 +401,10 @@ lay_out_table(struct agx_compiled_shader *shader, struct table_state *state,
 }
 
 static unsigned
-lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state)
+lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state,
+                 bool dword_ranges)
 {
-   unsigned uniform = 0;
+   unsigned uniform = state->uniform_base;
 
    if (state->stage == MESA_SHADER_VERTEX ||
        state->stage == MESA_SHADER_TESS_EVAL) {
@@ -388,14 +415,15 @@ lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state)
 
       if (count) {
          shader->push[shader->push_range_count++] = (struct agx_push_range){
-            .uniform = AGX_ABI_VUNI_VBO_BASE(0),
+            .uniform = state->uniform_base + AGX_ABI_VUNI_VBO_BASE(0),
             .table = AGX_SYSVAL_TABLE_ROOT,
             .offset = (uintptr_t)&u->attrib_base,
             .length = 4 * count,
          };
 
          shader->push[shader->push_range_count++] = (struct agx_push_range){
-            .uniform = AGX_ABI_VUNI_VBO_CLAMP(count, 0),
+            .uniform = state->uniform_base +
+                       AGX_ABI_VUNI_VBO_CLAMP(count, 0),
             .table = AGX_SYSVAL_TABLE_ROOT,
             .offset = (uintptr_t)&u->attrib_clamp,
             .length = 2 * count,
@@ -403,7 +431,7 @@ lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state)
       }
 
       shader->push[shader->push_range_count++] = (struct agx_push_range){
-         .uniform = AGX_ABI_VUNI_FIRST_VERTEX(count),
+         .uniform = state->uniform_base + AGX_ABI_VUNI_FIRST_VERTEX(count),
          .table = AGX_SYSVAL_TABLE_PARAMS,
          .offset = 0,
          .length = 4,
@@ -412,14 +440,15 @@ lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state)
       bool sw = state->hw_stage == MESA_SHADER_COMPUTE;
       if (sw) {
          shader->push[shader->push_range_count++] = (struct agx_push_range){
-            .uniform = AGX_ABI_VUNI_VERTEX_PARAMS(count),
+            .uniform = state->uniform_base +
+                       AGX_ABI_VUNI_VERTEX_PARAMS(count),
             .table = AGX_SYSVAL_TABLE_ROOT,
             .offset = (uintptr_t)&u->vertex_params,
             .length = 4,
          };
       }
 
-      uniform = AGX_ABI_VUNI_COUNT_GL(count, sw);
+      uniform = state->uniform_base + AGX_ABI_VUNI_COUNT_GL(count, sw);
    } else if (state->stage == MESA_SHADER_FRAGMENT) {
       struct agx_draw_uniforms *u = NULL;
       struct agx_stage_uniforms *s = NULL;
@@ -451,7 +480,8 @@ lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state)
     * uniform goes to the bindless texture base.
     */
    for (int t = AGX_NUM_SYSVAL_TABLES - 1; t >= 0; --t)
-      uniform = lay_out_table(shader, &state->tables[t], t, uniform);
+      uniform = lay_out_table(shader, &state->tables[t], t, uniform,
+                              dword_ranges);
 
    /* Step 4: Fill in the loads */
    util_dynarray_foreach(&state->loads, nir_intrinsic_instr *, intr_) {
@@ -486,16 +516,25 @@ lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state)
 
 bool
 agx_nir_lower_sysvals(nir_shader *shader, mesa_shader_stage desc_stage,
-                      bool lower_draw_params)
+                      bool lower_draw_params,
+                      unsigned texture_descriptor_size)
 {
+   assert(texture_descriptor_size == AGX_GALLIUM_DESCRIPTOR_AGX2_SIZE ||
+          texture_descriptor_size == AGX_GALLIUM_DESCRIPTOR_AGX3_SIZE);
+
    /* override stage for the duration on the pass. XXX: should refactor, but
     * it's annoying!
     */
    mesa_shader_stage phys_stage = shader->info.stage;
    shader->info.stage = desc_stage;
 
+   struct lower_sysvals_config config = {
+      .lower_draw_params = lower_draw_params,
+      .texture_descriptor_size = texture_descriptor_size,
+   };
+
    bool progress = nir_shader_instructions_pass(
-      shader, lower_sysvals, nir_metadata_control_flow, &lower_draw_params);
+      shader, lower_sysvals, nir_metadata_control_flow, &config);
 
    shader->info.stage = phys_stage;
    return progress;
@@ -504,17 +543,19 @@ agx_nir_lower_sysvals(nir_shader *shader, mesa_shader_stage desc_stage,
 bool
 agx_nir_layout_uniforms(nir_shader *shader,
                         struct agx_compiled_shader *compiled,
-                        unsigned *push_size)
+                        unsigned *push_size, unsigned uniform_base,
+                        bool dword_ranges)
 {
    struct state state = {
       .stage = compiled->stage,
       .hw_stage = shader->info.stage,
+      .uniform_base = uniform_base,
    };
 
    nir_shader_intrinsics_pass(shader, record_loads, nir_metadata_control_flow,
                               &state);
 
-   *push_size = lay_out_uniforms(compiled, &state);
+   *push_size = lay_out_uniforms(compiled, &state, dword_ranges);
 
    util_dynarray_fini(&state.loads);
 
