@@ -400,14 +400,23 @@ handle_glsl450_alu(struct vtn_builder *b, enum GLSLstd450 entrypoint,
                        src[0], nir_fneg(nb, src[0]));
       break;
 
-   case GLSLstd450Reflect:
+   case GLSLstd450Reflect: {
       /* I - 2 * dot(N, I) * N */
+      const unsigned save_math_ctrl = nb->fp_math_ctrl;
+      /* Keep a scalar dot paired: regrouping N * I as N * N can overflow
+       * before a small I brings the result back into the finite range.
+       * The outer multiply and subtract may still contract into an FMA.
+       */
+      if (src[0]->num_components == 1)
+         nb->fp_math_ctrl |= nir_fp_no_reassoc | nir_fp_no_transform;
+      nir_def *dot = nir_fdot(nb, src[0], src[1]);
+      nb->fp_math_ctrl = save_math_ctrl;
       dest->def =
          nir_a_minus_bc(nb, src[0],
                             src[1],
-                            nir_fmul(nb, nir_fdot(nb, src[0], src[1]),
-                                         NIR_IMM_FP(nb, 2.0)));
+                            nir_fmul(nb, dot, NIR_IMM_FP(nb, 2.0)));
       break;
+   }
 
    case GLSLstd450Refract: {
       nir_def *I = src[0];
