@@ -1273,6 +1273,14 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
                                         : iview1->planes[0].eot;
       }
       struct hk_native_pbe_descriptor pbe_arguments[4] = {target_pbe};
+      /* The native resolve averages in linear space when its PBE requests
+       * the sRGB transfer. Ordinary stores already have encoded tile bytes
+       * and retain the unmodified end-of-tile descriptor. */
+      if (direct_resolve && util_format_is_srgb(key->tib.logical_format[0]) &&
+          !(color_att[0].flags &
+            VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR))
+         ((uint8_t *)&pbe_arguments[0])[15] |= 0x20;
+
       if (dual_mrt_active)
          pbe_arguments[1] = target1_pbe;
       if (multi_mrt_active) {
@@ -1532,6 +1540,7 @@ struct hk_g17p_bg_eot_cache_key {
       uint32_t load_op;
       uint32_t store_op;
       uint32_t resolve_mode;
+      uint32_t flags;
    } attachments[HK_MAX_RTS];
    uint32_t layers;
    uint8_t color_attachment_count;
@@ -1579,6 +1588,7 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
       cache_key.attachments[i].image_view = (uintptr_t)att->imageView;
       cache_key.attachments[i].load_op = att->loadOp;
       cache_key.attachments[i].store_op = att->storeOp;
+      cache_key.attachments[i].flags = vk_get_rendering_attachment_flags(att);
       if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
          cache_key.attachments[i].clear = att->clearValue.color;
       if (att->resolveMode != VK_RESOLVE_MODE_NONE) {
