@@ -108,15 +108,16 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
          memcpy(agx_bo_map(binary->bo), binary->b.binary, size);
       }
    } else if (size) {
-      /* G17P's native compute Ioto program is built from the shader bytes at
-       * dispatch time, so a cached compute shader needs the CPU copy as well
-       * as its executable BO.  Keeping only the BO made the uncached dispatch
-       * work and the identical cached dispatch fail descriptor validation. */
-      binary->b.binary = malloc(size);
-      blob_copy_bytes(blob, binary->b.binary, size);
       binary->bo = agx_bo_create(&screen->dev, size, 0,
                                  AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
-      memcpy(agx_bo_map(binary->bo), binary->b.binary, size);
+      if (screen->dev.chip == AGX_CHIP_G17P) {
+         /* Native compute Ioto programs need the cached CPU shader bytes. */
+         binary->b.binary = malloc(size);
+         blob_copy_bytes(blob, binary->b.binary, size);
+         memcpy(agx_bo_map(binary->bo), binary->b.binary, size);
+      } else {
+         blob_copy_bytes(blob, agx_bo_map(binary->bo), size);
+      }
    }
 
    blob_copy_bytes(blob, &binary->uvs, sizeof(binary->uvs));

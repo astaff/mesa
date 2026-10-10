@@ -1449,13 +1449,10 @@ main(void)
       agx_chip_command_stream_generation(dev->chip) == AGX_CS_GENERATION_AGX2;
    int status = 0;
 
-   /* The state tracker must not insert this same ungrounded render blit for
-    * BGRA default-surface readback on AGX3.  The explicit pctx->blit above is
-    * retained as a compiler/stream ratchet, while API transfers take the
-    * mapped CPU conversion path until the pixel result is hardware-proven. */
-   if (!agx2 &&
-       screen->caps.texture_transfer_modes != PIPE_TEXTURE_TRANSFER_DEFAULT) {
-      fprintf(stderr, "AGX3 still advertises blit-based texture transfers\n");
+   /* Preserve the public accelerated transfer policy. This shim checks
+    * encoding, while BGRA/RGBA pixel conversion needs a hardware check. */
+   if (screen->caps.texture_transfer_modes != PIPE_TEXTURE_TRANSFER_BLIT) {
+      fprintf(stderr, "Accelerated texture transfers were disabled\n");
       status = 1;
    }
 

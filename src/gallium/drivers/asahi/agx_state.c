@@ -722,18 +722,13 @@ target_is_cube(enum pipe_texture_target target)
    return target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY;
 }
 
-static void
+static void NORETURN
 agx_native_descriptor_rejected(struct agx_device *dev, const char *operation)
 {
    mesa_loge("asahi: %s has no proven native descriptor encoding on %s",
              operation, agx_chip_name(dev->chip));
-
-   /* Every recognised AGX3 identity remains behind the device-open gate.  If
-    * this fires, stop before constructing or submitting a command stream; a
-    * zero descriptor is not a valid substitute for rejected hardware state.
-    */
-   assert(!agx_chip_driver_supported(dev->chip));
-   UNREACHABLE("native descriptor encoding rejected");
+   /* Never submit a zero or partially initialized native descriptor. */
+   abort();
 }
 
 static bool
@@ -1669,7 +1664,7 @@ agx_nir_lower_clip_m1_1(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *pos = intr->src[0].ssa;
    nir_def *z = nir_channel(b, pos, 2);
    nir_def *w = nir_channel(b, pos, 3);
-   nir_def *c = nir_load_clip_z_coeff_agx(b);
+   nir_def *c = nir_load_clip_z_coeff(b);
 
    /* Lerp. If c = 0, reduces to z. If c = 1/2, reduces to (z + w)/2 */
    nir_def *new_z = nir_ffma(b, nir_fneg(b, z), c, nir_ffma(b, w, c, z));
@@ -1916,7 +1911,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
        * copied. Declare the same shape that agx_draw_patches() launches. */
       nir->info.workgroup_size[0] = nir->info.tess.tcs_vertices_out;
       nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
-      NIR_PASS(_, nir, poly_nir_lower_tcs);
+      NIR_PASS(_, nir, poly_nir_lower_tcs, true);
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       NIR_PASS(_, nir, poly_nir_lower_gs, &gs_count, &gs_copy, &pre_gs,
                &gs_info);
@@ -2177,7 +2172,7 @@ agx_precompile_variant(struct agx_device *dev, struct pipe_context *pctx,
    return false;
 }
 
-static int
+static unsigned
 glsl_type_size(const struct glsl_type *type, bool bindless)
 {
    return glsl_count_attribute_slots(type, false);
@@ -4141,10 +4136,8 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
                                          &program_length))
       return 0;
 
-   if (agx_bo_sync_for_device(program_bo,
-                              t.gpu - program_bo->va->addr,
-                              program_length))
-      return 0;
+   agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
+                       program_length);
    if (full_va)
       *full_va = t.gpu;
    if (cs->stage == MESA_SHADER_FRAGMENT) {
@@ -4456,11 +4449,10 @@ agx_g17p_append_compute(struct agx_batch *batch,
       return agx_g17p_compute_failed("Ioto program generation");
    memcpy(program.cpu, native.bytes, native.length);
 
-   if ((shader_bo && agx_bo_sync_for_device(shader_bo, shader_sync_offset,
-                                            shader_sync_size)) ||
-       agx_bo_sync_for_device(program_bo, program.gpu - program_bo->va->addr,
-                              native.length))
-      return agx_g17p_compute_failed("shader/program sync");
+   if (shader_bo)
+      agx_bo_assert_range(shader_bo, shader_sync_offset, shader_sync_size);
+   agx_bo_assert_range(program_bo, program.gpu - program_bo->va->addr,
+                       native.length);
 
    struct agx3_compute_dispatch_sink sink = {
       .data = batch->cdm.current,
@@ -4644,10 +4636,8 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
           !agx3_g17p_compute_program_generate(dev->chip, &desc, &native))
          agx_native_descriptor_rejected(dev, "precompiled compute Ioto");
       memcpy(native_program.cpu, native.bytes, native.length);
-      if (agx_bo_sync_for_device(program_bo,
-                                 native_program.gpu - program_bo->va->addr,
-                                 native.length))
-         agx_native_descriptor_rejected(dev, "precompiled compute upload");
+      agx_bo_assert_range(program_bo, native_program.gpu - program_bo->va->addr,
+                          native.length);
 
       const struct agx3_compute_direct_grid direct = {
          .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
@@ -4925,10 +4915,8 @@ agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
       program_length = native.length;
    }
 
-   if (agx_bo_sync_for_device(program_bo,
-                              program_ptr.gpu - program_bo->va->addr,
-                              program_length))
-      agx_native_descriptor_rejected(dev, "mixed MRT program upload");
+   agx_bo_assert_range(program_bo, program_ptr.gpu - program_bo->va->addr,
+                       program_length);
 
    return (struct asahi_bg_eot){
       .usc = agx_usc_addr(dev, program_ptr.gpu),
@@ -5352,10 +5340,8 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
          program_length = native.length;
       }
 
-      if (agx_bo_sync_for_device(program_bo,
-                                 program_ptr.gpu - program_bo->va->addr,
-                                 program_length))
-         agx_native_descriptor_rejected(dev, "background program upload");
+      agx_bo_assert_range(program_bo, program_ptr.gpu - program_bo->va->addr,
+                          program_length);
 
       return (struct asahi_bg_eot){
          .usc = agx_usc_addr(dev, program_ptr.gpu),
