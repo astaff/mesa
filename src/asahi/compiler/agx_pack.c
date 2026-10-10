@@ -6,6 +6,9 @@
 #include "agx_compiler.h"
 #include "agx_opcodes.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 /* Binary patches needed for branch offsets */
 struct agx_branch_fixup {
    /* Offset into the binary to patch */
@@ -21,12 +24,18 @@ struct agx_branch_fixup {
 static void
 pack_assert_internal(const agx_instr *I, bool condition, const char *msg)
 {
-   if (!condition) {
-      fprintf(stderr, "Packing assertion failed for instruction:\n\n");
-      agx_print_instr(I, stderr);
-      fprintf(stderr, "\n%s\n", msg);
-      abort();
-   }
+   if (condition)
+      return;
+
+   FILE *out = stderr;
+
+
+   fprintf(out, "Packing assertion failed for instruction:\n\n");
+   agx_print_instr(I, out);
+   fprintf(out, "\n%s\n", msg);
+
+
+   abort();
 }
 
 #define pack_assert_msg(I, cond, msg)                                          \
@@ -451,8 +460,29 @@ agx_pack_alu(struct util_dynarray *emission, agx_instr *I)
       unsigned src_extend = (src >> 10);
 
       /* Size bit always zero and so omitted for 16-bit */
-      if (is_f16 && !is_cmpsel)
-         pack_assert(I, (src_short & (1 << 9)) == 0);
+      if (is_f16 && !is_cmpsel && (src_short & (1 << 9)) != 0) {
+         /* Bit 9 is the source size flag, and for an f16 op it is reused as
+          * the float-modifier bit below (fmod_offset == 9).  A 32-bit source
+          * on a 16-bit float op therefore has no encoding at all.
+          *
+          * Something upstream really does emit this -- measured on J414s out
+          * of dwm.exe's own shaders:
+          *   $r1h = hmul $r1l, ^r2      (r2 is 32-bit)
+          * agx_coerce_f16_src() narrows the known producer, but this backend
+          * is a process boundary for arbitrary DXIL- and SPIR-V-derived
+          * shaders, so keep the packer itself defensive.
+          *
+          * Report it (pack_assert_internal logs to a file and does not abort)
+          * and then force the field well-formed.  Leaving bit 9 set does NOT
+          * harmlessly pass the problem through -- it corrupts the float
+          * modifier of a live instruction, and feeding the GPU an instruction
+          * whose modifier bits are garbage risks a fault or hang, which is
+          * worse than a wrong pixel.  Clearing it encodes a legal 16-bit
+          * source: arithmetically wrong for this operand, but decodable.
+          */
+         pack_assert(I, false);
+         src_short &= ~(1u << 9);
+      }
 
       if (info.is_float || (I->op == AGX_OPCODE_FCMPSEL && !is_cmpsel)) {
          unsigned fmod = agx_pack_float_mod(I->src[s]);
@@ -936,7 +966,9 @@ agx_pack_instr(struct util_dynarray *emission, struct util_dynarray *fixups,
       uint64_t raw =
          agx_opcodes_info[I->op].encoding.exact | (I->imm << 8) |
          (I->scoreboard << 16) | ((uint64_t)T << 26) |
-         ((I->src[1].type == AGX_INDEX_IMMEDIATE) ? (1ul << 58) : 0) |
+         ((I->src[1].type == AGX_INDEX_IMMEDIATE)
+             ? (UINT64_C(1) << 58)
+             : 0) |
          ((uint64_t)U << 59);
 
       memcpy(util_dynarray_grow_bytes(emission, 1, 8), &raw, 8);
@@ -1207,6 +1239,20 @@ void
 agx_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 {
    struct util_dynarray fixups;
+
+   /*
+    * Everything below encodes AGX2 and only AGX2. M3 and later execute AGX3,
+    * a different instruction set whose encoding this file cannot produce.
+    *
+    * The device-open path already refuses those parts, so reaching here with
+    * one means a caller built a device key from somewhere else. Fail loudly:
+    * the alternative is emitting a plausible AGX2 stream for hardware that
+    * will decode it as something else entirely, which faults far away from
+    * the cause if it faults at all.
+    */
+   assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+          "AGX2 is the only instruction encoding this packer emits");
+
    util_dynarray_init(&fixups, ctx);
 
    agx_foreach_block(ctx, block) {

@@ -16,6 +16,79 @@ struct match {
    uint8_t shift;
 };
 
+static void
+peel_scaled_u32(nir_scalar *offset, uint8_t *shift, unsigned max_shift)
+{
+   nir_scalar value = nir_scalar_chase_movs(*offset);
+   if (!nir_scalar_is_alu(value))
+      return;
+
+   const nir_op op = nir_scalar_alu_op(value);
+   if (op == nir_op_ishl) {
+      nir_scalar amount = nir_scalar_chase_alu_src(value, 1);
+      if (nir_scalar_is_const(amount) &&
+          nir_scalar_as_uint(amount) <= max_shift) {
+         *offset = nir_scalar_chase_alu_src(value, 0);
+         *shift = nir_scalar_as_uint(amount);
+      }
+      return;
+   }
+
+   if (op != nir_op_imul)
+      return;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar factor = nir_scalar_chase_alu_src(value, i);
+      if (!nir_scalar_is_const(factor))
+         continue;
+
+      const uint64_t raw = nir_scalar_as_uint(factor);
+      if (!util_is_power_of_two_nonzero(raw))
+         continue;
+
+      const unsigned amount = util_logbase2(raw);
+      if (amount <= max_shift) {
+         *offset = nir_scalar_chase_alu_src(value, 1 - i);
+         *shift = amount;
+      }
+      return;
+   }
+}
+
+static nir_scalar
+strip_zero_shift(nir_scalar value)
+{
+   value = nir_scalar_chase_movs(value);
+   while (nir_scalar_is_alu(value) &&
+          nir_scalar_alu_op(value) == nir_op_ishl) {
+      nir_scalar amount = nir_scalar_chase_alu_src(value, 1);
+      if (!nir_scalar_is_const(amount) || nir_scalar_as_uint(amount) != 0)
+         break;
+      value = nir_scalar_chase_alu_src(value, 0);
+   }
+   return value;
+}
+
+/* Recover the native 32-bit index from an address-sized zero extension.
+ * agx_nir_fuse_lea may wrap this in a 64-bit LEA before this pass gets to
+ * select the load's base-plus-index addressing mode.
+ */
+static bool
+peel_u2u64_index(nir_scalar wide, nir_scalar *narrow, uint8_t *shift,
+                 unsigned max_shift)
+{
+   wide = strip_zero_shift(wide);
+   if (!nir_scalar_is_alu(wide) || nir_scalar_alu_op(wide) != nir_op_u2u64)
+      return false;
+
+   *narrow = nir_scalar_chase_alu_src(wide, 0);
+   if (narrow->def->bit_size != 32)
+      return false;
+
+   peel_scaled_u32(narrow, shift, max_shift);
+   return true;
+}
+
 static enum pipe_format
 format_for_bitsize(unsigned bitsize)
 {
@@ -41,6 +114,7 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
        intr->intrinsic != nir_intrinsic_store_global)
       return false;
 
+   const bool byte_indices = *(const bool *)data;
    b->cursor = nir_before_instr(&intr->instr);
 
    unsigned bitsize = intr->intrinsic == nir_intrinsic_store_global
@@ -61,15 +135,56 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_op op = nir_scalar_alu_op(base);
       if (op == nir_op_ulea_agx || op == nir_op_ilea_agx) {
          unsigned shift = nir_scalar_as_uint(nir_scalar_chase_alu_src(base, 2));
-         if (shift >= format_shift && shift <= max_shift) {
-            match = (struct match){
-               .base = nir_scalar_chase_alu_src(base, 0),
-               .offset = nir_scalar_chase_alu_src(base, 1),
-               .shift = shift - format_shift,
-               .sign_extend = (op == nir_op_ilea_agx),
-            };
+         if (shift <= max_shift) {
+            nir_scalar offset = nir_scalar_chase_alu_src(base, 1);
+            uint8_t extra_shift = 0;
+            if (op != nir_op_ulea_agx ||
+                !peel_u2u64_index(offset, &offset, &extra_shift,
+                                  max_shift - shift))
+               peel_scaled_u32(&offset, &extra_shift, max_shift - shift);
+
+            const unsigned total_shift = shift + extra_shift;
+            if (total_shift >= format_shift ||
+                (byte_indices && !shift_must_match && total_shift == 0 &&
+                 op == nir_op_ulea_agx && offset.def->bit_size == 32)) {
+               match = (struct match){
+                  .base = nir_scalar_chase_alu_src(base, 0),
+                  .offset = offset,
+                  .shift = total_shift >= format_shift
+                              ? total_shift - format_shift
+                              : AGX_NIR_MEMORY_INDEX_BYTES,
+                  .sign_extend = (op == nir_op_ilea_agx),
+               };
+            }
          }
       } else if (op == nir_op_iadd) {
+         /* A load from base + u2u64(offset32 << shift) maps directly to AGX's
+          * 64-bit base plus 32-bit register-index form when the scale covers
+          * the element size. Keeping the add in 64-bit ALU form would
+          * manufacture a carry chain that this address mode does not need.
+          */
+         for (unsigned i = 0; i < 2; ++i) {
+            nir_scalar narrow;
+            uint8_t shift = 0;
+            if (!peel_u2u64_index(nir_scalar_chase_alu_src(base, i), &narrow,
+                                  &shift, max_shift) ||
+                (shift < format_shift &&
+                 !(byte_indices && !shift_must_match && shift == 0)))
+               continue;
+
+            match = (struct match){
+               .base = nir_scalar_chase_alu_src(base, 1 - i),
+               .offset = narrow,
+               .shift = shift >= format_shift
+                           ? shift - format_shift
+                           : AGX_NIR_MEMORY_INDEX_BYTES,
+            };
+            break;
+         }
+
+         if (match.offset.def != NULL)
+            goto matched;
+
          for (unsigned i = 0; i < 2; ++i) {
             nir_scalar const_scalar = nir_scalar_chase_alu_src(base, i);
             if (!nir_scalar_is_const(const_scalar))
@@ -102,6 +217,8 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
          }
       }
    }
+
+matched:
 
    nir_def *offset = match.offset.def != NULL
                         ? nir_channel(b, match.offset.def, match.offset.comp)
@@ -151,7 +268,7 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 bool
-agx_nir_lower_address(nir_shader *nir)
+agx_nir_lower_address(nir_shader *nir, bool byte_indices)
 {
    bool progress = false;
 
@@ -169,7 +286,7 @@ agx_nir_lower_address(nir_shader *nir)
 
    /* Next, lower load/store using the lea's */
    NIR_PASS(progress, nir, nir_shader_intrinsics_pass, pass,
-            nir_metadata_control_flow, NULL);
+            nir_metadata_control_flow, &byte_indices);
 
    /* Finally, lower any leftover lea instructions back to ALU to let
     * nir_opt_algebraic simplify them from here.

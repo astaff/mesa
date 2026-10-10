@@ -5,6 +5,7 @@
 
 #include "util/bitset.h"
 #include "util/half_float.h"
+#include "util/u_debug.h"
 #include "agx_builder.h"
 #include "agx_compiler.h"
 #include "agx_opcodes.h"

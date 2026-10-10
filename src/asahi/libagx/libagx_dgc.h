@@ -7,6 +7,8 @@
 
 #include "compiler/libcl/libcl.h"
 #include "compiler/shader_enums.h"
+#include "lib/agx_chip.h"
+#include "lib/agx_vdm_index_list_core.h"
 #include "agx_pack.h"
 
 #define agx_push(ptr, T, cfg)                                                  \
@@ -15,7 +17,8 @@
       agx_pack(ptr, T, cfg)
 
 #define agx_push_packed(ptr, src, T)                                           \
-   static_assert(sizeof(src) == AGX_##T##_LENGTH);                             \
+   static_assert(sizeof(src) == AGX_##T##_LENGTH,                             \
+                 "packed AGX command size must match the hardware ABI");     \
    memcpy(ptr, &src, sizeof(src));                                             \
    ptr = (GLOBAL void *)(((uintptr_t)ptr) + sizeof(src));
 
@@ -23,9 +26,12 @@ static inline enum agx_index_size
 agx_translate_index_size(uint8_t size_B)
 {
    /* Index sizes are encoded logarithmically */
-   static_assert(__builtin_ctz(1) == AGX_INDEX_SIZE_U8);
-   static_assert(__builtin_ctz(2) == AGX_INDEX_SIZE_U16);
-   static_assert(__builtin_ctz(4) == AGX_INDEX_SIZE_U32);
+   static_assert(__builtin_ctz(1) == AGX_INDEX_SIZE_U8,
+                 "8-bit index size encoding must match the hardware ABI");
+   static_assert(__builtin_ctz(2) == AGX_INDEX_SIZE_U16,
+                 "16-bit index size encoding must match the hardware ABI");
+   static_assert(__builtin_ctz(4) == AGX_INDEX_SIZE_U32,
+                 "32-bit index size encoding must match the hardware ABI");
 
    assert((size_B == 1) || (size_B == 2) || (size_B == 4));
    return __builtin_ctz(size_B);
@@ -57,6 +63,19 @@ static inline unsigned
 agx_workgroup_threads(struct agx_workgroup wg)
 {
    return wg.x * wg.y * wg.z;
+}
+
+/* VK_EXT_transform_feedback converts the byte counter written by streamout
+ * into a non-indexed indirect draw count.  Keep the arithmetic shared by the
+ * GPU helper and host oracle, including the saturating subtraction required
+ * when counterOffset is larger than the captured byte count. */
+static inline uint32_t
+agx_xfb_vertex_count(uint32_t byte_count, uint32_t counter_offset,
+                     uint32_t vertex_stride)
+{
+   return vertex_stride && byte_count > counter_offset
+             ? (byte_count - counter_offset) / vertex_stride
+             : 0;
 }
 
 struct agx_grid {
@@ -206,6 +225,29 @@ agx_draw_index_buffer(struct agx_draw d)
    return ib;
 }
 
+/* Apple's AGX3 indirect indexed record stores the available index-buffer
+ * range in dwords minus one.  Use a widened intermediate so a range near the
+ * u32 ceiling cannot wrap while rounding up. */
+static inline bool
+agx_draw_indirect_index_buffer_size_word(struct agx_draw d,
+                                         uint32_t *size_word)
+{
+   assert(d.indexed && agx_is_indirect(d.b));
+
+   const uint64_t dwords = ((uint64_t)agx_draw_index_range_B(d) + 3) >> 2;
+   if (dwords == 0 || dwords > (uint64_t)0xffffffffu)
+      return false;
+
+   *size_word = (uint32_t)(dwords - 1);
+   return true;
+}
+
+static inline uint32_t
+agx_primitive_restart_index(enum agx_index_size index_size)
+{
+   return BITFIELD_MASK(8 * agx_index_size_to_B(index_size));
+}
+
 static bool
 agx_direct_draw_overreads_indices(struct agx_draw d)
 {
@@ -213,12 +255,46 @@ agx_direct_draw_overreads_indices(struct agx_draw d)
    return range_B > d.index_buffer_range_B;
 }
 
-enum agx_chip {
-   AGX_CHIP_G13G,
-   AGX_CHIP_G13X,
-   AGX_CHIP_G14G,
-   AGX_CHIP_G14X,
-};
+static inline bool
+agx_vdm_draw_supported(enum agx_chip chip, struct agx_draw draw,
+                       enum agx_primitive topology)
+{
+   switch (chip) {
+   case AGX_CHIP_G13G:
+   case AGX_CHIP_G13X:
+   case AGX_CHIP_G14G:
+   case AGX_CHIP_G14X:
+   case AGX_CHIP_G15P:
+      return true;
+   default:
+      break;
+   }
+
+   if (!agx_vdm_index_list_direct_target_supported_inline(chip))
+      return false;
+
+   const uint64_t ib = draw.indexed ? agx_draw_index_buffer(draw) : 0;
+   if (agx_is_indirect(draw.b)) {
+      uint32_t size_word = 0;
+      if (draw.indexed &&
+          !agx_draw_indirect_index_buffer_size_word(draw, &size_word))
+         return false;
+
+      struct agx_vdm_index_list_indirect_words words;
+      return agx_vdm_index_list_indirect_pack_words(
+         chip, (uint8_t)topology, draw.indexed, draw.restart,
+         (uint8_t)draw.index_size, ib, draw.b.ptr,
+         draw.indexed ? agx_primitive_restart_index(draw.index_size) : 0,
+         size_word, &words);
+   }
+
+   struct agx_vdm_index_list_direct_words words;
+   return agx_vdm_index_list_direct_pack_words(
+      chip, (uint8_t)topology, draw.indexed, draw.restart,
+      (uint8_t)draw.index_size, ib, draw.b.count[0], draw.b.count[1],
+      draw.indexed ? draw.index_bias : draw.start,
+      draw.indexed ? (align(agx_draw_index_range_B(draw), 4) >> 2) : 0, &words);
+}
 
 static inline GLOBAL uint32_t *
 agx_cdm_launch(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_grid grid,
@@ -274,6 +350,52 @@ agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
              enum agx_primitive topology)
 {
    uint64_t ib = draw.indexed ? agx_draw_index_buffer(draw) : 0;
+
+   if (agx_vdm_index_list_direct_target_supported_inline(chip)) {
+      if (agx_is_indirect(draw.b)) {
+         uint32_t size_word = 0;
+         const bool size_valid =
+            !draw.indexed ||
+            agx_draw_indirect_index_buffer_size_word(draw, &size_word);
+         struct agx_vdm_index_list_indirect_words words;
+         const bool valid =
+            size_valid && agx_vdm_index_list_indirect_pack_words(
+                             chip, (uint8_t)topology, draw.indexed,
+                             draw.restart, (uint8_t)draw.index_size, ib,
+                             draw.b.ptr,
+                             draw.indexed
+                                ? agx_primitive_restart_index(
+                                     draw.index_size)
+                                : 0,
+                             size_word, &words);
+         assert(valid);
+         if (!valid)
+            return out;
+
+         for (unsigned i = 0; i < words.count; ++i)
+            *out++ = words.words[i];
+         return out;
+      } else {
+         struct agx_vdm_index_list_direct_words words;
+         const bool valid = agx_vdm_index_list_direct_pack_words(
+            chip, (uint8_t)topology, draw.indexed, draw.restart,
+            (uint8_t)draw.index_size, ib, draw.b.count[0], draw.b.count[1],
+            draw.indexed ? draw.index_bias : draw.start,
+            draw.indexed ? (align(agx_draw_index_range_B(draw), 4) >> 2) : 0,
+            &words);
+         assert(valid);
+         if (!valid)
+            return out;
+
+         for (unsigned i = 0; i < words.count; ++i)
+            *out++ = words.words[i];
+         return out;
+      }
+   }
+
+   assert(agx_vdm_draw_supported(chip, draw, topology));
+   if (!agx_vdm_draw_supported(chip, draw, topology))
+      return out;
 
    agx_push(out, INDEX_LIST, cfg) {
       cfg.primitive = topology;
@@ -333,6 +455,60 @@ agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
 static inline uint32_t
 agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
 {
+   if (agx_vdm_index_list_direct_target_supported_inline(chip)) {
+      const uint64_t ib = draw.indexed ? agx_draw_index_buffer(draw) : 0;
+      if (agx_is_indirect(draw.b)) {
+         uint32_t size_word = 0;
+         if (draw.indexed &&
+             !agx_draw_indirect_index_buffer_size_word(draw, &size_word))
+            return 0;
+
+         struct agx_vdm_index_list_indirect_words words;
+         if (!agx_vdm_index_list_indirect_pack_words(
+                chip, 0, draw.indexed, draw.restart,
+                (uint8_t)draw.index_size, ib, draw.b.ptr,
+                draw.indexed
+                   ? agx_primitive_restart_index(draw.index_size)
+                   : 0,
+                size_word, &words))
+            return 0;
+
+         return words.count * 4;
+      } else {
+         struct agx_vdm_index_list_direct_words words;
+         if (!agx_vdm_index_list_direct_pack_words(
+                chip, 0, draw.indexed, draw.restart,
+                (uint8_t)draw.index_size, ib, draw.b.count[0], draw.b.count[1],
+                draw.indexed ? draw.index_bias : draw.start,
+                draw.indexed
+                   ? (align(agx_draw_index_range_B(draw), 4) >> 2)
+                   : 0,
+                &words))
+            return 0;
+
+         return words.count * 4;
+      }
+   }
+
+   switch (chip) {
+   case AGX_CHIP_G15G:
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+   case AGX_CHIP_G15D:
+   case AGX_CHIP_G16P:
+   case AGX_CHIP_G16G:
+   case AGX_CHIP_G16S:
+   case AGX_CHIP_G16C:
+   case AGX_CHIP_G17P:
+   case AGX_CHIP_G17A:
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
+   case AGX_CHIP_G17C:
+      return 0;
+   default:
+      break;
+   }
+
    uint32_t size = AGX_INDEX_LIST_LENGTH;
 
    if (agx_is_indirect(draw.b)) {
@@ -354,6 +530,35 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
 static inline GLOBAL uint32_t *
 agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
 {
+   /* CommandEncodingNext emits this exact type-1 memory-barrier word on every
+    * byte-witnessed G15--G17 identity.  Do not feed those chips through the
+    * legacy genxml packet below: that packet is AGX2 and has a different
+    * opcode/field layout.  Keep the unwitnessed G16P/G17A identities closed
+    * instead of guessing from their neighbouring families. */
+   switch (chip) {
+   case AGX_CHIP_G15G:
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+   case AGX_CHIP_G15D:
+   case AGX_CHIP_G16G:
+   case AGX_CHIP_G16S:
+   case AGX_CHIP_G16C:
+   case AGX_CHIP_G17P:
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
+   case AGX_CHIP_G17C:
+      *out++ = 0x21000960u;
+      return out;
+
+   case AGX_CHIP_G16P:
+   case AGX_CHIP_G17A:
+   case AGX_CHIP_UNKNOWN:
+      return out;
+
+   default:
+      break;
+   }
+
    agx_push(out, VDM_BARRIER, cfg) {
       cfg.unk_4 = (chip == AGX_CHIP_G13X);
       cfg.unk_5 = true;
@@ -607,12 +812,124 @@ agx_usc_words_precomp(GLOBAL uint32_t *out, CONST struct agx_shader *s,
    agx_usc_push_blob(&b, s->usc.data, s->usc.size);
 }
 
-/* This prototype is sufficient for sizing the output */
-static inline unsigned
-libagx_draw_robust_index_vdm_size()
+static inline uint32_t
+agx_robust_index_clamped_count(uint32_t requested, uint32_t available)
 {
-   struct agx_draw draw = agx_draw_indexed(0, 0, 0, 0, 0, 0, 0, 0, 0);
-   return agx_vdm_draw_size(0, draw);
+   const uint32_t limit =
+      available > 0xffffffffu - 32
+         ? 0xffffffffu
+         : available + 32;
+   return requested < limit ? requested : limit;
+}
+
+static inline bool
+agx_robust_index_shadow_sizes(uint32_t count, enum agx_index_size index_size,
+                              uint32_t *payload_B, uint32_t *allocation_B)
+{
+   if (index_size > AGX_INDEX_SIZE_U32 ||
+       count > (0xffffffffu - 15) >> index_size)
+      return false;
+
+   *payload_B = agx_indices_to_B(count, index_size);
+   *allocation_B = align(*payload_B, 16);
+   return true;
+}
+
+/*
+ * Robust indexed draws are generated on the GPU after the indirect argument
+ * record is visible.  G17P's HAL200 direct indexed body is not just the
+ * generic Index List: it always starts with the native restart State Update,
+ * and a freshly emitted render state additionally requires its context-
+ * relative draw-state selector immediately before that body.
+ *
+ * Keep the exact construction shared between the OpenCL producer and host
+ * tests.  Older command-stream generations retain their existing generic
+ * body unchanged.
+ */
+static inline GLOBAL uint32_t *
+agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
+                          struct agx_draw draw,
+                          enum agx_primitive topology,
+                          uint32_t draw_state_context_offset,
+                          bool render_state_emitted,
+                          uint64_t empty_draw_jump)
+{
+   /* G17P's native direct indexed packet requires both counts to be nonzero.
+    * Indirect-count predication deliberately zeros records above the runtime
+    * count, so those slots cannot contain a direct packet. Jump over the
+    * fixed-size GPU-generated slot instead. The host supplies the compact
+    * context-relative address immediately after this reservation, matching
+    * the same non-returning Stream Link used when a CPU-authored VDM chunk
+    * fills. A freshly emitted bind tail still requires its selector before
+    * any other VDM block. Emit that selector before the link so the link
+    * header is not decoded as a context-relative state address. No draw
+    * executes and the following CPU-authored command remains the only parser
+    * target.
+    */
+   if (chip == AGX_CHIP_G17P &&
+       (draw.b.count[0] == 0 || draw.b.count[1] == 0)) {
+      if (render_state_emitted)
+         *out++ = draw_state_context_offset;
+
+      *out++ = 0x80000000u | (uint32_t)(empty_draw_jump >> 32);
+      *out++ = (uint32_t)empty_draw_jump;
+      return out;
+   }
+
+   const uint64_t ib =
+      draw.index_buffer + agx_indices_to_B(draw.start, draw.index_size);
+   const uint32_t range_B =
+      draw.index_buffer_range_B -
+      agx_indices_to_B(draw.start, draw.index_size);
+
+   if (agx_vdm_index_list_direct_target_supported_inline(chip)) {
+      struct agx_vdm_index_list_direct_words words;
+      if (!agx_vdm_index_list_direct_pack_words(
+             chip, (uint8_t)topology, true, draw.restart,
+             (uint8_t)draw.index_size, ib, draw.b.count[0], draw.b.count[1],
+             draw.index_bias, align(range_B, 4) >> 2, &words))
+         return out;
+
+      if (chip == AGX_CHIP_G17P) {
+         if (render_state_emitted)
+            *out++ = draw_state_context_offset;
+
+         *out++ = 0x40000001u;
+         *out++ = agx_primitive_restart_index(draw.index_size);
+      }
+
+      for (unsigned i = 0; i < words.count; ++i)
+         *out++ = words.words[i];
+      return out;
+   }
+
+   /* This producer receives a host-validated direct indexed draw. Keep its
+    * failure path free of the printf/abort ABI: G17P precompiled machine code
+    * is cacheable and cannot embed a process-local diagnostic-buffer address. */
+   *out++ = 0x61f00000u | ((uint32_t)(ib >> 32) & 0xffu) |
+            ((uint32_t)topology << 8) |
+            ((uint32_t)draw.index_size << 17) |
+            (draw.restart ? 1u << 16 : 0);
+   *out++ = (uint32_t)ib;
+   *out++ = draw.b.count[0];
+   *out++ = draw.b.count[1];
+   *out++ = draw.index_bias;
+   *out++ = align(range_B, 4) >> 2;
+   return out;
+}
+
+static inline unsigned
+libagx_draw_robust_index_vdm_size(enum agx_chip chip,
+                                  bool render_state_emitted)
+{
+   struct agx_draw draw =
+      agx_draw_indexed(0, 1, 0, 0, 0, 0, 4, AGX_INDEX_SIZE_U16, false);
+   unsigned size_B = agx_vdm_draw_size(chip, draw);
+
+   if (chip == AGX_CHIP_G17P)
+      size_B += 8 + (render_state_emitted ? 4 : 0);
+
+   return size_B;
 }
 
 static inline unsigned

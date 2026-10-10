@@ -19,6 +19,11 @@ nir_udiv_round_up(nir_builder *b, nir_def *n, nir_def *d)
    return nir_udiv(b, nir_iadd(b, n, nir_iadd_imm(b, d, -1)), d);
 }
 
+struct agx_subgroup_lower_options {
+   bool g17p;
+   bool g17p_clustered_float;
+};
+
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -143,8 +148,16 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_ballot: {
-      /* Optimize popcount(ballot(true)) to load_active_subgroup_count_agx() */
-      if (!nir_src_is_const(intr->src[0]) || !nir_src_as_bool(intr->src[0]) ||
+      /* Optimize popcount(ballot(true)) to load_active_subgroup_count_agx().
+       *
+       * Not on G17P: Apple's compiler reads its active-count register (SR36)
+       * only inside the helper-guarded region of a uniform atomic, and
+       * compiles simd_sum(1u) to a reduction instead, so keep the ballot whose
+       * lane membership every other subgroup operation shares.
+       */
+      const struct agx_subgroup_lower_options *agx_options = data;
+      if (agx_options->g17p || !nir_src_is_const(intr->src[0]) ||
+          !nir_src_as_bool(intr->src[0]) ||
           !list_is_singular(&intr->def.uses))
          return false;
 
@@ -167,9 +180,14 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
+
+
 static bool
-lower_subgroup_filter(const nir_intrinsic_instr *intr, UNUSED const void *data)
+lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 {
+   const struct agx_subgroup_lower_options *agx_options = data;
+   unsigned cluster = 0;
+
    /* Use default behaviour for everything but scans */
    if (intr->intrinsic != nir_intrinsic_exclusive_scan &&
        intr->intrinsic != nir_intrinsic_inclusive_scan &&
@@ -181,16 +199,23 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, UNUSED const void *data)
 
    /* Hardware supports quad ops but no other support clustered reductions. */
    if (nir_intrinsic_has_cluster_size(intr)) {
-      unsigned cluster = nir_intrinsic_cluster_size(intr);
+      cluster = nir_intrinsic_cluster_size(intr);
       if (cluster && cluster != 4 && cluster < 32)
          return true;
    }
 
    switch (nir_intrinsic_reduction_op(intr)) {
    case nir_op_imul:
+      return true;
+
    case nir_op_fmin:
    case nir_op_fmax:
-      /* no hardware scan for this opcode, always lower it */
+      /* Fresh G17P witnesses pin the native qRedfmin/qRedfmax forms. Keep
+       * every other target and non-quad shape on the established common
+       * lowering path. */
+      if (agx_options->g17p_clustered_float && cluster == 4 &&
+          intr->def.bit_size == 32)
+         return false;
       return true;
 
    case nir_op_iadd:
@@ -208,12 +233,18 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, UNUSED const void *data)
    }
 }
 
-bool
-agx_nir_lower_subgroups(nir_shader *s)
+static bool
+agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float)
 {
+   const struct agx_subgroup_lower_options agx_options = {
+      .g17p = g17p_clustered_float,
+      .g17p_clustered_float = g17p_clustered_float,
+   };
+
    /* First, do as much common lowering as we can */
    nir_lower_subgroups_options opts = {
       .filter = lower_subgroup_filter,
+      .filter_data = &agx_options,
       .lower_read_first_invocation = true,
       .lower_inverse_ballot = true,
       .lower_to_scalar = true,
@@ -230,8 +261,20 @@ agx_nir_lower_subgroups(nir_shader *s)
    bool progress = nir_lower_subgroups(s, &opts);
 
    /* Then do AGX-only lowerings on top */
-   progress |=
-      nir_shader_intrinsics_pass(s, lower, nir_metadata_control_flow, NULL);
+   progress |= nir_shader_intrinsics_pass(s, lower, nir_metadata_control_flow,
+                                          (void *)&agx_options);
 
    return progress;
+}
+
+bool
+agx_nir_lower_subgroups(nir_shader *s)
+{
+   return agx_nir_lower_subgroups_internal(s, false);
+}
+
+bool
+agx_nir_lower_subgroups_g17p(nir_shader *s)
+{
+   return agx_nir_lower_subgroups_internal(s, true);
 }

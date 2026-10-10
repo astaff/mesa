@@ -11,7 +11,7 @@ VARIABLE = ~0
 
 class Opcode(object):
    def __init__(self, name, dests, srcs, imms, is_float, can_eliminate,
-                can_reorder, schedule_class, encoding):
+                can_reorder, schedule_class, encoding, agx3_mnemonic):
       self.name = name
       self.dests = dests if dests != VARIABLE else 0
       self.srcs = srcs if srcs != VARIABLE else 0
@@ -23,6 +23,7 @@ class Opcode(object):
       self.can_reorder = can_reorder
       self.schedule_class = schedule_class
       self.encoding = encoding
+      self.agx3_mnemonic = agx3_mnemonic
 
 class Immediate(object):
    def __init__(self, name, ctype):
@@ -45,11 +46,12 @@ class Encoding(object):
          assert(length_long == length_short + (4 if length_short > 8 else 2))
 
 def op(name, encoding, dests = 1, srcs = 0, imms = [], is_float = False,
-        can_eliminate = True, can_reorder = True, schedule_class = "none"):
+        can_eliminate = True, can_reorder = True, schedule_class = "none",
+        agx3_mnemonic = None):
    encoding = Encoding(encoding) if encoding is not None else None
 
    opcodes[name] = Opcode(name, dests, srcs, imms, is_float, can_eliminate,
-                          can_reorder, schedule_class,  encoding)
+                          can_reorder, schedule_class, encoding, agx3_mnemonic)
 
 def immediate(name, ctype = "uint32_t"):
    imm = Immediate(name, ctype)
@@ -76,8 +78,10 @@ MASK = immediate("mask")
 BFI_MASK = immediate("bfi_mask")
 LOD_MODE = immediate("lod_mode", "enum agx_lod_mode")
 PIXEL_OFFSET = immediate("pixel_offset")
+COLOUR_TARGET = immediate("colour_target", "uint8_t")
 STACK_SIZE = immediate("stack_size", 'int16_t')
 EXPLICIT_COORDS = immediate("explicit_coords", "bool")
+PERSPECTIVE = immediate("perspective", "bool")
 
 DIM = enum("dim", {
     0: '1d',
@@ -104,6 +108,8 @@ SHADOW = immediate("shadow", "bool")
 SPARSE = immediate("sparse", "bool")
 QUERY_LOD = immediate("query_lod", "bool")
 COHERENT = immediate("coherent", "bool")
+SCS_ZERO_EXTEND = immediate("scs_zero_extend", "bool")
+SCS_C_LOAD_MARKER = immediate("scs_c_load_marker", "bool")
 SCOREBOARD = immediate("scoreboard")
 ICOND = immediate("icond", "enum agx_icond")
 FCOND = immediate("fcond", "enum agx_fcond")
@@ -145,6 +151,15 @@ SR = enum("sr", {
    144: 'helper_op',
    146: 'helper_arg_l',
    147: 'helper_arg_h',
+   # G17P builtin background reload: native half-register layer input.
+   195: 'background_layer_id',
+   # AGX3 hardware-vertex inputs. Apple emits these as explicit 32-bit rld
+   # instructions instead of the AGX2 preloaded-input ABI.
+   216: 'instance_id',
+   217: 'tess_patch_id',
+   218: 'tess_coord_u',
+   219: 'tess_coord_v',
+   221: 'vertex_id',
 })
 
 ATOMIC_OPC = enum("atomic_opc", {
@@ -206,6 +221,10 @@ funop("sin_pt_1",  0b001010)
 funop("log2",      0b001100)
 funop("exp2",      0b001101)
 funop("sin_pt_2",  0b001110)
+op("sinc_agx3", None, srcs=1, is_float=True, agx3_mnemonic="f32sinc")
+# Sources: quadrant bits, selected true float, selected false float.
+op("bittest_select_agx3", None, srcs=3, imms=[IMM], is_float=True,
+   agx3_mnemonic="isel")
 funop("ceil",      0b010000)
 funop("trunc",     0b100000)
 funop("roundeven", 0b110000)
@@ -220,7 +239,12 @@ op("fmul", encoding = (0x1A, 4, 6), srcs = 2, is_float = True)
 op("hadd", encoding = (0x26, 4, 6), srcs = 2, is_float = True)
 op("hfma", encoding = (0x36, 6, 8), srcs = 3, is_float = True)
 op("hmul", encoding = (0x16, 4, 6), srcs = 2, is_float = True)
-op("mov_imm", encoding = (0x62, 6, 8), imms = [IMM])
+# Apple's AGX3 backend calls the same semantic operation `ldimm`.  This is the
+# first source-grounded AGX2 IR -> AGX3 mnemonic mapping: the native immediate
+# field reproduces all 14 probe constants exactly on G15, G16 and G17, while
+# the destination field follows the register-pressure ladder in 16-bit units.
+op("mov_imm", encoding = (0x62, 6, 8), imms = [IMM],
+   agx3_mnemonic = "ldimm")
 op("iadd", encoding = (0x0E, 8, _), srcs = 2, imms = [SHIFT])
 op("imad", encoding = (0x1E, 8, _), srcs = 3, imms = [SHIFT])
 op("bfi", encoding = (0x2E, 8, _), srcs = 3, imms = [BFI_MASK])
@@ -263,6 +287,26 @@ op("texture_sample",
       encoding = (0x31, 8, 10), # XXX WRONG SIZE
       srcs = 6, imms = [DIM, LOD_MODE, MASK, SCOREBOARD, OFFSET, SHADOW,
                         QUERY_LOD, GATHER, SPARSE])
+
+# Post-RA native publication into the sampler-private file. IMM names an
+# immutable resource value; it is not a GPR destination. Sources are the
+# coordinate pair and optional comparison reference.
+op("publish_texture_agx3", None, dests = 0, srcs = 2, imms = [IMM],
+   can_eliminate = False, can_reorder = False)
+
+# Pre-RA publication has independent scalar x/y/reference inputs. A native
+# coordinate COPY does not require the GPR inputs to form a contiguous vector.
+op("publish_texture_scalar_agx3", None, dests = 0, srcs = 3, imms = [IMM],
+   can_eliminate = False, can_reorder = False)
+
+# Immutable constant-program input. IMM names the logical uniform half in
+# the frozen loader interface, not a GPR or an already assigned TPS offset.
+op("load_cprog_agx3", None, srcs = 0, imms = [IMM])
+# Constant-program arithmetic with a native uniform-file destination (IMM,
+# in half-register units). No temporary GPR result or following COPY.
+for name, srcs in [("fadd", 2), ("fmul", 2), ("ffma", 3)]:
+   op(f"uniform_{name}_agx3", None, dests = 0, srcs = srcs, imms = [IMM],
+      is_float = True, can_eliminate = False)
 for memory, can_reorder in [("texture", True), ("image", False)]:
     coherency = [COHERENT] if not can_reorder else []
     op(f"{memory}_load", encoding = (0x71, 8, 10), # XXX WRONG SIZE
@@ -333,14 +377,29 @@ op("sample_mask", (0x7fc1, 6, _), dests = 0, srcs = 2,
 op("zs_emit", (0x41, 4, _), dests = 0, srcs = 2,
               can_eliminate = False, imms = [ZS], schedule_class = "coverage")
 
+# AGX3's tile store carries a *width*, not a format: `lstcol` cannot normalize
+# on the way out the way AGX2's st_tile could. A normalized 8-bit target is
+# therefore packed first -- `fltnorm` takes two 32-bit floats and writes them,
+# clamped and scaled, into the two halves of one 16-bit register, so a
+# four-channel 8-bit store costs exactly two of them. Sources: the two
+# channels; the second is null for an odd trailing channel. FORMAT selects
+# unsigned or signed normalization.
+op("fltnorm_agx3", _, dests = 1, srcs = 2, imms = [FORMAT], is_float = True,
+   agx3_mnemonic = "fltnorm")
+
+# The tilebuffer-read inverse: one 16-bit register of packed normalized lanes
+# in, a 32-bit float pair out.
+op("normflt_agx3", _, dests = 1, srcs = 1, imms = [FORMAT], is_float = True,
+   agx3_mnemonic = "normflt")
+
 # Sources: sample mask, explicit coords (if present)
 op("ld_tile", (0x49, 8, _), dests = 1, srcs = 2,
-        imms = [FORMAT, MASK, PIXEL_OFFSET, EXPLICIT_COORDS], can_reorder = False,
+        imms = [FORMAT, MASK, PIXEL_OFFSET, EXPLICIT_COORDS, COLOUR_TARGET], can_reorder = False,
         schedule_class = "coverage")
 
 # Sources: value, sample mask, explicit coords (if present)
 op("st_tile", (0x09, 8, _), dests = 0, srcs = 3,
-      can_eliminate = False, imms = [FORMAT, MASK, PIXEL_OFFSET, EXPLICIT_COORDS],
+      can_eliminate = False, imms = [FORMAT, MASK, PIXEL_OFFSET, EXPLICIT_COORDS, COLOUR_TARGET],
       schedule_class = "coverage")
 
 for (name, exact) in [("any", 0xC000), ("none", 0xC020), ("none_after", 0xC020)]:
@@ -371,15 +430,44 @@ op("convert", (0x3E | L, 6, _), srcs = 2, imms = [ROUND])
 # Sources are the coeffient register and the sample index (if applicable)
 op("iter", (0x21, 8, _), srcs = 2, imms = [CHANNELS, INTERPOLATION])
 
+# AGX3's f32interp is a scalar linear iterator. Perspective correction is a
+# software sequence around this operation, so retain the iterator's perspective
+# selector independently instead of pretending AGX2's fused iterproj exists.
+op("interp_agx3", None, srcs = 2,
+   imms = [INTERPOLATION, PERSPECTIVE])
+
+# G17P computes explicit interpolation coordinates in a 32-bit token consumed
+# by one or more scalar f32interp instructions. For sample interpolation the
+# input is the low 16 bits of the API sample index; for centroid interpolation
+# it is the native 16-bit coverage word.
+op("itrcoords_agx3", None, srcs = 1, imms = [INTERPOLATION])
+
+# Native projective-only RHW producer. A distinct opcode prevents CSE from
+# merging it with ordinary position.w, whose f32interp f54 must remain clear.
+op("rhw_interp_agx3", None, srcs = 2, imms = [INTERPOLATION])
+
+# G17P's native projective multiply carries the originating coefficient index.
+# Keep that provenance through SSA/RA; an ordinary fmul cannot encode it.
+op("persp_mul_agx3", None, srcs = 2, imms = [IMM], is_float = True)
+
+# Projective RCP also carries the RHW coefficient; preserve it independently.
+op("persp_rcp_agx3", None, srcs = 1, imms = [IMM], is_float = True)
+
+
 # Sources are the coeffient register for the varying, the coefficient register
 # for W, and the sample index (if applicable)
 op("iterproj", (0x21, 8, _), srcs = 3, imms = [CHANNELS, INTERPOLATION])
 
 op("ldcf", (0xA1, 8, _), srcs = 1, imms = [CHANNELS])
 op("st_vary", None, dests = 0, srcs = 2, can_eliminate = False)
+op("st_vary_mul_agx3", None, dests = 0, srcs = 3, can_eliminate = False)
+op("st_vary_fma_agx3", None, dests = 0, srcs = 4, can_eliminate = False)
 op("no_varyings", (0x80000051, 4, _), dests = 0, can_eliminate = False)
+# Both AGX3 encodings end every hash-pinned shader region with the canonical
+# four-byte `end`.  This maps the compiler's unconditional terminator only;
+# conditional termination remains unmapped.
 op("stop", (0x88, 2, _), dests = 0, can_eliminate = False,
-   schedule_class = "invalid")
+   schedule_class = "invalid", agx3_mnemonic = "end")
 op("trap", (0x08, 2, _), dests = 0, can_eliminate = False,
    schedule_class = "invalid")
 
@@ -402,8 +490,39 @@ op("block_image_store", (0xB1, 10, _), dests = 0, srcs = 4,
    imms = [FORMAT, DIM, EXPLICIT_COORDS], can_eliminate = False, schedule_class = "store")
 
 # Barriers
+# Apple's AGX3 backend calls the same field-free semantic operation `barrier`.
+# Exact occurrence ladders ground both the six-byte AGX3b and AGX3c encodings;
+# scheduling/packing still stays in the bounded AGX3 packer.
 op("threadgroup_barrier", (0x0068, 2, _), dests = 0, srcs = 0,
-   can_eliminate = False, schedule_class = "barrier")
+   can_eliminate = False, schedule_class = "barrier",
+   agx3_mnemonic = "barrier")
+
+# Semantic AGX3 fence. IMM is enum agx3_barrier_scope; the exact scope may
+# expand to one or two barrier instructions in the AGX3 packer. This pseudo is
+# emitted only for AGX3 device keys, leaving the AGX2 barrier sequence intact.
+op("scoped_barrier_agx3", _, dests = 0, srcs = 0, imms = [IMM],
+   can_eliminate = False, schedule_class = "barrier",
+   agx3_mnemonic = "barrier")
+
+# Direct-absolute scalar coverage-stack access. These internal pseudos are the
+# bounded landing point for future ray-query lowering; no generic address-space
+# operation is silently reinterpreted as SCS.
+op("scs_load_agx3", _, dests = 1, srcs = 0, imms = [IMM, FORMAT],
+   schedule_class = "load", agx3_mnemonic = "ldscs")
+op("scs_store_agx3", _, dests = 0, srcs = 1, imms = [IMM, FORMAT],
+   can_eliminate = False, schedule_class = "store", agx3_mnemonic = "stscs")
+
+# Uniform-base plus scalar-GPR-index SCS access.  The source order keeps the
+# address provenance explicit instead of recovering it from generic pointer
+# arithmetic after the fact: load(base, index), store(value, base, index).
+# The backend derives the hardware scale from FORMAT and refuses every other
+# address form.
+op("scs_load_uniform_indexed_agx3", _, dests = 1, srcs = 2,
+   imms = [IMM, FORMAT, SCS_ZERO_EXTEND, SCS_C_LOAD_MARKER],
+   schedule_class = "load", agx3_mnemonic = "ldscs")
+op("scs_store_uniform_indexed_agx3", _, dests = 0, srcs = 3,
+   imms = [IMM, FORMAT], can_eliminate = False, schedule_class = "store",
+   agx3_mnemonic = "stscs")
 
 def memory_barrier(name, a, b, c):
     op(name, (0xF5 | (a << 10) | (b << 8) | (c << 12), 2, _), dests = 0, srcs = 0,
@@ -484,3 +603,18 @@ for (name, is_float) in [("break_if_icmp", False), ("break_if_fcmp", True)]:
     op(name, _, dests = 0, srcs = 2,
        imms = [NEST, INVERT_COND, FCOND if is_float else ICOND, TARGET],
        can_eliminate = False, schedule_class = "invalid")
+
+# Native normalized RGB10A2 conversion, four floats to/from one packed word.
+op("pack_rgb10a2_agx3", _, dests=1, srcs=4, is_float=True, agx3_mnemonic="pack")
+op("unpack_rgb10a2_agx3", _, dests=1, srcs=1, agx3_mnemonic="unpack")
+# G17P's native coverage word is prepared before RA, from SR2 at one sample.
+# Keep the general sample-mask target explicit while selecting its native zero
+# no-op.
+op("get_coverage_1x_agx3", _, dests = 1, schedule_class = "coverage")
+op("sample_mask_agx3", _, dests = 0, srcs = 2, imms = [IMM],
+   can_eliminate = False, schedule_class = "coverage")
+# G17P depthf consumes the coverage dword, carrying any stencil reference in
+# its upper half, and full-width float32 depth when written. The tuple is
+# assembled before RA and published at staging halves 0 and 2.
+op("zs_emit_agx3", _, dests = 0, srcs = 1, imms = [ZS],
+   can_eliminate = False, schedule_class = "coverage")

@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 #include "util/macros.h"
 
 #ifdef __cplusplus
@@ -31,6 +33,25 @@ enum agx_compiler_dbg {
 /* clang-format on */
 
 uint64_t agx_get_compiler_debug(void);
+
+/* Why the last agx_compile_shader_nir() on this thread returned false
+ * ("" when it succeeded), for the driver's "cannot encode" error. */
+const char *agx_last_compile_refusal(void);
+
+/* Fragment-structure code generation choices that remain selectable. */
+enum agx_fs_structure_flag {
+   /* Compile the colour epilog into the fragment shader at link time, as
+    * Apple's compiler blends inline. Honeykrisp keeps the main shader's NIR
+    * and backend key; at fast-link it appends the draw's epilog, turns every
+    * export / load_exported pair into SSA values and compiles one fragment
+    * program. It falls back to the split main + epilog whenever the
+    * monolithic compile would change any uniform, rodata, varying or
+    * preamble layout the draw path takes from the API shader, or fails to
+    * compile. */
+   AGX_FS_STRUCTURE_INLINE_BLEND = BITFIELD_BIT(4),
+};
+
+uint32_t agx_get_fs_structure_flags(void);
 
 #ifdef __cplusplus
 } /* extern C */

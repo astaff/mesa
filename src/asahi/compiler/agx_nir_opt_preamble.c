@@ -6,7 +6,9 @@
 
 #include "compiler/nir/nir_builder.h"
 #include "util/macros.h"
+#include "util/u_debug.h"
 #include "agx_compiler.h"
+#include "util/bitset.h"
 #include "nir.h"
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"
@@ -38,6 +40,25 @@ def_size(nir_def *def, unsigned *size, unsigned *align,
    *size = (bit_size * def->num_components) / 16;
    *align = bit_size / 16;
    *class = preamble_class(def);
+}
+
+static void
+def_size_g17p(nir_def *def, unsigned *size, unsigned *align,
+              nir_preamble_class *class)
+{
+   def_size(def, size, align, class);
+   nir_intrinsic_instr *intr = nir_def_as_intrinsic_or_null(def);
+   if (!intr || intr->intrinsic != nir_intrinsic_bindless_image_agx ||
+       intr->src[0].ssa->bit_size != 64)
+      return;
+
+   /* G17P cannot export texture state, so its native image descriptor is
+    * carried in general uniforms. The opaque token is 32 bits; reserve the
+    * 64-bit payload that lower_store_preamble actually exports instead.
+    * Image-class slot units and the other encodings stay unchanged.
+    */
+   *class = nir_preamble_class_general;
+   *size = *align = 4;
 }
 
 static bool
@@ -263,13 +284,32 @@ instr_cost(nir_instr *instr, const void *data)
    }
 }
 
+/* G17P's vertex output store reads its 16-bit index from the uniform file
+ * (agx_instr_accepts_uniform), so an index computed in the preamble -- an
+ * unlinked vertex shader's per-draw slot plus the component -- costs the
+ * main program nothing. */
+static bool
+g17p_uniform_uvs_index(const nir_src *use)
+{
+   nir_instr *parent = nir_src_use_instr(use);
+   if (parent->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(parent);
+   return intr->intrinsic == nir_intrinsic_store_uvs_agx &&
+          use == &intr->src[1] && use->ssa->bit_size == 16 &&
+          use->ssa->num_components == 1;
+}
+
 static float
-rewrite_cost(nir_def *def, const void *data)
+rewrite_cost_impl(nir_def *def, bool g17p)
 {
    bool mov_needed = false, vectorizable = true;
    nir_foreach_use(use, def) {
       nir_instr *parent_instr = nir_src_use_instr(use);
-      if (parent_instr->type == nir_instr_type_tex) {
+      if (g17p && g17p_uniform_uvs_index(use)) {
+         continue;
+      } else if (parent_instr->type == nir_instr_type_tex) {
          /* TODO: Maybe check the source index, but biases can be uniform */
          break;
       } else if (parent_instr->type == nir_instr_type_phi) {
@@ -298,6 +338,18 @@ rewrite_cost(nir_def *def, const void *data)
                      : 0;
 }
 
+static float
+rewrite_cost(nir_def *def, const void *data)
+{
+   return rewrite_cost_impl(def, false);
+}
+
+static float
+rewrite_cost_g17p(nir_def *def, const void *data)
+{
+   return rewrite_cost_impl(def, true);
+}
+
 static bool
 avoid_instr(const nir_instr *instr, const void *data)
 {
@@ -314,6 +366,12 @@ static const nir_opt_preamble_options preamble_options = {
    .rewrite_cost_cb = rewrite_cost,
    .avoid_instr_cb = avoid_instr,
 
+   /* Custom-border emulation and DXVK's per-sample descriptor reads repeat
+    * one uniform expression at every guarded sample site; give them one slot
+    * so the storage is left for the remaining descriptor work.
+    */
+   .share_equal_values = true,
+
    /* hardware size is 512, but it's polite to leave some wiggle room to push
     * hot constants so we don't end up rematerializing all over the place.
     * 480 seems to be a sweetspot, based on a few minutes of shader-db.
@@ -327,6 +385,11 @@ static const nir_opt_preamble_options preamble_options = {
    .preamble_storage_size[nir_preamble_class_sampler] = 16,
 };
 
+struct preamble_image {
+   int16_t heap;
+   uint8_t bit_size;
+};
+
 /*
  * Bindless image handles can't be stored to uniforms, so we move them back to
  * the main shader. Effectively un-optimizing the preamble.
@@ -334,16 +397,19 @@ static const nir_opt_preamble_options preamble_options = {
 static bool
 lower_store_preamble(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   int16_t *heaps = data;
+   struct preamble_image *images = data;
    if (intr->intrinsic != nir_intrinsic_store_preamble ||
-       nir_intrinsic_preamble_class(intr) == nir_preamble_class_image)
+       nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
       return false;
 
    nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
    if (!handle || handle->intrinsic != nir_intrinsic_bindless_image_agx)
       return false;
 
-   heaps[nir_intrinsic_base(intr)] = nir_intrinsic_desc_set(handle);
+   images[nir_intrinsic_base(intr)] = (struct preamble_image) {
+      .heap = nir_intrinsic_desc_set(handle),
+      .bit_size = handle->src[0].ssa->bit_size,
+   };
    nir_src_rewrite(&intr->src[0], handle->src[0].ssa);
    return true;
 }
@@ -379,15 +445,21 @@ lower_preamble(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (intr->intrinsic != nir_intrinsic_load_preamble)
       return false;
 
-   int16_t *heaps = data;
+   struct preamble_image *images = data;
    b->cursor = nir_after_instr(&intr->instr);
 
    unsigned base = nir_intrinsic_base(intr);
    nir_def *new_ = NULL;
    bool ts = nir_intrinsic_preamble_class(intr) == nir_preamble_class_image;
    bool ss = nir_intrinsic_preamble_class(intr) == nir_preamble_class_sampler;
-   if (!ts && heaps[base] >= 0) {
-      new_ = nir_bindless_image_agx(b, &intr->def, .desc_set = heaps[base]);
+   if (nir_intrinsic_preamble_class(intr) == nir_preamble_class_general &&
+       images[base].heap >= 0) {
+      /* Reload the exported descriptor payload, then recreate the opaque
+       * token for its users. The token's own width is not the payload width.
+       */
+      intr->def.bit_size = images[base].bit_size;
+      new_ = nir_bindless_image_agx(b, &intr->def,
+                                   .desc_set = images[base].heap);
    }
 
    nir_foreach_use_safe(use, &intr->def) {
@@ -423,13 +495,135 @@ lower_preamble(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/*
+ * A preamble boolean that the main program only selects on is exported as the
+ * half 1.0 or 0.0 and compared against zero where it is used. This is Apple's
+ * G17P shape for a select on a constant-program flag: the constant program
+ * converts the flag once, and every select reads the uniform directly as its
+ * comparand (agx3_alu_fcmp_select, f42 = 3), instead of copying the 0/1 half
+ * into a register for each integer select.
+ */
+static bool
+agx_nir_export_select_flags_as_halves(nir_shader *nir)
+{
+   nir_function_impl *main = nir_shader_get_entrypoint(nir);
+   if (!main->preamble)
+      return false;
+   nir_function_impl *pre = nir_shader_get_preamble(nir);
+
+   BITSET_DECLARE(flag, 512);
+   BITSET_DECLARE(other, 512);
+   BITSET_ZERO(flag);
+   BITSET_ZERO(other);
+
+   nir_foreach_block(block, main) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+            continue;
+         const unsigned base = nir_intrinsic_base(intr);
+         const unsigned halves =
+            MAX2(intr->def.bit_size, 16) * intr->def.num_components / 16;
+         if (base + halves > 512)
+            return false;
+
+         bool selects_only = intr->def.bit_size == 1 &&
+                             intr->def.num_components == 1;
+         nir_foreach_use_including_if(use, &intr->def) {
+            if (!selects_only)
+               break;
+            if (nir_src_is_if(use)) {
+               selects_only = false;
+               break;
+            }
+            nir_instr *parent = nir_src_use_instr(use);
+            selects_only =
+               parent->type == nir_instr_type_alu &&
+               nir_instr_as_alu(parent)->op == nir_op_bcsel &&
+               use == &nir_instr_as_alu(parent)->src[0].src;
+         }
+         if (selects_only)
+            BITSET_SET(flag, base);
+         else
+            BITSET_SET_RANGE(other, base, base + halves - 1);
+      }
+   }
+
+   nir_foreach_block(block, pre) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+            continue;
+         const unsigned base = nir_intrinsic_base(intr);
+         nir_def *value = intr->src[0].ssa;
+         if (base < 512 && (value->bit_size != 1 || value->num_components != 1))
+            BITSET_SET(other, base);
+      }
+   }
+
+   BITSET_ANDNOT(flag, flag, other);
+   if (BITSET_IS_EMPTY(flag))
+      return false;
+
+   nir_foreach_block(block, pre) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general ||
+             nir_intrinsic_base(intr) >= 512 ||
+             !BITSET_TEST(flag, nir_intrinsic_base(intr)))
+            continue;
+         nir_builder b = nir_builder_at(nir_before_instr(instr));
+         nir_def *half = nir_bcsel(&b, intr->src[0].ssa,
+                                   nir_imm_float16(&b, 1.0),
+                                   nir_imm_float16(&b, 0.0));
+         nir_src_rewrite(&intr->src[0], half);
+      }
+   }
+
+   nir_foreach_block(block, main) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general ||
+             !BITSET_TEST(flag, nir_intrinsic_base(intr)))
+            continue;
+         intr->def.bit_size = 16;
+         nir_builder b = nir_builder_at(nir_after_instr(instr));
+         nir_def *set = nir_fneu_imm(&b, &intr->def, 0.0);
+         nir_def_rewrite_uses_after(&intr->def, set);
+      }
+   }
+
+   nir_progress(true, pre, nir_metadata_control_flow);
+   nir_progress(true, main, nir_metadata_control_flow);
+   return true;
+}
+
 bool
-agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes)
+agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p)
 {
    bool progress = false;
-   NIR_PASS(progress, nir, nir_opt_preamble, &preamble_options, sizes);
+   nir_opt_preamble_options options = preamble_options;
+   if (g17p) {
+      options.def_size = def_size_g17p;
+      options.rewrite_cost_cb = rewrite_cost_g17p;
+   }
+   NIR_PASS(progress, nir, nir_opt_preamble, &options, sizes);
+   if (progress && g17p)
+      NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves);
 
-   int16_t heap[512];
+   struct preamble_image heap[512];
    memset(heap, ~0, sizeof(heap));
 
    if (progress) {
@@ -442,4 +636,418 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes)
             nir_metadata_control_flow, heap);
 
    return progress;
+}
+
+/* General preamble exports are read through load_preamble, or implicitly as
+ * the base of a bindless image/sampler token. Image/sampler-class exports use
+ * separate native state and are deliberately left alone.
+ */
+bool
+agx_nir_remove_unused_preamble_exports(nir_shader *nir, unsigned reserved)
+{
+   if (!nir_shader_get_entrypoint(nir)->preamble)
+      return false;
+
+   bool read[512] = {false};
+   for (unsigned h = 0; h < MIN2(reserved, ARRAY_SIZE(read)); h++)
+      read[h] = true;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            unsigned base, size;
+            if (intr->intrinsic == nir_intrinsic_load_preamble &&
+                nir_intrinsic_preamble_class(intr) == nir_preamble_class_general) {
+               base = nir_intrinsic_base(intr);
+               size = MAX2(intr->def.bit_size, 16) * intr->def.num_components / 16;
+            } else if (intr->intrinsic == nir_intrinsic_bindless_image_agx ||
+                       intr->intrinsic == nir_intrinsic_bindless_sampler_agx) {
+               base = nir_intrinsic_desc_set(intr);
+               size = 4;
+            } else {
+               continue;
+            }
+            if (base >= ARRAY_SIZE(read) || size > ARRAY_SIZE(read) - base)
+               return false;
+            for (unsigned h = 0; h < size; h++)
+               read[base + h] = true;
+         }
+      }
+   }
+
+   bool progress = false;
+   nir_function_impl *impl = nir_shader_get_preamble(nir);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+            continue;
+         unsigned base = nir_intrinsic_base(intr);
+         nir_def *value = intr->src[0].ssa;
+         unsigned size = MAX2(value->bit_size, 16) * value->num_components / 16;
+         if (base >= ARRAY_SIZE(read) || size > ARRAY_SIZE(read) - base)
+            continue;
+         bool live = false;
+         for (unsigned h = 0; h < size; h++)
+            live |= read[base + h];
+         if (!live) {
+            nir_instr_remove(instr);
+            progress = true;
+         }
+      }
+   }
+   nir_foreach_function_impl(other, nir) {
+      nir_progress(other == impl && progress, other, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
+/* Native CProgs export a whole uniform word. When its two live halves are
+ * assigned in different control-flow blocks, defer only that pair's exports
+ * until the preamble finishes. Locals lowered to SSA preserve each path's
+ * last assignment, with undef on paths which never write a half. The pack
+ * preserves the defined neighbor even on such a path; do not initialize the
+ * unwritten half or change any main-program load or uniform allocation.
+ */
+bool
+agx_nir_coalesce_preamble_half_exports(nir_shader *nir, unsigned reserved,
+                                     unsigned allocated)
+{
+   if (!nir_shader_get_entrypoint(nir)->preamble)
+      return false;
+   nir_function_impl *impl = nir_shader_get_preamble(nir);
+
+   if (reserved >= allocated || allocated > 512)
+      return false;
+
+   bool written[512] = {false};
+   bool blocked[256] = {false};
+   nir_block *first_block[256] = {NULL};
+   bool cross_block[256] = {false};
+   for (unsigned h = 0; h < MIN2(reserved, ARRAY_SIZE(written)); h++)
+      blocked[h / 2] = true;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_jump) {
+            nir_jump_type type = nir_instr_as_jump(instr)->type;
+            if (type != nir_jump_break && type != nir_jump_continue)
+               return false;
+         }
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         unsigned base, size;
+         if (intr->intrinsic == nir_intrinsic_store_preamble) {
+            if (nir_intrinsic_preamble_class(intr) !=
+                nir_preamble_class_general)
+               continue;
+            nir_def *value = intr->src[0].ssa;
+            base = nir_intrinsic_base(intr);
+            size = MAX2(value->bit_size, 16) * value->num_components / 16;
+            if (base >= ARRAY_SIZE(written) ||
+                size > ARRAY_SIZE(written) - base)
+               return false;
+            if (value->num_components == 1 &&
+                (value->bit_size == 1 || value->bit_size == 16)) {
+               written[base] = true;
+               if (first_block[base / 2] && first_block[base / 2] != block)
+                  cross_block[base / 2] = true;
+               else
+                  first_block[base / 2] = block;
+               continue;
+            }
+         } else if (intr->intrinsic == nir_intrinsic_load_preamble &&
+                    nir_intrinsic_preamble_class(intr) ==
+                       nir_preamble_class_general) {
+            base = nir_intrinsic_base(intr);
+            size = MAX2(intr->def.bit_size, 16) * intr->def.num_components / 16;
+         } else if (intr->intrinsic == nir_intrinsic_bindless_image_agx ||
+                    intr->intrinsic == nir_intrinsic_bindless_sampler_agx) {
+            base = nir_intrinsic_desc_set(intr);
+            size = 4;
+         } else {
+            /* Do not move exports through an unaccounted-for side effect. */
+            if (!(nir_intrinsic_infos[intr->intrinsic].flags &
+                  NIR_INTRINSIC_CAN_ELIMINATE))
+               return false;
+            continue;
+         }
+         if (base >= ARRAY_SIZE(written) || size > ARRAY_SIZE(written) - base)
+            return false;
+         for (unsigned h = 0; h < size; h++)
+            blocked[(base + h) / 2] = true;
+      }
+   }
+
+   nir_variable *halves[512] = {NULL};
+   bool progress = false;
+   for (unsigned base = 0; base < ARRAY_SIZE(written); base += 2) {
+      if (base < reserved || base + 1 >= allocated || blocked[base / 2] ||
+          !cross_block[base / 2] || !written[base] || !written[base + 1])
+         continue;
+      for (unsigned h = 0; h < 2; h++)
+         halves[base + h] = nir_local_variable_create(
+            impl, glsl_uint16_t_type(), "preamble_half");
+      progress = true;
+   }
+   if (!progress)
+      return false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+            continue;
+         unsigned base = nir_intrinsic_base(intr);
+         if (!halves[base])
+            continue;
+         nir_builder b = nir_builder_at(nir_before_instr(instr));
+         nir_def *value = intr->src[0].ssa;
+         /* AGX represents scalar NIR booleans as the half values 0 or 1. */
+         if (value->bit_size == 1)
+            value = nir_bcsel(&b, value, nir_imm_intN_t(&b, 1, 16),
+                              nir_imm_intN_t(&b, 0, 16));
+         nir_store_var(&b, halves[base], value, 1);
+         nir_instr_remove(instr);
+      }
+   }
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   for (unsigned base = 0; base < ARRAY_SIZE(halves); base += 2) {
+      if (!halves[base])
+         continue;
+      nir_def *pair =
+         nir_pack_32_2x16_split(&b, nir_load_var(&b, halves[base]),
+                                nir_load_var(&b, halves[base + 1]));
+      nir_store_preamble(&b, pair, .base = base,
+                         .preamble_class = nir_preamble_class_general);
+   }
+   nir_progress(true, impl, nir_metadata_control_flow);
+   nir_lower_vars_to_ssa(nir);
+   return true;
+}
+
+
+static unsigned
+if_depth(const nir_instr *instr)
+{
+   unsigned depth = 0;
+   for (nir_cf_node *n = instr->block->cf_node.parent; n; n = n->parent)
+      depth += n->type == nir_cf_node_if;
+   return depth;
+}
+
+/* If this 64-bit value is a sample's texture or sampler handle, the least
+ * if-nesting depth of those samples; otherwise UINT_MAX.
+ */
+static unsigned
+sample_handle_depth(const nir_def *def)
+{
+   unsigned depth = UINT_MAX;
+   if (def->bit_size != 64 || def->num_components != 1)
+      return depth;
+
+   nir_foreach_use(use, def) {
+      nir_instr *parent = nir_src_use_instr(use);
+      if (parent->type != nir_instr_type_tex)
+         continue;
+      nir_tex_instr *tex = nir_instr_as_tex(parent);
+      const unsigned s = (nir_tex_src *)use - tex->src;
+      switch (tex->src[s].src_type) {
+      case nir_tex_src_texture_offset:
+      case nir_tex_src_texture_handle:
+      case nir_tex_src_sampler_offset:
+      case nir_tex_src_sampler_handle:
+         depth = MIN2(depth, if_depth(parent));
+         break;
+      default:
+         break;
+      }
+   }
+   return depth;
+}
+
+struct preamble_slot {
+   uint16_t base, size, align, pad_size;
+   bool handle;
+   unsigned depth; /* least if-depth of a sample using it as a handle */
+   uint16_t new_base;
+};
+
+static int
+find_slot(struct preamble_slot *slots, unsigned n, unsigned half)
+{
+   for (unsigned i = 0; i < n; ++i) {
+      if (half >= slots[i].base && half < slots[i].base + slots[i].size)
+         return i;
+   }
+   return -1;
+}
+
+/*
+ * nir_opt_preamble lays general exports out by benefit, so bindless texture
+ * and sampler handles of a shader with many exports can land above the range
+ * a sample reads directly, and each sample then copies its handles into
+ * registers first. Move every export that is used as a handle to the bottom of
+ * the general range [reserved, exports_end), keeping the others in order
+ * behind them. Uniforms from exports_end to the allocated size, if any, are
+ * copied in by the launch and stay where they are. Updates the allocated size
+ * when alignment grows the layout.
+ */
+bool
+agx_nir_place_preamble_handles_low(nir_shader *nir, unsigned reserved,
+                                   unsigned exports_end,
+                                   unsigned *allocated_inout)
+{
+   const unsigned allocated = *allocated_inout;
+   if (!nir_shader_get_entrypoint(nir)->preamble || allocated > 512 ||
+       exports_end > allocated)
+      return false;
+   const unsigned limit = exports_end < allocated ? exports_end : 512;
+
+   struct preamble_slot slots[512];
+   unsigned n = 0;
+   bool any_high_handle = false;
+
+   /* Every general export is one slot, sized and aligned like its value. */
+   nir_function_impl *preamble = nir_shader_get_preamble(nir);
+   nir_foreach_block(block, preamble) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+            continue;
+         const nir_def *value = intr->src[0].ssa;
+         const unsigned base = nir_intrinsic_base(intr);
+         const unsigned align = MAX2(value->bit_size, 16) / 16;
+         const unsigned size = align * value->num_components;
+         /* A lone half is written as a 32-bit copy whose other half must be
+          * padding (agx3_pack_binary), so it keeps its pair to itself. */
+         const unsigned slot_align = MAX2(align, 2);
+         const unsigned slot_size = ALIGN_POT(size, 2);
+         if (base < reserved || base + size > exports_end)
+            return false;
+
+         const int s = find_slot(slots, n, base);
+         if (s >= 0) {
+            /* The same slot written again (one value per branch). */
+            if (slots[s].base != base || slots[s].size != size)
+               return false;
+            continue;
+         }
+         if (find_slot(slots, n, base + size - 1) >= 0)
+            return false;
+         slots[n++] = (struct preamble_slot){
+            .base = base, .size = size, .align = slot_align,
+            .pad_size = slot_size, .depth = UINT_MAX};
+      }
+   }
+
+   /* Every read must fall inside one slot; handles are four aligned halves. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            unsigned base, size;
+            unsigned depth = UINT_MAX;
+            if (intr->intrinsic == nir_intrinsic_load_preamble &&
+                nir_intrinsic_preamble_class(intr) ==
+                   nir_preamble_class_general) {
+               base = nir_intrinsic_base(intr);
+               size = MAX2(intr->def.bit_size, 16) * intr->def.num_components / 16;
+               depth = sample_handle_depth(&intr->def);
+            } else if (intr->intrinsic == nir_intrinsic_bindless_image_agx ||
+                       intr->intrinsic == nir_intrinsic_bindless_sampler_agx) {
+               base = nir_intrinsic_desc_set(intr);
+               size = 4;
+               depth = if_depth(&intr->instr);
+            } else {
+               continue;
+            }
+            if (base < reserved || base >= exports_end)
+               continue;
+            const int s = find_slot(slots, n, base);
+            if (s < 0 || base + size > slots[s].base + slots[s].size)
+               return false;
+            if (depth != UINT_MAX) {
+               if (base != slots[s].base || slots[s].size != 4)
+                  return false;
+               slots[s].handle = true;
+               slots[s].align = 4;
+               slots[s].depth = MIN2(slots[s].depth, depth);
+               any_high_handle |= base > AGX3_SMP_HANDLE_MAX_HALF;
+            }
+         }
+      }
+   }
+
+   if (!any_high_handle)
+      return false;
+
+   /* Handles first, those of the least conditional samples first, then
+    * everything else in its current order. */
+   unsigned max_depth = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      if (slots[i].handle)
+         max_depth = MAX2(max_depth, slots[i].depth);
+   }
+   unsigned next = reserved;
+   for (unsigned depth = 0; depth <= max_depth + 1; ++depth) {
+      for (unsigned i = 0; i < n; ++i) {
+         if (slots[i].handle ? slots[i].depth != depth : depth <= max_depth)
+            continue;
+         next = ALIGN_POT(next, slots[i].align);
+         slots[i].new_base = next;
+         next += slots[i].pad_size;
+      }
+   }
+   /* Alignment can grow the layout by a few halves; stay below the launch's
+    * copies and in the hardware's uniform file. */
+   if (next > limit)
+      return false;
+   *allocated_inout = MAX2(allocated, next);
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const bool general =
+               (intr->intrinsic == nir_intrinsic_load_preamble ||
+                intr->intrinsic == nir_intrinsic_store_preamble) &&
+               nir_intrinsic_preamble_class(intr) == nir_preamble_class_general;
+            if (general) {
+               const unsigned base = nir_intrinsic_base(intr);
+               if (base < reserved || base >= exports_end)
+                  continue;
+               const struct preamble_slot *s = &slots[find_slot(slots, n, base)];
+               nir_intrinsic_set_base(intr, s->new_base + (base - s->base));
+            } else if (intr->intrinsic == nir_intrinsic_bindless_image_agx ||
+                       intr->intrinsic == nir_intrinsic_bindless_sampler_agx) {
+               const unsigned base = nir_intrinsic_desc_set(intr);
+               if (base < reserved || base >= exports_end)
+                  continue;
+               nir_intrinsic_set_desc_set(intr,
+                  slots[find_slot(slots, n, base)].new_base);
+            }
+         }
+      }
+      nir_progress(true, impl, nir_metadata_all);
+   }
+
+   return true;
 }

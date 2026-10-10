@@ -4,10 +4,12 @@
  */
 
 #include "agx_builder.h"
+#include "agx3_select_core.h"
 #include "agx_compiler.h"
 #include "agx_test.h"
 
 #include <gtest/gtest.h>
+#include "util/u_debug.h"
 
 static void
 agx_optimize_and_dce(agx_context *ctx)
@@ -109,6 +111,443 @@ TEST_F(Optimizer, FloatConversion)
       { agx_fadd_to(b, out, wx, wy); });
 }
 
+TEST_F(Optimizer, G17PPreservesHalfNotAfterBitwise)
+{
+   for (unsigned table : {AGX3_SEL_TT_AND, AGX3_SEL_TT_OR, AGX3_SEL_TT_XOR}) {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      for (agx_builder *b : {actual, expected}) {
+         b->shader->key = &key;
+         agx_index value = agx_bitop(b, hx, hy, table);
+         agx_index inverted = agx_not(b, value);
+         agx_unit_test(b, inverted);
+      }
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}
+
+TEST_F(Optimizer, G17PPreservesNarrowingAfterAdd)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index sum = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_fadd_to(actual, sum, wx, wy);
+   agx_index narrowed = agx_temp(actual->shader, AGX_SIZE_16);
+   agx_fmov_to(actual, narrowed, sum);
+   agx_unit_test(actual, narrowed);
+
+   sum = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_fadd_to(expected, sum, wx, wy);
+   narrowed = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_fmov_to(expected, narrowed, sum);
+   agx_unit_test(expected, narrowed);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(Optimizer, G17PPreservesZeroExtensionsBeforeExtract)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   for (agx_builder *b : {actual, expected}) {
+      b->shader->key = &key;
+      agx_index lo = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index hi = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, lo, hx);
+      agx_mov_to(b, hi, hy);
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_extr_to(b, out, lo, hi, agx_immediate(4), 0);
+      agx_unit_test(b, out);
+   }
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(Optimizer, G17PPreservesHalfWidenBeforeFltnorm)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index lo = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_index hi = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_fmov_to(actual, lo, hx);
+   agx_fmov_to(actual, hi, hy);
+   agx_index packed = agx_temp(actual->shader, AGX_SIZE_16);
+   agx_fltnorm_agx3_to(actual, packed, lo, hi, AGX_FORMAT_U8NORM);
+   agx_unit_test(actual, packed);
+
+   lo = agx_temp(expected->shader, AGX_SIZE_32);
+   hi = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_fmov_to(expected, lo, hx);
+   agx_fmov_to(expected, hi, hy);
+   packed = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_fltnorm_agx3_to(expected, packed, lo, hi, AGX_FORMAT_U8NORM);
+   agx_unit_test(expected, packed);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/*
+ * AGX3 has no select form without a register compare operand, so a select of
+ * two immediates -- here fused out of a compare of two constants -- has to
+ * fold to the chosen operand.
+ */
+TEST_F(Optimizer, G17PFoldsAConstantSelect)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index two = agx_mov_imm(actual, 32, 2);
+   agx_index five = agx_mov_imm(actual, 32, 5);
+   agx_index lt = agx_icmp(actual, two, five, AGX_ICOND_ULT, false);
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_icmpsel_to(actual, out, lt, agx_zero(), wx, wy, AGX_ICOND_UEQ);
+   agx_unit_test(actual, out);
+
+   /* Burn the indices of the dead constants, compare and select; the chosen
+    * operand then propagates into the use. */
+   for (unsigned i = 0; i < 4; ++i)
+      (void)agx_temp(expected->shader, AGX_SIZE_32);
+   agx_unit_test(expected, wy);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/* A compare of two constants used as a value folds the same way, before it is
+ * lowered to a select of two immediates.
+ */
+TEST_F(Optimizer, G17PFoldsAConstantCompare)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index zero = agx_mov_imm(actual, 16, 0);
+   agx_index six = agx_mov_imm(actual, 16, 6);
+   agx_index eq = agx_icmp(actual, zero, six, AGX_ICOND_UEQ, true);
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_16);
+   agx_iadd_to(actual, out, eq, hx, 0);
+   agx_unit_test(actual, out);
+
+   for (unsigned i = 0; i < 3; ++i)
+      (void)agx_temp(expected->shader, AGX_SIZE_16);
+   out = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_iadd_to(expected, out, agx_immediate(1), hx, 0);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/* The comparison width is unknown once both operands are immediates, so a
+ * signed compare of a 16-bit immediate with its top bit set stays a select.
+ */
+TEST_F(Optimizer, G17PKeepsASignDependentConstantSelect)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_16);
+   agx_icmpsel_to(actual, out, agx_abs(agx_immediate(0x8000)),
+                  agx_immediate(1), hx, hy, AGX_ICOND_SLT);
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_icmpsel_to(expected, out, agx_abs(agx_immediate(0x8000)),
+                  agx_immediate(1), hx, hy, AGX_ICOND_SLT);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/*
+ * A tied fcmpsel with a GTN or LTN condition is G17P's native minimum or
+ * maximum, and Apple's encoding carries the constant operand as one minifloat
+ * that serves as both the compared and the selected value. Fold the constant
+ * into both slots: folding into only the comparison -- which is what the
+ * generic rule does, because source 3 of a select is not a float source --
+ * leaves the packer a mixed-width general select it has no encoding for, and
+ * that is what made every max(x, 0.0) fail the shader closed.
+ */
+TEST_F(Optimizer, G17PFoldsBothHalvesOfATiedConstantFmax)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index minus_one = agx_mov_imm(actual, 32, 0xbf800000);
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(actual, out, wx, minus_one, wx, minus_one,
+                  AGX_FCOND_GTN);
+   agx_unit_test(actual, out);
+
+   const agx_index folded = agx_immediate_f(-1.0f);
+   /* Burn the index the dead constant held, so only the folding differs. */
+   (void)agx_temp(expected->shader, AGX_SIZE_32);
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(expected, out, wx, folded, wx, folded, AGX_FCOND_GTN);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(Optimizer, G17PVertexConstantWidth)
+{
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = mode == 3 ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
+      b->shader->key = &key;
+      b->shader->stage = mode == 1 ? MESA_SHADER_FRAGMENT : MESA_SHADER_VERTEX;
+      b->shader->is_preamble = mode == 2;
+      agx_index constant = agx_mov_imm(b, 32, fui(1.0f / 1024.0f));
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_ffma_to(b, out, wx, constant, wy);
+      agx_unit_test(b, out);
+      agx_opt_compact_constants(b->shader);
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_FFMA)
+            EXPECT_EQ(I->src[1].size, AGX_SIZE_16);
+         if (I->op == AGX_OPCODE_MOV_IMM)
+            EXPECT_EQ(I->imm, 0x1400u);
+      }
+   }
+}
+
+/* The constant may be written on either side. Half-folding the first pair is
+ * worse than the second: agx_opt_compact_constants then sees the surviving
+ * reference as the constant's only float use and narrows it to 16 bits,
+ * leaving a 32-bit maximum compared against a 16-bit register. */
+TEST_F(Optimizer, G17PFoldsBothHalvesOfATiedConstantFmaxWrittenFirst)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index zero = agx_mov_imm(actual, 32, 0);
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(actual, out, zero, wx, zero, wx, AGX_FCOND_GTN);
+   agx_unit_test(actual, out);
+
+   const agx_index folded = agx_immediate_f(0.0f);
+   (void)agx_temp(expected->shader, AGX_SIZE_32);
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(expected, out, folded, wx, folded, wx, AGX_FCOND_GTN);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/* A constant that is not an exact minifloat has no immediate encoding, so the
+ * tie stays in a register -- in both slots, never one. */
+TEST_F(Optimizer, G17PPreservesTiedConstantFmaxThatIsNotAMinifloat)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   /* 0.1f is not representable as an AGX minifloat. */
+   agx_index tenth = agx_mov_imm(actual, 32, 0x3dcccccd);
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(actual, out, wx, tenth, wx, tenth, AGX_FCOND_GTN);
+   agx_unit_test(actual, out);
+
+   tenth = agx_mov_imm(expected, 32, 0x3dcccccd);
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(expected, out, wx, tenth, wx, tenth, AGX_FCOND_GTN);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+/*
+ * A clamp against zero written as a compare and a select -- (0 < x) ? x : 0,
+ * (0 > x) ? x : 0, (x < 0) ? x : 0 or (x > 0) ? x : 0 -- is exactly the tied
+ * maximum (x GTN 0) ? x : 0 or minimum (x LTN 0) ? x : 0: a NaN or a zero of
+ * either sign compares false in both forms. Fusion leaves the comparator zero
+ * as a minifloat and the selected zero as a bit pattern; they are the same
+ * +0.0, so the select becomes the tied form.
+ */
+struct ZeroClamp {
+   bool zero_first;
+   enum agx_fcond cond;
+   enum agx_fcond tied;
+};
+
+static const ZeroClamp zero_clamps[] = {
+   {true, AGX_FCOND_LT, AGX_FCOND_GTN},
+   {true, AGX_FCOND_GT, AGX_FCOND_LTN},
+   {false, AGX_FCOND_LT, AGX_FCOND_LTN},
+   {false, AGX_FCOND_GT, AGX_FCOND_GTN},
+};
+
+static void
+build_zero_clamp(agx_builder *b, agx_index x, const ZeroClamp &c,
+                 uint32_t constant, bool abs_x)
+{
+   agx_index k = agx_mov_imm(b, 32, constant);
+   agx_index xs = abs_x ? agx_abs(x) : x;
+   agx_index cmp = c.zero_first ? agx_fcmp(b, k, xs, c.cond, false)
+                                : agx_fcmp(b, xs, k, c.cond, false);
+   agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+   agx_icmpsel_to(b, out, cmp, agx_zero(), k, x, AGX_ICOND_UEQ);
+   agx_unit_test(b, out);
+}
+
+TEST_F(Optimizer, G17PTiesAClampAgainstZero)
+{
+   for (const ZeroClamp &c : zero_clamps) {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      actual->shader->key = &key;
+      expected->shader->key = &key;
+
+      agx_index x = agx_fadd(actual, wx, wy);
+      build_zero_clamp(actual, x, c, 0, false);
+
+      x = agx_fadd(expected, wx, wy);
+      /* Burn the indices of the dead constant and compare. */
+      (void)agx_temp(expected->shader, AGX_SIZE_32);
+      (void)agx_temp(expected->shader, AGX_SIZE_16);
+      agx_index out = agx_temp(expected->shader, AGX_SIZE_32);
+      agx_fcmpsel_to(expected, out, x, agx_immediate(0), x, agx_immediate(0),
+                     c.tied);
+      agx_unit_test(expected, out);
+
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}
+
+/* Only a zero is the same value in both roles, and a modified x is a
+ * different value from the one selected; AGX2 has no tied form. */
+TEST_F(Optimizer, G17PKeepsOtherClampsGeneral)
+{
+   for (const ZeroClamp &c : zero_clamps) {
+      for (unsigned variant = 0; variant < 3; ++variant) {
+         agx_builder *b = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         key.dev.encoding =
+            variant == 2 ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
+         b->shader->key = &key;
+
+         agx_index x = agx_fadd(b, wx, wy);
+         build_zero_clamp(b, x, c, variant == 0 ? 0x3f800000 : 0,
+                          variant == 1);
+         agx_optimize_and_dce(b->shader);
+
+         unsigned selects = 0;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->op != AGX_OPCODE_FCMPSEL)
+               continue;
+            selects++;
+            EXPECT_EQ(I->fcond, c.cond);
+         }
+         EXPECT_EQ(selects, 1u);
+      }
+   }
+}
+
+/* A general select is not a minimum: its selected operands are not tied to the
+ * compared ones, so the compare-slot fold must stay compare-only. */
+TEST_F(Optimizer, G17PDoesNotFoldTheSelectSlotOfAnUntiedFcmpsel)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index minus_one = agx_mov_imm(actual, 32, 0xbf800000);
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(actual, out, wx, minus_one, wy, wz, AGX_FCOND_GTN);
+   agx_unit_test(actual, out);
+
+   (void)agx_temp(expected->shader, AGX_SIZE_32);
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_fcmpsel_to(expected, out, wx, agx_immediate_f(-1.0f), wy, wz,
+                  AGX_FCOND_GTN);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(Optimizer, G17PPreservesWideningBeforeWidthMatchedIntegerALU)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index widened = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_mov_to(actual, widened, hx);
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_xor_to(actual, out, widened, wy);
+   agx_unit_test(actual, out);
+   agx_index selected = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_icmpsel_to(actual, selected, widened, wz, wx, wy, AGX_ICOND_ULT);
+   agx_unit_test(actual, selected);
+
+   widened = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_mov_to(expected, widened, hx);
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_xor_to(expected, out, widened, wy);
+   agx_unit_test(expected, out);
+   selected = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_icmpsel_to(expected, selected, widened, wz, wx, wy, AGX_ICOND_ULT);
+   agx_unit_test(expected, selected);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
 TEST_F(Optimizer, FusedFABSNEG)
 {
    CASE32(agx_fadd_to(b, out, agx_fmov(b, agx_abs(wx)), wy),
@@ -183,6 +622,33 @@ TEST_F(Optimizer, FmulFsatF2F16)
          agx_fmov_to(b, out, tmp);
       },
       { agx_fmul_to(b, out, wx, wy)->saturate = true; });
+}
+
+TEST_F(Optimizer, G17PPreservesStandaloneSaturate)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_index product = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_fmul_to(actual, product, wx, wy);
+   agx_instr *sat = agx_fmov_to(actual, out, product);
+   sat->saturate = true;
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   product = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_fmul_to(expected, product, wx, wy);
+   sat = agx_fmov_to(expected, out, product);
+   sat->saturate = true;
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 
 TEST_F(Optimizer, FsatWithPhi)
@@ -376,6 +842,81 @@ TEST_F(Optimizer, BallotCondition)
           agx_fcmp_quad_ballot_to(b, out, wx, wy, AGX_FCOND_GT, false));
 }
 
+TEST_F(Optimizer, G17PBallotOfTwoRegistersKeepsTheComparison)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_ballot_to(actual, out, agx_icmp(actual, hx, hy, AGX_ICOND_UEQ, true));
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_temp(expected->shader, AGX_SIZE_16);
+   agx_index opposite = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_icmp_to(expected, opposite, hx, hy, AGX_ICOND_UEQ, false);
+   agx_icmp_ballot_to(expected, out, opposite, agx_zero(), AGX_ICOND_UEQ,
+                      false);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(Optimizer, G17PBallotOfHalfPredicateWidens)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_index active = agx_temp(actual->shader, AGX_SIZE_16);
+   agx_get_sr_coverage_to(actual, active, AGX_SR_IS_ACTIVE_THREAD);
+   agx_ballot_to(actual, out, active);
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_32);
+   active = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_get_sr_coverage_to(expected, active, AGX_SR_IS_ACTIVE_THREAD);
+   agx_index wide = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_mov_to(expected, wide, active);
+   agx_ballot_to(expected, out, wide);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(Optimizer, G17PQuadBallotOfConstantIsARegister)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   expected->shader->key = &key;
+
+   agx_index out = agx_temp(actual->shader, AGX_SIZE_16);
+   agx_quad_ballot_to(actual, out, agx_immediate(1));
+   agx_unit_test(actual, out);
+
+   out = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_index predicate = agx_temp(expected->shader, AGX_SIZE_16);
+   agx_mov_imm_to(expected, predicate, 1);
+   agx_quad_ballot_to(expected, out, predicate);
+   agx_unit_test(expected, out);
+
+   agx_optimize_and_dce(actual->shader);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
 TEST_F(Optimizer, BallotMultipleUses)
 {
    CASE32(
@@ -487,4 +1028,59 @@ TEST_F(Optimizer, IfInvertedCondition)
          agx_xor(b, agx_fcmp(b, hx, hy, AGX_FCOND_LT, false), agx_immediate(1)),
          agx_zero(), 1, AGX_ICOND_UEQ, true, NULL),
       agx_if_fcmp(b, hx, hy, 1, AGX_FCOND_LT, true, NULL));
+}
+
+TEST_F(Optimizer, G17PTileSampleConstantsStayInRegisters)
+{
+   /* The packer's existing G17PMultisampleTileSampleOperandIsARegister
+    * regression accepts registers and rejects these raw mask immediates.
+    * Optimizing a valid MOV+store must not recreate a refused operand.
+    */
+   for (unsigned mask : {0u, 1u, 3u, 15u, 32u, 64u}) {
+      SCOPED_TRACE(mask);
+      agx_builder *b = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      b->shader->key = &key;
+      agx_index coverage = agx_mov_imm(b, 16, mask);
+      agx_instr *store = agx_st_tile(b, hx, coverage, agx_null(),
+                                    AGX_FORMAT_I16, 1, 0, false, 0);
+      agx_optimize_and_dce(b->shader);
+      EXPECT_EQ(store->src[1].type, AGX_INDEX_NORMAL);
+      EXPECT_EQ(store->src[1].size, AGX_SIZE_16);
+      EXPECT_EQ(store->src[1].value, coverage.value);
+      unsigned moves = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_MOV_IMM) {
+            EXPECT_EQ(I->imm, mask);
+            EXPECT_EQ(I->dest[0].value, coverage.value);
+            moves++;
+         }
+      }
+      EXPECT_EQ(moves, 1u);
+   }
+}
+
+TEST_F(Optimizer, TileSampleImmediateControls)
+{
+   for (enum agx_isa_encoding enc : {AGX_ISA_ENCODING_AGX2,
+                                      AGX_ISA_ENCODING_AGX3B,
+                                      AGX_ISA_ENCODING_AGX3C}) {
+      for (unsigned mask : {0u, 255u}) {
+         if (enc == AGX_ISA_ENCODING_AGX3B && mask == 0)
+            continue;
+         SCOPED_TRACE(unsigned(enc));
+         SCOPED_TRACE(mask);
+         agx_builder *b = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         key.dev.encoding = enc;
+         b->shader->key = &key;
+         agx_instr *store = agx_st_tile(
+            b, hx, agx_mov_imm(b, 16, mask), agx_null(),
+            AGX_FORMAT_I16, 1, 0, false, 0);
+         agx_optimize_and_dce(b->shader);
+         EXPECT_EQ(store->src[1].type, AGX_INDEX_IMMEDIATE);
+         EXPECT_EQ(store->src[1].value, mask);
+      }
+   }
 }

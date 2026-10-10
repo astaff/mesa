@@ -4,8 +4,11 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include "util/bitset.h"
+#include "util/u_debug.h"
 #include "agx_compiler.h"
+#include "agx_debug.h"
 #include "shader_enums.h"
 
 static void
@@ -132,8 +135,9 @@ agx_opt_register_cache(agx_context *ctx)
 
             /* Handling divergent blocks would require physical CFG awareness.
              * Just bail for now, skipping this pass won't affect correctness.
+             * Subgroup-uniform ifs/loops have no physical divergence.
              */
-            I->src[s].discard = lu && !block->divergent;
+            I->src[s].discard = lu && !block->cf_divergent;
 
             /* Mark any source read by an ALU instruction in the same block as
              * wanting a .cache hint. This is better than just marking
@@ -149,6 +153,54 @@ agx_opt_register_cache(agx_context *ctx)
          }
 
          postra_liveness_ins(live, I);
+      }
+   }
+
+   /* Apple's G17P fragment loop test keeps
+    * its counter operand in the register cache (fs-apple.bin +0xbc, f11 on
+    * `icmp i, u6`). The block-local analysis above cannot: the counter's next
+    * reads are at the top of the loop, across the back edge. Cache a loop
+    * compare's register source when the loop header reads it with an ALU
+    * instruction before writing it, unless this read is its last use. */
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+      return;
+
+   agx_foreach_block(ctx, block) {
+      agx_block *header = NULL;
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index)
+            header = succ;
+      }
+      if (!header)
+         continue;
+
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op != AGX_OPCODE_IF_ICMP && I->op != AGX_OPCODE_WHILE_ICMP &&
+             I->op != AGX_OPCODE_BREAK_IF_ICMP)
+            continue;
+         agx_foreach_reg_src(I, s) {
+            if (I->src[s].discard || I->src[s].cache ||
+                I->src[s].type != AGX_INDEX_REGISTER)
+               continue;
+            const unsigned reg = I->src[s].value;
+            const unsigned nr = agx_index_size_16(I->src[s]);
+            bool read = false;
+            agx_foreach_instr_in_block(header, H) {
+               bool reads = false;
+               agx_foreach_reg_src(H, hs) {
+                  const unsigned r = H->src[hs].value;
+                  const unsigned rn = agx_index_size_16(H->src[hs]);
+                  reads |= r < reg + nr && reg < r + rn;
+               }
+               if (reads) {
+                  read = agx_is_alu(H);
+                  break;
+               }
+               if (writes_reg(H, reg))
+                  break;
+            }
+            I->src[s].cache = read;
+         }
       }
    }
 }

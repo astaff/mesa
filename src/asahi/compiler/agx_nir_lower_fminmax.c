@@ -20,7 +20,9 @@ could_be_denorm(nir_scalar s)
 {
    /* Constants can be denorms only if they are denorms. */
    if (nir_scalar_is_const(s)) {
-      return fpclassify(nir_scalar_as_float(s)) == FP_SUBNORMAL;
+      /* Classify FP32 bits before promotion to double normalizes them. */
+      uint32_t bits = nir_scalar_as_uint(s);
+      return (bits & 0x7f800000u) == 0 && (bits & 0x007fffffu) != 0;
    }
 
    /* Floating-point instructions flush denormals, so ALU results can only be

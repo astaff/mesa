@@ -1,5 +1,10 @@
 # Special registers
 
+Ground AGX3 compiler changes in Apple's own output for the same shader
+([`../isa/README-metal-witness.md`](../isa/README-metal-witness.md)).  Treat G16G
+and G17P as one AGX3B compiler target unless native code, hardware output, or a
+device limit proves a difference.
+
 `r0l` is the hardware nesting counter.
 
 `r1` is the hardware link register.

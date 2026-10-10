@@ -53,9 +53,14 @@ do_copy(agx_builder *b, const struct agx_copy *copy)
 
    if (copy->dest_mem && copy->src.memory) {
       /* Memory-memory copies need to be lowered to memory-register and
-       * register-memory, using a reserved scratch register.
+       * register-memory, using a reserved scratch register. Keep AGX3's r1
+       * available for a full-width divergent-shuffle index when required.
        */
-      agx_index scratch_reg = agx_register(2, copy->src.size);
+      const bool agx3_shuffle =
+         b->shader->any_quad_divergent_shuffle &&
+         b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
+      agx_index scratch_reg =
+         agx_register(agx3_shuffle ? 4 : 2, copy->src.size);
       agx_mov_to(b, scratch_reg, copy->src);
       agx_mov_to(b, dst, scratch_reg);
    } else if (copy->src.type == AGX_INDEX_IMMEDIATE) {
@@ -79,6 +84,17 @@ do_swap(agx_builder *b, const struct agx_copy *copy)
    agx_index y = copy->src;
    assert(x.memory == y.memory);
 
+   /* A copy's abs/neg is a float modifier composed into the move. AGX3's XOR
+    * swap has no field for one, so swap the registers themselves and apply
+    * the modifier to the moved value afterwards.
+    */
+   const bool agx3_modified =
+      b->shader->key &&
+      b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+      (y.abs || y.neg);
+   if (agx3_modified)
+      y.abs = y.neg = false;
+
    /* Memory-memory swaps lowered here, GPR swaps lowered later */
    if (x.memory) {
       agx_index temp1 = agx_register(4, copy->src.size);
@@ -90,6 +106,13 @@ do_swap(agx_builder *b, const struct agx_copy *copy)
       agx_mov_to(b, x, temp2);
    } else {
       agx_swap(b, x, y);
+   }
+
+   if (agx3_modified) {
+      agx_index modified = x;
+      modified.abs = copy->src.abs;
+      modified.neg = copy->src.neg;
+      agx_mov_to(b, x, modified);
    }
 }
 
@@ -189,9 +212,19 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
    copies = copies2;
    num_copies = num_copies2;
 
-   /* Set up the bookkeeping */
-   struct copy_ctx _ctx = {.entry_count = num_copies};
-   struct copy_ctx *ctx = &_ctx;
+   /* Set up the bookkeeping.  copy_ctx carries three AGX_NUM_MODELED_REGS
+    * (2048) entry arrays -- roughly 72 KiB -- and this runs on whatever
+    * thread the application called into the driver on.  A 1 MiB thread
+    * stack does not have that to spare underneath the rest of the compiler,
+    * so keep it on the heap.
+    */
+   struct copy_ctx *ctx = calloc(1, sizeof(*ctx));
+   if (ctx == NULL) {
+      free(copies2);
+      UNREACHABLE("failed to allocate parallel-copy context");
+   }
+
+   ctx->entry_count = num_copies;
 
    memset(ctx->physreg_dest, 0, sizeof(ctx->physreg_dest));
    memset(ctx->physreg_use_count, 0, sizeof(ctx->physreg_use_count));
@@ -387,6 +420,7 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
       entry->done = true;
    }
 
+   free(ctx);
    free(copies2);
 }
 

@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include "util/lut.h"
 #include "agx_builder.h"
+#include "asahi/isa/agx_minifloat.h"
 #include "agx_compiler.h"
 #include "agx_opcodes.h"
 
@@ -63,20 +65,92 @@ swap(agx_builder *b, agx_index x, agx_index y)
       agx_index reg32 = agx_register(x.value & ~1, AGX_SIZE_32);
       agx_extr_to(b, reg32, reg32, reg32, agx_immediate(16), 0);
    } else {
-      /* Otherwise, we're swapping GPRs and fallback on a XOR swap. */
+      /* We're swapping GPRs and fall back on a XOR swap. */
       agx_xor_to(b, x, x, y);
       agx_xor_to(b, y, x, y);
       agx_xor_to(b, x, x, y);
    }
 }
 
+/*
+ * G17P has no compare of two immediates. NIR folds constant comparisons, but
+ * backend lowering can still produce one after register allocation (an
+ * always-taken else of the structurizer, for instance), and the packer then
+ * refused the whole shader. Evaluate such a compare here: float immediates are
+ * minifloats, which have no NaN or infinity, so every known condition is exact;
+ * integer immediates go through agx_eval_immediate_icond(). Returns the truth
+ * value, or -1 to leave the instruction alone.
+ */
+static int
+agx3_immediate_compare(agx_context *ctx, const agx_instr *I)
+{
+   const agx_index a = I->src[0], c = I->src[1];
+   if (a.type != AGX_INDEX_IMMEDIATE || c.type != AGX_INDEX_IMMEDIATE ||
+       a.abs || a.neg || c.abs || c.neg)
+      return -1;
+
+   if (I->op == AGX_OPCODE_FCMP || I->op == AGX_OPCODE_FCMPSEL) {
+      const float x = agx_minifloat_decode(a.value);
+      const float y = agx_minifloat_decode(c.value);
+      switch (I->fcond) {
+      case AGX_FCOND_EQ: return x == y;
+      case AGX_FCOND_LT: return x < y;
+      case AGX_FCOND_GT: return x > y;
+      case AGX_FCOND_GE: return x >= y;
+      case AGX_FCOND_LE: return x <= y;
+      default: return -1;
+      }
+   }
+
+   bool cond;
+   return agx_eval_immediate_icond(ctx, I->icond, a, c, &cond) ? cond : -1;
+}
+
 static agx_instr *
 lower(agx_builder *b, agx_instr *I)
 {
+   const bool agx3 = b->shader->key != NULL &&
+                     b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
+
+   if (agx3 && (I->op == AGX_OPCODE_FCMP || I->op == AGX_OPCODE_ICMP)) {
+      const int truth = agx3_immediate_compare(b->shader, I);
+      if (truth >= 0)
+         return agx_mov_imm_to(b, I->dest[0], truth != I->invert_cond);
+   }
+
+   if (agx3 && !I->invert_cond &&
+       (I->op == AGX_OPCODE_FCMPSEL || I->op == AGX_OPCODE_ICMPSEL)) {
+      const int truth = agx3_immediate_compare(b->shader, I);
+      const agx_index chosen = I->src[truth ? 2 : 3];
+      if (truth >= 0 && chosen.type == AGX_INDEX_IMMEDIATE)
+         return agx_mov_imm_to(b, I->dest[0], chosen.value);
+      if (truth >= 0 && !chosen.abs && !chosen.neg &&
+          chosen.size == I->dest[0].size)
+         return agx_bitop_to(b, I->dest[0], chosen, agx_zero(),
+                             UTIL_LUT2(a));
+   }
+
    switch (I->op) {
 
    /* Various instructions are implemented as bitwise truth tables */
    case AGX_OPCODE_MOV:
+      if (agx3 && I->src[0].type == AGX_INDEX_IMMEDIATE)
+         return agx_mov_imm_to(b, I->dest[0], I->src[0].value);
+      /*
+       * A modifier on a move is agx_optimizer_fmov() having composed an fneg
+       * or fabs into the copy's source: agx_is_fmov() matches `fadd(x, -0.0)`,
+       * and agx_compose_float_src() carries its abs/neg across. The bitwise
+       * move below has no field for one, so the packer refused the whole
+       * shader for `-x` or `|x|` crossing a copy -- 19 of the 307 refusals in
+       * a three.js frame. Put the float move back instead: Apple spells a move
+       * as an add of the exact negative-zero minifloat, and that form carries
+       * both modifier bits (agx3_alu_fadd_minifloat_mod, agx3_alu_fadd_abs_*),
+       * so this is the pre-fold program rather than a new encoding.
+       */
+      if (agx3 && (I->src[0].abs || I->src[0].neg) &&
+          I->src[0].size == AGX_SIZE_32 &&
+          I->dest[0].size == AGX_SIZE_32)
+         return agx_fadd_to(b, I->dest[0], I->src[0], agx_negzero());
       return agx_bitop_to(b, I->dest[0], I->src[0], agx_zero(), UTIL_LUT2(a));
 
    case AGX_OPCODE_NOT:
@@ -107,14 +181,38 @@ lower(agx_builder *b, agx_instr *I)
 
    /* Writes to the nesting counter lowered to the real register */
    case AGX_OPCODE_BEGIN_CF:
+      /* AGX3 has an architectural exec-mask stack and no witnessed r0l
+       * nesting-counter write. Keep the pseudo for its zero-byte AGX3 packer
+       * mapping instead of silently emitting the AGX2 contract. */
+      if (agx3)
+         return NULL;
       return agx_mov_imm_to(b, agx_register(0, AGX_SIZE_16), 0);
 
    case AGX_OPCODE_BREAK:
+      if (agx3) {
+         /* AGX3 has no unconditional break instruction. Break on the
+          * integer identity r0l == r0l instead, using the compare+cnd
+          * sequence without clobbering a post-RA register.
+          *
+          * NEST carries over unchanged: it is the number of exec-mask levels
+          * the break unwinds in Mesa's model either way, and agx_opt_break_if
+          * only subtracts one when it actually folds an enclosing if away.
+          * The packer turns that into the native level count (nest + 1,
+          * because a loop owns two architectural levels), which CNDCF
+          * encodes at any depth. */
+         agx_index r0l = agx_register(0, AGX_SIZE_16);
+         return agx_break_if_icmp(b, r0l, r0l, I->nest, false, AGX_ICOND_UEQ,
+                                  I->target);
+      }
       agx_mov_imm_to(b, agx_register(0, AGX_SIZE_16), I->nest);
       return agx_pop_exec(b, 0);
 
    case AGX_OPCODE_BREAK_IF_ICMP:
    case AGX_OPCODE_BREAK_IF_FCMP: {
+      /* AGX3 lowers these directly to compare + cndlt, retaining the
+       * condition and avoiding AGX2's r0l/cmpsel fallback. */
+      if (agx3)
+         return NULL;
       if (I->nest == 1)
          return while_for_break_if(b, I);
       else
@@ -130,11 +228,41 @@ lower(agx_builder *b, agx_instr *I)
    }
 }
 
+/*
+ * AGX3 has no control-flow compare with an immediate on both sides. A constant
+ * condition can still reach one: SPIR-V such as dEQP-VK.reconvergence's keeps
+ * `if (true) { break; }` inside loops, and immediate inlining turns the
+ * condition into an immediate. The construct itself must stay, since it owns
+ * an exec-mask level, so keep the instruction and branch on the integer
+ * identity r0l == r0l, as an AGX3 unconditional break already does, inverted
+ * to preserve the constant outcome.
+ */
+static void
+agx3_lower_constant_cf_compare(agx_context *ctx, agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_IF_ICMP && I->op != AGX_OPCODE_ELSE_ICMP &&
+       I->op != AGX_OPCODE_WHILE_ICMP && I->op != AGX_OPCODE_BREAK_IF_ICMP)
+      return;
+
+   bool cond;
+   if (!agx_eval_immediate_icond(ctx, I->icond, I->src[0], I->src[1], &cond))
+      return;
+
+   agx_index r0l = agx_register(0, AGX_SIZE_16);
+   I->src[0] = r0l;
+   I->src[1] = r0l;
+   I->icond = AGX_ICOND_UEQ;
+   I->invert_cond = cond == I->invert_cond;
+}
+
 void
 agx_lower_pseudo(agx_context *ctx)
 {
    agx_foreach_instr_global_safe(ctx, I) {
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
+         agx3_lower_constant_cf_compare(ctx, I);
 
       if (lower(&b, I))
          agx_remove_instruction(I);

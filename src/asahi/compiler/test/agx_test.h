@@ -8,6 +8,7 @@
 
 #include <inttypes.h>
 #include <stdio.h>
+#include "compiler/nir/nir_builder.h"
 #include "agx_builder.h"
 #include "agx_compiler.h"
 
@@ -126,5 +127,90 @@ agx_shader_equal(agx_context *A, agx_context *B)
       pass(A->shader);                                                         \
       ASSERT_SHADER_EQUAL(A->shader, B->shader);                               \
    } while (0)
+
+/* nir_builder's named-argument macros expand to an initializer that mixes a
+ * positional element with designators, which C++ rejects as a C99 extension.
+ * Build the intrinsic first and set its indices through the accessors. */
+static inline nir_def *
+agx_test_load_preamble(nir_builder *b, unsigned num_components,
+                       unsigned bit_size, int base,
+                       nir_preamble_class cls = nir_preamble_class_general)
+{
+   nir_def *def = nir_load_preamble(b, num_components, bit_size);
+   nir_intrinsic_set_base(nir_def_as_intrinsic(def), base);
+   nir_intrinsic_set_preamble_class(nir_def_as_intrinsic(def), cls);
+   return def;
+}
+
+static inline nir_intrinsic_instr *
+agx_test_store_preamble(nir_builder *b, nir_def *value, int base,
+                        nir_preamble_class cls = nir_preamble_class_general)
+{
+   nir_intrinsic_instr *intr = nir_store_preamble(b, value);
+   nir_intrinsic_set_base(intr, base);
+   nir_intrinsic_set_preamble_class(intr, cls);
+   return intr;
+}
+
+static inline nir_def *
+agx_test_bindless_image_agx(nir_builder *b, nir_def *handle, unsigned desc_set)
+{
+   nir_def *def = nir_bindless_image_agx(b, handle);
+   nir_intrinsic_set_desc_set(nir_def_as_intrinsic(def), desc_set);
+   return def;
+}
+
+static inline nir_def *
+agx_test_load_global_constant(nir_builder *b, unsigned num_components,
+                              unsigned bit_size, nir_def *addr,
+                              unsigned align_mul, gl_access_qualifier access)
+{
+   nir_def *def = nir_load_global_constant(b, num_components, bit_size, addr);
+   nir_intrinsic_set_align(nir_def_as_intrinsic(def), align_mul, 0);
+   nir_intrinsic_set_access(nir_def_as_intrinsic(def), access);
+   return def;
+}
+
+static inline nir_def *
+agx_test_bindless_image_load(nir_builder *b, unsigned num_components,
+                             unsigned bit_size, nir_def *handle,
+                             nir_def *coords, nir_def *sample, nir_def *lod,
+                             enum glsl_sampler_dim dim, enum pipe_format format,
+                             gl_access_qualifier access, nir_alu_type dest_type)
+{
+   nir_def *def = nir_bindless_image_load(b, num_components, bit_size, handle,
+                                          coords, sample, lod);
+   nir_intrinsic_instr *intr = nir_def_as_intrinsic(def);
+   nir_intrinsic_set_image_dim(intr, dim);
+   nir_intrinsic_set_format(intr, format);
+   nir_intrinsic_set_access(intr, access);
+   nir_intrinsic_set_dest_type(intr, dest_type);
+   return def;
+}
+
+static inline nir_intrinsic_instr *
+agx_test_store_output(nir_builder *b, nir_def *value, nir_def *offset,
+                      nir_alu_type src_type, unsigned location)
+{
+   nir_intrinsic_instr *intr = nir_store_output(b, value, offset);
+   nir_io_semantics sem = {};
+   sem.location = location;
+   nir_intrinsic_set_src_type(intr, src_type);
+   nir_intrinsic_set_io_semantics(intr, sem);
+   return intr;
+}
+
+static inline nir_intrinsic_instr *
+agx_test_store_local_pixel_agx(nir_builder *b, nir_def *value, nir_def *mask,
+                               nir_def *coords, int base, unsigned write_mask,
+                               enum pipe_format format)
+{
+   nir_intrinsic_instr *intr =
+      nir_store_local_pixel_agx(b, value, mask, coords);
+   nir_intrinsic_set_base(intr, base);
+   nir_intrinsic_set_write_mask(intr, write_mask);
+   nir_intrinsic_set_format(intr, format);
+   return intr;
+}
 
 #endif

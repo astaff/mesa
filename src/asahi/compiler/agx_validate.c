@@ -104,8 +104,17 @@ agx_validate_sources(agx_instr *I)
           * standard floats, so we treat them as such in the IR, with an
           * implicit f16->f32 for 32-bit floating point operations.
           */
-         agx_validate_assert(src.size == AGX_SIZE_16);
-         agx_validate_assert(src.value < (1 << (ldst ? 16 : 8)));
+         /* G17P texture offsets are signed four-bit coordinate components,
+          * but the logical compare/offset source is modelled as 32-bit. This
+          * is the sole immediate form whose IR width is wider than its field.
+          */
+         bool texture_offset = I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 5 &&
+                               I->offset && !I->shadow;
+         agx_validate_assert(src.size ==
+                             (texture_offset ? AGX_SIZE_32 : AGX_SIZE_16));
+         const unsigned immediate_bits = ldst ? 16 :
+            (texture_offset && I->dim == AGX_DIM_3D) ? 12 : 8;
+         agx_validate_assert(src.value < (1u << immediate_bits));
       } else if (I->op == AGX_OPCODE_COLLECT && !agx_is_null(src)) {
          agx_validate_assert(src.size == I->src[0].size);
       } else if (I->op == AGX_OPCODE_PHI) {
@@ -148,7 +157,7 @@ agx_validate_defs(agx_instr *I, BITSET_WORD *defs)
 
 /** Returns number of registers written by an instruction */
 static unsigned
-agx_write_registers(const agx_instr *I, unsigned d)
+agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
 {
    unsigned size = agx_size_align_16(I->dest[d].size);
 
@@ -172,14 +181,56 @@ agx_write_registers(const agx_instr *I, unsigned d)
        */
       return (I->sparse ? 8 : 4) * size;
 
+   case AGX_OPCODE_LOAD_CPROG_AGX3:
+      assert(ctx->is_preamble && ctx->agx3_cprog_inputs_lowered &&
+             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B);
+      assert(I->nr_dests == 1 && I->nr_srcs == 0 && !I->saturate);
+      assert(I->dest[d].size == AGX_SIZE_16 || I->dest[d].size == AGX_SIZE_32);
+      assert(agx_channels(I->dest[d]) == 1 && I->imm < 512 && size <= 512 - I->imm);
+      return size;
+
    case AGX_OPCODE_DEVICE_LOAD:
    case AGX_OPCODE_LOCAL_LOAD:
    case AGX_OPCODE_STACK_LOAD:
    case AGX_OPCODE_LD_TILE:
+      if (I->op == AGX_OPCODE_LOCAL_LOAD && I->memory_is_packed) {
+         assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B);
+         assert(I->format == AGX_FORMAT_I8 && I->dest[d].size == AGX_SIZE_16);
+         return DIV_ROUND_UP(util_bitcount(I->mask), 2);
+      }
+      if (I->op == AGX_OPCODE_DEVICE_LOAD && I->memory_is_packed) {
+         assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B);
+         assert(I->dest[d].size == AGX_SIZE_32);
+         const unsigned bytes = I->format == AGX_FORMAT_I8 ? 1 :
+                                I->format == AGX_FORMAT_I16 ? 2 : 4;
+         return DIV_ROUND_UP(util_bitcount(I->mask) * bytes, 4) * 2;
+      }
+
+      /* An AGX3 tile load of an 8-bit attachment comes back packed, two
+       * channels to a 16-bit register; normflt_agx3 unpacks a normalized one
+       * and agx_unpack_integer_8_agx3 a pure integer one. */
+      if (I->op == AGX_OPCODE_LD_TILE &&
+          ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+          I->dest[d].size == AGX_SIZE_16 &&
+          (I->format == AGX_FORMAT_U8NORM || I->format == AGX_FORMAT_S8NORM ||
+           (I->format == AGX_FORMAT_I8 &&
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)))
+         return DIV_ROUND_UP(util_bitcount(I->mask), 2);
+
       /* Can write 16-bit or 32-bit. Anything logically 64-bit is already
        * expanded to 32-bit in the mask.
        */
       return util_bitcount(I->mask) * MIN2(size, 2);
+
+   /* One packed 16-bit register in, one 32-bit float per lane out. */
+   case AGX_OPCODE_NORMFLT_AGX3:
+   case AGX_OPCODE_UNPACK_RGB10A2_AGX3:
+      return agx_channels(I->dest[d]) * size;
+
+   /* U16/S16 fltnorm writes one 16-bit register per converted lane. U8/S8
+    * retains the scalar packed-byte destination. */
+   case AGX_OPCODE_FLTNORM_AGX3:
+      return agx_channels(I->dest[d]) * size;
 
    case AGX_OPCODE_LDCF:
       return 6;
@@ -237,9 +288,13 @@ agx_coordinate_registers(const agx_instr *I, enum agx_size size)
 }
 
 static unsigned
-agx_read_registers(const agx_instr *I, unsigned s)
+agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
 {
    unsigned size = agx_size_align_16(I->src[s].size);
+
+   /* This is a sampler-private value, not a dimensional GPR coordinate. */
+   if (agx_texture_resource(I) && s == 0)
+      return agx_index_size_16(I->src[s]);
 
    switch (I->op) {
    case AGX_OPCODE_MOV:
@@ -262,14 +317,50 @@ agx_read_registers(const agx_instr *I, unsigned s)
       else
          return size;
 
+   case AGX_OPCODE_UNIFORM_FADD_AGX3:
+   case AGX_OPCODE_UNIFORM_FMUL_AGX3:
+   case AGX_OPCODE_UNIFORM_FFMA_AGX3:
+      assert(ctx->is_preamble &&
+             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B);
+      assert(I->nr_dests == 0 && I->imm < 128 && !(I->imm & 1));
+      assert(I->nr_srcs == (I->op == AGX_OPCODE_UNIFORM_FFMA_AGX3 ? 3 : 2));
+      assert(!I->saturate && !I->src[s].memory &&
+             !I->src[s].abs && !I->src[s].neg);
+      if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+         assert(I->src[s].value <= 255);
+      } else {
+         assert(I->src[s].type == AGX_INDEX_NORMAL ||
+                I->src[s].type == AGX_INDEX_REGISTER);
+         assert(I->src[s].size == AGX_SIZE_32 && agx_channels(I->src[s]) == 1);
+      }
+      return size;
+
    case AGX_OPCODE_DEVICE_STORE:
    case AGX_OPCODE_LOCAL_STORE:
    case AGX_OPCODE_STACK_STORE:
    case AGX_OPCODE_ST_TILE:
       /* See agx_write_registers */
-      if (s == 0)
+      if (s == 0) {
+         if ((I->op == AGX_OPCODE_DEVICE_STORE ||
+              I->op == AGX_OPCODE_LOCAL_STORE) && I->memory_is_packed) {
+            assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B);
+            assert(I->format == AGX_FORMAT_I8);
+            return DIV_ROUND_UP(util_bitcount(I->mask), 2);
+         }
+
+         /* AGX3's tile store carries a width, not a format, so an 8-bit
+          * target arrives packed two channels to a 16-bit register. Normalized
+          * values use fltnorm; pure integers use agx_pack_integer_8_agx3. */
+         if (I->op == AGX_OPCODE_ST_TILE &&
+             ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+             I->src[0].size == AGX_SIZE_16 &&
+             (I->format == AGX_FORMAT_I8 ||
+              I->format == AGX_FORMAT_U8NORM ||
+              I->format == AGX_FORMAT_S8NORM))
+            return DIV_ROUND_UP(util_bitcount(I->mask), 2);
+
          return util_bitcount(I->mask) * MIN2(size, 2);
-      else if (s == 2 && I->explicit_coords)
+      } else if (s == 2 && I->explicit_coords)
          return 2;
       else
          return size;
@@ -288,6 +379,10 @@ agx_read_registers(const agx_instr *I, unsigned s)
          return 1;
       }
 
+   case AGX_OPCODE_ZS_EMIT_AGX3:
+      assert(s == 0 && I->zs >= 1 && I->zs <= 3);
+      return (I->zs & 1) ? 4 : 2;
+
    case AGX_OPCODE_IMAGE_WRITE:
       if (s == 0)
          return 4 * size /* data */;
@@ -303,6 +398,13 @@ agx_read_registers(const agx_instr *I, unsigned s)
          return agx_coordinate_registers(I, I->src[0].size);
       } else if (s == 1) {
          /* LOD */
+         if ((I->op == AGX_OPCODE_TEXTURE_LOAD ||
+              I->op == AGX_OPCODE_IMAGE_LOAD) &&
+             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+             I->src[s].type != AGX_INDEX_IMMEDIATE)
+             return 2;
+
          if (I->lod_mode == AGX_LOD_MODE_LOD_GRAD ||
              I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN) {
 
@@ -332,9 +434,12 @@ agx_read_registers(const agx_instr *I, unsigned s)
          } else {
             return 1;
          }
-      } else if (s == 5) {
-         /* Compare/offset */
-         return 2 * ((!!I->shadow) + (!!I->offset));
+       } else if (s == 5) {
+         /* Compare/offset. Immediate G17P offsets ride in SMP, while runtime
+          * offsets remain a two-component vector for PACK_SMPIR. AGX2 keeps
+          * its existing compare/offset collect. */
+         return agx_is_null(I->src[s]) ? 0
+                                      : 2 * agx_channels(I->src[s]);
       } else {
          return size;
       }
@@ -344,6 +449,13 @@ agx_read_registers(const agx_instr *I, unsigned s)
          return agx_coordinate_registers(I, I->src[3].size);
       else
          return size;
+
+   case AGX_OPCODE_NORMFLT_AGX3:
+      if (s == 0 &&
+          (I->format == AGX_FORMAT_U16NORM ||
+           I->format == AGX_FORMAT_S16NORM))
+         return agx_channels(I->dest[0]);
+      return size;
 
    case AGX_OPCODE_ATOMIC:
    case AGX_OPCODE_LOCAL_ATOMIC:
@@ -366,7 +478,7 @@ agx_validate_width(agx_context *ctx)
 
    agx_foreach_instr_global(ctx, I) {
       agx_foreach_dest(I, d) {
-         unsigned exp = agx_write_registers(I, d);
+         unsigned exp = agx_write_registers(ctx, I, d);
          unsigned act =
             agx_channels(I->dest[d]) * agx_size_align_16(I->dest[d].size);
 
@@ -386,7 +498,7 @@ agx_validate_width(agx_context *ctx)
          if (I->src[s].type == AGX_INDEX_NULL)
             continue;
 
-         unsigned exp = agx_read_registers(I, s);
+         unsigned exp = agx_read_registers(ctx, I, s);
          unsigned act =
             agx_channels(I->src[s]) * agx_size_align_16(I->src[s].size);
 
@@ -460,6 +572,12 @@ agx_validate_sr(const agx_instr *I)
       return true;
 
    switch (I->sr) {
+   case AGX_SR_INPUT_SAMPLE_MASK:
+      /* G17P SR39 combines immutable API input coverage with the mutable
+       * current coverage. Readers of its low nibble must be ordered against
+       * depth/stencil and coverage writes. */
+      return none || coverage;
+
    case AGX_SR_ACTIVE_THREAD_INDEX_IN_QUAD:
    case AGX_SR_ACTIVE_THREAD_INDEX_IN_SUBGROUP:
    case AGX_SR_TOTAL_ACTIVE_THREADS_IN_QUAD:

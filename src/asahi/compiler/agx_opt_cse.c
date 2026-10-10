@@ -80,9 +80,26 @@ instrs_equal(const void *_i1, const void *_i2)
       return false;
    if (i1->offset != i2->offset)
       return false;
+   /* Two samples that differ only in their coordinate offset are different
+    * samples. This field is not in the union `imm` covers, so it needs its
+    * own line here. */
+   if (i1->offset_xyz != i2->offset_xyz)
+      return false;
+   if (i1->pixel_offset != i2->pixel_offset)
+      return false;
+   if (i1->colour_target != i2->colour_target)
+      return false;
    if (i1->shadow != i2->shadow)
       return false;
+   if (i1->interpolation != i2->interpolation)
+      return false;
+   if (i1->perspective != i2->perspective)
+      return false;
    if (i1->shift != i2->shift)
+      return false;
+   if (i1->memory_is_packed != i2->memory_is_packed)
+      return false;
+   if (i1->memory_index_is_bytes != i2->memory_index_is_bytes)
       return false;
    if (i1->saturate != i2->saturate)
       return false;

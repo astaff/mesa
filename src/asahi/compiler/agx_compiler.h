@@ -23,6 +23,9 @@ extern "C" {
 /* r0-r127 inclusive, as pairs of 16-bits, gives 256 registers */
 #define AGX_NUM_REGS (256)
 
+/* G17P's register file: halves 0..191. */
+#define AGX3B_NUM_REGS (192)
+
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 
@@ -40,6 +43,8 @@ enum agx_index_type {
    AGX_INDEX_UNIFORM = 3,
    AGX_INDEX_REGISTER = 4,
    AGX_INDEX_UNDEF = 5,
+   /* Post-RA value in the sampler-private file, independent of GPRs. */
+   AGX_INDEX_RESOURCE = 6,
 };
 
 enum agx_size { AGX_SIZE_16 = 0, AGX_SIZE_32 = 1, AGX_SIZE_64 = 2 };
@@ -396,6 +401,22 @@ typedef struct {
    /* Invert icond/fcond */
    bool invert_cond : 1;
 
+   /*
+    * G17P carries a texture coordinate offset as an immediate field in the
+    * sample instruction (f43), while the depth comparator is a staged
+    * register. agx_emit_tex() cannot hand the packer both through src[5],
+    * which is one operand, so the offset rides here instead.
+    *
+    * Signed x/y/z nibbles, exactly as agx_nir_lower_texture()
+    * packs nir_tex_src_offset. Only meaningful when `offset` is set.
+    *
+    * NOTE: agx_opt_cse.c's instrs_equal() is hand-written and enumerates
+    * fields one at a time. This field is compared there. Anything added
+    * beside it must be too, or two samples differing only in their offset
+    * will CSE into one.
+    */
+   uint16_t offset_xyz;
+
    /* TODO: Handle tex ops more efficient */
    enum agx_dim dim       : 4;
    bool offset            : 1;
@@ -407,11 +428,25 @@ typedef struct {
    /* TODO: Handle tilebuffer ops more efficient */
    bool explicit_coords : 1;
 
+   /* Logical attachment identity, independent of the physical pixel_offset. */
+   uint8_t colour_target;
+
    /* TODO: Handle iter ops more efficient */
    enum agx_interpolation interpolation : 2;
+   bool perspective                    : 1;
 
    /* TODO: Handle loads more efficiently */
    bool coherent : 1;
+   /* AGX3 memory index scale excludes the access-format size. */
+   bool memory_index_is_bytes : 1;
+   /* Raw subword memory elements use packed payloads (device loads use
+    * 32-bit SSA words; byte stores and shared loads use 16-bit halves). */
+   bool memory_is_packed : 1;
+
+   /* Explicit AGX3 SCS load semantics.  These stay on the internal SCS pseudo
+    * and are never inferred from generic memory IR. */
+   bool scs_zero_extend : 1;
+   bool scs_c_load_marker : 1;
 
    /* Final st_vary op */
    bool last : 1;
@@ -427,8 +462,46 @@ typedef struct {
    bool saturate : 1;
    unsigned mask : 4;
 
-   unsigned padding : 8;
+   /* G17P implicit fragment samples do not copy their coordinates into the
+    * texture staging file after the arithmetic is complete.  Apple's compiler
+    * writes the final scalar operations directly to staging so helper lanes
+    * survive an odd-aligned hardware scissor.  The pre-RA sink pass marks the
+    * two scalar producers and their consuming sample here; the packer assigns
+    * their shared scoreboard slot after physical register allocation. */
+   bool agx3_tex_coord_stage : 1;
+   bool agx3_tex_coord_component : 1;
+   bool agx3_tex_coord_start : 1;
+   bool agx3_tex_coords_staged : 1;
+
 } agx_instr;
+
+static inline uint32_t
+agx_texture_resource(const agx_instr *I)
+{
+   return I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->nr_srcs &&
+          I->src[0].type == AGX_INDEX_RESOURCE ? I->src[0].value : 0;
+}
+
+static inline bool
+agx_is_texture_publication(const agx_instr *I)
+{
+   return I->op == AGX_OPCODE_PUBLISH_TEXTURE_AGX3 ||
+          I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3;
+}
+
+static inline uint32_t
+agx_publication_resource(const agx_instr *I)
+{
+   return agx_is_texture_publication(I) ? I->imm : 0;
+}
+
+static inline bool
+agx_is_vertex_store(const agx_instr *I)
+{
+   return I->op == AGX_OPCODE_ST_VARY ||
+          I->op == AGX_OPCODE_ST_VARY_MUL_AGX3 ||
+          I->op == AGX_OPCODE_ST_VARY_FMA_AGX3;
+}
 
 static inline void
 agx_replace_src(agx_instr *I, unsigned src_index, agx_index replacement)
@@ -456,6 +529,12 @@ typedef struct agx_block {
    /* Could there be masked execution? */
    bool divergent;
 
+   /* Some enclosing if or loop may diverge within the subgroup (NIR
+    * divergence analysis on AGX3; equal to divergent on AGX2). Used only for
+    * register-cache discard hints.
+    */
+   bool cf_divergent;
+
    /* Liveness analysis results */
    struct u_sparse_bitset live_in;
    struct u_sparse_bitset live_out;
@@ -474,8 +553,10 @@ typedef struct agx_block {
     */
    bool loop_header;
 
-   /* Offset of the block in the emitted binary */
-   off_t offset, last_offset;
+   /* Offsets of the block in the emitted binary.  On AGX3, loop_exit_offset
+    * names the first CNDEND after a loop backedge, before any enclosing-scope
+    * CNDENDs that happen to share the block. */
+   off_t offset, last_offset, loop_exit_offset;
 
    /** Available for passes to use for metadata */
    uint8_t pass_flags;
@@ -486,6 +567,14 @@ typedef struct {
    mesa_shader_stage stage;
    bool is_preamble;
    unsigned scratch_size_B;
+   /* The input mask/compact ranks are frozen before native import selection.
+    * Later DCE may remove a read without changing this external interface. */
+   bool agx3_cprog_inputs_lowered;
+
+   /* AGX3b: thread-private storage half a returned device atomic publishes
+    * its old value to, above the spill frame.
+    */
+   unsigned agx3_atomic_return_tps_half;
 
    struct list_head blocks; /* list of agx_block */
    struct agx_shader_info *out;
@@ -503,11 +592,19 @@ typedef struct {
    /* Mask of pixel fences we've definitely already waited for. */
    uint16_t already_pixel_waited;
 
+   /* G17P depth/stencil writes not yet emitted. Every sample's write shares
+    * one class-1 transaction, released after the last. */
+   unsigned zs_writes_left;
+
+   /* The first coverage update in an explicit-early fragment is the one
+    * per-pixel Z/S test.  It has a distinct G17P acquire/retain protocol. */
+   bool force_early_tests_pending;
+
    /* Has r0l been zeroed yet due to control flow? */
    bool any_cf;
 
-   /* Do we need r0h zero throughout the program to handle quad-divergent
-    * shuffle?
+   /* Do we need a reserved zero register throughout the program to handle
+    * quad-divergent shuffle?
     */
    bool any_quad_divergent_shuffle;
 
@@ -518,6 +615,9 @@ typedef struct {
 
    /* Total nesting across all loops, to determine if we need push_exec */
    unsigned total_nesting;
+
+   /* Enclosing ifs/loops that may diverge; see agx_block::cf_divergent. */
+   unsigned divergent_nesting;
 
    /* During instruction selection, for inserting control flow */
    agx_block *current_block;
@@ -534,6 +634,21 @@ typedef struct {
     */
    agx_index preloaded[AGX_NUM_REGS];
 
+   /* AGX3B pixel-centre 1/W, computed once in the start block. */
+   agx_index agx3_center_rcp_w;
+
+   /* AGX_G17P_SR32_PIXEL_COORD: the 32-bit native pixel-coordinate special
+    * registers read by load_pixel_coord and the 16-bit halves NIR sees, so a
+    * zero extension of a half can reuse the register (Apple reads SR80/81 as
+    * zero-extended 32-bit values: native fragment 0x40/0x48 feed 32-bit XORs
+    * directly). Null unless the pixel coordinate was loaded. */
+   agx_index agx3_pixel_coord_native[2];
+   agx_index agx3_pixel_coord_half[2];
+
+   /* AGX_G17P_SHARED_RHW: the centre-interpolated projective 1/W computed in
+    * the entry block by the first perspective input load, reused by later
+    * loads instead of a fresh RHW f32interp + f32rcp pair. Null until then. */
+
    /* Beginning of our stack allocation used for spilling, below that is
     * NIR-level scratch.
     */
@@ -541,14 +656,32 @@ typedef struct {
 
    /* Beginning of stack allocation used for parallel copy lowering */
    bool has_spill_pcopy_reserved;
+
+   /* The remat-only spiller had to spill a value to scratch; register
+    * allocation must finish with real spilling under the full budget. */
+   bool remat_fallback_spilled;
    unsigned spill_pcopy_base;
 
    /* Stats for shader-db */
    unsigned loop_count;
    unsigned max_reg;
 
+   /* Half of the AGX3 compiler staging footprint. Unlike max_reg, this
+    * describes the separate file consumed by UVSW and texture inputs. */
+   unsigned agx3_staging_halfs;
+   bool agx3_staging_known;
+   bool agx3_fltnorm_start;
+   bool agx3_mrt_tile_ops_ordered;
+   struct agx3_colour_link_info agx3_colour_link;
+
    /* Promoted constants. These will be appended to the binary at the end. */
    uint16_t rodata[512];
+   /* An intrinsic or ALU op this backend does not implement reached
+    * instruction selection; the compile is refused right after emission. */
+   bool unsupported_instruction;
+   /* Register allocation found no legal placement for a constrained value
+    * (agx_register_allocate.c); the compile is refused after agx_ra(). */
+   bool ra_failed;
 } agx_context;
 
 static inline void
@@ -1012,7 +1145,11 @@ agx_builder_insert(agx_cursor *cursor, agx_instr *I)
    UNREACHABLE("Invalid cursor option");
 }
 
-bool agx_instr_accepts_uniform(enum agx_opcode op, unsigned src_index,
+bool agx3_tex_uniform_pair_unwitnessed(const agx_context *ctx,
+                                       const agx_instr *I, agx_index texture,
+                                       agx_index sampler);
+bool agx_instr_accepts_uniform(enum agx_isa_encoding encoding,
+                               enum agx_opcode op, unsigned src_index,
                                unsigned value, enum agx_size size);
 
 /* Routines defined for AIR */
@@ -1021,20 +1158,79 @@ void agx_print_instr(const agx_instr *I, FILE *fp);
 void agx_print_block(const agx_block *block, FILE *fp);
 void agx_print_shader(const agx_context *ctx, FILE *fp);
 void agx_optimizer_forward(agx_context *ctx);
+bool agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond,
+                              agx_index x, agx_index y, bool *result);
 void agx_optimizer_backward(agx_context *ctx);
 void agx_lower_divergent_shuffle(agx_context *ctx);
 void agx_lower_pseudo(agx_context *ctx);
 void agx_lower_spill(agx_context *ctx);
+void agx3_split_vector_stack_access(agx_context *ctx);
+bool agx3_lower_texture_publications(agx_context *ctx);
+bool agx3_lower_scalar_texture_publications(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 void agx_opt_compact_constants(agx_context *ctx);
 void agx_opt_promote_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
+void agx_ilp_schedule(agx_context *ctx);
+bool agx3_lower_uniform_program(agx_context *ctx);
+/* Success/refusal, not a progress flag. Call only for AGX3B preambles. */
+bool agx3_lower_cprog_inputs(agx_context *ctx);
+bool agx3_cprog_spill_provenance(const agx_context *ctx);
+bool agx3_cprog_certify_static_spill(const agx_context *ctx,
+                                      bool imports_only_before_ra);
+bool agx3_lower_uniform_half_exports(agx_context *ctx);
+bool agx3_analyze_preamble_uniform_inputs(agx_context *ctx, bool *has_inputs);
+/* UVSW carries the UVS index and the staging address in two independent
+ * eight-bit operands, so the hardware addresses 256 vertex outputs while only
+ * 128 distinct staging pairs exist.
+ *
+ * Apple's G17P compiler emits position plus thirty-one float4 user locations
+ * as 128 UVSWs for UVS indices 0..127, and __GPU_LD_MD root.field1.field3 is
+ * 128; a thirty-second float4 exceeds the fragment's 127 coefficients. Each
+ * of those outputs stages at half 2k, and that scheme is kept verbatim for
+ * the first AGX3_G17P_STAGING_OUTPUTS of any program.
+ *
+ * GL asks for more than Apple's own compiler ever emits: a points geometry
+ * shader may write the full 128 interleaved transform-feedback components as
+ * thirty-one float4 locations and still need position (four) and point size
+ * (one), which is 129 outputs. Those past the staging capacity reuse the
+ * addresses of batches that have already drained -- every batch boundary
+ * waits on all six scoreboard slots, so the COPY/UVSW pair that last owned a
+ * staging half has retired long before it is written again, twenty-one
+ * batches later. Nothing about the UVS index itself wraps. */
+#define AGX3_MAX_VERTEX_OUTPUTS 256u
+#define AGX3_G17P_STAGING_OUTPUTS 128u
+
+/* UVS_POSITION is the first group in the hardware's UVS order (see
+ * agx_uvs.h) and agx_nir_lower_uvs.c gives it four entries whether or not
+ * the shader writes gl_Position. A vertex program that writes no position
+ * therefore starts its outputs here, and nowhere else. */
+#define AGX3_UVS_POSITION_ENTRIES 4u
+
+/* Number of 16-bit registers RA keeps reserved at the bottom of the register
+ * file for the whole shader.
+ */
+static inline unsigned
+agx_reserved_registers(const agx_context *ctx)
+{
+   if (ctx->has_spill_pcopy_reserved)
+      return 8;
+   else if (ctx->any_quad_divergent_shuffle)
+      return ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 ? 2 : 4;
+   else if (ctx->any_cf)
+      return 1;
+   else
+      return 0;
+}
+
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
+unsigned agx3_tile_store_bank(agx_context *ctx);
+
 void agx_lower_64bit_postra(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);
@@ -1042,6 +1238,12 @@ void agx_opt_register_cache(agx_context *ctx);
 void agx_opt_break_if(agx_context *ctx);
 void agx_opt_jmp_none(agx_context *ctx);
 void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
+
+/* AGX3 (M3/M4/M5) binary emission. Returns false -- failing the shader,
+ * never aborting -- on any op or operand outside the grounded subset.
+ * The AGX2 path above is unaffected; callers select on the device
+ * encoding. */
+bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
 
 #ifndef NDEBUG
 void agx_validate(agx_context *ctx, const char *after_str);
@@ -1092,11 +1294,26 @@ void agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
 void agx_compute_liveness(agx_context *ctx);
 void agx_liveness_ins_update(struct u_sparse_bitset *live, agx_instr *I);
 
-bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes);
+bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p);
+bool agx_nir_remove_unused_preamble_exports(nir_shader *s, unsigned reserved);
+bool agx_nir_coalesce_preamble_half_exports(nir_shader *s, unsigned reserved,
+                                          unsigned allocated);
+/* Highest uniform half a G17P sample can name directly as its texture or
+ * sampler handle (agx_instr_accepts_uniform): handles above it are copied to
+ * registers before every sample.
+ */
+#define AGX3_SMP_HANDLE_MAX_HALF 252
+
+bool agx_nir_place_preamble_handles_low(nir_shader *s, unsigned reserved,
+                                         unsigned exports_end,
+                                         unsigned *allocated);
+agx_block *agx_reconverged_mrt_tail(agx_context *ctx);
 bool agx_nir_lower_load_mask(nir_shader *shader);
 bool agx_nir_lower_ubo(nir_shader *shader);
-bool agx_nir_lower_shared_bitsize(nir_shader *shader);
-bool agx_nir_lower_frag_sidefx(nir_shader *s);
+bool agx_nir_lower_shared_bitsize(nir_shader *shader, bool element_indices);
+bool agx_nir_lower_frag_sidefx(nir_shader *s, bool g17p);
+void agx_lower_agx3_fma_sources(agx_context *ctx);
+void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
 
 struct agx_cycle_estimate {
    /* ALU throughput */
