@@ -131,6 +131,8 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       enum agx_va_flags flags = 0;
       uint64_t bda_fixed_addr = 0;
       if (bda_capture_replay) {
+         if (dev->dev.replay_heap_initialized)
+            flags |= AGX_VA_CAPTURE_REPLAY;
          bda_fixed_addr = hk_get_bda_replay_addr(pCreateInfo);
          if (bda_fixed_addr != 0)
             flags |= AGX_VA_FIXED;
@@ -147,7 +149,58 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       buffer->vk.device_address = buffer->va->addr;
 
       /* Bind scratch pages to make read/write across the VA valid */
-      hk_bind_scratch(dev, buffer->va, 0, vma_size_B);
+      VkResult result = hk_bind_scratch(dev, buffer->va, 0, vma_size_B);
+      if (result != VK_SUCCESS) {
+         agx_va_free(&dev->dev, buffer->va, true);
+         buffer->va = NULL;
+         vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         return result;
+      }
+
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+         (buffer->vk.create_flags &
+           VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT)) {
+         const uint64_t entries = DIV_ROUND_UP(vma_size_B, AIL_PAGESIZE);
+
+         if (entries > UINT32_MAX ||
+             DIV_ROUND_UP(entries, 32) >
+                (SIZE_MAX - sizeof(struct hk_sparse_buffer_map_header)) /
+                   sizeof(uint32_t)) {
+            agx_va_free(&dev->dev, buffer->va, true);
+            buffer->va = NULL;
+            vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+            return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Sparse buffer residency map is too large");
+         }
+
+         const uint64_t map_size_B = align64(
+            sizeof(struct hk_sparse_buffer_map_header) +
+               (DIV_ROUND_UP(entries, 32) * sizeof(uint32_t)),
+            AIL_PAGESIZE);
+
+         buffer->sparse_map = agx_bo_create(
+            &dev->dev, map_size_B, AIL_PAGESIZE,
+            AGX_BO_WRITEBACK | AGX_BO_ZERO_ON_REUSE,
+            "Vulkan sparse buffer residency map");
+         if (!buffer->sparse_map || !agx_bo_map(buffer->sparse_map)) {
+            agx_bo_unreference(&dev->dev, buffer->sparse_map);
+            buffer->sparse_map = NULL;
+            agx_va_free(&dev->dev, buffer->va, true);
+            buffer->va = NULL;
+            vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+            return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Sparse buffer residency map allocation failed");
+         }
+
+         buffer->sparse_map_entries = entries;
+         struct hk_sparse_buffer_map_header *map =
+            agx_bo_map(buffer->sparse_map);
+         memset(map, 0, map_size_B);
+         map->resource_base = buffer->va->addr;
+         map->page_count = entries;
+
+         agx_bo_assert_range(buffer->sparse_map, 0, map_size_B);
+      }
    }
 
    *pBuffer = hk_buffer_to_handle(buffer);
@@ -169,6 +222,8 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
       agx_va_free(&dev->dev, buffer->va, true);
    }
 
+   agx_bo_unreference(&dev->dev, buffer->sparse_map);
+
    vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
 }
 
@@ -180,9 +235,14 @@ hk_GetDeviceBufferMemoryRequirements(
    VK_FROM_HANDLE(hk_device, dev, device);
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
-   const uint32_t alignment = hk_get_buffer_alignment(
-      hk_device_physical(dev), pInfo->pCreateInfo->usage,
-      pInfo->pCreateInfo->flags);
+   VkBufferUsageFlags2KHR usage = pInfo->pCreateInfo->usage;
+   const VkBufferUsageFlags2CreateInfoKHR *usage2 = vk_find_struct_const(
+      pInfo->pCreateInfo->pNext, BUFFER_USAGE_FLAGS_2_CREATE_INFO_KHR);
+   if (usage2)
+      usage = usage2->usage;
+
+   const uint32_t alignment =
+      hk_get_buffer_alignment(pdev, usage, pInfo->pCreateInfo->flags);
 
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
       .size = align64(pInfo->pCreateInfo->size, alignment),
@@ -260,7 +320,10 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
 
       if (buffer->va) {
          VK_FROM_HANDLE(hk_device, dev, device);
-         size_t size = MIN2(mem->bo->size, buffer->va->size_B);
+         /* The VA allocation includes an overread guard, not backed by this
+          * buffer's memory. Mapping it too can exceed the BO when a captured
+          * BDA buffer occupies the last suballocation (Firefox/Zink). */
+         size_t size = align64(buffer->vk.size, 16384);
 
          /* Lower mapping: read-write */
          int ret = agx_bo_bind(&dev->dev, mem->bo, buffer->vk.device_address,
@@ -300,21 +363,12 @@ hk_GetBufferOpaqueCaptureAddress(UNUSED VkDevice device,
 }
 
 uint64_t
-hk_buffer_address(const struct hk_buffer *buffer, uint64_t offset,
-                  bool read_only)
+hk_buffer_address_sparse_ro(const struct hk_buffer *buffer, uint64_t offset)
 {
    struct hk_device *dev = (struct hk_device *)buffer->vk.base.device;
-   uint64_t addr = vk_buffer_address(&buffer->vk, offset);
 
-   /* If we are accessing the buffer read-only, we want to return the read-only
-    * shadow mapping so non-resident pages return zeroes. That only applies to
-    * sparse resident buffers, which will have buffer->va != NULL. If buffer->va
-    * is NULL, the buffer is not sparse resident, so we don't need the fix up...
-    * and indeed, there may not be a shadow map available.
-    */
-   if (read_only && buffer->va) {
-      addr = agx_rw_addr_to_ro(&dev->dev, addr);
-   }
-
-   return addr;
+   /* Sparse resident buffers read through the read-only shadow mapping so
+    * non-resident pages return zeroes. */
+   assert(buffer->va != NULL);
+   return agx_rw_addr_to_ro(&dev->dev, vk_buffer_address(&buffer->vk, offset));
 }

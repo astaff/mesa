@@ -5,6 +5,9 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_image.h"
+#include "hk_g17p_compression.h"
+#include "agx_bg_eot_key.h"
+#include "hk_native_descriptor.h"
 #include "asahi/layout/layout.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "util/bitscan.h"
@@ -12,6 +15,7 @@
 #include "util/format/u_formats.h"
 #include "util/macros.h"
 #include "util/u_math.h"
+#include "util/u_debug.h"
 #include "vulkan/vulkan_core.h"
 
 #include "agx_bo.h"
@@ -19,15 +23,13 @@
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_entrypoints.h"
+#include "hk_g17p_meta_copy_core.h"
+#include "hk_image_layout_core.h"
 #include "hk_physical_device.h"
 
 #include "vk_format.h"
 
-/* Minimum alignment encodable for our descriptors. The hardware texture/PBE
- * descriptors require 16-byte alignment. Our software PBE atomic descriptor
- * requires 128-byte alignment, but we could relax that one if we wanted.
- */
-#define HK_PLANE_ALIGN_B 128
+#include <inttypes.h>
 
 /* However, exposing the standard sparse block sizes requires using the standard
  * alignment 65k.
@@ -40,6 +42,43 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
 {
    VkFormatFeatureFlags2 features = 0;
 
+   /* G17P reconstructs single-plane interleaved 4:2:2 in the shader rather
+    * than in the texture unit (hk_image_view.c programs these views as plain
+    * four-component words), so it can honour chroma-reconstruction features
+    * that the generic path below cannot, and it used to advertise all of
+    * them.  Explicit reconstruction is withdrawn.
+    *
+    * Advertising CHROMA_RECONSTRUCTION_EXPLICIT is what makes a conformance
+    * run evaluate this driver against the explicit reference, and the
+    * explicit 4:2:2 reference in VK-GL-CTS is wrong for COSITED_EVEN: at even
+    * luma index it weights the chroma sample at subI + 1, one chroma texel
+    * right of the texel COSITED_EVEN co-sites with that luma texel.  We do
+    * not carry a capability whose only effect is to select a broken
+    * reference.  MIDPOINT_CHROMA_SAMPLES and SEPARATE_RECONSTRUCTION_FILTER
+    * go with it: both only describe how chroma is reconstructed, and the
+    * remaining COSITED_EVEN path is reconstructed implicitly as far as the
+    * API is concerned.
+    *
+    * Note this is NOT bit-for-bit what the generic path below computes for
+    * these formats.  There n_planes == 1 and the single plane's
+    * denominator_scales are {1, 1} (vk_format.c, y_plane(...)), so
+    * cosited_chroma stays false and neither chroma-location bit is added at
+    * all.  That reading is not reconciled with M1/M2 conformance and has not
+    * been measured on M1/M2 hardware, so do not copy it here on the strength
+    * of code inspection alone.  COSITED_EVEN is kept because it is what this
+    * driver actually implements and passes.
+    */
+   if (agx_native_graphics(&pdev->dev) && hk_packed_ycbcr_bits(vk_format)) {
+      if (tiling != VK_IMAGE_TILING_OPTIMAL && tiling != VK_IMAGE_TILING_LINEAR)
+         return 0;
+      return VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+             VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+             VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+             VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+             VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+             VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
+   }
+
    /* This optional format needs hacks for opaque black, so hide for
     * performance. We might specially enable this for Proton / behind a driconf.
     */
@@ -47,8 +86,74 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
       return 0;
 
    enum pipe_format p_format = hk_format_to_pipe_format(vk_format);
+   /* D16S8 uses the existing independent D16 and S8 planes. */
+   if (vk_format == VK_FORMAT_D16_UNORM_S8_UINT) {
+      if (pdev->dev.chip != AGX_CHIP_G17P)
+         return 0;
+      p_format = PIPE_FORMAT_Z16_UNORM;
+   }
    if (p_format == PIPE_FORMAT_NONE)
       return 0;
+
+   enum pipe_format padded = hk_padded_image_format(p_format);
+   if (agx_native_graphics(&pdev->dev) && padded != p_format) {
+      /* Linear and external modifier layouts must retain the API's packed
+       * texel stride. This path is restricted to driver-owned optimal images. */
+      if (tiling != VK_IMAGE_TILING_OPTIMAL)
+         return 0;
+      VkFormatFeatureFlags2 rgb = VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+         VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+      const enum pipe_format integer = hk_scaled_texture_format(padded);
+
+      /* A scaled format reaches this block only because it is three-component
+       * and therefore padded. Everything this block would grant it rests on
+       * the integer-fetch-plus-convert emulation that the withdrawal below
+       * removed for every other component count, so withhold it here too and
+       * leave these formats uniformly unsupported as images, as they are on
+       * G13 and G14. */
+      if (integer != PIPE_FORMAT_NONE)
+         return 0;
+
+      const enum pipe_format storage =
+         integer != PIPE_FORMAT_NONE ? integer : padded;
+      /* vkCmdBlitImage between a scaled and a non-scaled format has no
+       * agreed-upon result: the scaled side carries integer values and the
+       * other carries normalized ones, so no conversion satisfies both. Other
+       * drivers withhold every image feature from scaled formats for this
+       * reason. Keep sampling and transfers, which are well-defined, and
+       * withhold blit. */
+      const bool blittable = integer == PIPE_FORMAT_NONE;
+      if (ail_pixel_format[storage].texturable) {
+         rgb |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
+         if (blittable)
+            rgb |= VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
+         if (!util_format_is_pure_integer(storage) ||
+             hk_uscaled_normalized_format(padded) != PIPE_FORMAT_NONE)
+            rgb |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+      }
+      if (ail_pixel_format[storage].renderable && blittable)
+         rgb |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
+      if (ail_pixel_format[padded].renderable) {
+         rgb |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+         if (!util_format_is_pure_integer(padded))
+            rgb |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
+      }
+      return rgb;
+   }
+
+   /* Keep compressed-family reporting atomic with the corresponding Vulkan
+    * feature. The complete BC, ETC2/EAC and ASTC LDR format matrices are
+    * hardware-qualified through the native G17P sampled/upload path. */
+   if (pdev->dev.chip == AGX_CHIP_G17P &&
+       util_format_is_compressed(p_format) &&
+       !hk_g17p_bc_format_supported(vk_format)) {
+      const enum util_format_layout layout =
+         util_format_description(p_format)->layout;
+      const bool enabled = layout == UTIL_FORMAT_LAYOUT_ETC ||
+                           layout == UTIL_FORMAT_LAYOUT_ASTC;
+      if (!enabled)
+         return 0;
+   }
 
    /* NPOT formats only supported for texel buffers */
    if (!util_is_power_of_two_nonzero(util_format_get_blocksize(p_format)))
@@ -59,6 +164,21 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
     */
    if (util_format_is_compressed(p_format) && tiling != VK_IMAGE_TILING_OPTIMAL)
       return 0;
+
+   /* No scaled format has an ail_pixel_format[] entry on any generation: the
+    * hardware does not sample them.  hk_scaled_texture_format() maps SSCALED
+    * to SINT and USCALED to UINT, and the image features above were granted on
+    * the strength of that emulation -- an integer fetch plus an int-to-float
+    * conversion in the shader.  Gate them on descriptor generation 9 and G13
+    * and G14 never saw them, so the whole scaled image-format surface existed
+    * on one generation only, which is not a hardware difference.
+    *
+    * Withdraw it.  radv and anv withhold every image feature from scaled
+    * formats; matching that makes the optional VK_FORMAT_*_[SU]SCALED_* image
+    * formats uniformly unsupported here, as they already are on G13 and G14.
+    * Vertex-buffer use of the same formats is unaffected: it does not come
+    * through this function.
+    */
 
    if (ail_pixel_format[p_format].texturable) {
       features |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
@@ -93,7 +213,11 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
           tiling == VK_IMAGE_TILING_LINEAR)
          return 0;
 
-      features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+      /* Depth/stencil blits use the common graphics meta path, so the
+       * destination capability follows attachment support rather than the
+       * colour-PBE `renderable` table above. */
+      features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+                  VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
    }
 
    /* Our image atomic lowering doesn't bother to handle linear */
@@ -179,6 +303,45 @@ hk_get_image_format_features(struct hk_physical_device *pdev,
          VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT;
    }
 
+   /* G17P used to add CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE here, and only
+    * G17P: agx_native_graphics() is G16G/G17P, so M1/M2 reach these formats
+    * without it and every explicit_* conformance case is NotSupported there.
+    *
+    * That bit is the sole route into VK-GL-CTS's explicit reconstruction
+    * reference, and both of its routines are wrong.  reconstructLinearX-
+    * ChromaSample() treats its constant as the weight of the first chroma
+    * sample; reconstructLinearXYChromaSample() hands the same constants to
+    * linearInterpolate(), which weights the second.  So the X-only routine is
+    * wrong at COSITED_EVEN and the XY routine is wrong at MIDPOINT in either
+    * axis -- which is exactly the failing set: 4:2:2 cosited, and 4:2:0
+    * cosited_midpoint / midpoint_cosited / midpoint_midpoint, with
+    * cosited_cosited passing.
+    *
+    * We are not giving this up because we cannot do it.  G17P's explicit
+    * multi-plane reconstruction is correct: over 171 logged failing sample
+    * points the driver matched the Vulkan spec reconstruction 171/171 and the
+    * as-written CTS value 0/171, while the reference's own bounds contained
+    * the as-written value 171/171 and the spec value 0/171.  The same
+    * instrument scored 248/248 on packed 4:2:2 before it was extended here.
+    * We are giving up claiming a capability whose only effect is to select a
+    * proven-wrong reference, and matching what M1/M2 report.
+    *
+    * The cost is real and deliberate: 512 conformance cases that pass today
+    * become NotSupported, alongside the 512 that fail.  Nothing outside
+    * ycbcr.conversion.*.chroma_reconstruction moves -- of the 53,768
+    * multi-plane YCbCr cases, exactly 1,024 request explicit reconstruction.
+    *
+    * Nothing is needed on the sampler side.  Unlike packed single-plane,
+    * whose views are programmed as plain four-component word textures so
+    * hk_sampler.c must force the shader lowering on, multi-plane views are
+    * real YCbCr views: hk_sampler.c's forcing is gated on
+    * hk_packed_ycbcr_bits(), which is 0 here, so multi-plane only ever
+    * reconstructed explicitly when an application asked.  Withdrawing the bit
+    * makes that request illegal, lower_ycbcr_explicit() stops firing, and the
+    * common implicit path takes over -- the path the 1,536 default_* cases
+    * already exercise and pass.
+    */
+
    if (cosited_chroma)
       features |= VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT;
 
@@ -213,7 +376,7 @@ static bool
 hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
                 unsigned width, unsigned height, unsigned samples,
                 VkImageCreateFlagBits flags, VkImageUsageFlagBits usage,
-                const void *pNext)
+                const void *pNext, bool allow_agx3)
 {
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(format);
@@ -222,13 +385,24 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
       format = ycbcr_info->planes[plane].format;
       width /= ycbcr_info->planes[plane].denominator_scales[0];
       height /= ycbcr_info->planes[plane].denominator_scales[0];
-   } else if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
-      format = (plane == 0) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_S8_UINT;
+   } else if (hk_split_depth_stencil(format)) {
+      format = hk_depth_stencil_plane_format(format, plane);
    }
 
    /* Allow disabling compression for debugging */
    if (dev->debug & AGX_DBG_NOCOMPRESS)
       return false;
+
+   /* AGX3 compresses only what hk_g17p_compression_eligible() admitted
+    * (allow_agx3). That excludes images shared through DRM modifiers or
+    * external memory, so hk_can_compress_format() -- which decides whether
+    * the compressed modifier is advertised -- is always false on AGX3. */
+   if (hk_descriptor_generation_is_agx3(
+          agx_chip_descriptor_generation(dev->chip)) &&
+       !allow_agx3) {
+      perf_debug_dev(dev, "No compression: AGX3 image outside G17P policy");
+      return false;
+   }
 
    /* TODO: Handle compression with sparse. This should be doable but it's a bit
     * subtle. Correctness first.
@@ -247,11 +421,17 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
     *
     * Feedback loops are problematic with compression. The GL driver bans them.
     * Interestingly, the relevant CTS tests pass on G13G and G14C, but not on
-    * G13D. For now, conservatively ban compression with feedback loops.
+    * G13D. Keep that restriction except for depth images already admitted by
+    * the G17P policy. Rejecting those here contradicts the depth policy and
+    * makes the host-copy performance query report a plain device layout;
+    * Zink then retains HOST_TRANSFER and never compresses its depth images.
     */
-   if (usage &
-       (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT | VK_IMAGE_USAGE_STORAGE_BIT |
-        VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) {
+   const bool depth_feedback = dev->chip == AGX_CHIP_G17P && allow_agx3 &&
+                               hk_g17p_compression_depth_format(format);
+   if ((usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
+                 VK_IMAGE_USAGE_STORAGE_BIT)) ||
+       ((usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) &&
+        !depth_feedback)) {
 
       perf_debug_dev(
          dev, "No compression: incompatible usage -%s%s%s",
@@ -293,8 +473,16 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
       return false;
    }
 
+   if (allow_agx3)
+      perf_debug_dev(dev, "G17P compression enabled: %s %ux%u",
+                     util_format_short_name(p_format), width, height);
+
    return true;
 }
+
+static bool
+hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
+                            const VkImageCreateInfo *info);
 
 bool
 hk_can_compress_format(const struct agx_device *dev, VkFormat format)
@@ -305,7 +493,73 @@ hk_can_compress_format(const struct agx_device *dev, VkFormat format)
     *
     * Likewise, we do not set flags as flags only disable compression.
     */
-   return hk_can_compress(dev, format, 0, 64, 64, 1, 0, 0, NULL);
+   return hk_can_compress(dev, format, 0, 64, 64, 1, 0, 0, NULL, false);
+}
+
+bool
+hk_interchange_format(const struct agx_device *dev, VkFormat format)
+{
+   if (dev->chip != AGX_CHIP_G17P || (dev->debug & AGX_DBG_NOCOMPRESS))
+      return false;
+
+   switch (format) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+hk_interchange_supported(const struct agx_device *dev, VkFormat format,
+                         VkImageType type, VkImageCreateFlags flags,
+                         VkImageUsageFlags usage, const void *pNext)
+{
+   if (!hk_interchange_format(dev, format) || type != VK_IMAGE_TYPE_2D)
+      return false;
+
+   /* Same restrictions as any compressed image: no storage, host copies or
+    * sparse, and views only of compatible formats.  Feedback-loop usage is
+    * accepted here exactly as for an explicit GPU_TILED_COMPRESSED modifier
+    * (zink adds it to every imported render-target dmabuf); allocation never
+    * chooses interchange for it, see choose_drm_format_mod(). */
+   if (usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT | VK_IMAGE_USAGE_STORAGE_BIT))
+      return false;
+   if (flags & (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
+                VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT |
+                VK_IMAGE_CREATE_DISJOINT_BIT))
+      return false;
+
+   if (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+      const struct VkImageFormatListCreateInfo *list =
+         pNext ? vk_find_struct_const(pNext, IMAGE_FORMAT_LIST_CREATE_INFO)
+               : NULL;
+      if (!list || !list->viewFormatCount)
+         return false;
+      const enum pipe_format p_format = hk_format_to_pipe_format(format);
+      for (unsigned i = 0; i < list->viewFormatCount; ++i) {
+         if (!ail_formats_compatible(
+                p_format, hk_format_to_pipe_format(list->pViewFormats[i])))
+            return false;
+      }
+   }
+   return true;
+}
+
+static bool
+hk_interchange_create_info(struct hk_device *dev, const VkImageCreateInfo *info)
+{
+   return hk_interchange_supported(&dev->dev, info->format, info->imageType,
+                                   info->flags, info->usage, info->pNext) &&
+          info->mipLevels == 1 && info->arrayLayers == 1 &&
+          info->samples == VK_SAMPLE_COUNT_1_BIT && info->extent.width >= 16 &&
+          info->extent.height >= 16 && info->extent.width <= 16384 &&
+          info->extent.height <= 16384;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -349,13 +603,34 @@ hk_GetPhysicalDeviceImageFormatProperties2(
    if (pImageFormatInfo->flags & (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT |
                                   VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
                                   VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) {
+      /* Sparse format enumeration also uses this query. Do not report a
+       * supported sparse image when the device cannot bind sparse memory.
+       */
+      if (!pdev->vk.supported_features.sparseBinding)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
       features &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
 
-      /* We also do not support sparse RGB32 uniform texel buffers, as we do not
-       * have residency query support for this interaction and there are no
-       * known use cases.
+      /* We also do not support sparse RESIDENCY on a format whose texel block
+       * is not a power of two, as we have no residency granularity to report
+       * for that interaction and there are no known use cases.
+       *
+       * Sparse BINDING and ALIASED have no such interaction: they bind and
+       * alias opaque memory ranges and never ask about texel blocks.
+       * Refusing them there made
+       * vkGetPhysicalDeviceImageFormatProperties fail a combination the spec
+       * requires. CTS excludes a non-power-of-two pixel size only under
+       * VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT (vktApiFeatureInfo.cpp,
+       * isRequiredImageParameterCombination), and the combination it then
+       * demands and we refused is
+       * SPARSE_ALIASED_BIT|SPARSE_BINDING_BIT with SAMPLED usage --
+       * captured on Neo. Every three-channel format failed
+       * dEQP-VK.api.info.image_format_properties as soon as sparseBinding was
+       * advertised. G17P stores a three-channel image padded to four, so it
+       * is the generation that reaches this at all.
        */
-      if (!util_is_power_of_two_nonzero(
+      if ((pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
+          !util_is_power_of_two_nonzero(
              vk_format_get_blocksize(pImageFormatInfo->format))) {
 
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -428,6 +703,19 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
 
+   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *drm_mod_info =
+      vk_find_struct_const(pImageFormatInfo->pNext,
+                           PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
+   const bool interchange =
+      pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+      drm_mod_info &&
+      drm_mod_info->drmFormatModifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED;
+   if (interchange &&
+       !hk_interchange_supported(&pdev->dev, pImageFormatInfo->format,
+                                 pImageFormatInfo->type, pImageFormatInfo->flags,
+                                 pImageFormatInfo->usage, pImageFormatInfo->pNext))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    const uint32_t max_dim = 16384;
    VkExtent3D maxExtent;
    uint32_t maxArraySize;
@@ -454,6 +742,10 @@ hk_GetPhysicalDeviceImageFormatProperties2(
    uint32_t maxMipLevels = util_logbase2(max_dim) + 1;
    if (ycbcr_info != NULL || pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR)
       maxMipLevels = 1;
+   if (interchange) {
+      maxMipLevels = 1;
+      maxArraySize = 1;
+   }
 
    VkSampleCountFlags sampleCounts = VK_SAMPLE_COUNT_1_BIT;
    if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
@@ -464,6 +756,18 @@ hk_GetPhysicalDeviceImageFormatProperties2(
 
       sampleCounts =
          VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+
+      VkSampleCountFlags attachmentSampleCounts = UINT32_MAX;
+      if (features & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT)
+         attachmentSampleCounts &=
+            pdev->vk.properties.framebufferColorSampleCounts;
+      if (vk_format_has_depth(pImageFormatInfo->format))
+         attachmentSampleCounts &=
+            pdev->vk.properties.framebufferDepthSampleCounts;
+      if (vk_format_has_stencil(pImageFormatInfo->format))
+         attachmentSampleCounts &=
+            pdev->vk.properties.framebufferStencilSampleCounts;
+      sampleCounts &= attachmentSampleCounts;
    }
 
    /* From the Vulkan 1.2.199 spec:
@@ -613,9 +917,45 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT: {
          VkHostImageCopyDevicePerformanceQueryEXT *hic_props = s;
 
+         /* Compare against the device-copy image, including private G17P
+          * compression. hk_can_compress_format() is for DRM modifiers and
+          * deliberately excludes private AGX3 compression.
+          *
+          * The query omits dimensions, levels, layers and samples. Choose a
+          * shape that permits compression: if any such image can compress,
+          * host-transfer images cannot promise the same layout.
+          */
+         const VkExternalMemoryImageCreateInfo external_create_info = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext = pImageFormatInfo->pNext,
+            .handleTypes = external_info ? external_info->handleType : 0,
+         };
+         const VkImageCreateInfo device_copy_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &external_create_info,
+            .flags = pImageFormatInfo->flags,
+            .imageType = pImageFormatInfo->type,
+            .format = pImageFormatInfo->format,
+            .extent = {64, 64, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = pImageFormatInfo->tiling,
+            .usage = (pImageFormatInfo->usage &
+                      ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) |
+                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+         };
+         bool can_compress = false;
+         if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL) {
+            for (unsigned plane = 0; plane < plane_count; ++plane) {
+               can_compress |= hk_can_compress_create_info(
+                  &pdev->dev, plane, &device_copy_info);
+            }
+         }
+
          hic_props->optimalDeviceAccess = hic_props->identicalMemoryLayout =
-            !(pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
-              hk_can_compress_format(&pdev->dev, pImageFormatInfo->format));
+            !can_compress;
          break;
       }
       default:
@@ -707,12 +1047,34 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
 }
 
 static bool
-hk_can_compress_create_info(struct hk_device *dev, unsigned plane,
+hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info)
 {
-   return hk_can_compress(&dev->dev, info->format, plane, info->extent.width,
+   /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
+    * AGX3 chips stay plain until their packets are recovered. */
+   bool allow_agx3 = hk_g17p_compression_eligible(dev->chip, plane, info);
+
+   /* Compressed data is only decodable through its own channel class. Every
+    * G17P writer of a colour image is a PBE; the end-of-tile PBE may store a
+    * different format from the image (agx_g17p_rt0_pbe_format packs
+    * R11G11B10/RGB9E5 into R32_UINT words). Never compress an image whose
+    * store class would differ from the class its textures read. */
+   if (allow_agx3 && !vk_format_is_depth_or_stencil(info->format)) {
+      const enum pipe_format p_format = hk_format_to_pipe_format(info->format);
+      const enum pipe_format store = agx_g17p_rt0_pbe_format(
+         util_format_linear(hk_padded_image_format(p_format)));
+      if (!ail_formats_compatible(p_format, store)) {
+         perf_debug_dev(dev,
+                        "No compression: G17P stores %s through class of %s",
+                        util_format_short_name(p_format),
+                        util_format_short_name(store));
+         allow_agx3 = false;
+      }
+   }
+
+   return hk_can_compress(dev, info->format, plane, info->extent.width,
                           info->extent.height, info->samples, info->flags,
-                          info->usage, info->pNext);
+                          info->usage, info->pNext, allow_agx3);
 }
 
 static enum ail_tiling
@@ -743,7 +1105,7 @@ hk_map_compression(struct hk_device *dev, const VkImageCreateInfo *info,
       return false;
 
    case VK_IMAGE_TILING_OPTIMAL:
-      return hk_can_compress_create_info(dev, plane, info);
+      return hk_can_compress_create_info(&dev->dev, plane, info);
 
    case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:
       return ail_is_drm_modifier_compressed(modifier);
@@ -759,6 +1121,15 @@ modifier_get_score(uint64_t mod)
    switch (mod) {
    case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
       return 10;
+
+   /* Display-native compressed layout, scanned out by DCP directly.  Below
+    * GPU_TILED too: AGX3 never advertises GPU_TILED_COMPRESSED (see
+    * hk_can_compress()), so a compositor's main tranche built from this
+    * driver's modifier list is {GPU_TILED, interchange, LINEAR} and must keep
+    * choosing GPU_TILED.  Interchange then wins only against LINEAR, i.e. in a
+    * display (scanout) list that cannot take GPU tiling. */
+   case DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED:
+      return 3;
 
    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
       return 5;
@@ -781,13 +1152,21 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
    bool can_compress = true;
 
    for (uint8_t plane = 0; plane < plane_count; plane++) {
-      if (!hk_can_compress_create_info(dev, plane, info))
+      if (!hk_can_compress_create_info(&dev->dev, plane, info))
          can_compress = false;
    }
+
+   const bool interchange =
+      plane_count == 1 &&
+      !(info->usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) &&
+      hk_interchange_create_info(dev, info);
 
    for (uint32_t i = 0; i < modifier_count; ++i) {
       if (!can_compress &&
           modifiers[i] == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED)
+         continue;
+      if (!interchange &&
+          modifiers[i] == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED)
          continue;
 
       uint32_t score = modifier_get_score(modifiers[i]);
@@ -828,7 +1207,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    /* We do not support interleaved depth/stencil. Instead, we decompose to
     * a depth plane and a stencil plane.
     */
-   if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+   if (hk_split_depth_stencil(image->vk.format)) {
       image->plane_count = 2;
    }
 
@@ -861,6 +1240,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          modifier = choose_drm_format_mod(dev, image->plane_count, pCreateInfo,
                                           mod_list_info->drmFormatModifierCount,
                                           mod_list_info->pDrmFormatModifiers);
+
       }
 
       assert(modifier != DRM_FORMAT_MOD_INVALID);
@@ -868,34 +1248,76 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       image->vk.drm_format_mod = modifier;
    }
 
+   if (mod_explicit_info &&
+       (mod_explicit_info->drmFormatModifierPlaneCount != image->plane_count ||
+        !mod_explicit_info->pPlaneLayouts)) {
+      return vk_errorf(
+         dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+         "DRM modifier provides %u planes for a %u-plane image",
+         mod_explicit_info->drmFormatModifierPlaneCount, image->plane_count);
+   }
+
+   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED) {
+      if (!hk_interchange_create_info(dev, pCreateInfo))
+         return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                          "interchange modifier on an ineligible image");
+
+      /* The row pitch is part of the modifier's contract with appledrm. */
+      const uint64_t pitch_B = DIV_ROUND_UP(pCreateInfo->extent.width, 16) *
+                               256 * vk_format_get_blocksize(pCreateInfo->format);
+      if (mod_explicit_info &&
+          mod_explicit_info->pPlaneLayouts[0].rowPitch != pitch_B)
+         return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                          "interchange plane row pitch 0x%" PRIx64 " != 0x%" PRIx64,
+                          mod_explicit_info->pPlaneLayouts[0].rowPitch, pitch_B);
+   }
+
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(pCreateInfo->format);
+   uint64_t implicit_plane_cursor_B = 0;
+
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       VkFormat format =
          ycbcr_info ? ycbcr_info->planes[plane].format : pCreateInfo->format;
 
-      if (format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
-         format = (plane == 0) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_S8_UINT;
-      }
+      format = hk_depth_stencil_plane_format(format, plane);
 
       const uint8_t width_scale =
          ycbcr_info ? ycbcr_info->planes[plane].denominator_scales[0] : 1;
       const uint8_t height_scale =
          ycbcr_info ? ycbcr_info->planes[plane].denominator_scales[1] : 1;
 
+      const enum pipe_format p_format = hk_format_to_pipe_format(format);
+      const enum pipe_format layout_format =
+         agx_native_graphics(&dev->dev) &&
+               pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL
+            ? hk_padded_image_format(p_format)
+            : p_format;
       uint32_t linear_stride_B = 0;
       if (mod_explicit_info &&
-          image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR)
-         linear_stride_B = mod_explicit_info->pPlaneLayouts[plane].rowPitch;
+          image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR) {
+         const uint64_t minimum_stride_B = util_format_get_stride(
+            p_format, DIV_ROUND_UP(pCreateInfo->extent.width, width_scale));
+         if (!hk_image_explicit_linear_stride(
+                mod_explicit_info->pPlaneLayouts[plane].rowPitch,
+                minimum_stride_B, &linear_stride_B)) {
+            return vk_errorf(
+               dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+               "invalid linear DRM plane %u row pitch 0x%" PRIx64, plane,
+               mod_explicit_info->pPlaneLayouts[plane].rowPitch);
+         }
+      }
 
       bool compressed =
          hk_map_compression(dev, pCreateInfo, plane, image->vk.drm_format_mod);
 
       image->planes[plane].layout = (struct ail_layout){
+         .policy = ail_layout_policy_for_descriptor_generation(
+            agx_chip_descriptor_generation(dev->dev.chip)),
          .tiling = hk_map_tiling(dev, pCreateInfo, image->vk.drm_format_mod),
          .compressed = compressed,
          .mipmapped_z = pCreateInfo->imageType == VK_IMAGE_TYPE_3D,
-         .format = hk_format_to_pipe_format(format),
+         .format = layout_format,
 
          .linear_stride_B = linear_stride_B,
 
@@ -912,6 +1334,42 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       };
 
       ail_make_miptree(&image->planes[plane].layout);
+
+      uint64_t plane_end_B;
+      if (mod_explicit_info) {
+         const uint64_t plane_offset_B =
+            mod_explicit_info->pPlaneLayouts[plane].offset;
+         if (!hk_image_explicit_plane_range(plane_offset_B,
+                                            image->planes[plane].layout.size_B,
+                                            &plane_end_B)) {
+            return vk_errorf(
+               dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+               "invalid DRM plane %u range at 0x%" PRIx64, plane,
+               plane_offset_B);
+         }
+         image->planes[plane].offset_B = plane_offset_B;
+
+         for (uint8_t prior = 0; prior < plane; prior++) {
+            if (hk_image_plane_ranges_overlap(
+                   plane_offset_B, image->planes[plane].layout.size_B,
+                   image->planes[prior].offset_B,
+                   image->planes[prior].layout.size_B)) {
+               return vk_errorf(
+                  dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                  "DRM plane %u overlaps plane %u", plane, prior);
+            }
+         }
+      } else if (image->disjoint) {
+         image->planes[plane].offset_B = 0;
+      } else if (!hk_image_implicit_plane_range(
+                    implicit_plane_cursor_B, image->planes[plane].layout.size_B,
+                    &image->planes[plane].offset_B, &plane_end_B)) {
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "image plane layout exceeds the address space");
+      }
+
+      if (!image->disjoint)
+         implicit_plane_cursor_B = MAX2(implicit_plane_cursor_B, plane_end_B);
    }
 
    return VK_SUCCESS;
@@ -929,11 +1387,11 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
    if (sparse_bound) {
       size_t size = align(plane->layout.size_B, HK_SPARSE_ALIGN_B);
       plane->va = agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, 0, 0);
-      plane->addr = plane->va->addr;
-      if (plane->addr == 0) {
+      if (!plane->va) {
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Sparse VMA allocation failed");
       }
+      plane->addr = plane->va->addr;
 
       /* Bind scratch pages to discard writes, including from lowered software
        * texture atomics. Reads will use the hardware texture unit sparse
@@ -942,19 +1400,34 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
        * In the future we could optimize this out using the PBE sparse support
        * but that needs more reverse-engineering.
        */
-      hk_bind_scratch(dev, plane->va, 0, size);
+      VkResult result = hk_bind_scratch(dev, plane->va, 0, size);
+      if (result != VK_SUCCESS) {
+         agx_va_free(&dev->dev, plane->va, true);
+         plane->va = NULL;
+         plane->addr = 0;
+         return result;
+      }
    }
 
    if (sparse_resident) {
       plane->sparse_map =
          agx_bo_create(&dev->dev, plane->layout.sparse_table_size_B,
                        AIL_PAGESIZE, 0, "Sparse map");
+      if (!plane->sparse_map)
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "Sparse residency map allocation failed");
 
       /* Zero-initialize the sparse map. This ensures all tiles are disabled,
        * which provides correct behaviour for unmapped tiles.
        */
-      memset(agx_bo_map(plane->sparse_map), 0,
-             plane->layout.sparse_table_size_B);
+      void *map = agx_bo_map(plane->sparse_map);
+      if (!map) {
+         agx_bo_unreference(&dev->dev, plane->sparse_map);
+         plane->sparse_map = NULL;
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "Sparse residency map mapping failed");
+      }
+      memset(map, 0, plane->layout.sparse_table_size_B);
    }
 
    return VK_SUCCESS;
@@ -1004,6 +1477,7 @@ hk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    result = hk_image_init(dev, image, pCreateInfo);
    if (result != VK_SUCCESS) {
+      hk_image_finish(dev, image, pAllocator);
       vk_free2(&dev->vk.alloc, pAllocator, image);
       return result;
    }
@@ -1041,13 +1515,36 @@ static void
 hk_image_plane_add_req(struct hk_image_plane *plane, bool sparse,
                        uint64_t *size_B, uint32_t *align_B)
 {
-   unsigned plane_align_B = sparse ? HK_SPARSE_ALIGN_B : HK_PLANE_ALIGN_B;
+   unsigned plane_align_B = sparse ? HK_SPARSE_ALIGN_B : HK_IMAGE_PLANE_ALIGN_B;
    assert(util_is_power_of_two_or_zero64(*align_B));
    assert(util_is_power_of_two_or_zero64(plane_align_B));
 
    *align_B = MAX2(*align_B, plane_align_B);
-   *size_B = align64(*size_B, plane_align_B);
-   *size_B += plane->layout.size_B;
+   assert(plane->offset_B <= UINT64_MAX - plane->layout.size_B);
+   *size_B = MAX2(*size_B, plane->offset_B + plane->layout.size_B);
+}
+
+/* All of G17P's memory is one unified heap, and DXVK suballocates every
+ * resource the driver does not prefer to have dedicated into chunks of up to
+ * 256 MiB, packing even large render targets one to three per chunk; the
+ * Subnautica menu leaves at least 31% of those chunks unused. Prefer (never
+ * require) a dedicated allocation for attachments and for large images so
+ * they get exactly their size. Sparse and disjoint images cannot take one,
+ * and images that may be exported or imported keep their answer. */
+#define HK_DEDICATED_IMAGE_MIN_B (4ull << 20)
+
+static bool
+hk_image_prefers_dedicated(const struct hk_image *image, bool sparse,
+                           uint64_t size_B)
+{
+   if (sparse || image->disjoint || image->vk.external_handle_types ||
+       image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      return false;
+
+   const VkImageUsageFlags attachment =
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   return (image->vk.usage & attachment) || size_B >= HK_DEDICATED_IMAGE_MIN_B;
 }
 
 static void
@@ -1086,8 +1583,9 @@ hk_get_image_memory_requirements(struct hk_device *dev, struct hk_image *image,
    vk_foreach_struct(sType, ext, pMemoryRequirements->pNext) {
       switch (sType) {
       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
-         VkMemoryDedicatedRequirements *dedicated = ext;
-         dedicated->prefersDedicatedAllocation = false;
+         VkMemoryDedicatedRequirements *dedicated = (void *)ext;
+         dedicated->prefersDedicatedAllocation =
+            hk_image_prefers_dedicated(image, sparse, size_B);
          dedicated->requiresDedicatedAllocation = false;
          break;
       }
@@ -1254,14 +1752,7 @@ hk_get_image_subresource_layout(UNUSED struct hk_device *dev,
    const uint8_t p = hk_image_aspects_to_plane(image, isr->aspectMask);
    const struct hk_image_plane *plane = &image->planes[p];
 
-   uint64_t offset_B = 0;
-   if (!image->disjoint) {
-      uint32_t align_B = 0;
-      /* TODO: sparse? */
-      for (unsigned plane = 0; plane < p; plane++)
-         hk_image_plane_add_req(&image->planes[plane], false, &offset_B,
-                                &align_B);
-   }
+   uint64_t offset_B = plane->offset_B;
    offset_B +=
       ail_get_layer_level_B(&plane->layout, isr->arrayLayer, isr->mipLevel);
 
@@ -1322,12 +1813,10 @@ hk_GetDeviceImageSubresourceLayoutKHR(
    hk_image_finish(dev, &image, NULL);
 }
 
-static void
+static bool
 hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
-                    struct hk_device_memory *mem, uint64_t *offset_B)
+                    struct hk_device_memory *mem, uint64_t memory_offset_B)
 {
-   *offset_B = align64(*offset_B, HK_PLANE_ALIGN_B);
-
    if (plane->va) {
 #if 0
       agx_bo_bind_vma(dev->ws_dev,
@@ -1339,12 +1828,17 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
 #endif
       UNREACHABLE("todo");
    } else {
-      plane->addr = mem->bo->va->addr + *offset_B;
-      plane->map = agx_bo_map(mem->bo) + *offset_B;
-      plane->rem = mem->bo->size - (*offset_B);
+      uint64_t bo_offset_B;
+      if (!hk_image_plane_binding(
+             mem->bo->va->addr, mem->bo->size, memory_offset_B, plane->offset_B,
+             plane->layout.size_B, &plane->addr, &bo_offset_B))
+         return false;
+
+      plane->map = agx_bo_map(mem->bo) + bo_offset_B;
+      plane->rem = mem->bo->size - bo_offset_B;
    }
 
-   *offset_B += plane->layout.size_B;
+   return true;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1370,16 +1864,20 @@ hk_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
 #endif
 
       assert(mem);
-      uint64_t offset_B = pBindInfos[i].memoryOffset;
+      const uint64_t offset_B = pBindInfos[i].memoryOffset;
       if (image->disjoint) {
          const VkBindImagePlaneMemoryInfo *plane_info = vk_find_struct_const(
             pBindInfos[i].pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
          uint8_t plane =
             hk_image_aspects_to_plane(image, plane_info->planeAspect);
-         hk_image_plane_bind(dev, &image->planes[plane], mem, &offset_B);
+         if (!hk_image_plane_bind(dev, &image->planes[plane], mem, offset_B))
+            return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "image plane %u exceeds bound memory", plane);
       } else {
          for (unsigned plane = 0; plane < image->plane_count; plane++) {
-            hk_image_plane_bind(dev, &image->planes[plane], mem, &offset_B);
+            if (!hk_image_plane_bind(dev, &image->planes[plane], mem, offset_B))
+               return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                                "image plane %u exceeds bound memory", plane);
          }
       }
 
@@ -1406,7 +1904,7 @@ hk_plane_index(VkFormat format, VkImageAspectFlags aspect_mask)
    case VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT:
       return 2;
    case VK_IMAGE_ASPECT_STENCIL_BIT:
-      return format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+      return hk_split_depth_stencil(format);
    }
 }
 
@@ -1721,7 +2219,7 @@ hk_CopyImageToImageEXT(VkDevice _device,
       pCopyImageToImageInfo->flags & VK_HOST_IMAGE_COPY_MEMCPY_EXT;
 
    for (uint32_t i = 0; i < pCopyImageToImageInfo->regionCount; ++i) {
-      if (src_image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+      if (hk_split_depth_stencil(src_image->vk.format)) {
          VkImageCopy2 info = pCopyImageToImageInfo->pRegions[i];
          u_foreach_bit(b, info.dstSubresource.aspectMask) {
             info.srcSubresource.aspectMask = BITFIELD_BIT(b);

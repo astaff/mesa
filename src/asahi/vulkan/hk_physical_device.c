@@ -6,10 +6,13 @@
  */
 #include "hk_physical_device.h"
 
+#include "asahi/compiler/agx_compile.h"
 #include "asahi/compiler/agx_nir_texture.h"
+#include "asahi/compiler/agx_debug.h"
 #include "asahi/lib/agx_device.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "util/disk_cache.h"
+#include "util/hex.h"
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 #include "git_sha1.h"
@@ -17,11 +20,16 @@
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
+#include "hk_memory_budget_core.h"
+#include "hk_agx3_vdm_decode.h"
+#include "hk_native_descriptor.h"
 #include "hk_private.h"
+#include "hk_ray_tracing_core.h"
 #include "hk_shader.h"
 #include "hk_wsi.h"
 
 #include "util/simple_mtx.h"
+#include "util/u_debug.h"
 #include "vulkan/vulkan_core.h"
 #include "vulkan/wsi/wsi_common.h"
 #include "vk_drm_syncobj.h"
@@ -45,13 +53,59 @@ hk_get_vk_version()
    return VK_MAKE_VERSION(1, 4, VK_HEADER_VERSION);
 }
 
+/* Vulkan cache and opaque-layout UUIDs must not alias across Apple GPU
+ * contracts.  In particular, G15+ changes the ISA, command streams and
+ * descriptor layouts independently, while G17 splits AGX3b/AGX3c and
+ * HAL200/HAL300 by variant.  Hash explicit scalars instead of a C struct so
+ * padding and host ABI cannot enter the persistent identity. */
+static void
+hk_hash_device_generation_contract(blake3_hasher *ctx,
+                                   const struct agx_device *dev)
+{
+   const uint32_t values[] = {
+      dev->params.gpu_generation,
+      (uint8_t)dev->params.gpu_variant,
+      dev->params.gpu_revision,
+      dev->chip,
+      agx_chip_isa_encoding(dev->chip),
+      agx_chip_command_stream_generation(dev->chip),
+      agx_chip_descriptor_generation(dev->chip),
+      agx_chip_sampler_generation(dev->chip),
+      agx_chip_sampler_heap_element_size(dev->chip),
+   };
+
+   _mesa_blake3_update(ctx, values, sizeof(values));
+}
+
 static void
 hk_get_device_extensions(const struct hk_instance *instance,
                          struct vk_device_extension_table *ext)
 {
+   /*
+    * VK_KHR_ray_query and everything it depends on.  Software traversal:
+    * grounded end to end in shader ALU and global loads, with no dependence
+    * on the partially mapped AGX3 intersect_ray SCS ABI -- but it has never
+    * executed on hardware, and an extension bit is a promise.  It stays off
+    * until the exact-result oracle passes on a real G17P.
+    */
+   const bool ray_query = false;
+
+   /*
+    * VK_KHR_ray_tracing_pipeline.  The whole pipeline compiles to one compute
+    * megakernel over the same software traversal ray_query uses, so it needs
+    * exactly what ray_query needs and nothing more -- but it has never
+    * executed on hardware either, and an extension bit is a promise.
+    */
+   const bool ray_tracing_pipeline = ray_query;
+
    *ext = (struct vk_device_extension_table){
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
+      .KHR_acceleration_structure = ray_query,
+      .KHR_deferred_host_operations = ray_query,
+      .KHR_ray_query = ray_query,
+      .KHR_ray_tracing_pipeline = ray_tracing_pipeline,
+      .KHR_ray_tracing_maintenance1 = ray_tracing_pipeline,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
       .KHR_calibrated_timestamps = true,
@@ -137,6 +191,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_swapchain_mutable_format = true,
 #endif
       .KHR_synchronization2 = true,
+      .KHR_unified_image_layouts = true,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
       .KHR_vertex_attribute_divisor = true,
@@ -149,7 +204,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
       .EXT_calibrated_timestamps = true,
-      .EXT_conditional_rendering = false,
+      .EXT_conditional_rendering = true,
       .EXT_color_write_enable = true,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
@@ -181,7 +236,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
-      .EXT_memory_budget = false,
+      .EXT_memory_budget = true,
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_non_seamless_cube_map = true,
@@ -309,10 +364,15 @@ hk_get_device_features(
       .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = true,
-      .storageInputOutput16 = false,
+      /* HAL200 interpolation is 32-bit, but the compiler performs matching
+       * type-correct widening at ST_VARY and narrowing after interpolation. */
+      .storageInputOutput16 = dev->chip == AGX_CHIP_G17P,
       .multiview = true,
-      .multiviewGeometryShader = false,
-      .multiviewTessellationShader = false,
+      /* ViewIndex is lowered into the layer output of the last
+       * pre-rasterization stage and the draw is duplicated per view, so
+       * tessellation and geometry shaders work with multiview too. */
+      .multiviewGeometryShader = true,
+      .multiviewTessellationShader = true,
       .variablePointersStorageBuffer = true,
       .variablePointers = true,
       .shaderDrawParameters = true,
@@ -320,7 +380,7 @@ hk_get_device_features(
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
-      .drawIndirectCount = true,
+      .drawIndirectCount = supported_extensions->KHR_draw_indirect_count,
       .storageBuffer8BitAccess = true,
       .uniformAndStorageBuffer8BitAccess = true,
       .storagePushConstant8 = true,
@@ -359,6 +419,35 @@ hk_get_device_features(
       .timelineSemaphore = true,
       .bufferDeviceAddress = true,
       .bufferDeviceAddressCaptureReplay = true,
+
+      /* VK_KHR_acceleration_structure / VK_KHR_ray_query, gated with the
+       * extensions above.  Host-side builds stay off: they are unimplemented
+       * and a conformant application therefore never reaches them. */
+      .accelerationStructure = supported_extensions->KHR_acceleration_structure,
+      .accelerationStructureCaptureReplay = false,
+      .accelerationStructureIndirectBuild = false,
+      .accelerationStructureHostCommands = false,
+      .descriptorBindingAccelerationStructureUpdateAfterBind = false,
+      .rayQuery = supported_extensions->KHR_ray_query,
+      .rayTraversalPrimitiveCulling = supported_extensions->KHR_ray_query ||
+                                      supported_extensions->KHR_ray_tracing_pipeline,
+
+      /* VK_KHR_ray_tracing_pipeline.  Shader-group handle capture/replay is
+       * off because shaderGroupHandleCaptureReplaySize is zero: a handle is a
+       * device-unique index with nothing to replay.  The pipeline stack size
+       * is static scratch in the compiled megakernel, so the dynamic state
+       * cannot change it and is not advertised either. */
+      .rayTracingPipeline = supported_extensions->KHR_ray_tracing_pipeline,
+      .rayTracingPipelineShaderGroupHandleCaptureReplay = false,
+      .rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false,
+      .rayTracingPipelineTraceRaysIndirect =
+         supported_extensions->KHR_ray_tracing_pipeline,
+
+      /* VK_KHR_ray_tracing_maintenance1 */
+      .rayTracingMaintenance1 =
+         supported_extensions->KHR_ray_tracing_maintenance1,
+      .rayTracingPipelineTraceRaysIndirect2 =
+         supported_extensions->KHR_ray_tracing_maintenance1,
       .bufferDeviceAddressMultiDevice = false,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
@@ -467,6 +556,20 @@ hk_get_device_features(
       .shaderSubgroupRotate = true,
       .shaderSubgroupRotateClustered = true,
 
+      /* VK_KHR_unified_image_layouts
+       *
+       * Honeykrisp does not act on VkImageLayout anywhere: barriers
+       * (hk_CmdPipelineBarrier2) discard the dependency info and simply end the
+       * open batches, hk_CmdBeginRendering ignores the attachment layouts, and
+       * hk_TransitionImageLayoutEXT is a documented no-op.  Compression is
+       * decided once at image creation and is never a function of the layout,
+       * so VK_IMAGE_LAYOUT_GENERAL is already equivalent to every other layout.
+       *
+       * Video is not supported, so the video half stays false.
+       */
+      .unifiedImageLayouts = true,
+      .unifiedImageLayoutsVideo = false,
+
       /* VK_KHR_vertex_attribute_divisor */
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
@@ -495,8 +598,9 @@ hk_get_device_features(
       .colorWriteEnable = true,
 
       /* VK_EXT_conditional_rendering */
-      .conditionalRendering = false,
-      .inheritedConditionalRendering = false,
+      .conditionalRendering = supported_extensions->EXT_conditional_rendering,
+      .inheritedConditionalRendering =
+         supported_extensions->EXT_conditional_rendering,
 
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
@@ -671,19 +775,158 @@ hk_get_device_features(
       .presentAtAbsoluteTime = true,
 #endif
    };
+
+   if (dev->chip == AGX_CHIP_G17P) {
+      /* The first HAL200 path is intentionally one ordinary, single-sample
+       * graphics pipeline. Keep optional feature reporting within that path
+       * until the corresponding joined Ioto programs are implemented. */
+      /* Geometry and tessellation shaders run in compute and draw through
+       * their raster and evaluation vertex programs, as on AGX2. */
+      /* Known issue: 16-bit varyings across the tessellation-to-geometry
+       * handoff (interface_matching.*.vert_tesc_tese_geom_frag float16). */
+      features->geometryShader = true;
+      features->tessellationShader = true;
+      features->shaderTessellationAndGeometryPointSize =
+         features->geometryShader || features->tessellationShader;
+      features->geometryStreams = features->geometryShader;
+      features->extendedDynamicState3RasterizationStream =
+         features->geometryShader;
+      features->extendedDynamicState2PatchControlPoints =
+         features->tessellationShader;
+      features->extendedDynamicState3TessellationDomainOrigin =
+         features->tessellationShader;
+      /* IA vertex/primitive recording, including reset/reuse/unavailable
+       * handling, has passed its exact hardware oracle twice. Every applicable
+       * graphics/compute counter now has a strict native helper or fragment-
+       * prolog compiler oracle and shares the guarded compact-report ABI. */
+      features->pipelineStatisticsQuery = true;
+      /* The graphics-stage descriptor, storage-write and atomic paths record
+       * through HAL200 but are not yet qualified on hardware. */
+      features->vertexPipelineStoresAndAtomics = false;
+      /* Qualified on hardware: g17p-vulkan-fragment-side-effects renders
+       * 1024/1024 exact pixels, 0 cleared, 0 wrong, with 0/256 mixed 2x2
+       * quads and 0/32 mixed 8x4 SIMD groups, and its fragment stores,
+       * atomics, untouched vertex fields, guard words and three-second
+       * stability all verify exactly. No GPU faults.
+       *
+       * The earlier 513/1024 that kept this gated was measured against a
+       * build predating 53aac78d1aa, which replaced the FragDepth write in
+       * agx_nir_lower_frag_sidefx with a late test and deleted the depth path
+       * that failure ran through. That change also lost the pass's
+       * idempotence -- Honeykrisp preprocesses every shader twice and a
+       * sample mask leaves no trace in shader_info -- so every side-effecting
+       * fragment shader emitted sample_mask twice, which
+       * agx_nir_lower_sample_mask documents as incorrect. Both are fixed.
+       *
+       * Dawn requires this feature; without it Chromium's WebGPU silently
+       * falls back to SwiftShader. */
+      features->fragmentStoresAndAtomics = true;
+      features->advancedBlendCoherentOperations = true;
+      /* Sparse binding and residency reuse the AGX2 architecture wholesale:
+       * per-page VM_BIND with unbound pages mapped to the scratch/zero page,
+       * a read-only shadow at +sparse_ro_offset, and a userspace sparse map
+       * that the G17P texture descriptor points at in Sparse mode. The kernel
+       * already accepts DRM_ASAHI_BIND_SINGLE_PAGE binds, and the G17P user VA
+       * window is split for the RO alias exactly as AGX2 is. Keep it off until
+       * the residency-query descriptor path is qualified on hardware; every
+       * piece below is chip-agnostic. */
+      const bool sparse = false;
+      features->shaderResourceResidency = sparse;
+      features->sparseBinding = sparse;
+      features->sparseResidencyAliased = sparse;
+      features->sparseResidencyImage2D = sparse;
+      features->sparseResidencyBuffer = sparse;
+      /* The common Honeykrisp lowering duplicates a draw per view, writes
+       * ViewIndex through the draw root and routes it through the packed
+       * layer/viewport UVS output.  G17P now also has exact array BG/EOT
+       * coordinates, completing the two-view render path. */
+      features->multiview = true;
+      /* The direct triangle path uses the native geometry pipeline plus the
+       * G17P-compiled libagx XFB counter-copy kernel. */
+      features->transformFeedback = true;
+      /* Precompiled predicate kernels use the same direct HAL200 Ioto launch
+       * as the public compute path, followed by native indirect Index Lists.
+       * Both indexed and non-indexed count/clamp/stride paths are qualified. */
+      features->drawIndirectCount = true;
+      /* G17P's native layer output occupies the high half of the shared
+       * layer/viewport UVS scalar.  The public bit is backed by the exact
+       * two-instance/two-layer image qualification. */
+      features->shaderOutputLayer = true;
+      /* VK_KHR_shader_quad_control permits quad operations and derivatives
+       * inside divergent control flow.  The ordinary subgroup quad shuffles
+       * exposed below do not establish that stronger execution guarantee. */
+      features->shaderQuadControl = false;
+   }
+
+   /* A multiview promise for a stage this device does not expose is
+    * meaningless, so keep the pair consistent however the stage bits above
+    * resolved. */
+   features->multiviewGeometryShader &= features->geometryShader;
+   features->multiviewTessellationShader &= features->tessellationShader;
+
+   /* G16G inserts explicit view bounds for robust image operations in NIR.
+    * It qualifies both robust modes, and its descriptor swizzle supplies the
+    * required out-of-bounds alpha. */
+   if (dev->chip == AGX_CHIP_G16G) {
+      features->robustImageAccess = true;
+      features->robustImageAccess2 = true;
+   }
+}
+
+/* Stages a pipeline or shader object may contain on this device. Every
+ * shader-stage mask reported in the properties must stay inside this set.
+ */
+static VkShaderStageFlags
+hk_supported_shader_stages(const struct vk_features *features)
+{
+   VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT |
+                               VK_SHADER_STAGE_FRAGMENT_BIT |
+                               VK_SHADER_STAGE_COMPUTE_BIT;
+
+   if (features->tessellationShader) {
+      stages |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+   }
+
+   if (features->geometryShader)
+      stages |= VK_SHADER_STAGE_GEOMETRY_BIT;
+
+   return stages;
 }
 
 static void
 hk_get_device_properties(const struct agx_device *dev,
                          const struct hk_instance *instance,
+                         const struct vk_features *features,
                          struct vk_properties *properties)
 {
+   const unsigned descriptor_generation =
+      agx_chip_descriptor_generation(dev->chip);
+   const bool texel_buffer_single_texel_alignment =
+      hk_descriptor_generation_is_agx2(descriptor_generation) ||
+      dev->chip == AGX_CHIP_G17P;
+
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
       VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
 
+   /* G17P renders, resolves and stores multisample colour and depth: on an
+    * A18 Pro the g17p-vulkan-msaa-resolve2/4, -store-fetch4 and -depth4
+    * probes read back exact resolved values, per-sample colour and per-sample
+    * depth coverage. Integer and storage images stay single-sample there:
+    * multisample tiles are built only for 8-bit UNORM colour, and storage
+    * images have no multisample descriptor.
+    */
+   const VkSampleCountFlagBits other_sample_counts =
+      dev->chip == AGX_CHIP_G17P ? VK_SAMPLE_COUNT_1_BIT : sample_counts;
+
    uint64_t os_page_size = 16384;
    os_get_page_size(&os_page_size);
+
+   const struct agx_device_key compiler_key = {
+      .chip = dev->chip,
+      .encoding = agx_chip_isa_encoding(dev->chip),
+   };
 
    /* The hardware limit is 128. However, we need to set a lower limit to
     * account for duplicated system values: clip/cull and viewport targets.
@@ -691,13 +934,17 @@ hk_get_device_properties(const struct agx_device *dev,
     * giving a theoretical limit of 119. We round down to 116 to give a sensible
     * limit in vec4s.
     */
+   /* G17P has the same 128-word UVS budget: Apple's compiler writes position
+    * plus thirty-one float4 user locations, and its fragment linker admits 127
+    * coefficients. The same reserve for clip/cull and layer/viewport words
+    * applies. */
    unsigned max_vgt_output_components = 116;
 
    *properties = (struct vk_properties){
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
-      .deviceID = 0,
+      .deviceID = dev->chip == AGX_CHIP_G17P ? dev->params.chip_id : 0,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
       /* Vulkan 1.0 limits */
@@ -706,7 +953,12 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxImageDimension3D = 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
-      .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE,
+      /* The G17P texture/PBE includes the software alignment tail in its
+       * height. Reserve the worst-case 15 R8 texels so a maximally sized
+       * view at a single-texel offset still fits the native 2D descriptor.
+       */
+      .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
+                               (dev->chip == AGX_CHIP_G17P ? 15 : 0),
       .maxUniformBufferRange = 65536,
 
       /* From a hardware perspective, storage buffers are lowered to global
@@ -724,6 +976,44 @@ hk_get_device_properties(const struct agx_device *dev,
       .bufferImageGranularity = 0x400,
       .sparseAddressSpaceSize = HK_SPARSE_ADDR_SPACE_SIZE,
       .maxBoundDescriptorSets = HK_MAX_SETS,
+      /* VK_KHR_acceleration_structure limits.  The counts are the
+       * specification's own 24/29-bit encoding maxima, which is what bounds
+       * us: the geometry, instance and primitive ids all live in packed
+       * fields.  Scratch alignment is 128 because the common builder's
+       * shaders address scratch as uvec4. */
+      .maxGeometryCount = (1u << 24) - 1,
+      .maxInstanceCount = (1u << 24) - 1,
+      .maxPrimitiveCount = (1u << 29) - 1,
+      .maxPerStageDescriptorAccelerationStructures = HK_MAX_DESCRIPTORS,
+      .maxPerStageDescriptorUpdateAfterBindAccelerationStructures =
+         HK_MAX_DESCRIPTORS,
+      .maxDescriptorSetAccelerationStructures = HK_MAX_DESCRIPTORS,
+      .maxDescriptorSetUpdateAfterBindAccelerationStructures =
+         HK_MAX_DESCRIPTORS,
+      .minAccelerationStructureScratchOffsetAlignment = 128,
+
+      /* VK_KHR_ray_tracing_pipeline.  shaderGroupHandleSize is fixed at 32 by
+       * the specification.  The base and handle alignments are the
+       * specification's minima -- nothing in the megakernel's SBT fetch
+       * requires more, because every record address arrives as a device
+       * address the shader adds a stride to.
+       *
+       * maxRayRecursionDepth is 1, and that is a real limit rather than a
+       * policy: recursion is unrolled into the megakernel at compile time, so
+       * every extra level multiplies the compiled code.  Raising it is a
+       * decision about code size, not a hardware question.
+       *
+       * maxRayDispatchInvocationCount is bounded by what one compute dispatch
+       * can launch, since the launch is exactly a compute dispatch. */
+      .shaderGroupHandleSize = HK_RAY_TRACING_GROUP_HANDLE_SIZE,
+      .maxRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH,
+      .maxShaderGroupStride = 16384,
+      .shaderGroupBaseAlignment = 64,
+      .shaderGroupHandleCaptureReplaySize = 0,
+      .maxRayDispatchInvocationCount = 1u << 30,
+      .shaderGroupHandleAlignment = 32,
+      .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
+
       .maxPerStageDescriptorSamplers = HK_MAX_DESCRIPTORS,
       .maxPerStageDescriptorUniformBuffers = HK_MAX_DESCRIPTORS,
       .maxPerStageDescriptorStorageBuffers = HK_MAX_DESCRIPTORS,
@@ -739,8 +1029,11 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxDescriptorSetSampledImages = HK_MAX_DESCRIPTORS,
       .maxDescriptorSetStorageImages = HK_MAX_DESCRIPTORS,
       .maxDescriptorSetInputAttachments = HK_MAX_DESCRIPTORS,
-      .maxVertexInputAttributes = AGX_MAX_VBUFS,
-      .maxVertexInputBindings = AGX_MAX_ATTRIBS,
+      /* Bounded by the vertex prolog register ABI, not by the key tables:
+       * 21 on G17P, 29 on AGX2 (agx_max_vertex_attribs). DXVK's D3D9
+       * fixed-function vertex shader needs 18. */
+      .maxVertexInputAttributes = agx_max_vertex_attribs(&compiler_key),
+      .maxVertexInputBindings = AGX_MAX_VBUFS,
       .maxVertexInputAttributeOffset = 65535,
       .maxVertexInputBindingStride = 2048,
 
@@ -799,10 +1092,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .framebufferStencilSampleCounts = sample_counts,
       .maxColorAttachments = HK_MAX_RTS,
       .sampledImageColorSampleCounts = sample_counts,
-      .sampledImageIntegerSampleCounts = sample_counts,
+      .sampledImageIntegerSampleCounts = other_sample_counts,
       .sampledImageDepthSampleCounts = sample_counts,
       .sampledImageStencilSampleCounts = sample_counts,
-      .storageImageSampleCounts = sample_counts,
+      .storageImageSampleCounts = other_sample_counts,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics = true,
       /* FIXME: Is timestamp period actually 1? */
@@ -838,8 +1131,7 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* Vulkan 1.1 properties */
       .subgroupSize = 32,
-      .subgroupSupportedStages =
-         VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_ALL_GRAPHICS,
+      .subgroupSupportedStages = hk_supported_shader_stages(features),
       .subgroupSupportedOperations =
          VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
          VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT |
@@ -866,7 +1158,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .independentResolveNone = true,
       .independentResolve = true,
       .driverID = VK_DRIVER_ID_MESA_HONEYKRISP,
-      .conformanceVersion = (VkConformanceVersion){1, 4, 0, 0},
+      .conformanceVersion = (VkConformanceVersion){1, 4, 6, 2},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
@@ -913,7 +1205,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .filterMinmaxSingleComponentFormats = instance->drirc.misc.fake_minmax,
       .filterMinmaxImageComponentMapping = false,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
-      .framebufferIntegerColorSampleCounts = sample_counts,
+      .framebufferIntegerColorSampleCounts = other_sample_counts,
 
       /* Vulkan 1.3 properties */
       .minSubgroupSize = 32,
@@ -930,9 +1222,11 @@ hk_get_device_properties(const struct agx_device *dev,
       .integerDotProduct4x8BitPackedSignedAccelerated = false,
       .integerDotProduct4x8BitPackedMixedSignednessAccelerated = false,
       .storageTexelBufferOffsetAlignmentBytes = HK_MIN_TEXEL_BUFFER_ALIGNMENT,
-      .storageTexelBufferOffsetSingleTexelAlignment = true,
+      .storageTexelBufferOffsetSingleTexelAlignment =
+         texel_buffer_single_texel_alignment,
       .uniformTexelBufferOffsetAlignmentBytes = HK_MIN_TEXEL_BUFFER_ALIGNMENT,
-      .uniformTexelBufferOffsetSingleTexelAlignment = true,
+      .uniformTexelBufferOffsetSingleTexelAlignment =
+         texel_buffer_single_texel_alignment,
       .maxBufferSize = HK_MAX_BUFFER_SIZE,
 
       /* Vulkan 1.4 properties */
@@ -1035,7 +1329,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .variableSampleLocations = false,
 
       /* VK_EXT_shader_object */
-      .shaderBinaryVersion = 0,
+      .shaderBinaryVersion = HK_AGX3_SHADER_BINARY_VERSION,
 
       /* VK_EXT_transform_feedback */
       .maxTransformFeedbackStreams = 4,
@@ -1047,7 +1341,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .transformFeedbackQueries = true,
       .transformFeedbackStreamsLinesTriangles = true,
       .transformFeedbackRasterizationStreamSelect = true,
-      .transformFeedbackDraw = false,
+      .transformFeedbackDraw = true,
 
       /* VK_KHR_vertex_attribute_divisor */
       .maxVertexAttribDivisor = UINT32_MAX,
@@ -1064,6 +1358,25 @@ hk_get_device_properties(const struct agx_device *dev,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
    };
+
+   if (dev->chip == AGX_CHIP_G17P) {
+      /* Measured per operation under the G17P drm-shim:
+       *
+       *   BASIC             g22_subgroup_basic          encodes
+       *   VOTE              g21_subgroup_vote           encodes
+       *   BALLOT            g05_subgroup_ballot         encodes
+       *   ARITHMETIC        g06_subgroup_arith          encodes
+       *   SHUFFLE           g07_subgroup_shuffle        encodes
+       *   SHUFFLE_RELATIVE  g25_subgroup_shuffle_rel    encodes
+       *   CLUSTERED         g23_subgroup_clustered      encodes
+       *   QUAD              g08_subgroup_quad           encodes
+       *   ROTATE/CLUSTERED  g24_subgroup_rotate         encodes
+       *
+       * Quad broadcasts and swaps are now grounded for the compute and
+       * fragment stages.  Keep subgroupQuadOperationsInAllStages false until
+       * every other advertised graphics stage is independently witnessed. */
+      properties->subgroupQuadOperationsInAllStages = false;
+   }
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
             (strlen(instance->drirc.debug.force_vk_devicename) > 0) ?
@@ -1107,6 +1420,10 @@ hk_get_device_properties(const struct agx_device *dev,
       VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL,
       VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
       VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+      /* VK_KHR_dynamic_rendering_local_read is supported, and
+       * unifiedImageLayouts makes this layout interchangeable with the rest,
+       * so host copy has to accept it too. */
+      VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ,
       // VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
       VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
    };
@@ -1127,10 +1444,58 @@ hk_get_device_properties(const struct agx_device *dev,
       /* Make sure we don't match with other vendors */
       const char *driver = "honeykrisp-v1";
       _mesa_blake3_update(&blake3_ctx, driver, strlen(driver));
+      hk_hash_device_generation_contract(&blake3_ctx, dev);
       _mesa_blake3_final(&blake3_ctx, blake3);
 
       memcpy(properties->optimalTilingLayoutUUID, blake3, VK_UUID_SIZE);
    }
+}
+
+/* Every AGX_*, HK_* and ASAHI_* environment variable that can change generated
+ * code or serialized objects is part of the cache identity, not only the bits
+ * hk_physical_device_compiler_flags() packs. Variables that only print or pick
+ * a runtime path are excluded so tracing keeps a warm cache. */
+extern char **environ;
+static int
+hk_env_cmp(const void *a, const void *b)
+{
+   return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static uint64_t
+hk_codegen_env_hash(void)
+{
+   static const char *const runtime_only[] = {
+      "TRACE", "DUMP", "_LOG", "PERF", "VERBOSE", "DEBUG_OBJECT", "SLOW_DRAW",
+      "DISK_CACHE_ID", "LAZY_GENERIC", "FORCE_GENERIC", "BIND_PREDICT",
+      "VARIANT_TRACE", "SLOW_SUBMIT", "PROLOG_DISK_CACHE",
+   };
+   const char *list[512];
+   unsigned n = 0;
+   for (char **e = environ; e && *e && n < ARRAY_SIZE(list); ++e) {
+      if (strncmp(*e, "AGX_", 4) && strncmp(*e, "HK_", 3) &&
+          strncmp(*e, "ASAHI_", 6))
+         continue;
+      const char *eq = strchr(*e, '=');
+      const size_t name_len = eq ? (size_t)(eq - *e) : strlen(*e);
+      bool skip = false;
+      for (unsigned i = 0; i < ARRAY_SIZE(runtime_only) && !skip; ++i) {
+         const size_t l = strlen(runtime_only[i]);
+         for (size_t o = 0; o + l <= name_len && !skip; ++o)
+            skip = !strncmp(*e + o, runtime_only[i], l);
+      }
+      if (!skip)
+         list[n++] = *e;
+   }
+   qsort(list, n, sizeof(list[0]), hk_env_cmp);
+   uint64_t h = 0xcbf29ce484222325ull;
+   for (unsigned i = 0; i < n; ++i)
+      for (const char *c = list[i]; ; ++c) {
+         h = (h ^ (uint8_t)*c) * 0x100000001b3ull;
+         if (!*c)
+            break;
+      }
+   return h;
 }
 
 static void
@@ -1143,9 +1508,12 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 
    _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
                      sizeof(instance->driver_build_sha));
+   hk_hash_device_generation_contract(&blake3_ctx, &pdev->dev);
 
    const uint64_t compiler_flags = hk_physical_device_compiler_flags(pdev);
    _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
+   const uint64_t env_hash = hk_codegen_env_hash();
+   _mesa_blake3_update(&blake3_ctx, &env_hash, sizeof(env_hash));
 
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
@@ -1162,11 +1530,19 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 
    assert(len == sizeof(renderer) - 2);
 
-   char timestamp[BLAKE3_HEX_LEN];
-   _mesa_blake3_format(timestamp, instance->driver_build_sha);
-
+   /* The driver id names the single-file cache directory: keep it to the
+    * 20-byte build-id (40 hex digits), not the zero-padded 32-byte buffer.
+    * Steam records single-file cache directories as "L7:<driver id>" cut
+    * to 64 characters and prunes directories that match no bucket, so a
+    * longer id would get the live cache deleted.
+    */
+   const unsigned id_bytes = 20;
+   static_assert(sizeof(instance->driver_build_sha) >= 20);
+   char timestamp[2 * 20 + 1];
+   mesa_bytes_to_hex(timestamp, instance->driver_build_sha, id_bytes);
    const uint64_t driver_flags = hk_physical_device_compiler_flags(pdev);
-   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+   pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags ^
+      (env_hash * UINT64_C(0xff51afd7ed558ccd)));
    if (pdev->vk.disk_cache != NULL) {
       pdev->vk.properties.pipelineBinaryInternalCache = true;
       pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
@@ -1208,11 +1584,12 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
    uint64_t total_used = 0;
    for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
       const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
-      uint64_t used = p_atomic_read(&heap->used);
+      uint64_t used = p_atomic_read(&heap->used) +
+                         p_atomic_read(&heap->cached);
       total_used += used;
    }
 
-   return pdev->sysmem - total_used;
+   return total_used < pdev->sysmem ? pdev->sysmem - total_used : 0;
 }
 
 VkResult
@@ -1290,12 +1667,23 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    struct vk_device_extension_table supported_extensions;
    hk_get_device_extensions(instance, &supported_extensions);
 
+   if (pdev->dev.chip == AGX_CHIP_G17P) {
+      /* Advanced blending is hardware-qualified on A18 Pro for every
+       * operation and advertised overlap/premultiplication mode, including
+       * coherent sequencing, across the bounded one-attachment profile. */
+
+      /* This extension controls divergent quad derivatives, not the standard
+       * subgroup quad shuffle operations exposed above. */
+      supported_extensions.KHR_shader_quad_control = false;
+   }
+
    struct vk_features supported_features;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 
    struct vk_properties properties;
-   hk_get_device_properties(&pdev->dev, instance, &properties);
+   hk_get_device_properties(&pdev->dev, instance, &supported_features,
+                            &properties);
 
    properties.drmHasRender = true;
    properties.drmRenderMajor = major(render_dev);
@@ -1306,6 +1694,26 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
                                     &properties, &dispatch_table);
    if (result != VK_SUCCESS)
       goto fail_agx_device;
+
+   /* Descriptor writes encode a scaled_conversion kind only for views whose
+    * format is [SU]SCALED (hk_scaled_texture_format()). Such a view needs
+    * sampled-image or input-attachment features for its format, so if no
+    * scaled format has them, no valid descriptor carries a nonzero kind. */
+   pdev->scaled_sampling = false;
+   for (VkFormat f = VK_FORMAT_UNDEFINED + 1;
+        f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK && !pdev->scaled_sampling; ++f) {
+      if (hk_scaled_texture_format(hk_format_to_pipe_format(f)) ==
+          PIPE_FORMAT_NONE)
+         continue;
+      const VkFormatFeatureFlags2 sampled =
+         VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+         VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+         VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+      pdev->scaled_sampling =
+         (hk_get_image_format_features(pdev, f, VK_IMAGE_TILING_OPTIMAL) |
+          hk_get_image_format_features(pdev, f, VK_IMAGE_TILING_LINEAR)) &
+         sampled;
+   }
 
    hk_physical_device_init_pipeline_cache(pdev);
 
@@ -1348,11 +1756,56 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
 
-   pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
-      .queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
-                     VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT,
+   VkQueueFlags queue_flags =
+      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+      VK_QUEUE_SPARSE_BINDING_BIT;
+   if (pdev->dev.chip == AGX_CHIP_G17P) {
+      /* Graphics, compute and transfers use the native HAL200 queue path.
+       * Sparse binding rides the shared per-page VM_BIND path; advertise it
+       * only when the same opt-in that turns on the sparse features above is
+       * set, so the queue family and the device features stay consistent. */
+      queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT |
+                    VK_QUEUE_TRANSFER_BIT;
+      if (pdev->vk.supported_features.sparseBinding)
+         queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
+   }
 
-      .queue_count = 1,
+   uint32_t queue_count = 1;
+   if (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) {
+#define HK_ADVERTISED_QUEUES 8u
+      struct drm_asahi_queue_limits limits = {0};
+      struct drm_asahi_get_params query = {
+         .param_group = DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS,
+         .pointer = (uintptr_t)&limits,
+         .size = sizeof(limits),
+      };
+      if (pdev->dev.ops.simple_ioctl(&pdev->dev, DRM_IOCTL_ASAHI_GET_PARAMS,
+                                    &query)) {
+         result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                            "Failed to query kernel queue limits: %m");
+         goto fail_disk_cache;
+      }
+      if (!limits.max_queues || !limits.max_in_flight_per_queue) {
+         result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                            "Kernel reports no usable command queues");
+         goto fail_disk_cache;
+      }
+      /* limits.max_queues is the machine-wide pool of application GART
+       * contexts (g17_queue_limits.rs: contexts 5..62), shared with every
+       * other client on the device. VkQueueFamilyProperties::queueCount is a
+       * per-device guarantee: an application may create a device with that
+       * many queues and expect it to succeed. Handing the shared pool out as
+       * the guarantee makes any application that asks for queueCount queues
+       * fail as soon as other clients hold contexts. Advertise a count we
+       * can deliver; a real guarantee needs a per-client reservation in the
+       * kernel. */
+      queue_count = MIN2(limits.max_queues, HK_ADVERTISED_QUEUES);
+   }
+
+   pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
+      .queue_flags = queue_flags,
+
+      .queue_count = queue_count,
    };
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
 
@@ -1436,7 +1889,8 @@ hk_GetPhysicalDeviceMemoryProperties2(
 
          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
             const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
-            uint64_t used = p_atomic_read(&heap->used);
+            uint64_t used = p_atomic_read(&heap->used) +
+                            p_atomic_read(&heap->cached);
 
             /* From the Vulkan 1.3.278 spec:
              *

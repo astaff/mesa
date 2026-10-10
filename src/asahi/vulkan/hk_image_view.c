@@ -5,10 +5,12 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_image_view.h"
+#include "util/half_float.h"
 #include "util/format/u_format.h"
 #include "vulkan/vulkan_core.h"
 
 #include "agx_helpers.h"
+#include "agx_bg_eot_key.h"
 #include "agx_nir_texture.h"
 #include "agx_pack.h"
 #include "hk_device.h"
@@ -22,6 +24,7 @@
 
 enum hk_desc_usage {
    HK_DESC_USAGE_SAMPLED,
+   HK_DESC_USAGE_SAMPLED_FILTERABLE,
    HK_DESC_USAGE_STORAGE,
    HK_DESC_USAGE_INPUT,
    HK_DESC_USAGE_BG_EOT,
@@ -51,7 +54,7 @@ hk_image_view_type_is_array(VkImageViewType view_type)
 
 static enum agx_texture_dimension
 translate_image_view_type(VkImageViewType view_type, bool msaa, bool layered,
-                          enum hk_desc_usage usage)
+                          enum hk_desc_usage usage, bool cubes_to_2d)
 {
    if (usage == HK_DESC_USAGE_EMRT || usage == HK_DESC_USAGE_INPUT ||
        (usage == HK_DESC_USAGE_LAYERED_BG_EOT && layered)) {
@@ -64,8 +67,6 @@ translate_image_view_type(VkImageViewType view_type, bool msaa, bool layered,
       return msaa ? AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED
                   : AGX_TEXTURE_DIMENSION_2D;
    }
-
-   bool cubes_to_2d = usage != HK_DESC_USAGE_SAMPLED;
 
    switch (view_type) {
    case VK_IMAGE_VIEW_TYPE_1D:
@@ -143,6 +144,21 @@ struct hk_3d {
    unsigned x, y, z;
 };
 
+/* A texel block wider or taller than one pixel means the API extent and the
+ * layout's element grid differ, so a view that does not share the block has to
+ * divide the extent down.  Block-compressed formats are the usual case, but
+ * the single-plane 4:2:2 formats are blocked (2x1) without being compressed --
+ * util_format_is_compressed() is false for them.  Testing the block itself
+ * covers both; it is what the extent arithmetic below actually needs.
+ */
+static bool
+format_is_blocked(enum pipe_format format)
+{
+   return util_format_get_blockwidth(format) > 1 ||
+          util_format_get_blockheight(format) > 1 ||
+          util_format_get_blockdepth(format) > 1;
+}
+
 static struct hk_3d
 view_denominator(struct hk_image_view *view)
 {
@@ -150,12 +166,12 @@ view_denominator(struct hk_image_view *view)
    enum pipe_format img_format =
       hk_format_to_pipe_format(view->vk.image->format);
 
-   if (util_format_is_compressed(view_format)) {
+   if (format_is_blocked(view_format)) {
       /*
-       * We can do an uncompressed view of a compressed image but not the other
+       * We can do an unblocked view of a blocked image but not the other
        * way around.
        */
-      assert(util_format_is_compressed(img_format));
+      assert(format_is_blocked(img_format));
       assert(util_format_get_blockwidth(img_format) ==
              util_format_get_blockwidth(view_format));
       assert(util_format_get_blockheight(img_format) ==
@@ -166,12 +182,12 @@ view_denominator(struct hk_image_view *view)
       return (struct hk_3d){1, 1, 1};
    }
 
-   if (!util_format_is_compressed(img_format)) {
-      /* Both formats uncompressed */
+   if (!format_is_blocked(img_format)) {
+      /* Both formats have 1x1 blocks */
       return (struct hk_3d){1, 1, 1};
    }
 
-   /* Else, img is compressed but view is not */
+   /* Else, img is blocked but view is not */
    return (struct hk_3d){
       util_format_get_blockwidth(img_format),
       util_format_get_blockheight(img_format),
@@ -189,6 +205,9 @@ format_for_plane(struct hk_image_view *view, unsigned view_plane)
    VkFormat plane_format =
       ycbcr_info ? ycbcr_info->planes[view_plane].format : view->vk.format;
 
+   if (view->vk.format == VK_FORMAT_D16_UNORM_S8_UINT)
+      plane_format = hk_depth_stencil_plane_format(view->vk.format,
+         view->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT);
    enum pipe_format p_format = hk_format_to_pipe_format(plane_format);
    if (view->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT)
       p_format = get_stencil_format(p_format);
@@ -196,9 +215,10 @@ format_for_plane(struct hk_image_view *view, unsigned view_plane)
    return p_format;
 }
 
-static void
-pack_texture(struct hk_image_view *view, unsigned view_plane,
-             enum hk_desc_usage usage, struct agx_texture_packed *out)
+static bool
+pack_texture(struct hk_device *dev, struct hk_image_view *view,
+             unsigned view_plane, enum hk_desc_usage usage,
+             struct hk_native_texture_descriptor *out)
 {
    struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
    const uint8_t image_plane = view->planes[view_plane].image_plane;
@@ -206,12 +226,38 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
    struct ail_layout *layout = &plane->layout;
    uint64_t base_addr = hk_image_base_address(image, image_plane);
 
-   bool cubes_to_2d = usage != HK_DESC_USAGE_SAMPLED;
+   const bool sampled_like = usage == HK_DESC_USAGE_SAMPLED ||
+                             usage == HK_DESC_USAGE_SAMPLED_FILTERABLE;
+   bool cubes_to_2d = !sampled_like;
 
    unsigned level = view->vk.base_mip_level;
    unsigned layer = view->vk.base_array_layer;
 
    enum pipe_format p_format = format_for_plane(view, view_plane);
+   const unsigned packed_ycbcr = agx_native_graphics(&dev->dev)
+      ? hk_packed_ycbcr_bits(view->vk.format) : 0;
+   if (packed_ycbcr)
+      p_format = packed_ycbcr == 8 ? PIPE_FORMAT_R8G8B8A8_UNORM :
+                                    PIPE_FORMAT_R16G16B16A16_UNORM;
+   const bool padded_rgb = agx_native_graphics(&dev->dev) &&
+                          hk_padded_image_format(p_format) != p_format;
+   if (padded_rgb)
+      p_format = hk_padded_image_format(p_format);
+   if (agx_native_graphics(&dev->dev)) {
+      enum pipe_format integer = hk_scaled_texture_format(p_format);
+      enum pipe_format normalized = hk_uscaled_normalized_format(p_format);
+      if (usage == HK_DESC_USAGE_SAMPLED_FILTERABLE &&
+          normalized != PIPE_FORMAT_NONE) {
+         p_format = normalized;
+         integer = PIPE_FORMAT_NONE;
+      }
+      /* Scaled formats sample through an integer descriptor and a shader
+       * conversion (see hk_descriptor_set.c). Background tile reloads and
+       * storage views need the integer physical values too, or a later
+       * partial render saturates untouched USCALED pixels. */
+      if (integer != PIPE_FORMAT_NONE)
+         p_format = integer;
+   }
    const struct util_format_description *desc =
       util_format_description(p_format);
 
@@ -223,6 +269,16 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
       desc->swizzle[2],
       desc->swizzle[3],
    };
+
+   /* A three-component image is stored in a four-component physical format,
+    * so the padded channel is whatever the allocation happened to contain.
+    * The API format has no alpha, and Vulkan requires a sampled texel with no
+    * alpha channel to read one.  Taking the swizzle from the physical format
+    * returns the padding instead, which is why every sampled RGB/BGR format
+    * mismatched.  Force it back.
+    */
+   if (padded_rgb && sampled_like)
+      format_swizzle[3] = PIPE_SWIZZLE_1;
 
    /* Different APIs have different depth/stencil swizzle rules. Vulkan expects
     * R001 behaviour, override here because Mesa's format table is not that.
@@ -257,9 +313,11 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
 
    util_format_compose_swizzles(format_swizzle, view_swizzle, out_swizzle);
 
-   agx_pack(out, TEXTURE, cfg) {
+   struct AGX_TEXTURE cfg = {AGX_TEXTURE_header};
+   {
       cfg.dimension = translate_image_view_type(
-         view->vk.view_type, view->vk.image->samples > 1, layers > 1, usage);
+         view->vk.view_type, view->vk.image->samples > 1, layers > 1, usage,
+         cubes_to_2d);
       cfg.layout = agx_translate_layout(layout->tiling);
       cfg.channels = ail_pixel_format[p_format].channels;
       cfg.type = ail_pixel_format[p_format].type;
@@ -286,6 +344,9 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
          cfg.first_level = level;
          cfg.last_level = level + view->vk.level_count - 1;
       }
+
+      if (packed_ycbcr)
+         cfg.width = DIV_ROUND_UP(cfg.width, 2);
 
       /* To implement sparse resident textures, the hardware texture descriptor
        * can instead point to a secondary page table controlled in userspace.
@@ -354,16 +415,33 @@ pack_texture(struct hk_image_view *view, unsigned view_plane,
 
       if (layout->tiling == AIL_TILING_LINEAR) {
          cfg.stride = ail_get_linear_stride_B(layout, 0) - 16;
+      } else if (layout->tiling == AIL_TILING_INTERCHANGE) {
+         /* HAL200 encodeImageReadState gives Interchange the Linear row-stride
+          * field (word1[61:46]), in macroblocks per row minus one
+          * (Texture::getStride); genxml stores stride >> 4. */
+         cfg.stride = (layout->stride_el[0] / 16 - 1) << 4;
       } else {
          cfg.page_aligned_layers = layout->page_aligned_layers;
       }
+
    }
+
+   return hk_pack_native_texture(
+      agx_chip_descriptor_generation(dev->dev.chip), out, &cfg);
 }
 
-static void
+static bool
 pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
-         enum hk_desc_usage usage, struct agx_pbe_packed *out)
+         enum hk_desc_usage usage, struct hk_native_pbe_descriptor *out,
+         uint64_t *atomic_sw_out)
 {
+   const unsigned generation =
+      agx_chip_descriptor_generation(dev->dev.chip);
+   if (!hk_native_pbe_hardware_supported(generation)) {
+      memset(out, 0, sizeof(*out));
+      return false;
+   }
+
    struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
    const uint8_t image_plane = view->planes[view_plane].image_plane;
    struct ail_layout *layout = &image->planes[image_plane].layout;
@@ -373,8 +451,12 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    unsigned layer = view->vk.base_array_layer;
 
    enum pipe_format p_format = format_for_plane(view, view_plane);
-   const struct util_format_description *desc =
-      util_format_description(p_format);
+   if (agx_native_graphics(&dev->dev)) {
+      p_format = hk_padded_image_format(p_format);
+      enum pipe_format integer = hk_scaled_texture_format(p_format);
+      if (integer != PIPE_FORMAT_NONE)
+         p_format = integer;
+   }
 
    bool eot =
       usage == HK_DESC_USAGE_BG_EOT || usage == HK_DESC_USAGE_LAYERED_BG_EOT;
@@ -385,16 +467,31 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    if (eot)
       p_format = util_format_linear(p_format);
 
+   if (eot && dev->dev.chip == AGX_CHIP_G17P)
+      p_format = agx_g17p_rt0_pbe_format(p_format);
+
+   const struct util_format_description *desc =
+      util_format_description(p_format);
+
    bool msaa = view->vk.image->samples > 1;
    struct hk_3d denom = view_denominator(view);
 
    unsigned layers = view->vk.view_type == VK_IMAGE_VIEW_TYPE_3D
                         ? image->vk.extent.depth
                         : view->vk.layer_count;
+   /* A non-layered auxiliary program addresses only layer zero, even when
+    * the attachment view spans more layers. Keep the linear extension and
+    * native layer count consistent with its 2D descriptor dimension. */
+   if (usage == HK_DESC_USAGE_BG_EOT)
+      layers = 1;
 
-   agx_pack(out, PBE, cfg) {
+   struct AGX_PBE cfg = {AGX_PBE_header};
+   if (atomic_sw_out)
+      *atomic_sw_out = 0;
+   {
       cfg.dimension =
-         translate_image_view_type(view->vk.view_type, msaa, layers > 1, usage);
+         translate_image_view_type(view->vk.view_type, msaa, layers > 1,
+                                   usage, usage != HK_DESC_USAGE_SAMPLED);
       cfg.layout = agx_translate_layout(layout->tiling);
       cfg.channels = ail_pixel_format[p_format].channels;
       cfg.type = ail_pixel_format[p_format].type;
@@ -457,8 +554,11 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
             cfg.level = level;
          }
 
+         /* A single-layer BG/EOT descriptor is 2D even when the API view
+          * is an array. It does not need the linear array-stride extension. */
          if (layout->tiling == AIL_TILING_LINEAR &&
-             (hk_image_view_type_is_array(view->vk.view_type))) {
+             hk_image_view_type_is_array(view->vk.view_type) &&
+             (layers > 1 || cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY)) {
 
             cfg.depth_linear = layers;
             cfg.layer_stride_linear = (layout->layer_stride_B - 0x80);
@@ -472,6 +572,13 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
 
          if (layout->tiling == AIL_TILING_LINEAR) {
             cfg.stride = ail_get_linear_stride_B(layout, level) - 4;
+            assert(cfg.levels == 1);
+         } else if (layout->tiling == AIL_TILING_INTERCHANGE) {
+            /* PBEStateEncoderGen9::StateFields: Interchange takes the Linear
+             * stride field, macroblocks per row minus one at word1[59:44];
+             * the codec encodes stride_B / 16 - 1 there (stride_B =
+             * stride + 4).  Hardware-verified: v6 ix-pattern@mb. */
+            cfg.stride = (layout->stride_el[0] / 16) * 16 - 4;
             assert(cfg.levels == 1);
          } else {
             cfg.page_aligned_layers = layout->page_aligned_layers;
@@ -492,7 +599,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
       /* When the descriptor isn't extended architecturally, we use
        * the last 8 bytes as a sideband to accelerate image atomics.
        */
-      if (!cfg.extended &&
+      if (hk_native_pbe_supported(generation) && !cfg.extended &&
           (layout->writeable_image || usage == HK_DESC_USAGE_EMRT)) {
 
          if (msaa) {
@@ -515,7 +622,35 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
             cfg.layer_stride_sw = layout->layer_stride_B;
          }
       }
-   };
+
+      /* Gen9's architectural PBE consumes all 32 bytes, so it cannot reuse
+       * AGX2 words 4/5 as software metadata.  Preserve the same compact ABI in
+       * the descriptor's dedicated tail: level offset [0:26], log2 tile width
+       * [27:30], log2 tile height [31:34], layer stride [35:61], and log2
+       * sample count [62:63].  The
+       * shader-side Gen9 decoder consumes this word independently of the
+       * native PBE. */
+      if (atomic_sw_out && generation == 9 && !cfg.extended &&
+          (layout->writeable_image || usage == HK_DESC_USAGE_EMRT)) {
+         /* A linear image addresses texels through the native PBE's row
+          * stride and is never layered here, so its sideband carries no tile
+          * geometry or layer stride. */
+         const bool linear = layout->tiling == AIL_TILING_LINEAR;
+         if (!hk_pack_g17p_image_atomic_sw(
+                ail_get_level_offset_B(layout, cfg.level),
+                linear ? 1 : layout->tilesize_el[level].width_el,
+                linear ? 1 : layout->tilesize_el[level].height_el,
+                linear ? 0 : layout->layer_stride_B,
+                msaa ? image->vk.samples : 1, atomic_sw_out))
+            return false;
+      }
+   }
+
+   /* eMRT uses the ordinary native array-store path, not the non-array
+    * end-of-tile builtin. Multisample stores instead address the linear
+    * buffer descriptor constructed above. */
+
+   return hk_pack_native_pbe(generation, out, &cfg);
 }
 
 static VkResult
@@ -526,6 +661,20 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
    memset(view, 0, sizeof(*view));
 
    vk_image_view_init(&dev->vk, &view->vk, pCreateInfo);
+
+   const float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
+   view->sampled_min_lod_fp16 = _mesa_float_to_half(min_lod);
+   view->sampled_min_lod_uint16 = min_lod;
+
+   {
+      const enum pipe_format logical = hk_format_to_pipe_format(view->vk.format);
+      const enum pipe_format integer = hk_scaled_texture_format(logical);
+      view->g17p_scaled_conversion =
+         integer == PIPE_FORMAT_NONE ? 0
+         : util_format_is_pure_sint(integer) ? 1 : 2;
+      view->g17p_uscaled_normalized =
+         hk_uscaled_normalized_format(logical) != PIPE_FORMAT_NONE;
+   }
 
    /* First, figure out which image planes we need. For depth/stencil, we only
     * have one aspect viewed at a time.
@@ -552,19 +701,90 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
 
    /* Fill in each view plane separately */
    for (unsigned p = 0; p < view->plane_count; p++) {
-      pack_texture(view, p, HK_DESC_USAGE_SAMPLED, &view->planes[p].sampled);
-      pack_texture(view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].ro_storage);
-      pack_texture(view, p, HK_DESC_USAGE_INPUT, &view->planes[p].ia);
-      pack_texture(view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_texture);
-      pack_texture(view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].background);
-      pack_texture(view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
-                   &view->planes[p].layered_background);
+      const bool textures_valid =
+         pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED,
+                      &view->planes[p].sampled) &&
+         pack_texture(dev, view, p, HK_DESC_USAGE_STORAGE,
+                      &view->planes[p].ro_storage) &&
+         pack_texture(dev, view, p, HK_DESC_USAGE_INPUT,
+                      &view->planes[p].ia) &&
+         pack_texture(dev, view, p, HK_DESC_USAGE_EMRT,
+                      &view->planes[p].emrt_texture) &&
+         pack_texture(dev, view, p, HK_DESC_USAGE_BG_EOT,
+                      &view->planes[p].background) &&
+         pack_texture(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
+                      &view->planes[p].layered_background);
+      if (!textures_valid)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-      pack_pbe(dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage);
-      pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].eot);
-      pack_pbe(dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe);
-      pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
-               &view->planes[p].layered_eot);
+      if (dev->dev.chip == AGX_CHIP_G17P) {
+         VkResult result = hk_descriptor_table_add(
+            dev, &dev->sampled_images, &view->planes[p].sampled, 32,
+            &view->planes[p].sampled_heap_index);
+         if (result != VK_SUCCESS)
+            return result;
+         view->planes[p].filterable_valid =
+            hk_uscaled_normalized_format(hk_padded_image_format(
+               hk_format_to_pipe_format(view->vk.format))) != PIPE_FORMAT_NONE &&
+            pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED_FILTERABLE,
+                         &view->planes[p].sampled_filterable);
+         if (view->planes[p].filterable_valid) {
+            result = hk_descriptor_table_add(
+               dev, &dev->sampled_images, &view->planes[p].sampled_filterable,
+               32, &view->planes[p].filterable_heap_index);
+            if (result != VK_SUCCESS) {
+               /* Nothing was reserved, so the destroy path must not try to
+                * release an index we do not own. */
+               view->planes[p].filterable_valid = false;
+               return result;
+            }
+         }
+         if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
+            result = hk_descriptor_table_add(
+               dev, &dev->sampled_images, &view->planes[p].ro_storage, 32,
+               &view->planes[p].storage_heap_index);
+            if (result != VK_SUCCESS)
+               return result;
+         }
+         /* Input attachments use an array-shaped descriptor independently
+          * of the application sampled view. Keep the exact native bytes in
+          * the indexed heap rather than sampling through the wrong shape. */
+         if (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
+            result = hk_descriptor_table_add(
+               dev, &dev->sampled_images, &view->planes[p].ia, 32,
+               &view->planes[p].input_heap_index);
+            if (result != VK_SUCCESS)
+               return result;
+         }
+      }
+
+      view->planes[p].storage_pbe_valid = pack_pbe(
+         dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage,
+         &view->planes[p].storage_atomic_sw);
+      view->planes[p].eot_pbe_valid =
+         pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].eot,
+                  NULL);
+      view->planes[p].emrt_pbe_valid = pack_pbe(
+         dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
+         &view->planes[p].emrt_atomic_sw);
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+          (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+          view->planes[p].emrt_pbe_valid) {
+         const struct ail_layout *layout =
+            &image->planes[view->planes[p].image_plane].layout;
+         const unsigned level = view->vk.base_mip_level;
+         view->planes[p].emrt_aligned_width =
+            align(u_minify(layout->width_px, level),
+                  layout->tilesize_el[level].width_el);
+         VkResult result = hk_descriptor_table_add(
+            dev, &dev->sampled_images, &view->planes[p].emrt_texture, 32,
+            &view->planes[p].emrt_read_heap_index);
+         if (result != VK_SUCCESS)
+            return result;
+      }
+      view->planes[p].layered_eot_pbe_valid =
+         pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
+                  &view->planes[p].layered_eot, NULL);
    }
 
    return VK_SUCCESS;
@@ -579,6 +799,33 @@ hk_DestroyImageView(VkDevice _device, VkImageView imageView,
 
    if (!view)
       return;
+
+   if (dev->dev.chip == AGX_CHIP_G17P) {
+      for (unsigned p = 0; p < view->plane_count; ++p) {
+         if (view->planes[p].emrt_read_heap_index)
+            hk_descriptor_table_remove(dev, &dev->sampled_images,
+                                        view->planes[p].emrt_read_heap_index);
+         if (view->planes[p].storage_heap_index)
+            hk_descriptor_table_remove(dev, &dev->sampled_images,
+                                        view->planes[p].storage_heap_index);
+         if (view->planes[p].input_heap_index)
+            hk_descriptor_table_remove(dev, &dev->sampled_images,
+                                        view->planes[p].input_heap_index);
+         if (view->planes[p].sampled_heap_index)
+            hk_descriptor_table_remove(dev, &dev->sampled_images,
+                                        view->planes[p].sampled_heap_index);
+         /* The filterable descriptor was reserved in hk_image_view_init but
+          * never released here, leaking one sampled_images entry per view
+          * whose format has a uscaled-normalized equivalent. The table only
+          * grows (doubling to max_alloc, then VK_ERROR_OUT_OF_HOST_MEMORY),
+          * so a long run creating many views eventually cannot create any
+          * more. Keyed on filterable_valid rather than a nonzero index
+          * because index 0 is a valid descriptor index. */
+         if (view->planes[p].filterable_valid)
+            hk_descriptor_table_remove(dev, &dev->sampled_images,
+                                        view->planes[p].filterable_heap_index);
+      }
+   }
 
    vk_image_view_finish(&view->vk);
    vk_free2(&dev->vk.alloc, pAllocator, view);

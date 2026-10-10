@@ -13,6 +13,8 @@
 
 #include "asahi/lib/agx_bo.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
+#include "vk_common_entrypoints.h"
 
 #include <inttypes.h>
 #include <sys/mman.h>
@@ -170,6 +172,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    const VkExportMemoryAllocateInfo *export_info =
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
+   const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
 
    VkExternalMemoryHandleTypeFlagBits handle_types = 0;
@@ -220,15 +225,35 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       }
    }
 
+   if (mem->vk.alloc_flags &
+       VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
+      mem->opaque_capture_address =
+         capture_info && capture_info->opaqueCaptureAddress
+            ? capture_info->opaqueCaptureAddress
+            : mem->bo->va->addr;
+   }
+
    /* Shadow map in case this is used for a sparse resident buffer */
    int ret = agx_bo_bind(&dev->dev, mem->bo,
                          agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
                          mem->bo->size, 0, DRM_ASAHI_BIND_READ);
-   if (ret)
-      return VK_ERROR_UNKNOWN;
+   if (ret) {
+      /* The bind fails once the VM carries a sticky error. */
+      agx_bo_unreference(&dev->dev, mem->bo);
+      mem->bo = NULL;
+      vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);
+
+   uint64_t heap_used = p_atomic_add_return(&heap->used, mem->bo->size);
+   if (heap_used > heap->size) {
+      hk_FreeMemory(device, hk_device_memory_to_handle(mem), pAllocator);
+      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "Out of heap memory");
+   }
 
    if (fd_info && fd_info->handleType) {
       /* From the Vulkan spec:
@@ -238,16 +263,10 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        *    implementation. The application must not perform any operations on
        *    the file descriptor after a successful import."
        *
-       * If the import fails, we leave the file descriptor open.
+       * Only consume it after heap accounting has accepted the allocation;
+       * every failure must leave the caller's file descriptor open.
        */
       close(fd_info->fd);
-   }
-
-   uint64_t heap_used = p_atomic_add_return(&heap->used, mem->bo->size);
-   if (heap_used > heap->size) {
-      hk_FreeMemory(device, hk_device_memory_to_handle(mem), pAllocator);
-      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "Out of heap memory");
    }
 
    *pMem = hk_device_memory_to_handle(mem);
@@ -276,6 +295,11 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_remove_ext_bo(dev, mem->bo);
+
+   /* Freeing a mapped memory object unmaps it. The shared mapping goes with
+    * the BO; an owned one belongs to this object alone. */
+   if (mem->map_owned)
+      agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
 
    agx_bo_unreference(&dev->dev, mem->bo);
 
@@ -330,7 +354,30 @@ hk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
                        "Memory object already mapped.");
    }
 
-   mem->map = agx_bo_map_placed(mem->bo, fixed_addr);
+   /* Bound a placed mapping by the memory object, not the BO: the BO cache
+    * may have handed us one up to twice as large, and the application has
+    * reserved only mem->vk.size at this address.
+    *
+    * An exported allocation and its imports into this device are distinct
+    * memory objects over one agx_bo. Each maps, unmaps, frees and reserves
+    * independently, so each gets a mapping of its own rather than the BO's
+    * shared one, which unmapping any of them would otherwise tear down
+    * under the others. A BO only one memory object can reach keeps the
+    * cached mapping. */
+   if (mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) {
+      mem->map = agx_bo_map_owned(mem->bo, fixed_addr, mem->vk.size,
+                                  &mem->map_size);
+      mem->map_owned = mem->map != NULL;
+   }
+   if (!mem->map_owned)
+      mem->map = agx_bo_map_placed(mem->bo, fixed_addr, mem->vk.size);
+   if (mem->map == NULL) {
+      *ppData = NULL;
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                       "failed to map memory BO handle %u",
+                       mem->bo->uapi_handle);
+   }
+
    assert(!fixed_addr || mem->map == fixed_addr);
    *ppData = mem->map + offset;
 
@@ -346,20 +393,47 @@ hk_UnmapMemory2KHR(VkDevice device,
    if (mem == NULL)
       return VK_SUCCESS;
 
+   if (mem->map_owned) {
+      if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
+         VK_FROM_HANDLE(hk_device, dev, device);
+
+         /* Exactly this object's mapping, as below. */
+         void *err = mmap(mem->map, mem->map_size, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+         if (err == MAP_FAILED) {
+            return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                             "Failed to map over original mapping");
+         }
+      } else {
+         agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
+      }
+      mem->map = NULL;
+      mem->map_size = 0;
+      mem->map_owned = false;
+      return VK_SUCCESS;
+   }
+
    if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
       VK_FROM_HANDLE(hk_device, dev, device);
 
-      void *err = mmap(mem->bo->_map, mem->bo->size, PROT_NONE,
+      /* Reserve exactly what was mapped. A placed map covers the
+       * VkDeviceMemory's allocationSize, not the cached BO's size, and
+       * PROT_NONE'ing the difference lands on address space the application
+       * reserved for itself -- the guard pages dEQP-VK.memory.map_placed.*
+       * fills and reads back. */
+      void *err = mmap(mem->bo->_map, agx_bo_map_size(mem->bo), PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
       if (err == MAP_FAILED) {
          return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
                           "Failed to map over original mapping");
       }
       mem->bo->_map = NULL;
+      mem->bo->_map_size = 0;
    } else {
       if (mem->bo->_map) {
-         munmap(mem->bo->_map, mem->bo->size);
+         munmap(mem->bo->_map, agx_bo_map_size(mem->bo));
          mem->bo->_map = NULL;
+         mem->bo->_map_size = 0;
       }
    }
 
@@ -405,15 +479,18 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
       return VK_SUCCESS;
    default:
       assert(!"unsupported handle type");
-      return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "vkGetMemoryFdKHR: unsupported handle type 0x%x",
+                       pGetFdInfo->handleType);
    }
 }
 
 VKAPI_ATTR uint64_t VKAPI_CALL
 hk_GetDeviceMemoryOpaqueCaptureAddress(
    UNUSED VkDevice device,
-   UNUSED const VkDeviceMemoryOpaqueCaptureAddressInfo *pInfo)
+   const VkDeviceMemoryOpaqueCaptureAddressInfo *pInfo)
 {
-   /* Addresses are replayed at buffer and image creation, not memory. */
-   return 0;
+   VK_FROM_HANDLE(hk_device_memory, memory, pInfo->memory);
+
+   return memory->opaque_capture_address;
 }

@@ -5,12 +5,14 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_descriptor_set_layout.h"
+#include "asahi/lib/agx_abi.h"
 
 #include "hk_descriptor_set.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
+#include "hk_native_descriptor.h"
 
 #include "vk_pipeline_layout.h"
 
@@ -39,14 +41,45 @@ hk_descriptor_stride_align_for_type(
       /* TODO: How do samplers work? */
    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-      *stride = *alignment = sizeof(struct hk_sampled_image_descriptor);
+      *stride = hk_sampled_image_descriptor_layout(
+                   agx_chip_descriptor_generation(pdev->dev.chip)).stride;
+      *alignment = 8;
       break;
 
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      *stride = hk_storage_image_descriptor_layout(
+                   agx_chip_descriptor_generation(pdev->dev.chip)).stride;
+      if (pdev->dev.chip == AGX_CHIP_G17P) {
+         *stride += HK_G17P_STORAGE_SW_SIZE;
+         /* imgwci addresses PBE records in a heap, and stores treat the
+          * descriptor set as that heap. The PBE descriptor starts 32 bytes
+          * into the combined texture/PBE record, so both the binding offset
+          * and every array stride must keep it on a record boundary. Without
+          * this, an SSBO followed by a storage image places the PBE at +48
+          * and stores silently target the wrong block. */
+         *alignment = HK_G17P_STORAGE_ALIGNMENT;
+         *stride = HK_G17P_STORAGE_STRIDE;
+      } else {
+         *alignment = 8;
+      }
+      break;
+
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-      *stride = sizeof(struct hk_storage_image_descriptor);
-      *alignment = 8;
+      *stride = hk_storage_image_descriptor_layout(
+                   agx_chip_descriptor_generation(pdev->dev.chip)).stride;
+      /* Native texture/PBE records occupy 64 bytes, followed by the two
+       * heap indices and 24 bytes of buffer size/offset/address metadata.
+       * The shader must never decode AGX2 software fields from Gen9 bytes.
+       */
+      if (pdev->dev.chip == AGX_CHIP_G17P) {
+         *stride = AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE;
+         /* Texel-buffer stores address the PBE through the set's PBE heap,
+          * like storage images. */
+         *alignment = HK_G17P_STORAGE_ALIGNMENT;
+      } else {
+         *alignment = 8;
+      }
       break;
 
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
@@ -59,6 +92,13 @@ hk_descriptor_stride_align_for_type(
       *stride = *alignment = 0; /* These don't take up buffer space */
       break;
 
+   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+      /* An acceleration structure descriptor is nothing but the address of
+       * its BVH: the traversal walks it with plain global loads, so there is
+       * no hardware descriptor and no bounds information to carry. */
+      *stride = *alignment = sizeof(uint64_t);
+      break;
+
    case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
       *stride = 1; /* Array size is bytes */
       *alignment = HK_MIN_UBO_ALIGNMENT;
@@ -66,8 +106,12 @@ hk_descriptor_stride_align_for_type(
 
    case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
       *stride = *alignment = 0;
-      if (type_list == NULL)
-         *stride = *alignment = HK_MAX_DESCRIPTOR_SIZE;
+      if (type_list == NULL || type_list->descriptorTypeCount == 0) {
+         *stride = HK_MAX_DESCRIPTOR_SIZE;
+         *alignment = pdev->dev.chip == AGX_CHIP_G17P
+                         ? HK_G17P_STORAGE_ALIGNMENT
+                         : 8;
+      }
       for (unsigned i = 0; type_list && i < type_list->descriptorTypeCount;
            i++) {
          /* This shouldn't recurse */
@@ -145,6 +189,9 @@ hk_CreateDescriptorSetLayout(VkDevice device,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    layout->binding_count = num_bindings;
+   layout->descriptor_generation =
+      agx_chip_descriptor_generation(pdev->dev.chip);
+   layout->native_sampler_indices = pdev->dev.chip == AGX_CHIP_G17P;
 
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];
@@ -259,37 +306,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
    layout->non_variable_descriptor_buffer_size = buffer_size;
    layout->vk.dynamic_descriptor_count = dynamic_buffer_count;
 
-   struct mesa_blake3 blake3_ctx;
-   _mesa_blake3_init(&blake3_ctx);
-
-#define BLAKE3_UPDATE_VALUE(x)                                                 \
-   _mesa_blake3_update(&blake3_ctx, &(x), sizeof(x));
-   BLAKE3_UPDATE_VALUE(layout->non_variable_descriptor_buffer_size);
-   BLAKE3_UPDATE_VALUE(layout->vk.dynamic_descriptor_count);
-   BLAKE3_UPDATE_VALUE(layout->binding_count);
-
-   for (uint32_t b = 0; b < num_bindings; b++) {
-      BLAKE3_UPDATE_VALUE(layout->binding[b].type);
-      BLAKE3_UPDATE_VALUE(layout->binding[b].flags);
-      BLAKE3_UPDATE_VALUE(layout->binding[b].array_size);
-      BLAKE3_UPDATE_VALUE(layout->binding[b].offset);
-      BLAKE3_UPDATE_VALUE(layout->binding[b].stride);
-      BLAKE3_UPDATE_VALUE(layout->binding[b].dynamic_buffer_index);
-
-      if (layout->binding[b].immutable_samplers != NULL) {
-         for (uint32_t i = 0; i < layout->binding[b].array_size; i++) {
-            const struct hk_sampler *sampler =
-               layout->binding[b].immutable_samplers[i];
-
-            /* We zalloc the object, so it's safe to hash the whole thing */
-            if (sampler != NULL && sampler->vk.ycbcr_conversion != NULL)
-               BLAKE3_UPDATE_VALUE(sampler->vk.ycbcr_conversion->state);
-         }
-      }
-   }
-#undef BLAKE3_UPDATE_VALUE
-
-   _mesa_blake3_final(&blake3_ctx, layout->vk.blake3);
+   hk_descriptor_set_layout_hash(layout);
 
    *pSetLayout = hk_descriptor_set_layout_to_handle(layout);
 

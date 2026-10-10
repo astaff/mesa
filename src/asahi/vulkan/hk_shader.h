@@ -8,6 +8,7 @@
 #pragma once
 
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/compiler/agx_nir.h"
 #include "poly/nir/poly_nir.h"
 #include "util/macros.h"
 #include "agx_linker.h"
@@ -15,11 +16,14 @@
 #include "agx_pack.h"
 #include "agx_usc.h"
 #include "agx_uvs.h"
+#include "agx_vdm_state_update_core.h"
 
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_private.h"
 
+#include "nir_xfb_info.h"
+#include "nir.h"
 #include "shader_enums.h"
 #include "vk_pipeline_cache.h"
 
@@ -81,7 +85,14 @@ struct hk_shader_info {
          bool early_fragment_tests;
          bool writes_memory;
 
-         uint8_t _pad[7];
+         /* Rasterization samples the G17P coverage updates are compiled for */
+         uint8_t g17p_samples;
+
+         /* AGX_G17P_UNIT_RANGE_BLEND: every colour output is provably in
+          * [0, 1] (computed only with the flag set). */
+         bool g17p_colour_unit_range;
+
+         uint8_t _pad[5];
       } fs;
 
       struct {
@@ -109,11 +120,41 @@ struct hk_shader_info {
    uint8_t cull_distance_array_size;
    uint8_t set_count;
 
+   /* Positive proof recorded before inserting the default Layer output.
+    * Only original vertex hardware variants qualify.  False is unknown.
+    * Serialized with shader binary version 26 or newer.
+    */
+   bool g17p_default_layer_zero;
+
+   /* The bounded G17P graphics/compute path lowers one Gen9 combined
+    * image/sampler to native texture/sampler state 0. Command recording joins
+    * the bound descriptor set and native sampler heap into those CProg slots.
+    */
+   bool agx3_combined_sampler_valid;
+   bool agx3_uses_root;
+   /* Actual uniform address selected after stage and resource lowering. */
+   unsigned agx3_root_uniform;
+   bool agx3_txf_texture_valid;
+   bool agx3_storage_image_valid;
+   bool agx3_sampled_storage_valid;
+   bool agx3_indexed_sampler_valid;
+   bool agx3_indexed_storage_valid;
+   struct agx_g17p_combined_sampler_binding agx3_combined_sampler;
+   struct agx_g17p_txf_binding agx3_txf_texture;
+   struct agx_g17p_storage_image_binding agx3_storage_image;
+   struct agx_g17p_sampled_storage_binding agx3_sampled_storage;
+   struct agx_g17p_indexed_storage_binding agx3_indexed_storage;
+
    /* XXX: is there a less goofy way to do this? I really don't want dynamic
     * allocation here.
+    *
+    * nir_gather_xfb_info() emits at most one output per component of a
+    * captured slot, and vertex-pipeline outputs occupy the slots below
+    * VARYING_SLOT_VAR31 + 1. Sixty-four entries overflowed into the next
+    * variant (a CTS vertex shader captures 94 outputs).
     */
    nir_xfb_info xfb_info;
-   nir_xfb_output_info xfb_outputs[64];
+   nir_xfb_output_info xfb_outputs[4 * (VARYING_SLOT_VAR31 + 1)];
 };
 
 /*
@@ -138,6 +179,11 @@ struct hk_shader {
    struct agx_fragment_face_2_packed frag_face;
    struct agx_counts_packed counts;
 
+   /* Native AGX3 VertexProgramVariant state.  G17P hardware vertex shaders
+    * with position and up to two ordinary varying slots populate the exact
+    * no-preamble fields; other AGX3 layouts remain zero. */
+   struct agx_vdm_state_update_program_info agx3_vdm_state_update;
+
    const void *code_ptr;
    uint32_t code_size;
 
@@ -145,13 +191,25 @@ struct hk_shader {
    uint32_t data_size;
 
    /* BO for any uploaded shader part */
+   /* Code heap chunk holding the binary, at bo_offset. */
    struct agx_bo *bo;
+   uint32_t bo_offset;
 
    /* Cache of fast linked variants */
    struct {
       simple_mtx_t lock;
       struct hash_table *ht;
+      bool lazy_ht;
    } linked;
+
+   /* The variant was compiled (hk_compile_nir) or deserialized from a
+    * compiled variant.  False only for a variant that was never compiled,
+    * e.g. the software vertex variant of a shader without a tessellation or
+    * geometry successor.  A compiled variant may have zero bytes of code: a
+    * G17P fragment shader with no work (an empty main) is all prolog and
+    * epilog, so code_size == 0 does not mean "never compiled".
+    */
+   bool compiled;
 
    /* If there's only a single possibly linked variant, direct pointer. TODO:
     * Union with the cache to save some space?
@@ -165,7 +223,20 @@ struct hk_shader {
 
    /* Address of the start of the shader data section */
    uint64_t data_addr;
+
+   /* The fragment main's NIR (serialized just before its backend compile)
+    * and that compile's key, so fast-link can build one program with the
+    * draw's colour epilog inlined. NULL when the shape is not eligible. */
+   void *g17p_mono_nir;
+   size_t g17p_mono_nir_size;
+   struct agx_shader_key g17p_mono_key;
 };
+
+static inline uint64_t
+hk_shader_code_va(const struct hk_shader *s)
+{
+   return s->bo->va->addr + s->bo_offset;
+}
 
 enum hk_vs_variant {
    /* Hardware vertex shader, when next stage is fragment */
@@ -219,31 +290,121 @@ hk_num_variants(mesa_shader_stage stage)
 }
 
 /*
+ * A G17P hardware vertex program whose UVS layout does not start at component
+ * zero with a four-component position group. The AGX3 packer admits a dense
+ * terminal output run only from five outputs up, a floor every position-
+ * writing shader clears through its four position components alone, so every
+ * shape below needs the sparse component-addressed staging protocol instead.
+ *
+ * `info` is the hardware shader being compiled and `sw_stage` the API stage it
+ * serves; `xfb_outputs` says whether the pipeline records transform feedback.
+ */
+static inline bool
+hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
+                              mesa_shader_stage sw_stage, bool xfb_outputs)
+{
+   if (info->stage != MESA_SHADER_VERTEX)
+      return false;
+
+   return info->has_transform_feedback_varyings || xfb_outputs ||
+          sw_stage == MESA_SHADER_GEOMETRY ||
+          /* A raster-discard TES may write only point size, leaving the
+           * four position components absent just like an XFB raster VS. */
+          sw_stage == MESA_SHADER_TESS_EVAL ||
+          info->next_stage == MESA_SHADER_GEOMETRY ||
+          /* The hardware variant of a control-point vertex shader is never
+           * bound -- the software variant runs in compute -- but it is still
+           * compiled, and its UVS layout is as sparse as the geometry case
+           * above. Without this the AGX3 packer refuses it at st_vary #4 and
+           * takes every G17P tessellation pipeline with it. */
+          info->next_stage == MESA_SHADER_TESS_CTRL ||
+          /* A vertex shader may legally write no gl_Position at all. The
+           * four-entry UVS position group stays reserved, so its user
+           * varyings are a dense run based at AGX3_UVS_POSITION_ENTRIES --
+           * the same shape as the XFB and geometry cases -- but there are
+           * fewer than five of them, so the dense-run admission refuses the
+           * store at st_vary #4. That is the whole
+           * dEQP-VK.pipeline.*.no_position.basic.*.v0* family. */
+          !(info->outputs_written & VARYING_BIT_POS);
+}
+
+/*
  * An hk_api shader maps 1:1 to a VkShader object. An hk_api_shader may contain
  * multiple hardware hk_shader's, built at shader compile time. This complexity
- * is required to efficiently implement the legacy geometry pipeline.
+ * implements the legacy geometry pipeline and native sample-count variants.
  */
 struct hk_api_shader {
    struct vk_shader vk;
 
+   /* Non-NULL only for a fresh API wrapper borrowing immutable deserialized
+    * code/data from the device's bounded binary cache. */
+   struct hk_shader_binary_cache_entry *binary_cache_entry;
+
    /* Is this an internal passthrough geometry shader? */
    bool is_passthrough;
+
+   /* Dynamic G17P sample-rate/coverage shaders have native 1x/2x/4x binaries. */
+   bool g17p_sample_variants;
+
+   /* The one-sample binary compiles with the shader; the multisample ones
+    * compile from this source on first use (hk_fs_build_sample_variant). */
+   struct hk_fs_sample_source *sample_source;
+
+   /* Non-NULL for a shader compiled without custom-border emulation because
+    * the device had created no sampler that needs it: what its emulating
+    * twin compiles from, and the twin once built (hk_border_twin). */
+   struct hk_border_source *border_source;
+
+   /* Compiled with a custom-border emulation that a device without a sampler
+    * needing it would have left out (serialized; such a binary is refused
+    * there, so a cache never hands it out unneeded). */
+   bool border_emulating;
 
    struct hk_shader variants[];
 };
 
+/* The custom-border-emulating twin of a shader with a border source, built
+ * on first use. Thread-safe; NULL if it cannot be built. */
+struct hk_api_shader *hk_border_twin(struct hk_device *dev,
+                                     struct hk_api_shader *obj);
+
+/* Make the `samples` variant of a dynamic-sample-count G17P fragment shader
+ * available to hk_fs_variant(). Thread-safe; a no-op for other shaders. */
+VkResult hk_fs_build_sample_variant(struct hk_device *dev,
+                                    struct hk_api_shader *obj,
+                                    unsigned samples);
+
+void hk_shader_binary_cache_finish(struct hk_device *dev);
+bool hk_shader_ensure_link_ht_locked(struct hk_shader *shader);
+
+static inline unsigned
+hk_api_num_variants(const struct hk_api_shader *obj)
+{
+   return obj->g17p_sample_variants ? 3 : hk_num_variants(obj->vk.stage);
+}
+
+static inline size_t
+hk_api_shader_size(mesa_shader_stage stage, bool samples)
+{
+   unsigned count = samples ? 3 : hk_num_variants(stage);
+   return sizeof(struct hk_api_shader) + count * sizeof(struct hk_shader);
+}
+
 #define hk_foreach_variant(api_shader, var)                                    \
    for (struct hk_shader *var = api_shader->variants;                          \
-        var < api_shader->variants + hk_num_variants(api_shader->vk.stage);    \
+        var < api_shader->variants + hk_api_num_variants(api_shader);          \
         ++var)
 
 static const char *
 hk_variant_name(struct hk_api_shader *obj, struct hk_shader *variant)
 {
    unsigned i = variant - obj->variants;
-   assert(i < hk_num_variants(obj->vk.stage));
+   assert(i < hk_api_num_variants(obj));
 
-   if (hk_num_variants(obj->vk.stage) == 1) {
+   if (obj->g17p_sample_variants) {
+      static const char *names[] = {"1 sample", "2 samples", "4 samples"};
+      return names[i];
+   } else if (hk_api_num_variants(obj) == 1) {
       return NULL;
    } else if (obj->vk.stage == MESA_SHADER_GEOMETRY) {
       assert(i < ARRAY_SIZE(hk_gs_variant_name));
@@ -260,7 +421,7 @@ hk_only_variant(struct hk_api_shader *obj)
    if (!obj)
       return NULL;
 
-   assert(hk_num_variants(obj->vk.stage) == 1);
+   assert(hk_api_num_variants(obj) == 1);
    return &obj->variants[0];
 }
 
@@ -271,6 +432,28 @@ hk_any_variant(struct hk_api_shader *obj)
       return NULL;
 
    return &obj->variants[0];
+}
+
+/* Link a complete pipeline's fragment shader for the state the pipeline
+ * fixes, so its first draw finds the linked program. */
+void hk_prelink_pipeline_fragment(struct hk_device *dev,
+                                  struct hk_api_shader *vs,
+                                  struct hk_api_shader *fs,
+                                  const struct vk_graphics_pipeline_state *state);
+
+static inline struct hk_shader *
+hk_fs_variant(struct hk_api_shader *obj, unsigned samples)
+{
+   if (!obj)
+      return NULL;
+
+   assert(obj->vk.stage == MESA_SHADER_FRAGMENT);
+   if (obj->g17p_sample_variants)
+      assert(samples == 0 || samples == 1 || samples == 2 || samples == 4);
+   if (!obj->g17p_sample_variants)
+      return hk_only_variant(obj);
+
+   return &obj->variants[samples > 1 ? util_logbase2(samples) : 0];
 }
 
 static struct hk_shader *
@@ -299,10 +482,35 @@ hk_pre_gs_variant(struct hk_api_shader *obj)
 struct hk_linked_shader {
    struct agx_linked_shader b;
 
+   /* Immutable G17P compute-program templates keyed by uniform-range shape.
+    * Entries are published lock-free while command buffers record in
+    * parallel and are released with this linked executable. */
+   void *g17p_compute_templates;
+
+   /* G17P stage programs of this executable, one per uniform-range layout,
+    * patched with each draw's range addresses (struct hk_g17p_gfx_loader). */
+   void *g17p_gfx_loaders;
+
    /* True if the VS prolog uses software indexing, either for geom/tess or
     * adjacency primitives.
     */
    bool sw_indexing;
+
+   /* True when sw_indexing is set purely because the topology carries
+    * adjacency, i.e. the bound program is still the hardware vertex shader
+    * and only fetches its own indices. The geometry/tessellation case, where
+    * the software vertex shader runs as a compute kernel, is a different
+    * shape and keeps sw_indexing with this clear. */
+   bool sw_indexing_hw_vs;
+
+   /* Absolute uniform-half base selected by the fragment epilog key for its
+    * dynamic blend constants. Zero means the standard half4 ABI. */
+   uint16_t g17p_blend_constant_base;
+   uint16_t g17p_emrt_heap_base;
+
+   /* The pipeline-statistics fragment prolog loads its counter address from
+    * the descriptor root even when the application fragment shader does not. */
+   bool g17p_prolog_uses_root;
 
    /* Distinct from hk_shader::counts due to addition of cf_binding_count, which
     * is delayed since it depends on cull distance.
@@ -316,6 +524,15 @@ struct hk_linked_shader {
    } usc;
 };
 
+/* `main_part`, when non-NULL, replaces main->b as the linked main part
+ * (the inline-blend monolithic fragment program); main still supplies the
+ * API shader's uniform and resource layout. */
+struct hk_linked_shader *hk_fast_link_part(struct hk_device *dev, bool fragment,
+                                           struct hk_shader *main,
+                                           struct agx_shader_part *main_part,
+                                           struct agx_shader_part *prolog,
+                                           struct agx_shader_part *epilog,
+                                           unsigned nr_samples_shaded);
 struct hk_linked_shader *hk_fast_link(struct hk_device *dev, bool fragment,
                                       struct hk_shader *main,
                                       struct agx_shader_part *prolog,
@@ -327,9 +544,45 @@ extern const struct vk_device_shader_ops hk_device_shader_ops;
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev);
 
-static inline nir_address_format
-hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
+/* The bounded native CProg shape both graphics stages admit: imported
+ * uniform inputs stored in, and exactly filling, the preamble's TPS frame,
+ * with a known staging footprint. */
+static inline bool
+hk_g17p_native_cprog_qualified(const struct agx_shader_info *info)
 {
+   return info->has_preamble && info->preamble_size &&
+          info->agx3_preamble_staging_known && info->nr_preamble_gprs &&
+          info->nr_preamble_gprs <= 256 &&
+          (info->preamble_scratch_size ==
+              info->agx3_preamble_inputs.storage_bytes ||
+           agx3_cprog_static_spill_info_valid(info)) &&
+          (!!info->agx3_preamble_inputs.count ==
+           info->agx3_preamble_tps_inputs);
+}
+
+/* A null uniform buffer is based at the zero page, which spans
+ * maxUniformBufferRange, so null descriptors need no bounds when uniform
+ * buffer robustness is disabled. Null storage buffers still need them to
+ * discard stores. */
+static inline nir_address_format
+hk_ubo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
+{
+   return robustness == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
+             ? nir_address_format_64bit_global_32bit_offset
+             : nir_address_format_64bit_bounded_global;
+}
+
+static inline nir_address_format
+hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness,
+                      bool null_descriptor)
+{
+   /* A null buffer descriptor has a zero range.  Preserve that range through
+    * explicit-I/O lowering even when ordinary robustness is disabled so null
+    * loads return zero and null stores are discarded before touching the
+    * read-only zero page. */
+   if (null_descriptor)
+      return nir_address_format_64bit_bounded_global;
+
    switch (robustness) {
    case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT:
       return nir_address_format_64bit_global_32bit_offset;
@@ -342,13 +595,15 @@ hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
 }
 
 bool hk_lower_uvs_index(nir_shader *s, mesa_shader_stage sw_stage,
-                        unsigned nr_vbos);
+                        unsigned nr_vbos, unsigned uniform_base);
 
 bool
 hk_nir_lower_descriptors(nir_shader *nir,
                          const struct vk_pipeline_robustness_state *rs,
                          uint32_t set_layout_count,
-                         struct vk_descriptor_set_layout *const *set_layouts);
+                         struct vk_descriptor_set_layout *const *set_layouts,
+                         bool sparse_buffer_residency,
+                         uint64_t sparse_ro_offset, bool scaled_sampling);
 
 VkResult hk_compile_shader(struct hk_device *dev,
                            struct vk_shader_compile_info *info,
@@ -371,3 +626,7 @@ hk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
 struct hk_api_shader *hk_meta_shader(struct hk_device *dev,
                                      hk_internal_builder_t builder, void *data,
                                      size_t data_size);
+struct spirv_to_nir_options
+hk_get_spirv_options(struct vk_physical_device *vk_pdev,
+                     UNUSED mesa_shader_stage stage,
+                     const struct vk_pipeline_robustness_state *rs);

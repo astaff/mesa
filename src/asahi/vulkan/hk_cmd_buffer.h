@@ -20,13 +20,29 @@
 #include "pool.h"
 #include "shader_enums.h"
 
+#include "asahi/compiler/agx3_ioto_uniform_program.h"
+#include "hk_agx3_ioto_program_core.h"
+#include "asahi/genxml/agx3_cmdstream.h"
+#include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx_ppp_hal200_graphics_core.h"
+#include "asahi/lib/agx_ppp_viewport_payload_core.h"
+#include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
+#include "asahi/lib/agx_va_runtime_hole.h"
+
 #include "hk_private.h"
+#include "hk_conditional_render_core.h"
 #include "hk_shader.h"
+#include "hk_sync.h"
 
 #include "hk_cmd_pool.h"
+#include "hk_cs_root_size.h"
 #include "hk_descriptor_set.h"
+#include "hk_drm_render_core.h"
+#include "hk_ioto_arena_core.h"
+#include "hk_pipeline_statistics_core.h"
 
 #include "asahi/lib/agx_nir_lower_vbo.h"
+#include "util/hash_table.h"
 #include "util/u_dynarray.h"
 #include "vulkan/vulkan_core.h"
 
@@ -39,10 +55,59 @@ struct hk_cmd_bo;
 struct hk_cmd_pool;
 struct hk_image_view;
 struct hk_push_descriptor_set;
+struct hk_ray_tracing_pipeline;
+struct hk_api_shader;
 struct hk_shader;
 struct hk_linked_shader;
 struct agx_usc_builder;
 struct vk_shader;
+
+/* A complete but unpublished HAL200 state update.  The referenced VDM state
+ * is command-buffer-owned.  The scissor/depth records stay inline until the
+ * draw chooses its live stream, so preparation cannot perturb stream-local
+ * indices or make firmware-visible bytes reachable early. */
+struct hk_g17p_prepared_bind_tail {
+   struct agx_vdm_hal200_bind_tail tail;
+   uint8_t scissors[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS]
+                   [AGX_SCISSOR_LENGTH];
+   uint8_t depth_bias[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS]
+                    [AGX_DEPTH_BIAS_LENGTH];
+   uint64_t dynamic_generation;
+   uint64_t descriptor_generation;
+   uint64_t vertex_buffer_generation;
+   uint64_t root;
+   /* The fragment shader variant the tail launches and the uniform-DMA set
+    * base its program was built with (hk_g17p_dma_set_base()). */
+   const struct hk_shader *fragment_shader;
+   uint64_t fragment_dma_set_base;
+   struct hk_image_view *render_color0;
+   struct hk_image_view *render_depth;
+   struct hk_image_view *render_stencil;
+   VkRect2D render_area;
+   VkFormat render_depth_format;
+   uint32_t render_width;
+   uint32_t render_height;
+   uint32_t render_layer_count;
+   uint32_t render_view_mask;
+   uint8_t render_color_count;
+   uint8_t render_samples;
+   struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
+   struct hk_linked_shader *linked_vs;
+   struct hk_linked_shader *linked_fs;
+   uint64_t varyings;
+   uint32_t varying_counts_32;
+   uint32_t varying_counts_16;
+   uint32_t occlusion_index;
+   uint8_t topology;
+   uint8_t object_type;
+   uint8_t provoking;
+   uint8_t occlusion_mode;
+   uint8_t viewport_count;
+   bool generate_primitive_id;
+   bool force_never_in_shader;
+   bool in_meta;
+   bool valid;
+};
 
 /** Root descriptor table. */
 struct hk_root_descriptor_table {
@@ -59,8 +124,12 @@ struct hk_root_descriptor_table {
          uint32_t view_index;
          uint32_t ppp_multisamplectl;
 
-         /* Vertex input state */
-         uint64_t attrib_base[AGX_MAX_VBUFS];
+         /* Vertex input state, indexed by compacted attribute slot. The
+          * bases live at the end of this arm (attrib_base below): the clamp
+          * and stride tables at 32 entries exactly fill the 256 bytes the
+          * three 16-entry tables used to, which keeps every later field --
+          * notably the pinned pipeline_stats offsets -- where it was.
+          */
          uint32_t attrib_clamps[AGX_MAX_VBUFS];
          uint32_t attrib_strides[AGX_MAX_VBUFS];
 
@@ -100,14 +169,61 @@ struct hk_root_descriptor_table {
          uint16_t rasterization_stream;
          uint16_t _pad6;
 
+         /* Alpha-to-coverage enable for fragment shaders that write the
+          * sample mask; they apply it before their own coverage update.
+          * Sysval fields must sit at 4-byte offsets (root table loads). */
+         uint16_t alpha_to_coverage;
+         uint16_t _pad7;
+
          /* Mapping from varying slots written by the last vertex stage to UVS
           * indices. This mapping must be compatible with the fragment shader.
           */
          uint8_t uvs_index[VARYING_SLOT_MAX];
+
+         /* GPU addresses of the immutable NIR constant-data blobs of the
+          * bound vertex and fragment shaders, or zero if they have none. */
+         uint64_t vs_constant_data_addr;
+         uint64_t fs_constant_data_addr;
+
+         /* Vertex attribute base addresses, indexed by compacted slot. */
+         uint64_t attrib_base[AGX_MAX_VBUFS];
       } draw;
       struct {
+         /* GPU address of the immutable NIR constant-data blob for the
+          * currently bound compute shader. */
+         uint64_t constant_data_addr;
          uint64_t group_count_addr;
          uint32_t base_group[3];
+
+         /* Native G17P indirect dispatch only.  The grid helper reads the
+          * threadgroup counts at group_count_addr, multiplies them by
+          * grid_helper_local_size, and publishes the six-u32 launch geometry
+          * at grid_helper_geometry_addr for the main record to consume.  For
+          * an indirect-local grid, group_count_addr instead holds a launch
+          * geometry, which the geometry copy helper publishes as it is.  Both
+          * are zero for every direct dispatch and for every other chip. */
+         uint64_t grid_helper_geometry_addr;
+
+         /* Native G17P indirect dispatch whose argument buffer is a sparse
+          * residency buffer: the base of that buffer's residency bitmap (a
+          * struct hk_sparse_buffer_map_header followed by one bit per page),
+          * and zero otherwise.  When it is set, group_count_addr names the
+          * PRIMARY mapping rather than the read-only shadow, and the grid
+          * helper reads the bitmap to decide whether the arguments are
+          * resident, publishing a zero grid when they are not.  See
+          * hk_CmdDispatchIndirect() for why the shadow cannot be read
+          * directly here. */
+         uint64_t grid_helper_sparse_map_addr;
+
+         uint32_t grid_helper_local_size[3];
+         uint32_t _pad_grid_helper;
+
+         /* VK_KHR_ray_tracing_pipeline: device address of the
+          * VkTraceRaysIndirectCommand2KHR record the megakernel reads its
+          * shader binding tables and launch size from.  Zero for every
+          * ordinary compute dispatch; the ray-tracing megakernel is the only
+          * shader that loads it. */
+         uint64_t trace_rays_addr;
       } cs;
    };
 
@@ -119,7 +235,18 @@ struct hk_root_descriptor_table {
 
    /* Start index in dynamic_buffers where each set starts */
    uint8_t set_dynamic_buffer_start[HK_MAX_SETS];
+
+   /* Process-local on G17P; loaded through the root instead of cached code. */
+   uint64_t printf_buffer_address;
 };
+
+/* The graphics arm is the larger of the two, so everything after the union --
+ * push constants, dynamic buffers, the printf address -- keeps its offset when
+ * a compute field is added. Growing the compute arm past it would move all of
+ * them at once, which no single change should do silently. */
+static_assert(sizeof(((struct hk_root_descriptor_table *)0)->cs) <=
+                 sizeof(((struct hk_root_descriptor_table *)0)->draw),
+              "compute root fields must not grow the root descriptor table");
 
 /* helper macro for computing root descriptor byte offsets */
 #define hk_root_descriptor_offset(member)                                      \
@@ -127,7 +254,12 @@ struct hk_root_descriptor_table {
 
 struct hk_descriptor_state {
    bool root_dirty;
+   uint64_t generation;
    struct hk_root_descriptor_table root;
+
+   /* One past the highest root.dynamic_buffers entry any bind wrote. Later
+    * entries are unread by every bound layout and stay out of uploads. */
+   uint8_t dynamic_buffer_end;
 
    uint32_t set_sizes[HK_MAX_SETS];
    struct hk_descriptor_set *sets[HK_MAX_SETS];
@@ -135,6 +267,7 @@ struct hk_descriptor_state {
 
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
    uint32_t push_dirty;
+   uint32_t push_active;
 };
 
 struct hk_attachment {
@@ -152,7 +285,31 @@ struct hk_attachment {
 
 struct hk_bg_eot {
    uint64_t usc;
-   struct agx_counts_packed counts;
+   union {
+      struct agx_counts_packed counts;
+      uint64_t rsrc_spec;
+   };
+};
+
+/* BG/EOT programs are self-addressed and may reference command-buffer pool
+ * uploads, so reuse them only inside the command buffer which owns both. One
+ * exact render-pass key owns its main/partial BG/EOT variants; hash collisions
+ * remain harmless misses. */
+#define HK_G17P_BG_EOT_CACHE_ENTRIES 16
+#define HK_G17P_BG_EOT_CACHE_KEY_MAX 768
+struct hk_g17p_bg_eot_dev_entry;
+
+struct hk_g17p_bg_eot_cache_entry {
+   uint8_t key[HK_G17P_BG_EOT_CACHE_KEY_MAX];
+   struct hk_bg_eot program[4];
+   /* frg-codegen v4: the device-lifetime entry this pass fills or reuses,
+    * or NULL. */
+   struct hk_g17p_bg_eot_dev_entry *dev_entry;
+   uint64_t hash;
+   uint16_t key_size;
+   uint8_t valid_variants;
+   uint8_t direct_color_resolve_variants;
+   bool valid;
 };
 
 struct hk_render_registers {
@@ -194,6 +351,14 @@ struct hk_rendering_state {
    uint32_t layer_count;
    uint32_t view_mask;
 
+   /* The main G17P EOT writes the single-sample resolve target directly. */
+   bool g17p_direct_color_resolve;
+
+   /* Exact admission result for the current physical tilebuffer layout.
+    * The layout is immutable after BeginRendering except for the one
+    * attachmentless late-sample transition, which refreshes this value. */
+   bool g17p_rt0_layout_supported;
+
    uint32_t color_att_count;
    struct hk_attachment color_att[HK_MAX_RTS];
    struct hk_attachment depth_att;
@@ -201,6 +366,22 @@ struct hk_rendering_state {
 
    struct agx_tilebuffer_layout tilebuffer;
    struct hk_render_registers cr;
+
+   /* G17P precise depth store: the ZLS words for the
+    * stream that ends the pass, when it is also the first stream (only) or
+    * a later one (last). Depth honours storeOp there; stencil keeps the
+    * forced store. zls_first_cs is the stream BeginRendering created. */
+   bool zls_precise;
+   struct agx_zls_control_packed zls_control_only, zls_control_last;
+   const void *zls_first_cs;
+
+   /* Preserve untouched NONE/NONE attachments, and (HK_G17P_ZLS_ELIDE_
+    * UNTOUCHED, default on) LOAD/STORE ones. The pass may drop its
+    * depth/stencil attachment from every control stream when no draw or
+    * clear in it tests, writes, bounds-tests or clears depth/stencil (see
+    * hk_g17p_zls_elide()). */
+   bool g17p_zls_elide_ok;
+   bool g17p_depth_touched;
 };
 
 struct hk_index_buffer_state {
@@ -218,18 +399,163 @@ enum hk_dirty {
    HK_DIRTY_VARYINGS = BITFIELD_BIT(3),
 };
 
+/* Where a G17P graphics uniform range's source address comes from. */
+enum hk_g17p_range_source {
+   /* Fixed for the shader and device (heap pointers, promoted constants). */
+   HK_G17P_RANGE_SOURCE_CONSTANT = 0,
+   /* The graphics root plus a fixed offset. */
+   HK_G17P_RANGE_SOURCE_ROOT = 1,
+   HK_G17P_RANGE_SOURCE_DRAW_PARAMS = 2,
+   HK_G17P_RANGE_SOURCE_DRAW_ID = 3,
+   /* A bound descriptor set's address plus a fixed offset, or the zero page
+    * when the set is not bound (uniform DMA spans). */
+   HK_G17P_RANGE_SOURCE_SET = 4,
+   /* A whole uniform DMA buffer span: the buffer whose descriptor the root
+    * (dynamic buffers) or a static descriptor set holds at a fixed byte, plus
+    * a fixed offset, while that buffer covers the span. */
+   HK_G17P_RANGE_SOURCE_BUFFER = 5,
+   /* Uploaded while collecting the ranges (combined-sampler pointers,
+    * spilled render-target descriptors), or a buffer span the buffer does
+    * not wholly cover: not re-derivable. */
+   HK_G17P_RANGE_SOURCE_UPLOADED,
+};
+
+struct hk_g17p_gfx_loader;
+
+/* How a stage's uniform ranges derive from the draw state, recorded from a
+ * collection by hk_g17p_graphics_uniform_ranges(), and the loader they were
+ * published with. A draw with the same shader, linked executable, imageblock,
+ * range-selecting state (hk_g17p_launch_flags()) and, for a fragment shader,
+ * admission inputs derives its ranges from it. Every BO the loader names was
+ * retained when it was recorded. */
+#define HK_G17P_LAUNCH_SLOTS 8
+#define HK_G17P_LAUNCH_ROOT_SET 0xff
+
+struct hk_g17p_launch {
+   const struct hk_shader *s;
+   const struct hk_linked_shader *linked;
+   const struct hk_g17p_gfx_loader *loader;
+   const struct hk_shader *hw_vs;
+   uint16_t tile_size_px;
+   uint8_t sample_size_B;
+   uint8_t nr_samples;
+   uint8_t topology;
+   uint8_t provoking;
+   uint8_t flags;
+   uint8_t count;
+   bool valid;
+   uint8_t source[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   /* Descriptor set of a SET or BUFFER range; HK_G17P_LAUNCH_ROOT_SET for a
+    * BUFFER range whose descriptor is in the root. */
+   uint8_t set[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint16_t start_halfs[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint16_t size_halfs[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   /* Byte of a BUFFER range's descriptor in its root or set. */
+   uint16_t descriptor_B[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   /* Root/set/buffer offset, or the address of a constant range. */
+   uint64_t offset[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+};
+
+struct hk_g17p_graphics_ioto_cache_entry {
+   /* The loader of the last draw, the program published from it and the
+    * range addresses written into it (hk_g17p_publish_gfx_loader()). */
+   const struct hk_g17p_gfx_loader *loader;
+   const struct hk_linked_shader *loader_linked;
+   uint64_t loader_program;
+   struct agx3_ioto_uniform_range
+      loader_ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+
+   /* Inputs of the last admitted program (hk_upload_usc_words_internal()). */
+   struct {
+      const struct hk_shader *s;
+      const struct hk_linked_shader *linked;
+      const struct hk_shader *hw_vs;
+      bool spills;
+      uint8_t topology;
+      uint8_t provoking;
+   } admit;
+};
+
+/* The inputs of a G17P VertexProgramVariant state update other than the
+ * pipeline address (hk_agx3_publish_vertex_state()). */
+struct hk_g17p_vdm_update_key {
+   const struct hk_shader *hw_vs;
+   uint32_t selector;
+   uint8_t draw_path;
+   uint8_t provoking;
+   bool rasterization_enabled;
+   bool primitive_id;
+   bool ordinary;
+   bool selector_valid;
+};
+
 struct hk_graphics_state {
    struct hk_rendering_state render;
    struct hk_descriptor_state descriptors;
 
    enum hk_dirty dirty;
+   /* CmdBindVertexBuffers is not vk_dynamic_graphics_state and therefore does
+    * not advance its generation.  Prepared G17P roots snapshot this separate
+    * identity so a post-BeginRendering bind cannot publish stale attrib VAs. */
+   uint64_t vertex_buffer_generation;
+   /* The vertex_buffer_generation that descriptors.root.draw.attrib_* were
+    * last derived from (hk_flush_dynamic_state_slow()'s vertex-buffer
+    * block).  A prepared bind tail records this, not the live generation:
+    * a tail rebuilt outside a full flush (vkCmdBindIndexBuffer) must not
+    * vouch for a root whose attrib VAs predate the latest vertex binding. */
+   uint64_t root_vertex_buffer_generation;
 
    uint64_t root;
    uint64_t draw_params;
    uint64_t draw_id_ptr;
+   uint32_t g17p_draw_params_value[2];
+   uint32_t g17p_draw_id_value;
+   bool g17p_draw_params_host_valid;
+   bool g17p_draw_id_host_valid;
+
+   struct hk_g17p_prepared_bind_tail g17p_bind_tail;
+   /* The last complete build of g17p_bind_tail, whose other fields still
+    * describe its inputs. A rebuild whose only changed inputs are the root,
+    * descriptor or vertex-buffer identity (a descriptor push or vertex-buffer
+    * bind) reads exactly the same state for every record except the fragment
+    * record's stage program, which is recomputed from fs_fields; see
+    * hk_g17p_build_native_bind_tail(). */
+   struct {
+      struct agx_ppp_hal200_fragment_fields fs_fields;
+      /* The state block of the last build or memo rebuild: CPU copy, its
+       * compact address and size. */
+      const uint8_t *state_cpu;
+      uint32_t state_compact;
+      uint32_t state_size;
+      const struct hk_shader *fs;
+      const struct hk_shader *hw_vs;
+      bool valid;
+   } g17p_bind_tail_memo;
+
+   /* Per vertex-attribute slot: the last API format seen and the pipe format
+    * and interchange block size hk_flush_dynamic_state_slow() derives from
+    * it, which are pure functions of the format. */
+   struct {
+      VkFormat vk_format;
+      enum pipe_format format;
+      unsigned interchange_align;
+   } vb_format_memo[AGX_MAX_VBUFS];
+
+   /* The last VertexProgramVariant state update this command buffer encoded,
+    * keyed by every encoder input except the pipeline address; see
+    * hk_agx3_publish_vertex_state(). */
+   struct {
+      struct hk_g17p_vdm_update_key key;
+      struct agx_vdm_state_update encoded;
+      bool valid;
+   } g17p_vdm_update_memo;
 
    uint32_t shaders_dirty;
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
+
+   /* Stages bound to a shader compiled without custom-border emulation that
+    * has an emulating twin to switch to once the device needs it. */
+   uint32_t border_free_stages;
 
    /* Vertex buffers */
    struct hk_addr_range vb[AGX_MAX_VBUFS];
@@ -272,13 +598,66 @@ struct hk_graphics_state {
    /* Fast linked shader data structures */
    uint64_t varyings;
    struct agx_varyings_vs linked_varyings;
+   /* hk_g17p_smooth_varyings_supported() of the last (linked FS, hardware
+    * VS, topology, provoking) it evaluated against the linked_varyings
+    * above. Cleared whenever linked_varyings is reassigned. */
+   struct {
+      const void *linked;
+      const void *vs;
+      uint32_t topology;
+      uint32_t provoking;
+      bool valid;
+      bool result;
+   } g17p_smooth_memo;
 
    uint32_t linked_dirty;
    struct hk_linked_shader *linked[MESA_SHADER_STAGES];
-   bool generate_primitive_id;
 
-   /* Whether blend constants are required by the active blend state */
-   bool uses_blend_constant;
+   /* Last complete fast-link selection for this command buffer. The shader
+    * identity is part of the cache key: identical bytes owned by a different
+    * shader may have a different lifetime. Graphics-state invalidation clears
+    * these records with the rest of gfx state. */
+   struct {
+      struct hk_shader *shader;
+      struct hk_fast_link_key_vs key;
+      bool valid;
+   } fast_link_vs;
+   struct {
+      struct hk_shader *shader;
+      struct hk_fast_link_key_fs key;
+      bool valid;
+   } fast_link_fs;
+
+   /* Exact last VS/FS loader identities. These are recording-only selectors;
+    * the published programs and every referenced BO remain command-buffer-
+    * owned. Submission never mutates or consults this cache. */
+   struct hk_g17p_graphics_ioto_cache_entry g17p_ioto[2];
+   struct hk_g17p_launch g17p_launch[2][HK_G17P_LAUNCH_SLOTS];
+   /* Exact command-buffer-owned uploads for combined texture/sampler pointer
+    * pairs.  Shader/material switches may revisit the same pair thousands of
+    * times; a fresh upload address would otherwise force a fresh Ioto program
+    * even though the GPU-visible values are identical. */
+   struct {
+      /* Key: descriptor-set texture word address and sampler state address. */
+      uint64_t pointers[2];
+      /* The uploaded pair; its texture pointer is 32-byte aligned
+       * (hk_g17p_texture_state_pointer). */
+      uint64_t published[2];
+      uint64_t address;
+      bool valid;
+   } g17p_combined_sampler_pointers[32];
+
+   /* Exact immutable eMRT descriptor-table upload used by every fragment
+    * program in one spilled render configuration. */
+   struct {
+      uint8_t entries[HK_MAX_RTS][AGX_G17P_EMRT_DESCRIPTOR_SIZE];
+      uint64_t address;
+      uint64_t pointer;
+      uint8_t color_att_count;
+      bool valid;
+   } g17p_spilled_rt_descs;
+
+   bool generate_primitive_id;
 
    /* Tessellation state */
    struct {
@@ -298,6 +677,23 @@ struct hk_compute_state {
    struct hk_api_shader *shader;
 };
 
+/*
+ * VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR state.  Descriptor sets and push
+ * constants bound to the ray-tracing bind point are separate from the compute
+ * ones, even though the pipeline executes as a compute shader: an application
+ * may bind a compute pipeline's sets between vkCmdBindPipeline and
+ * vkCmdTraceRaysKHR and neither may disturb the other.
+ */
+struct hk_ray_tracing_state {
+   struct hk_descriptor_state descriptors;
+   struct hk_ray_tracing_pipeline *pipeline;
+};
+
+#define HK_RT_SHADER_STAGES                                                    \
+   (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |         \
+    VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |       \
+    VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR)
+
 struct hk_cmd_push {
    void *map;
    uint64_t addr;
@@ -310,18 +706,7 @@ struct hk_scratch_req {
    bool preamble;
 };
 
-/*
- * Represents a firmware timestamp request.  Handle is a kernel timestamp object
- * handle, not a GEM handle.
- *
- * The kernel/firmware uses the handle/offset_B to write. We use the address to
- * read the results back. We could deduplicate this, but this is convenient.
- */
-struct agx_timestamp_req {
-   uint64_t addr;
-   uint32_t handle;
-   uint32_t offset_B;
-};
+/* struct agx_timestamp_req lives in hk_sync.h. */
 
 /*
  * hk_cs represents a single control stream, to be enqueued either to the
@@ -356,8 +741,30 @@ struct hk_cs {
    /* End pointer of the current chunk of the control stream */
    void *end;
 
+   /* AGX3 CDM: the value of current just after a strong cache flush, so a
+    * flush requested with nothing recorded since it can be elided. */
+   void *strong_flush_end;
+
+   /* Likewise for the weak ordering barrier attached to a native launch. A
+    * later cache-flush request upgrades this record in place instead of
+    * emitting two adjacent barriers. */
+   void *weak_barrier_end;
+
+   /* AGX3 CDM: the value of current just after a standalone barrier that is
+    * the stream's *first* record. Apple's emitter only opens a stream with a
+    * barrier (the strong flush that makes a preceding render visible), so a
+    * stream is canonical on its own; but concatenating it after a stream that
+    * already ends in a barrier leaves two adjacent barriers with no launch
+    * between them, which Apple never emits. hk_cs_merge_cdm() uses this to
+    * fold the leading record into the destination's trailing one. */
+   void *leading_barrier_end;
+
    /* Whether there is more than just the root chunk */
    bool stream_linked;
+
+   /* Active-context selector consumed by AGX3 VertexProgramVariant. */
+   bool agx3_active_context_selector_valid;
+   uint32_t agx3_raw_active_context_selector;
 
    /* Whether the sampler heap is required. Although we always must maintain the
     * heap for correctness, it's often not necessary since we can push lots of
@@ -375,29 +782,70 @@ struct hk_cs {
       struct hk_scratch_req fs;
    } scratch;
 
-   /* Immediate writes, type libagx_imm_write. These all happen in parallel at
-    * the end of the control stream. This accelerates queries. Implies CDM.
+   /* Immediate writes, type libagx_imm_write. These happen at the end of the
+    * control stream (parallel on AGX2, native ordered stores on G17P). This
+    * accelerates queries. Implies CDM.
     */
    struct util_dynarray imm_writes;
+
+   /* Number of successfully emitted draws whose last raster producer is
+    * positively known to export only the default Layer=0, without multiview.
+    * Compare with stats.cmds: untracked emitters conservatively disqualify.
+    * The wider proof count does not wrap with stats.cmds.
+    */
+   uint64_t g17p_layer_zero_draws;
+   bool g17p_layer_zero_unknown;
+
+   /* An upper bound of the primitives every draw recorded into this G17P
+    * render stream submits (hk_draw_primitive_bound()), saturating at
+    * UINT64_MAX, which also stands for "not bounded when recorded". Secondary
+    * command buffers replay into the primary's stream and add to it there. */
+   uint64_t g17p_primitive_bound;
+
+   /* This stream begins (vkCmdBeginRendering without RESUMING) and ends
+    * (vkCmdEndRendering without SUSPENDING) its render pass: it is the whole
+    * pass, not a part split off or continued. */
+   bool g17p_pass_begins, g17p_pass_ends;
 
    /* Statistics */
    struct {
       uint32_t calls, cmds, flushes, merged;
    } stats;
 
-   /* Timestamp writes. Currently just compute end / fragment end. We could
-    * flesh this out later if we want finer info. (We will, but it's not
-    * required for conformance.)
+   /* Timestamp writes: the start of the command (compute start, render
+    * vertex start) and its end (compute end, render fragment end). The
+    * kernel writes both from the firmware's native pass record.
     */
    struct {
+      struct agx_timestamp_req start;
       struct agx_timestamp_req end;
    } timestamp;
+
+   /* G17P query commands observe timestamp writes from earlier streams.
+    * Firmware start timestamps reach query memory only at retirement, so a
+    * producer cannot be merged across this consumer boundary.
+    */
+   bool g17p_timestamp_query;
+
+   /* Recorded dependencies, see hk_sync.h. */
+   struct hk_sync_stream sync;
+
+   /* Writable destinations known while recording meta compute dispatches. */
+   struct hk_drm_attachment_set compute_attachments;
 
    /* Remaining state is for graphics only, ignored for compute */
    struct agx_tilebuffer_layout tib;
 
    struct util_dynarray scissor, depth_bias;
    uint64_t uploaded_scissor, uploaded_zbias;
+
+   /* G17P: the last uploaded draw-state selector record and the scissor /
+    * depth-bias array sizes and viewport count it selects for. */
+   struct {
+      uint32_t offset;
+      uint32_t scissor_size, depth_bias_size;
+      uint8_t viewport_count;
+   } g17p_draw_state;
 
    /* We can only set ppp_multisamplectl once per batch. has_sample_locations
     * tracks if we've committed to a set of sample locations yet. vk_meta
@@ -410,6 +858,11 @@ struct hk_cs {
 
    struct hk_render_registers cr;
 
+   /* Snapshot of the writable image ranges for this exact VDM command. Render
+    * state may change before queue submission, so the synthetic fragment
+    * attachment command must travel with the control stream it describes. */
+   struct hk_drm_attachment_set fragment_attachments;
+
    /* Active restart index if one is set. Zero if there is no restart index set
     * yet, since Vulkan does not allow zero restart indices (unlike OpenGL).
     * This is used in place of dirty tracking, because dirty tracking
@@ -417,6 +870,26 @@ struct hk_cs {
     */
    uint32_t restart_index;
 };
+
+static inline unsigned
+hk_sync_sq(const struct hk_cs *cs)
+{
+   return cs->type == HK_CS_VDM ? HK_SYNC_VDM : HK_SYNC_CDM;
+}
+
+/* The later of two streams in list order; NULL is earlier than anything. */
+static inline struct hk_cs *
+hk_sync_later(struct hk_cs *a, struct hk_cs *b)
+{
+   if (!a)
+      return b;
+   if (!b)
+      return a;
+   return b->sync.seq > a->sync.seq ? b : a;
+}
+
+void *hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
+                                 uint64_t target, bool vdm);
 
 /*
  * Helper to merge two compute control streams, concatenating the second control
@@ -429,15 +902,87 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    assert(a->cmd == b->cmd);
    assert(!a->timestamp.end.handle);
 
-   agx_cdm_jump(a->current, b->addr);
-   a->current = b->current;
-   a->stream_linked = true;
+   const size_t b_size = (uint8_t *)b->current - (uint8_t *)b->start;
+   const size_t remaining = (uint8_t *)a->end - (uint8_t *)a->current;
+   const bool inline_b = !a->stream_linked && !b->stream_linked &&
+                         hk_cs_space_fits(remaining, b_size,
+                                          AGX_CDM_STREAM_LINK_LENGTH);
+
+   if (inline_b) {
+      uint8_t *dst = a->current;
+
+      /* Two barriers with no launch between them is not a shape Apple's CDM
+       * emitter produces, and the G17P stream oracle rejects it. Within one
+       * stream hk_cdm_cache_flush() already strengthens the trailing record
+       * in place; do the same across a concatenation. b's leading barrier is
+       * the strong flush, so copying its word over a's trailing barrier is
+       * exactly that upgrade -- no encoder needed, and it removes a record
+       * rather than adding one. */
+      const bool b_opens_with_barrier =
+         b->leading_barrier_end &&
+         (uint8_t *)b->leading_barrier_end ==
+            (uint8_t *)b->start + AGX3_CDM_BARRIER_SIZE;
+      const bool a_ends_with_barrier =
+         ((uint8_t *)a->current == (uint8_t *)a->strong_flush_end ||
+          (uint8_t *)a->current == (uint8_t *)a->weak_barrier_end) &&
+         (uint8_t *)a->current - (uint8_t *)a->start >= AGX3_CDM_BARRIER_SIZE;
+      const size_t b_skip = (b_opens_with_barrier && a_ends_with_barrier)
+                               ? AGX3_CDM_BARRIER_SIZE
+                               : 0;
+      if (b_skip)
+         memcpy(dst - AGX3_CDM_BARRIER_SIZE, b->start, AGX3_CDM_BARRIER_SIZE);
+
+      memcpy(dst, (const uint8_t *)b->start + b_skip, b_size - b_skip);
+      a->current = dst + (b_size - b_skip);
+
+      /* These markers point just past an emitted barrier. Preserve them in
+       * the destination root so another adjacent merge still has an exact
+       * view of the stream tail. A marker on the folded record maps onto the
+       * trailing record that absorbed it. */
+      a->strong_flush_end =
+         b->strong_flush_end
+            ? dst + ((uint8_t *)b->strong_flush_end - (uint8_t *)b->start) -
+                 b_skip
+            : NULL;
+      a->weak_barrier_end =
+         b->weak_barrier_end
+            ? dst + ((uint8_t *)b->weak_barrier_end - (uint8_t *)b->start) -
+                 b_skip
+            : NULL;
+   } else {
+      void *link_end =
+         hk_cmd_buffer_emit_cs_jump(a->cmd, a->current, b->addr, false);
+      const bool linked = link_end != a->current;
+      a->current = b->current;
+      a->end = b->end;
+      a->chunk = b->chunk;
+      a->stream_linked |= linked || b->stream_linked;
+      a->strong_flush_end = b->strong_flush_end;
+      a->weak_barrier_end = b->weak_barrier_end;
+   }
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->scratch.cs.main |= b->scratch.cs.main;
    a->scratch.cs.preamble |= b->scratch.cs.preamble;
 
-   a->timestamp = b->timestamp;
+   /* Submission sees only the merged root. Keep the destinations recorded
+    * by both streams without changing their inline/link batching policy. */
+   for (unsigned i = 0; i < b->compute_attachments.count; ++i) {
+      const struct drm_asahi_attachment *attachment =
+         &b->compute_attachments.list[i];
+      hk_drm_attachment_set_add(&a->compute_attachments,
+                                attachment->pointer, attachment->size);
+   }
+   a->compute_attachments.complete &= b->compute_attachments.complete;
+
+   /* The merged command ends where b ended. It starts where a started; a
+    * start stamp b carried was a top-of-pipe write, which any earlier value
+    * also satisfies. The caller refuses the merge when both have one. */
+   a->timestamp.end = b->timestamp.end;
+   if (!a->timestamp.start.handle)
+      a->timestamp.start = b->timestamp.start;
+
+   a->g17p_timestamp_query |= b->g17p_timestamp_query;
 
    a->stats.calls += b->stats.calls;
    a->stats.cmds += b->stats.cmds;
@@ -459,19 +1004,62 @@ struct hk_uploader {
    uint8_t *map;
    uint64_t base;
    uint32_t offset;
+   uint32_t capacity;
+
+   /* VDM uploader only: low alias of base (its hk_vdm_allocation's alias). */
+   uint64_t vdm_alias;
+};
+
+/*
+ * Bump arena for the G17P Ioto programs one command buffer records. Semantic
+ * program reuse happens before reservation; resource programs embed their
+ * reserved address, so post-composition byte hashing cannot deduplicate them.
+ * See hk_ioto_arena_core.h for why programs cannot each have a BO.
+ */
+struct hk_ioto_arena {
+   /* Chunk currently being filled. Owned by hk_cmd_buffer::large_bos. */
+   struct agx_bo *bo;
+   uint8_t *map;
+   uint64_t base;
+   uint32_t cursor;
+   uint32_t capacity;
+
+   /* Recording statistics, reported when the arena cannot grow. */
+   uint32_t programs;
+   uint64_t program_bytes;
+   uint64_t chunk_bytes;
 };
 
 struct hk_cmd_buffer {
    struct vk_command_buffer vk;
 
+   /* frg-codegen v4: the per-recording BG/EOT cache (13.5 KiB) lives outside
+    * `state` so the full-state memset of every reset no longer clears it;
+    * hk_reset_cmd_buffer() invalidates the entries instead. Entries are only
+    * read when valid, so this is the same cache contract. */
+   struct hk_g17p_bg_eot_cache_entry
+      g17p_bg_eot_cache[HK_G17P_BG_EOT_CACHE_ENTRIES];
+   uint8_t g17p_bg_eot_cache_next;
+
+   /* Set by hk_reset_cmd_buffer, cleared by vkBeginCommandBuffer. */
+   bool g17p_pristine;
+
    struct {
       struct hk_graphics_state gfx;
       struct hk_compute_state cs;
+      struct hk_ray_tracing_state rt;
+      struct hk_conditional_render_state conditional;
    } state;
 
    struct {
-      struct hk_uploader main, usc;
+      struct hk_uploader main, usc, root, vdm, streams;
    } uploader;
+
+   /* Command-pool slab spans leased by this command buffer's VDM uploader. */
+   struct list_head vdm_allocations;
+   /* Most recently addressed span. Recording often references the current
+    * 4 KiB VDM chunk many times before moving to the next one. */
+   struct hk_vdm_allocation *g17p_vdm_last_allocation;
 
    /* List of all recorded control streams */
    struct list_head control_streams;
@@ -495,10 +1083,21 @@ struct hk_cmd_buffer {
       struct hk_cs *post_gfx;
    } current_cs;
 
+   /* Recorded dependencies between control streams, see hk_sync.h. */
+   struct hk_sync_state sync;
+
+   /* Tile hazards: struct hk_sync_pass_record for every recorded pass
+    * instance footprint, in recording order. Cleared by hk_sync_reset. */
+   struct util_dynarray sync_pass_records;
+
    /* Are we currently inside a vk_meta operation? This alters sample location
     * behaviour.
     */
    bool in_meta;
+
+   /* CmdClearAttachments is the sole vk_meta operation affected by
+    * conditional rendering. */
+   bool conditional_meta;
 
    /* XXX: move me?
     *
@@ -511,9 +1110,105 @@ struct hk_cmd_buffer {
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
 
-   /* Owned large BOs */
+   /* Owned BOs and retained references needed by recorded commands. */
    struct util_dynarray large_bos;
+   /* Direct-mapped temporal cache avoids rescanning large_bos for the linked
+    * vertex/fragment shader, setup and rodata BOs repeated by every draw. */
+   struct agx_bo *recent_retained_bos[16];
+   /* Open-addressed pointer set of the BOs hk_cmd_buffer_retain_bo() has
+    * appended to large_bos (capacity a power of two, or zero). A recording
+    * retains one BO per distinct shader/setup/program it publishes, so a
+    * linear scan of large_bos on every temporal-cache miss grew quadratically
+    * with the number of pipelines a command buffer uses. */
+   struct agx_bo **retained_set;
+   uint32_t retained_set_capacity;
+   uint32_t retained_set_count;
+
+   /* Executable USC-window arena the G17P Ioto programs recorded by this
+    * command buffer are bump-allocated from. Its chunks are owned by
+    * large_bos, so it dies with the recording like every other program
+    * reference. */
+   struct hk_ioto_arena ioto;
 };
+
+/* Transfer entry points bracket their recording so the streams they create
+ * belong to the transfer stage class (VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT and
+ * its sub-stages). Nesting is fine: meta helpers re-enter through the
+ * dispatch table. */
+static inline void
+hk_sync_xfer_begin(struct hk_cmd_buffer *cmd)
+{
+   cmd->sync.xfer_depth++;
+}
+
+static inline void
+hk_sync_xfer_end(struct hk_cmd_buffer *cmd)
+{
+   assert(cmd->sync.xfer_depth > 0);
+   cmd->sync.xfer_depth--;
+}
+
+/*
+ * One reservation inside the Ioto arena: where the program is to be composed,
+ * and the address the composer must be given for it.
+ */
+struct hk_ioto_reservation {
+   void *map;
+   uint64_t va;
+};
+
+/*
+ * Reserve `size` bytes of executable USC-window space for one Ioto program.
+ * On failure the command buffer error is already set.
+ */
+bool hk_cmd_reserve_ioto_program_slow(struct hk_cmd_buffer *cmd, size_t size,
+                                      const char *label,
+                                      struct hk_ioto_reservation *reservation);
+
+/* AGX_IOTO_PROGRAM_ALIGNMENT, checked in hk_ioto_arena.c. */
+#define HK_IOTO_PROGRAM_ALIGNMENT 64u
+
+static inline bool
+hk_cmd_reserve_ioto_program(struct hk_cmd_buffer *cmd, size_t size,
+                            const char *label,
+                            struct hk_ioto_reservation *reservation)
+{
+   /* The placement hk_ioto_arena_place() computes, in the current chunk. */
+   struct hk_ioto_arena *arena = &cmd->ioto;
+   const uint32_t mask = HK_IOTO_PROGRAM_ALIGNMENT - 1;
+   if (likely(reservation && size != 0 && size <= UINT32_MAX && arena->map &&
+              arena->cursor <= arena->capacity &&
+              arena->cursor <= UINT32_MAX - mask)) {
+      const uint32_t offset = (arena->cursor + mask) & ~mask;
+      if (likely(offset <= arena->capacity &&
+                 (uint32_t)size <= arena->capacity - offset)) {
+         *reservation = (struct hk_ioto_reservation){
+            .map = arena->map + offset,
+            .va = arena->base + offset,
+         };
+         arena->cursor = offset + (uint32_t)size;
+         return true;
+      }
+   }
+
+   return hk_cmd_reserve_ioto_program_slow(cmd, size, label, reservation);
+}
+
+/*
+ * Publish the `length` bytes composed at reservation->map and return the
+ * reserved address for the launch record.
+ */
+uint64_t hk_cmd_publish_ioto_program(struct hk_cmd_buffer *cmd,
+                                     const struct hk_ioto_reservation *
+                                        reservation,
+                                     size_t length);
+
+/* Clean the current chunk's programs from the CPU cache (cached command
+ * memory); hk_cmd_buffer_publish_cached_uploads() fences it. */
+void hk_ioto_arena_clean(struct hk_cmd_buffer *cmd);
+
+/* Release the arena's bookkeeping. The chunks themselves are in large_bos. */
+void hk_ioto_arena_finish(struct hk_cmd_buffer *cmd);
 
 VK_DEFINE_HANDLE_CASTS(hk_cmd_buffer, vk.base, VkCommandBuffer,
                        VK_OBJECT_TYPE_COMMAND_BUFFER)
@@ -524,6 +1219,46 @@ static inline struct hk_cmd_pool *
 hk_cmd_buffer_pool(struct hk_cmd_buffer *cmd)
 {
    return (struct hk_cmd_pool *)cmd->vk.pool;
+}
+
+/* Whether the current blend state reads the blend constants. Derived from
+ * the dynamic graphics state at each use rather than cached: the fragment
+ * stage program (its blend-constant uniform range) is built by bind-time and
+ * BeginRendering preparation as well as by the draw, and that preparation
+ * runs before the draw-time dirty-state flush. A cached copy refreshed only
+ * by that flush was stale there, so the first draw after a blend-equation
+ * change published a fragment program without the blend-constant range and
+ * the epilog read unwritten uniforms. Prepared programs are keyed by
+ * dynamic_graphics_state.generation, which covers every input here. */
+static inline bool
+hk_uses_blend_constant(const struct vk_color_blend_state *cb)
+{
+   static_assert(VK_BLEND_FACTOR_CONSTANT_COLOR + 3 ==
+                    VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,
+                 "constant factors are contiguous");
+
+   for (unsigned i = 0; i < cb->attachment_count; ++i) {
+      const unsigned factors[] = {
+         cb->attachments[i].src_color_blend_factor,
+         cb->attachments[i].src_alpha_blend_factor,
+         cb->attachments[i].dst_color_blend_factor,
+         cb->attachments[i].dst_alpha_blend_factor,
+      };
+
+      for (unsigned j = 0; j < ARRAY_SIZE(factors); ++j) {
+         if (factors[j] >= VK_BLEND_FACTOR_CONSTANT_COLOR &&
+             factors[j] <= VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA)
+            return true;
+      }
+   }
+
+   return false;
+}
+
+static inline bool
+hk_cmd_uses_blend_constant(const struct hk_cmd_buffer *cmd)
+{
+   return hk_uses_blend_constant(&cmd->vk.dynamic_graphics_state.cb);
 }
 
 /*
@@ -567,35 +1302,171 @@ hk_bound_sw_vs_before_gs(struct hk_graphics_state *gfx)
    return &api->variants[HK_VS_VARIANT_SW];
 }
 
-struct agx_ptr hk_pool_alloc_internal(struct hk_cmd_buffer *cmd, uint32_t size,
-                                      uint32_t alignment, bool usc);
+struct agx_ptr hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
+                                       struct hk_uploader *uploader,
+                                       uint32_t size, uint32_t alignment,
+                                       enum hk_cmd_bo_type type);
+
+/* Bump allocation from the uploader's current BO; a new BO or a large
+ * allocation takes hk_pool_alloc_from_slow(). */
+static inline struct agx_ptr
+hk_pool_alloc_from(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
+                   uint32_t size, uint32_t alignment,
+                   enum hk_cmd_bo_type type)
+{
+   assert(alignment > 0);
+   const uint32_t offset = align(uploader->offset, alignment);
+   if (likely(uploader->map != NULL && size <= HK_CMD_BO_SIZE &&
+              offset <= HK_CMD_BO_SIZE && size <= HK_CMD_BO_SIZE - offset)) {
+      uploader->offset = offset + size;
+      return (struct agx_ptr){
+         .gpu = uploader->base + offset,
+         .cpu = uploader->map + offset,
+      };
+   }
+
+   return hk_pool_alloc_from_slow(cmd, uploader, size, alignment, type);
+}
+
+struct agx_ptr hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
+                                uint32_t alignment);
+struct agx_ptr hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd,
+                                         uint32_t size, uint32_t alignment);
+
+uint64_t hk_g17p_vdm_compact(struct hk_cmd_buffer *cmd, uint64_t primary);
+uint64_t hk_g17p_vdm_alias(struct hk_cmd_buffer *cmd, uint64_t primary);
 
 uint64_t hk_pool_upload(struct hk_cmd_buffer *cmd, const void *data,
                         uint32_t size, uint32_t alignment);
 
+/*
+ * G17P does not honour the low five bits of the texture-table pointer that
+ * the combined-sampler ABIs publish in uniform halves 0..3: the 32-byte
+ * texture state is read as if the pointer were 32-byte aligned.  Sampled-image
+ * descriptors only have 8-byte alignment and a 72-byte stride in a descriptor
+ * set, so set address + binding offset is generally not a valid table
+ * pointer.  Measured on G17P with vkCmdBlitImage of D32_SFLOAT_S8_UINT, whose
+ * pushed set holds the depth and stencil texture words at offsets 72 and 144:
+ * every depth and stencil texel read back wrong, and when the qword before
+ * the stencil texture word (the depth descriptor's last qword) was nonzero the
+ * texture unit's read faulted (VM error at 0x40000000000, VK_ERROR_DEVICE_LOST
+ * in Pokemon Scarlet).  The same descriptor bytes published at a 32-byte
+ * aligned address -- including 32 mod 64 -- read back exactly and never
+ * faulted, while 8 and 16 mod 32 still read back wrong.
+ *
+ * Returns texture_va when it is already aligned, otherwise the address of a
+ * 32-byte-aligned command-buffer copy of the descriptor record (texture word
+ * plus the software fields after it, which descriptor crawls through the
+ * same pointer may read), or 0 on allocation failure.  The ABIs using this
+ * that need a copy are not selected when sampled-image update-after-bind is
+ * enabled.  The direct txf ABI may still publish an already aligned live set
+ * pointer in that case.  The combined-sampler ABIs also snapshot the
+ * descriptor's sampler index at record time, so their copies hold what the set
+ * holds when the commands execute.
+ */
+#define HK_G17P_TEXTURE_STATE_ALIGN 32
+
+uint64_t hk_g17p_texture_state_pointer(struct hk_cmd_buffer *cmd,
+                                       uint64_t texture_va,
+                                       const void *descriptor,
+                                       uint32_t available_B);
+uint64_t hk_pool_usc_upload(struct hk_cmd_buffer *cmd, const void *data,
+                            uint32_t size, uint32_t alignment);
+
+/* Keep externally owned storage referenced by recorded GPU commands alive for
+ * the command-buffer lifetime. Repeated uses of the same BO are deduplicated.
+ */
+void hk_cmd_buffer_retain_bo(struct hk_cmd_buffer *cmd, struct agx_bo *bo);
+void hk_cmd_buffer_release_bos(struct hk_cmd_buffer *cmd,
+                               struct agx_device *dev);
+
 static inline struct agx_ptr
 hk_pool_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
-   return hk_pool_alloc_internal(cmd, size, alignment, false);
+   return hk_pool_alloc_from(cmd, &cmd->uploader.main, size, alignment,
+                             HK_CMD_BO_MAIN);
 }
 
 static inline struct agx_ptr
 hk_pool_usc_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
-   return hk_pool_alloc_internal(cmd, size, alignment, true);
+   return hk_pool_alloc_from(cmd, &cmd->uploader.usc, size, alignment,
+                             HK_CMD_BO_USC);
 }
 
-void hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+/*
+ * Allocate a payload that a VDM record references through its 40-bit pointer.
+ * HAL200 draw-state fields are narrower than the VDM control-stream pointer,
+ * so those payloads retain a device-global low alias. Control-stream roots
+ * themselves use the constrained main heap directly.
+ */
+static inline struct agx_ptr
+hk_pool_vdm_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   /* Bump-allocate from the current VDM chunk and derive its compact pointer
+    * from the chunk's alias.  Allocations never overlap, so this is the
+    * address hk_g17p_vdm_compact() resolves through the chunk's
+    * hk_vdm_allocation; anything else takes the general path below. */
+   struct hk_uploader *vdm = &cmd->uploader.vdm;
+   const uint32_t vdm_offset = align(vdm->offset, alignment);
+   uint32_t vdm_compact;
+   if (likely(vdm->map && vdm_offset <= vdm->capacity &&
+              size <= vdm->capacity - vdm_offset &&
+              hk_g17p_vdm_low_window_enabled(&dev->dev) &&
+              agx_g17p_vdm_alias_compact_inline(vdm->vdm_alias + vdm_offset,
+                                                &vdm_compact) &&
+              vdm_compact != 0)) {
+      vdm->offset = vdm_offset + size;
+      return (struct agx_ptr){
+         .gpu = vdm_compact,
+         .cpu = vdm->map + vdm_offset,
+      };
+   }
+
+   struct agx_ptr T = hk_pool_vdm_primary_alloc(cmd, size, alignment);
+
+   if (T.gpu && hk_g17p_vdm_low_window_enabled(&dev->dev)) {
+      T.gpu = hk_g17p_vdm_compact(cmd, T.gpu);
+      if (!T.gpu) {
+         vk_command_buffer_set_error(&cmd->vk,
+                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         T.cpu = NULL;
+      }
+   }
+
+   return T;
+}
+
+bool hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+/* A depth/stencil clear touched the pass's attachment (ZLS elision). */
+void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd);
+
 uint32_t hk_default_sample_positions(unsigned nr_samples);
 
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
 {
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return NULL;
+
+   /* A recorded dependency may have ordered the open general compute stream
+    * after work that follows it in the list. It is then ended, and the work
+    * goes into a stream positioned after that requirement. Work of a new
+    * stage class must also update the reused stream's kind and dependencies,
+    * so later barriers include transfers and meta graphics emitted there. */
+   if (*ptr && ptr == &cmd->current_cs.cs &&
+       (cmd->sync.cs_check_pending ||
+        (hk_sync_general_cs_kind(cmd) & ~(*ptr)->sync.kind)))
+      hk_sync_check_cs(cmd);
+
    if ((*ptr) == NULL) {
       /* Allocate root control stream */
-      size_t initial_size = 65536;
-      struct agx_ptr root = hk_pool_alloc(cmd, initial_size, 1024);
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      size_t initial_size = hk_cs_root_size(dev->dev.chip, compute);
+      struct agx_ptr root = hk_pool_cs_alloc(cmd, initial_size, 1024);
       if (!root.cpu)
          return NULL;
 
@@ -612,8 +1483,21 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       };
 
       list_inithead(&cs->node);
+      hk_drm_attachment_set_init(&cs->compute_attachments);
+      /* Only known meta destinations are collected so far. */
+      cs->compute_attachments.complete = false;
 
       bool before_gfx = (ptr == &cmd->current_cs.pre_gfx);
+
+      if (!compute) {
+         const bool initialized = hk_cs_init_graphics(cmd, cs);
+         if (!hk_graphics_cs_publishable(
+                dev->dev.chip, initialized,
+                cs->agx3_active_context_selector_valid)) {
+            free(cs);
+            return NULL;
+         }
+      }
 
       /* Insert into the command buffer. We usually append to the end of the
        * command buffer, except for pre-graphics streams which go right before
@@ -629,8 +1513,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
 
       *ptr = cs;
 
-      if (!compute)
-         hk_cs_init_graphics(cmd, cs);
+      hk_sync_stream_created(cmd, cs, ptr, compute);
    }
 
    assert(*ptr != NULL);
@@ -685,6 +1568,12 @@ hk_cs_destroy(struct hk_cs *cs)
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
+bool hk_g17p_smooth_varyings_supported(
+   struct hk_cmd_buffer *cmd, const struct hk_linked_shader *linked);
+
+void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
+                                       void *current);
+
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
                                    struct hk_cs **ptr)
@@ -698,6 +1587,17 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
       if (cs->imm_writes.size) {
          hk_dispatch_imm_writes(cmd, cs);
       }
+
+      /* A transformed draw may reserve a pre-graphics stream and then prove
+       * that it has no vertices to process. Do not leave an empty CDM job in
+       * the submission list. A stream that only carries a timestamp stays:
+       * that is the one job the stamp can ride on. */
+      if (cs->stats.cmds == 0 && cs->stats.flushes == 0 &&
+          !cs->timestamp.end.handle && !cs->timestamp.start.handle) {
+         hk_sync_forget_stream(cmd, cs);
+         list_del(&cs->node);
+         hk_cs_destroy(cs);
+      }
    }
 
    *ptr = NULL;
@@ -709,28 +1609,41 @@ hk_cmd_buffer_end_compute(struct hk_cmd_buffer *cmd)
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.cs);
 }
 
-void hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd);
+/* Return true when the VDM was replaced/removed, false when it needs normal
+ * graphics finalization (for example, a native background clear). */
+bool hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd);
 
 static void
 hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.gfx;
 
-   if (cs && cs->stats.cmds == 0) {
-      hk_optimize_empty_vdm(cmd);
-   } else if (cs) {
+   if (cs && cs->stats.cmds == 0 && hk_optimize_empty_vdm(cmd))
+      cs = NULL;
+
+   if (cs) {
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      const bool full_usc_state = dev->dev.chip == AGX_CHIP_G17P;
       /* Scissor and depth bias arrays are staged to dynamic arrays on the
        * CPU. When we end the control stream, they're done growing and are
-       * ready for upload.
+       * ready for upload. G17P's ISP consumes these as full bit-40-set GART
+       * addresses, matching native's USC-window allocations; a main-heap
+       * address has bit 39 set and incorrectly selects the upper root.
        */
       cs->uploaded_scissor =
-         hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+         full_usc_state
+            ? hk_pool_usc_upload(cmd, cs->scissor.data, cs->scissor.size, 64)
+            : hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
 
       cs->uploaded_zbias =
-         hk_pool_upload(cmd, cs->depth_bias.data, cs->depth_bias.size, 64);
+         full_usc_state
+            ? hk_pool_usc_upload(cmd, cs->depth_bias.data,
+                                 cs->depth_bias.size, 64)
+            : hk_pool_upload(cmd, cs->depth_bias.data,
+                             cs->depth_bias.size, 64);
 
       /* TODO: maybe free scissor/depth_bias now? */
-      cs->current = agx_vdm_terminate(cs->current);
+      cs->current = hk_cmd_buffer_emit_vdm_terminate(cmd, cs->current);
    }
 
    cmd->current_cs.gfx = NULL;
@@ -758,8 +1671,10 @@ hk_pipeline_stat_addr(struct hk_cmd_buffer *cmd,
       assert(!cmd->in_meta && "queries paused for meta");
       assert(util_bitcount(stat) == 1 && "by construction");
 
-      /* Prefix sum to determine the compacted index in the query pool */
-      uint32_t index = util_bitcount(flags & (stat - 1));
+      uint32_t index;
+      const bool present =
+         hk_pipeline_statistics_report_index(flags, stat, &index);
+      assert(present && "enabled statistic has a compact report index");
 
       return root->draw.pipeline_stats + (sizeof(uint64_t) * index);
    } else {
@@ -805,6 +1720,8 @@ hk_get_descriptors_state(struct hk_cmd_buffer *cmd,
       return &cmd->state.gfx.descriptors;
    case VK_PIPELINE_BIND_POINT_COMPUTE:
       return &cmd->state.cs.descriptors;
+   case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
+      return &cmd->state.rt.descriptors;
    default:
       UNREACHABLE("Unhandled bind point");
    }
@@ -819,10 +1736,33 @@ void hk_meta_resolve_rendering(struct hk_cmd_buffer *cmd,
 uint64_t hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
                                    VkPipelineBindPoint bind_point);
 
-void hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
-                        struct hk_shader *s);
+void hk_reserve_scratch_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                             struct hk_shader *s);
 
-uint32_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+static inline void
+hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                   struct hk_shader *s)
+{
+   /* Not scratch but this is the most convenient place for this... */
+   cs->uses_sampler_heap |= s->b.info.uses_sampler_heap;
+
+   /* G17P publishes a shader's spill frame as thread-private storage in its
+    * SPECTPR. There is no helper-program stack, and the kernel rejects a
+    * command that names one. */
+   if ((s->b.info.scratch_size == 0 && s->b.info.preamble_scratch_size == 0) ||
+       agx_chip_command_stream_generation(
+          hk_cmd_buffer_device(cmd)->dev.chip) == AGX_CS_GENERATION_HAL200)
+      return;
+
+   hk_reserve_scratch_slow(cmd, cs, s);
+}
+
+/* AGX2 returns its shader-base-relative USC offset.  G17P returns the absolute
+ * 48-bit Ioto program VA consumed by HAL200 VDM state. */
+uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
+                              const struct hk_shader *s);
+
+uint64_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
 
 void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
@@ -840,6 +1780,54 @@ void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
                           struct agx_grid grid,
                           struct agx_workgroup local_size);
 
+void hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                             struct hk_shader *s, struct agx_grid grid,
+                             struct agx_workgroup local_size);
+
+void hk_g17p_prewarm_linked_compute_shader(struct hk_device *dev,
+                                            struct hk_shader *s,
+                                            struct hk_linked_shader *linked);
+void hk_g17p_linked_compute_cache_finish(struct hk_linked_shader *linked);
+void hk_g17p_linked_graphics_cache_finish(struct hk_device *dev,
+                                          struct hk_linked_shader *linked);
+
+/*
+ * Saved application state around a driver-internal meta operation.  The
+ * acceleration-structure builder needs this as much as a blit does: the
+ * common build shaders bind their own compute pipeline and push constants,
+ * so a build recorded between two application dispatches would otherwise
+ * silently clobber them.
+ */
+struct hk_meta_save {
+   struct vk_vertex_input_state _dynamic_vi;
+   struct vk_sample_locations_state _dynamic_sl;
+   struct vk_dynamic_graphics_state dynamic;
+   struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
+   struct hk_addr_range vb0;
+   struct hk_descriptor_set *desc0;
+   /* Nested meta must retain the outer query/conditional-rendering scope. */
+   bool in_meta;
+   bool has_push_desc0;
+   bool push_active0;
+   enum agx_visibility_mode occlusion;
+   struct hk_push_descriptor_set push_desc0;
+   VkQueryPipelineStatisticFlags pipeline_stats_flags;
+   uint8_t push[HK_MAX_PUSH_SIZE];
+};
+
+void hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
+                   VkPipelineBindPoint bind_point);
+void hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
+                 VkPipelineBindPoint bind_point);
+
+void hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd,
+                          struct hk_api_shader *shader, uint64_t record_addr,
+                          uint64_t group_count_addr, struct agx_grid grid);
+
+void hk_cmd_dispatch_unaligned(VkCommandBuffer commandBuffer,
+                               uint32_t invocations_x, uint32_t invocations_y,
+                               uint32_t invocations_z);
+
 static inline void
 hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             struct hk_shader *s, struct agx_grid grid,
@@ -849,7 +1837,19 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   uint32_t usc = hk_upload_usc_words(cmd, s, s->only_linked);
+   if (agx_chip_command_stream_generation(dev->dev.chip) ==
+       AGX_CS_GENERATION_HAL200) {
+      hk_reserve_scratch(cmd, cs, s);
+      hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
+      return;
+   }
+
+   uint64_t uploaded = hk_upload_usc_words(cmd, s, s->only_linked);
+   if (uploaded > UINT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   uint32_t usc = uploaded;
 
    hk_reserve_scratch(cmd, cs, s);
    hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);
@@ -858,11 +1858,36 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 void hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
                          enum agx_barrier barrier, enum libagx_program idx,
                          void *data, size_t data_size);
+void hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
+                              enum agx_barrier barrier,
+                              enum libagx_program idx, const void *data,
+                              size_t data_size);
+
+/* Turn a three/four/five-word indirect argument record into an execution-time
+ * conditional record. `barrier` selects the ordered compute stream which must
+ * precede its consumer. */
+uint64_t hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd,
+                                        uint64_t source, uint32_t words,
+                                        enum agx_barrier barrier);
 
 #define MESA_DISPATCH_PRECOMP hk_dispatch_precomp
 
 void hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                     bool after_gfx);
+
+/* Dispatch the native G17P raw-address fill meta shader into an explicitly
+ * selected compute stream.  The target may be the ordinary or post-graphics
+ * stream; the latter preserves query-availability ordering. */
+void hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
+                            uint64_t address, uint64_t size, uint32_t value);
+
+/* Poll a naturally aligned 32-bit device address from a native G17P compute
+ * stream until it reaches value. */
+void hk_g17p_meta_wait_addr(struct hk_cmd_buffer *cmd, uint64_t address,
+                            uint32_t value);
+void hk_native_meta_copy_query(struct hk_cmd_buffer *cmd, uint64_t destination,
+                               uint64_t source, uint64_t availability,
+                               VkQueryResultFlags flags);
 
 void agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
                          uint64_t attribs_read, struct agx_velem_key *keys);

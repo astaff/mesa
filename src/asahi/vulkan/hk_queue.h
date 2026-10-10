@@ -8,6 +8,7 @@
 #pragma once
 
 #include "hk_private.h"
+#include "hk_sync.h"
 #include "vk_queue.h"
 
 struct hk_device;
@@ -16,7 +17,7 @@ struct hk_queue {
    struct vk_queue vk;
 
    struct {
-      /* Asahi kernel queue ID */
+      /* Asahi kernel queue ID, UINT32_MAX until the first GPU submission. */
       uint32_t id;
 
       /* Timeline syncobj backing the queue */
@@ -30,6 +31,13 @@ struct hk_queue {
        */
       uint64_t timeline_value;
    } drm;
+
+   /* Device-lifetime command storage for the G17P SSTT maintenance encoder.
+    * Sparse image remaps submit this record before their signal operations. */
+   struct agx_bo *g17p_sstt_flush_bo;
+
+   /* Kinds of streams this queue has ever run, see hk_sync.h. */
+   struct hk_sync_queue sync;
 };
 
 static inline struct hk_device *

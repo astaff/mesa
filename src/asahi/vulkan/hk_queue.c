@@ -2,9 +2,6 @@
  * Copyright 2024 Valve Corporation
  * Copyright 2024 Alyssa Rosenzweig
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
- * Copyright 2024 Valve Corporation
- * Copyright 2024 Alyssa Rosenzweig
- * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * Copyright © 2016 Red Hat.
  * Copyright © 2016 Bas Nieuwenhuizen
  *
@@ -19,15 +16,29 @@
 #include "agx_bo.h"
 #include "agx_device.h"
 #include "agx_pack.h"
+#include "asahi/genxml/agx3_cmdstream.h"
+#include "agx_vdm_hal200_bind_tail_core.h"
 #include "decode.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
+#include "hk_drm_render_core.h"
+#include "hk_drm_prior_core.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <xf86drm.h>
+#include "util/cache_ops.h"
 #include "util/list.h"
 #include "util/macros.h"
+#include "util/os_time.h"
+#include "util/u_atomic.h"
+#include "util/u_debug.h"
+#include "util/u_call_once.h"
 #include "util/u_dynarray.h"
 #include "vulkan/vulkan_core.h"
 
@@ -35,6 +46,38 @@
 #include "layout.h"
 #include "vk_drm_syncobj.h"
 #include "vk_sync.h"
+
+/* Signal scope includes all earlier commands on this Vulkan queue. A DRM
+ * timeline point retains its predecessor fence chain; an individual submit's
+ * aggregate fence covers only that submit. Transferring the queue point orders
+ * completion without introducing a GPU execution dependency or a CPU wait.
+ */
+static VkResult
+queue_signal_timeline(struct hk_device *dev, struct hk_queue *queue,
+                      struct vk_queue_submit *submit)
+{
+   int fd = dev->dev.fd;
+
+   /* Each output becomes signalled only when this queue point and its
+    * predecessor chain complete.
+    */
+   for (unsigned i = 0; i < submit->signal_count; ++i) {
+      struct vk_sync_signal *signal = &submit->signals[i];
+
+      assert(vk_sync_type_is_drm_syncobj(signal->sync->type));
+      const struct vk_drm_syncobj *syncobj =
+         vk_sync_as_drm_syncobj(signal->sync);
+
+      int ret = drmSyncobjTransfer(
+         fd, syncobj->syncobj, signal->signal_value,
+         queue->drm.syncobj, queue->drm.timeline_value, 0);
+      if (ret)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "DRM_IOCTL_SYNCOBJ_TRANSFER failed: %m");
+   }
+
+   return VK_SUCCESS;
+}
 
 /*
  * We need to specially handle submits with no control streams. The kernel
@@ -55,25 +98,15 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
       assert(vk_sync_type_is_drm_syncobj(wait->sync->type));
       const struct vk_drm_syncobj *syncobj = vk_sync_as_drm_syncobj(wait->sync);
 
-      drmSyncobjTransfer(fd, queue->drm.syncobj, ++queue->drm.timeline_value,
-                         syncobj->syncobj, wait->wait_value, 0);
+      int ret = drmSyncobjTransfer(
+         fd, queue->drm.syncobj, ++queue->drm.timeline_value,
+         syncobj->syncobj, wait->wait_value, 0);
+      if (ret)
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "DRM_IOCTL_SYNCOBJ_TRANSFER failed: %m");
    }
 
-   /* Transfer the queue timeline into each out fence. They will all be
-    * signalled when we reach this point.
-    */
-   for (unsigned i = 0; i < submit->signal_count; ++i) {
-      struct vk_sync_signal *signal = &submit->signals[i];
-
-      assert(vk_sync_type_is_drm_syncobj(signal->sync->type));
-      const struct vk_drm_syncobj *syncobj =
-         vk_sync_as_drm_syncobj(signal->sync);
-
-      drmSyncobjTransfer(fd, syncobj->syncobj, signal->signal_value,
-                         queue->drm.syncobj, queue->drm.timeline_value, 0);
-   }
-
-   return VK_SUCCESS;
+   return queue_signal_timeline(dev, queue, submit);
 }
 
 static void
@@ -86,6 +119,8 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
       .cdm_ctrl_stream_base = cs->addr,
       .cdm_ctrl_stream_end = cs->addr + len,
 
+      .ts.start.handle = cs->timestamp.start.handle,
+      .ts.start.offset = cs->timestamp.start.offset_B,
       .ts.end.handle = cs->timestamp.end.handle,
       .ts.end.offset = cs->timestamp.end.offset_B,
    };
@@ -102,21 +137,60 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
    }
 }
 
+/* Neither attachment storage nor empty-tile operations may observe the
+ * layers eliminated below.  Draws and their XY coverage remain untouched.
+ */
+static bool
+hk_g17p_attachmentless_render(const struct hk_device *dev,
+                                    const struct hk_cs *cs)
+{
+   if (dev->dev.chip != AGX_CHIP_G17P ||
+       cs->tib.sample_size_B != 0 || cs->cr.process_empty_tiles ||
+       cs->cr.depth.buffer || cs->cr.depth.meta ||
+       cs->cr.stencil.buffer || cs->cr.stencil.meta)
+      return false;
+
+   /* The tilebuffer builder normalizes an attachmentless sample count to
+    * one.  Check attachment formats explicitly; nr_samples is not a tag.
+    * This also excludes colour attachments spilled outside the tilebuffer.
+    */
+   for (unsigned i = 0; i < ARRAY_SIZE(cs->tib.logical_format); ++i) {
+      if (cs->tib.logical_format[i] != PIPE_FORMAT_NONE)
+         return false;
+   }
+
+   return true;
+}
+
 static void
 asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
                        struct drm_asahi_cmd_render *c)
 {
+   size_t len = cs->stream_linked ? hk_cs_root_size(dev->dev.chip, false)
+                                  : (cs->current - cs->start);
+   const uint8_t *submitted_start = cs->start;
+   uint64_t submitted_full = cs->addr;
+
    memset(c, 0, sizeof(*c));
 
-   c->vdm_ctrl_stream_base = cs->addr;
+   c->vdm_ctrl_stream_base =
+      hk_g17p_vdm_low_window_enabled(&dev->dev)
+         ? hk_g17p_vdm_alias(cs->cmd, cs->addr)
+         : cs->addr;
 
    agx_pack(&c->ppp_ctrl, CR_PPP_CONTROL, cfg) {
       cfg.enable_w_clamp = true;
       cfg.fixed_point_format = 1;
    }
 
-   c->width_px = cs->cr.width;
-   c->height_px = cs->cr.height;
+   const bool empty_attachmentless =
+      cs->stats.cmds == 0 && hk_g17p_attachmentless_render(dev, cs);
+   const bool layer_zero_attachmentless =
+      cs->stats.cmds > 0 && !cs->g17p_layer_zero_unknown &&
+      cs->g17p_layer_zero_draws == cs->stats.cmds &&
+      hk_g17p_attachmentless_render(dev, cs);
+   c->width_px = empty_attachmentless ? 1 : cs->cr.width;
+   c->height_px = empty_attachmentless ? 1 : cs->cr.height;
 
    c->isp_bgobjdepth = cs->cr.isp_bgobjdepth;
    c->isp_bgobjvals = cs->cr.isp_bgobjvals;
@@ -124,9 +198,18 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
-   agx_pack(&c->isp_zls_pixels, CR_ISP_ZLS_PIXELS, cfg) {
-      cfg.x = cs->cr.zls_width;
-      cfg.y = cs->cr.zls_height;
+   if (dev->dev.chip == AGX_CHIP_G17P) {
+      c->isp_zls_pixels = hk_drm_g17p_zls_pixels(
+         cs->cr.zls_width, cs->cr.zls_height, cs->cr.depth.buffer,
+         cs->cr.depth.meta, cs->cr.stencil.buffer, cs->cr.stencil.meta);
+      c->isp_bgobjdepth = hk_drm_g17p_depth_clear(
+         c->isp_bgobjdepth, cs->cr.depth.buffer, cs->cr.depth.meta,
+         cs->cr.stencil.buffer, cs->cr.stencil.meta);
+   } else {
+      agx_pack(&c->isp_zls_pixels, CR_ISP_ZLS_PIXELS, cfg) {
+         cfg.x = cs->cr.zls_width;
+         cfg.y = cs->cr.zls_height;
+      }
    }
 
    c->depth.base = cs->cr.depth.buffer;
@@ -142,7 +225,19 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->flags |= DRM_ASAHI_RENDER_DBIAS_IS_INT;
    }
 
-   if (dev->dev.debug & AGX_DBG_NOCLUSTER) {
+   /* Native sets the fragment stage's few-primitives bit at the end of a
+    * render pass whose known primitive count is at most four, and never for
+    * a continued pass or one with uncounted (indirect, mesh) work. This
+    * stream's bound counts every draw of the whole pass, so it proves that. */
+   if (dev->dev.chip == AGX_CHIP_G17P &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
+       cs->g17p_pass_begins && cs->g17p_pass_ends &&
+       cs->g17p_primitive_bound <= 4) {
+      c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
+   }
+
+   if ((dev->dev.debug & AGX_DBG_NOCLUSTER) &&
+       dev->dev.chip != AGX_CHIP_G17P) {
       c->flags |= DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING;
    }
 
@@ -150,7 +245,8 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
 
    /* Can be 0 for attachmentless rendering with no draws */
    c->samples = MAX2(cs->tib.nr_samples, 1);
-   c->layers = cs->cr.layers;
+   c->layers = (empty_attachmentless || layer_zero_attachmentless)
+                  ? 1 : cs->cr.layers;
 
    /* Drawing max size will OOM and fail submission. But vkd3d-proton does this
     * for emulating no-attachment rendering. Clamp to something reasonable and
@@ -168,25 +264,22 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    c->sample_size_B = cs->tib.sample_size_B;
 
    float tan_60 = 1.732051f;
-   c->isp_merge_upper_x = fui(tan_60 / cs->cr.width);
-   c->isp_merge_upper_y = fui(tan_60 / cs->cr.height);
+   c->isp_merge_upper_x = fui(tan_60 / c->width_px);
+   c->isp_merge_upper_y = fui(tan_60 / c->height_px);
 
    c->bg.usc = cs->cr.bg.main.usc | 4;
    c->eot.usc = cs->cr.eot.main.usc | 4;
    c->partial_bg.usc = cs->cr.bg.partial.usc | 4;
    c->partial_eot.usc = cs->cr.eot.partial.usc | 4;
 
-   memcpy(&c->bg.rsrc_spec, &cs->cr.bg.main.counts,
-          sizeof(struct agx_counts_packed));
-
-   memcpy(&c->eot.rsrc_spec, &cs->cr.eot.main.counts,
-          sizeof(struct agx_counts_packed));
-
-   memcpy(&c->partial_bg.rsrc_spec, &cs->cr.bg.partial.counts,
-          sizeof(struct agx_counts_packed));
-
-   memcpy(&c->partial_eot.rsrc_spec, &cs->cr.eot.partial.counts,
-          sizeof(struct agx_counts_packed));
+   hk_drm_render_resource_specs_pack(
+      &(struct hk_drm_render_resource_specs){
+         .bg = cs->cr.bg.main.rsrc_spec,
+         .eot = cs->cr.eot.main.rsrc_spec,
+         .partial_bg = cs->cr.bg.partial.rsrc_spec,
+         .partial_eot = cs->cr.eot.partial.rsrc_spec,
+      },
+      c);
 
    c->isp_scissor_base = cs->uploaded_scissor;
    c->isp_dbias_base = cs->uploaded_zbias;
@@ -212,6 +305,11 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->fragment_helper.data = dev->scratch.fs.buf->va->addr;
       c->fragment_helper.cfg = cs->scratch.fs.preamble ? (1 << 16) : 0;
       c->fragment_helper.binary = agx_helper_program(&dev->bg_eot);
+   }
+
+   if (cs->timestamp.start.handle) {
+      c->ts_vtx.start.handle = cs->timestamp.start.handle;
+      c->ts_vtx.start.offset = cs->timestamp.start.offset_B;
    }
 
    if (cs->timestamp.end.handle) {
@@ -245,15 +343,65 @@ union drm_asahi_cmd {
    struct drm_asahi_cmd_render render;
 };
 
-/* XXX: Batching multiple commands per submission is causing rare (7ppm) flakes
- * on the CTS once lossless compression is enabled. This needs to be
- * investigated before we can reenable this mechanism. We are likely missing a
- * cache flush or barrier somewhere.
+static void
+asahi_append_compute_attachments(struct hk_device *dev,
+                                 struct util_dynarray *payload,
+                                 const struct hk_cs *cs)
+{
+   const struct hk_drm_attachment_set *set = &cs->compute_attachments;
+   const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
+   const struct drm_asahi_cmd_header header = {
+      .cmd_type = DRM_ASAHI_SET_COMPUTE_ATTACHMENTS,
+      .size = count * sizeof(set->list[0]),
+      .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+      .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+   };
+   /* Clear the preceding command's list even for an attachmentless dispatch. */
+   util_dynarray_append(payload, header);
+   if (count)
+      util_dynarray_append_array(payload, struct drm_asahi_attachment,
+                                 set->list, count);
+}
+
+static void
+asahi_append_fragment_attachments(struct hk_device *dev,
+                                  struct util_dynarray *payload,
+                                  const struct hk_cs *cs)
+{
+   const struct hk_drm_attachment_set *set = &cs->fragment_attachments;
+   const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
+   const struct drm_asahi_cmd_header header = {
+      .cmd_type = DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS,
+      .size = count * sizeof(set->list[0]),
+      .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+      .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+   };
+
+   /* Emit even an empty set. Attachment commands affect subsequent hardware
+    * commands in the same submit, so an attachmentless render must clear the
+    * set retained by the preceding render. */
+   util_dynarray_append(payload, header);
+   if (count)
+      util_dynarray_append_array(payload, struct drm_asahi_attachment,
+                                 set->list, count);
+
+   if (!set->complete || count != set->count) {
+      perf_debug_dev(&dev->dev,
+                     "Fragment attachment hint incomplete: retained %u, emitted %u (kernel limit %u)",
+                     set->count, count, dev->dev.params.max_attachments);
+   }
+}
+
+/* Submit all ordered control streams together up to the kernel's advertised
+ * limit.  Splitting every stream into a separate ioctl serializes real games
+ * at the queue boundary; keep single-stream submission only as an explicit
+ * diagnostic control.
  */
 static inline unsigned
 max_commands_per_submit(struct hk_device *dev)
 {
-   return HK_PERF(dev, BATCH) ? 64 : 1;
+   return hk_drm_submit_command_limit(
+      !HK_PERF(dev, NOBATCH), dev->dev.params.max_commands_per_submission);
 }
 
 static VkResult
@@ -261,6 +409,11 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
                     unsigned ring_idx)
 {
    struct agx_submit_virt virt = {.ring_idx = ring_idx};
+
+   /* Complete the cache cleans of CPU-cached descriptor writes
+    * (hk_descriptor_set_publish()) before the GPU can read them. */
+   if (dev->dev.chip == AGX_CHIP_G17P && util_has_cache_ops())
+      util_post_flush_fence();
 
    if (dev->dev.is_virtio) {
       u_rwlock_rdlock(&dev->external_bos.lock);
@@ -274,11 +427,9 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
    if (dev->dev.is_virtio)
       u_rwlock_rdunlock(&dev->external_bos.lock);
 
-   /* XXX: don't trap */
-   if (ret) {
-      fprintf(stderr, "DRM_IOCTL_ASAHI_SUBMIT failed: %m\n");
-      assert(0);
-   }
+   if (ret)
+      return vk_device_set_lost(&dev->vk,
+                                "DRM_IOCTL_ASAHI_SUBMIT failed: %m");
 
    return VK_SUCCESS;
 }
@@ -290,8 +441,9 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
  * bounds.
  */
 static VkResult
-queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
-                    unsigned command_count, unsigned ring_idx)
+queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
+                    struct drm_asahi_submit *submit, unsigned command_count,
+                    unsigned ring_idx, const uint64_t prior_base[2])
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -312,36 +464,45 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
       assert(count > 0);
 
       unsigned base_offs = offs;
-      unsigned cdm_count = 0, vdm_count = 0;
+      struct hk_drm_command_span span;
+      if (!hk_drm_next_command_span(cmdbuf, submit->cmdbuf_size, base_offs,
+                                    count, &span)) {
+         return vk_device_set_lost(
+            &dev->vk, "Invalid internal Asahi command stream framing");
+      }
+      offs = span.end_offset;
+      unsigned cdm_count = span.compute_count;
+      unsigned vdm_count = span.render_count;
+      if (last && offs != submit->cmdbuf_size) {
+         return vk_device_set_lost(
+            &dev->vk, "Trailing synthetic Asahi commands without hardware");
+      }
 
       /* We need to fix up the barriers since barriers are ioctl-relative */
-      for (unsigned i = 0; i < count; ++i) {
-         struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + offs);
-         offs += sizeof(*cmd) + cmd->size;
+      for (unsigned scan = base_offs; scan < offs;) {
+         struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + scan);
+         scan += sizeof(*cmd) + cmd->size;
 
-         if (cmd->cmd_type == DRM_ASAHI_CMD_RENDER)
-            vdm_count++;
-         else if (cmd->cmd_type == DRM_ASAHI_CMD_COMPUTE)
-            cdm_count++;
+         if (cmd->cmd_type != DRM_ASAHI_CMD_RENDER &&
+             cmd->cmd_type != DRM_ASAHI_CMD_COMPUTE)
+            continue;
 
-         if (cmd->vdm_barrier != DRM_ASAHI_BARRIER_NONE) {
-            assert(cmd->vdm_barrier >= submitted_vdm);
-            cmd->vdm_barrier -= submitted_vdm;
-         }
-
-         if (cmd->cdm_barrier != DRM_ASAHI_BARRIER_NONE) {
-            assert(cmd->cdm_barrier >= submitted_cdm);
-            cmd->cdm_barrier -= submitted_cdm;
-         }
+         if (!hk_drm_rebase_prior(cmd, cmd + 1, submitted_vdm,
+                                  submitted_cdm, prior_base,
+                                  queue->sync.exact_prior))
+            return vk_device_set_lost(&dev->vk,
+                                      "Invalid historical Asahi prefix");
       }
 
       /* We can't signal the out-syncobjs until all prior work finishes. Since
        * only the last ioctl will signal, make sure it waits on prior ioctls.
        *
        * TODO: there might be a more performant way to do this.
-       */
+      */
       if (last && !first) {
-         struct drm_asahi_cmd_header *cmd = (void *)(cmdbuf + base_offs);
+         assert(span.first_hardware_offset != SIZE_MAX);
+         struct drm_asahi_cmd_header *cmd =
+            (void *)(cmdbuf + span.first_hardware_offset);
 
          if (cmd->vdm_barrier == DRM_ASAHI_BARRIER_NONE)
             cmd->vdm_barrier = 0;
@@ -350,7 +511,11 @@ queue_submit_looped(struct hk_device *dev, struct drm_asahi_submit *submit,
             cmd->cdm_barrier = 0;
       }
 
-      bool has_in_syncs = first;
+      /* Without the first-command dependency, later chunks have independent
+       * roots too. Each must carry the original input syncs. Legacy kernels
+       * retain the first-command chain and receive the waits only once. */
+      bool has_in_syncs = first ||
+         (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS);
       bool has_out_syncs = last;
 
       struct drm_asahi_submit submit_ioctl = {
@@ -380,6 +545,7 @@ struct hk_bind_builder {
    struct hk_device *dev;
    struct vk_object_base *obj_base;
    struct agx_va *va;
+   struct hk_buffer *buffer;
    struct hk_image *image;
 
    /* State */
@@ -395,12 +561,14 @@ struct hk_bind_builder {
 
 static inline struct hk_bind_builder
 hk_bind_builder(struct hk_device *dev, struct vk_object_base *obj_base,
-                struct agx_va *va, struct hk_image *image)
+                struct agx_va *va, struct hk_buffer *buffer,
+                struct hk_image *image)
 {
    struct hk_bind_builder b = {
       .dev = dev,
       .obj_base = obj_base,
       .va = va,
+      .buffer = buffer,
       .image = image,
    };
 
@@ -418,52 +586,6 @@ hk_flush_bind(struct hk_bind_builder *b)
    perf_debug(b->dev, "Sparse bind");
 
    uint64_t va_addr = b->va->addr + b->resourceOffset;
-
-   /* If we have an image with sparse residency, we have a userspace-managed
-    * sparse page table map, which we need to keep in sync with the real
-    * kernel-managed page table.  This ensures textures get strict residency
-    * semantics, using the hardware sparse support.
-    */
-   if (b->image && b->image->planes[0].sparse_map != NULL) {
-      assert(b->image->plane_count == 1 && "multiplane sparse not supported");
-
-      uint32_t *map = agx_bo_map(b->image->planes[0].sparse_map);
-      uint64_t size_page = ail_bytes_to_pages(b->size);
-
-      struct ail_layout *layout = &b->image->planes[0].layout;
-      uint64_t layer_stride_page = ail_bytes_to_pages(layout->layer_stride_B);
-
-      for (unsigned offs_page = 0; offs_page < size_page; offs_page++) {
-         /* Determine the target page to bind */
-         uint64_t target_page =
-            ail_bytes_to_pages(b->resourceOffset) + offs_page;
-
-         /* The page table is per-layer. Fortunately, layers are page-aligned,
-          * so we can divide to find the layer & the page relative to the start
-          * of the layer, which give us the index into the sparse map.
-          *
-          * Note that we can end up out-of-bounds since the hardware page size
-          * (16k) is smaller than the Vulkan standard sparse block size (65k).
-          * Just clamp out-of-bounds maps - there is sufficient VA space for
-          * them but not sufficient sparse map space for them.
-          */
-         uint64_t z = target_page / layer_stride_page;
-         if (z >= layout->depth_px)
-            break;
-
-         uint64_t page_in_layer = target_page % layer_stride_page;
-         unsigned idx = ail_page_to_sparse_index_el(layout, z, page_in_layer);
-
-         agx_pack(map + idx, SPARSE_BLOCK, cfg) {
-            cfg.enabled = b->mem != NULL;
-            cfg.unknown = cfg.enabled;
-
-            if (cfg.enabled) {
-               cfg.address = va_addr + (offs_page * AIL_PAGESIZE);
-            }
-         }
-      }
-   }
 
    /* When the app wants to unbind, replace the bound pages with scratch pages
     * so we don't leave a gap.
@@ -502,16 +624,126 @@ hk_flush_bind(struct hk_bind_builder *b)
    return VK_SUCCESS;
 }
 
-static int
+static VkResult
+hk_sparse_buffer_map_commit(struct hk_bind_builder *b)
+{
+   if (!b->buffer || !b->buffer->sparse_map)
+      return VK_SUCCESS;
+
+   struct hk_sparse_buffer_map_header *header =
+      agx_bo_map(b->buffer->sparse_map);
+   uint32_t *map = (uint32_t *)(header + 1);
+   struct drm_asahi_gem_bind_op *ops = b->binds.data;
+   const unsigned count = util_dynarray_num_elements(
+      &b->binds, struct drm_asahi_gem_bind_op);
+   assert((count % 2) == 0);
+
+   for (unsigned i = 0; i < count; i += 2) {
+      const struct drm_asahi_gem_bind_op *op = &ops[i];
+      assert(op->addr >= b->va->addr);
+      const uint64_t first = (op->addr - b->va->addr) / AIL_PAGESIZE;
+      const uint64_t pages = DIV_ROUND_UP(op->range, AIL_PAGESIZE);
+      const bool resident =
+         op->handle != b->dev->dev.scratch_bo->uapi_handle;
+
+      for (uint64_t page = 0; page < pages; ++page) {
+         if (first + page >= b->buffer->sparse_map_entries)
+            break;
+
+         const uint64_t target = first + page;
+         const uint32_t mask = BITFIELD_BIT(target & 31);
+         if (resident)
+            map[target >> 5] |= mask;
+         else
+            map[target >> 5] &= ~mask;
+      }
+   }
+
+   agx_bo_assert_range(b->buffer->sparse_map, 0,
+                              b->buffer->sparse_map->size);
+
+   return VK_SUCCESS;
+}
+
+static void
+hk_sparse_image_map_commit(struct hk_bind_builder *b)
+{
+   if (!b->image || !b->image->planes[0].sparse_map)
+      return;
+
+   assert(b->image->plane_count == 1 && "multiplane sparse not supported");
+
+   uint32_t *map = agx_bo_map(b->image->planes[0].sparse_map);
+   struct ail_layout *layout = &b->image->planes[0].layout;
+   const uint64_t layer_stride_page =
+      ail_bytes_to_pages(layout->layer_stride_B);
+   struct drm_asahi_gem_bind_op *ops = b->binds.data;
+   const unsigned count = util_dynarray_num_elements(
+      &b->binds, struct drm_asahi_gem_bind_op);
+   assert((count % 2) == 0);
+
+   /* Each logical sparse bind is followed by its read-only shadow.  Publish
+    * residency metadata only after the atomic kernel batch succeeded. */
+   for (unsigned i = 0; i < count; i += 2) {
+      const struct drm_asahi_gem_bind_op *op = &ops[i];
+      assert(op->addr >= b->va->addr);
+      const uint64_t resource_offset = op->addr - b->va->addr;
+      const uint64_t size_page = ail_bytes_to_pages(op->range);
+      const bool enabled =
+         op->handle != b->dev->dev.scratch_bo->uapi_handle;
+
+      for (uint64_t offs_page = 0; offs_page < size_page; ++offs_page) {
+         const uint64_t target_page =
+            ail_bytes_to_pages(resource_offset) + offs_page;
+         const uint64_t z = target_page / layer_stride_page;
+         if (z >= layout->depth_px)
+            break;
+
+         const uint64_t page_in_layer = target_page % layer_stride_page;
+         const unsigned idx =
+            ail_page_to_sparse_index_el(layout, z, page_in_layer);
+
+         agx_pack(map + idx, SPARSE_BLOCK, cfg) {
+            cfg.enabled = enabled;
+            cfg.unknown = enabled;
+            if (enabled)
+               cfg.address = op->addr + (offs_page * AIL_PAGESIZE);
+         }
+      }
+   }
+}
+
+static VkResult
 hk_bind_builder_finish(struct hk_bind_builder *b)
 {
-   hk_flush_bind(b);
+   b->result = hk_flush_bind(b);
 
    /* Submit everything to the kernel at once */
-   if (b->binds.size > 0) {
-      b->dev->dev.ops.bo_bind(
-         &b->dev->dev, b->binds.data,
-         util_dynarray_num_elements(&b->binds, struct drm_asahi_gem_bind_op));
+   if (b->result == VK_SUCCESS && b->binds.size > 0) {
+      const unsigned op_count =
+         util_dynarray_num_elements(&b->binds, struct drm_asahi_gem_bind_op);
+
+      /* One op per hardware tile plus its read-only shadow, so a large
+       * layered mip chain submits thousands.  The kernel copies and stages
+       * the whole batch, so the op count is what decides whether this bind
+       * can be satisfied when memory is tight -- print it when asked, rather
+       * than leaving a VM_BIND ENOMEM with no size attached to it. */
+      perf_debug_dev(&b->dev->dev, "Sparse bind batch: %u ops (%u bytes)",
+                     op_count, (unsigned)b->binds.size);
+
+      int ret = b->dev->dev.ops.bo_bind(&b->dev->dev, b->binds.data,
+                                        op_count);
+      if (ret) {
+         const int error = errno ? errno : EIO;
+         b->result = vk_errorf(
+            b->dev,
+            error == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_ERROR_UNKNOWN,
+            "Sparse VM_BIND batch failed: %s", strerror(error));
+      } else {
+         b->result = hk_sparse_buffer_map_commit(b);
+         if (b->result == VK_SUCCESS)
+            hk_sparse_image_map_commit(b);
+      }
    }
 
    util_dynarray_fini(&b->binds);
@@ -551,7 +783,7 @@ hk_sparse_buffer_bind_memory(struct hk_device *device,
    VK_FROM_HANDLE(hk_buffer, buffer, bind->buffer);
 
    struct hk_bind_builder b =
-      hk_bind_builder(device, &buffer->vk.base, buffer->va, NULL);
+      hk_bind_builder(device, &buffer->vk.base, buffer->va, buffer, NULL);
 
    for (uint32_t i = 0; i < bind->bindCount; ++i) {
       struct hk_device_memory *cur_mem = NULL;
@@ -573,7 +805,8 @@ hk_sparse_image_opaque_bind_memory(
    VK_FROM_HANDLE(hk_image, image, bind->image);
 
    struct hk_bind_builder b =
-      hk_bind_builder(device, &image->vk.base, image->planes[0].va, image);
+      hk_bind_builder(device, &image->vk.base, image->planes[0].va, NULL,
+                      image);
 
    for (uint32_t i = 0; i < bind->bindCount; ++i) {
       struct hk_device_memory *mem = NULL;
@@ -653,7 +886,8 @@ hk_sparse_image_bind_memory(struct hk_device *device,
    struct ail_layout *layout = &image->planes[0].layout;
 
    struct hk_bind_builder b =
-      hk_bind_builder(device, &image->vk.base, image->planes[0].va, image);
+      hk_bind_builder(device, &image->vk.base, image->planes[0].va, NULL,
+                      image);
 
    for (uint32_t i = 0; i < bind->bindCount; ++i) {
       struct hk_device_memory *mem = NULL;
@@ -733,10 +967,56 @@ hk_queue_submit_bind_sparse_memory(struct hk_device *device,
    return VK_SUCCESS;
 }
 
+static bool
+hk_sparse_submission_updates_sstt(const struct vk_queue_submit *submission)
+{
+   for (uint32_t i = 0; i < submission->image_opaque_bind_count; ++i) {
+      VK_FROM_HANDLE(hk_image, image, submission->image_opaque_binds[i].image);
+      if (submission->image_opaque_binds[i].bindCount &&
+          image->planes[0].sparse_map)
+         return true;
+   }
+
+   for (uint32_t i = 0; i < submission->image_bind_count; ++i) {
+      VK_FROM_HANDLE(hk_image, image, submission->image_binds[i].image);
+      if (submission->image_binds[i].bindCount &&
+          image->planes[0].sparse_map)
+         return true;
+   }
+
+   return false;
+}
+
+static VkResult
+hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (queue->drm.id != UINT32_MAX)
+      return VK_SUCCESS;
+
+   /* The common queue submit path serializes submissions to this queue.
+    * A logical queue, including one used only for host synchronization, does
+    * not need a kernel scheduling context until it actually submits work. */
+   queue->drm.id = agx_create_command_queue(
+      &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1));
+   if (queue->drm.id != UINT32_MAX)
+      return VK_SUCCESS;
+
+   const int error = errno;
+   const VkResult result =
+      error == ENOMEM ? VK_ERROR_OUT_OF_HOST_MEMORY :
+      (error == ENOSPC || error == EBUSY) ? VK_ERROR_OUT_OF_DEVICE_MEMORY :
+      (error == EPERM || error == EACCES) ? VK_ERROR_NOT_PERMITTED_EXT :
+      VK_ERROR_INITIALIZATION_FAILED;
+   return vk_errorf(dev, result, "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %s",
+                    strerror(error));
+}
+
 static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit)
 {
+   bool flush_sstt = false;
+
    /* TODO: Support asynchronous sparse queue? */
    if (submit->buffer_bind_count || submit->image_bind_count ||
        submit->image_opaque_bind_count) {
@@ -744,9 +1024,12 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       VkResult result = hk_queue_submit_bind_sparse_memory(dev, submit);
       if (result != VK_SUCCESS)
          return result;
+
+      flush_sstt = dev->dev.chip == AGX_CHIP_G17P &&
+                   hk_sparse_submission_updates_sstt(submit);
    }
 
-   unsigned command_count = 0;
+   unsigned command_count = flush_sstt ? 1 : 0;
 
    /* Gather the number of individual commands to submit up front */
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
@@ -760,12 +1043,35 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                   "Submitting %u control streams (%u command buffers)",
                   command_count, submit->command_buffer_count);
 
-   if (command_count == 0)
+   if (command_count == 0) {
+      /* A barrier-only command buffer still has a second scope in later
+       * submissions. Unsupported kernels retain their existing path. */
+      if (queue->sync.exact_prior &&
+          !hk_sync_resolve_submit(
+             queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
+             submit->command_buffer_count, false, false, 0))
+         return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
       return queue_submit_empty(dev, queue, submit);
+   }
 
+   VkResult queue_result = hk_queue_ensure_drm(dev, queue);
+   if (queue_result != VK_SUCCESS)
+      return queue_result;
+
+   const uint64_t prior_base[HK_SYNC_NUM_SQ] = {
+      queue->sync.submitted[HK_SYNC_VDM], queue->sync.submitted[HK_SYNC_CDM],
+   };
+
+   /* G17P permits independent engines and physical render queues to finish
+    * out of order. Publish API signals from the cumulative queue point after
+    * the ioctl, preserving independent execution while covering earlier work.
+    */
+   const bool cumulative_signals = dev->dev.chip == AGX_CHIP_G17P;
+   const unsigned kernel_signal_count =
+      cumulative_signals ? 0 : submit->signal_count;
    unsigned wait_count = 0;
    struct drm_asahi_sync *syncs =
-      alloca((submit->wait_count + submit->signal_count + 1) *
+      alloca((submit->wait_count + kernel_signal_count + 1) *
              sizeof(struct drm_asahi_sync));
 
    for (unsigned i = 0; i < submit->wait_count; ++i) {
@@ -778,9 +1084,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
        */
       bool skip = false;
       if (submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) {
-         uint32_t v1 = submit->waits[i].wait_value;
+         const uint64_t v1 = submit->waits[i].wait_value;
          for (unsigned j = 0; j < submit->wait_count; ++j) {
-            uint32_t v2 = submit->waits[j].wait_value;
+            const uint64_t v2 = submit->waits[j].wait_value;
             if (i != j && submit->waits[i].sync == submit->waits[j].sync &&
                 (v1 < v2 || (v1 == v2 && i < j))) {
                skip = true;
@@ -796,13 +1102,13 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                       submit->waits[i].wait_value);
    }
 
-   for (unsigned i = 0; i < submit->signal_count; ++i) {
+   for (unsigned i = 0; i < kernel_signal_count; ++i) {
       asahi_fill_sync(&syncs[wait_count + i], submit->signals[i].sync,
                       submit->signals[i].signal_value);
    }
 
    /* Signal progress on the queue itself */
-   syncs[wait_count + submit->signal_count] = (struct drm_asahi_sync){
+   syncs[wait_count + kernel_signal_count] = (struct drm_asahi_sync){
       .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
       .handle = queue->drm.syncobj,
       .timeline_value = ++queue->drm.timeline_value,
@@ -813,16 +1119,64 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    unsigned nr_vdm = 0, nr_cdm = 0;
 
+   if (flush_sstt) {
+      assert(queue->g17p_sstt_flush_bo);
+      struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);
+      const struct drm_asahi_cmd_compute_with_prior cmd = {
+         .legacy = {
+            .cdm_ctrl_stream_base = queue->g17p_sstt_flush_bo->va->addr,
+            .cdm_ctrl_stream_end =
+               queue->g17p_sstt_flush_bo->va->addr +
+               AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE +
+               AGX3_CDM_STREAM_TERMINATE_SIZE,
+         },
+      };
+      if (queue->sync.exact_prior)
+         header.size = sizeof(cmd);
+      util_dynarray_append(&payload, header);
+      util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
+      nr_cdm++;
+   }
+
+   /* Tile hazards against this queue's earlier submissions need the point
+    * the queue has completed; fetched only when a partial-tile render pass
+    * instance is submitted while such a footprint may still be running. On
+    * failure every earlier submission is treated as still running. */
+   uint64_t completed = 0;
+   if (hk_sync_submit_needs_completed(
+          queue, (struct hk_cmd_buffer *const *)submit->command_buffers,
+          submit->command_buffer_count)) {
+      uint64_t point = 0;
+      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) == 0)
+         completed = point;
+   }
+
+   /* Every command's barrier fields come from recorded dependencies. Legacy
+    * kernels attach input syncs only to the first command, requiring a chain.
+    * A kernel advertising per-command waits needs no such execution edge. */
+   if (!hk_sync_resolve_submit(queue,
+                          (struct hk_cmd_buffer *const *)submit->command_buffers,
+                          submit->command_buffer_count, flush_sstt,
+                          wait_count > 0 &&
+                          !(dev->dev.params.features &
+                            DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS),
+                          completed)) {
+      util_dynarray_fini(&payload);
+      return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
+   }
+
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
-         /* Barrier on previous command */
          struct drm_asahi_cmd_header header =
-            agx_cmd_header(cs->type == HK_CS_CDM, nr_vdm, nr_cdm);
-
-         util_dynarray_append(&payload, header);
+            agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],
+                           cs->sync.barrier[HK_SYNC_CDM]);
+         assert(header.vdm_barrier == DRM_ASAHI_BARRIER_NONE ||
+                header.vdm_barrier <= nr_vdm);
+         assert(header.cdm_barrier == DRM_ASAHI_BARRIER_NONE ||
+                header.cdm_barrier <= nr_cdm);
 
          if (cs->type == HK_CS_CDM) {
             perf_debug(
@@ -832,22 +1186,52 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                cs->stats.merged);
 
             assert(cs->stats.cmds > 0 || cs->stats.flushes > 0 ||
-                   cs->timestamp.end.handle);
+                   cs->timestamp.end.handle || cs->timestamp.start.handle);
 
-            struct drm_asahi_cmd_compute cmd;
-            asahi_fill_cdm_command(dev, cs, &cmd);
-            util_dynarray_append(&payload, cmd);
+            asahi_append_compute_attachments(dev, &payload, cs);
+            struct drm_asahi_cmd_compute_with_prior cmd = {0};
+            asahi_fill_cdm_command(dev, cs, &cmd.legacy);
+            if (queue->sync.exact_prior) {
+               header.size = sizeof(cmd);
+               cmd.prior_vdm = cs->sync.prior[HK_SYNC_VDM];
+               cmd.prior_cdm = cs->sync.prior[HK_SYNC_CDM];
+            }
+            util_dynarray_append(&payload, header);
+            util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
             nr_cdm++;
          } else {
             assert(cs->type == HK_CS_VDM);
             perf_debug(cmdbuf, "%u: Submitting VDM with %u API draws, %u draws",
                        i, cs->stats.calls, cs->stats.cmds);
             assert(cs->stats.cmds > 0 || cs->cr.process_empty_tiles ||
-                   cs->timestamp.end.handle);
+                   cs->timestamp.end.handle || cs->timestamp.start.handle);
 
-            struct drm_asahi_cmd_render cmd;
-            asahi_fill_vdm_command(dev, cs, &cmd);
-            util_dynarray_append(&payload, cmd);
+            asahi_append_fragment_attachments(dev, &payload, cs);
+            struct drm_asahi_cmd_render_with_prior cmd = {0};
+            asahi_fill_vdm_command(dev, cs, &cmd.legacy);
+
+            /* The render's vertex half depends on no earlier render while its
+             * fragment half does (hk_sync: every render dependency targets
+             * fragment or attachment work alone): let the kernel order only
+             * the fragment half after them, so this render's vertex work can
+             * overlap their fragment work. Compute dependencies keep ordering
+             * the vertex half either way. */
+            if ((dev->dev.params.features &
+                 DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+                cs->sync.ta_split &&
+                cs->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                cs->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+                (cs->sync.barrier[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
+                 cs->sync.prior[HK_SYNC_VDM] != 0))
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+            header.size = hk_drm_render_command_size(
+               dev->dev.chip == AGX_CHIP_G17P, queue->sync.exact_prior);
+            if (queue->sync.exact_prior) {
+               cmd.prior_vdm = cs->sync.prior[HK_SYNC_VDM];
+               cmd.prior_cdm = cs->sync.prior[HK_SYNC_CDM];
+            }
+            util_dynarray_append(&payload, header);
+            util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
             nr_vdm++;
          }
       }
@@ -864,7 +1248,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       .flags = 0,
       .queue_id = queue->drm.id,
       .in_sync_count = wait_count,
-      .out_sync_count = submit->signal_count + 1,
+      .out_sync_count = kernel_signal_count + 1,
       .cmdbuf_size = payload.size,
       .syncs = (uint64_t)(uintptr_t)(syncs),
       .cmdbuf = (uint64_t)(uintptr_t)(payload.data),
@@ -875,11 +1259,20 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       result =
          queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx);
    } else {
-      result = queue_submit_looped(dev, &submit_ioctl, command_count,
-                                   queue->drm.virt_ring_idx);
+      result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
+                                   queue->drm.virt_ring_idx, prior_base);
+   }
+   if (cumulative_signals) {
+      /* The kernel can publish an error fence even when submission fails.
+       * Forward it when present, without waiting for a missing queue point
+       * or replacing the original submit error with a transfer error. */
+      const VkResult signal_result = queue_signal_timeline(dev, queue, submit);
+      if (result == VK_SUCCESS)
+         result = signal_result;
    }
 
    util_dynarray_fini(&payload);
+
    return result;
 }
 
@@ -956,27 +1349,30 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* TODO: Lift when kernel side is ready and we can handle failures in
-    * create_command_queue.
-    */
+   /* High-priority scheduling still needs kernel qualification. */
    enum drm_asahi_priority drm_priority = translate_priority(priority);
    if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH) {
+      vk_free(&dev->vk.alloc, queue);
       return VK_ERROR_NOT_PERMITTED_EXT;
    }
 
    result = vk_queue_init(&queue->vk, &dev->vk, pCreateInfo, index_in_family);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      vk_free(&dev->vk.alloc, queue);
       return result;
+   }
 
    queue->vk.driver_submit = hk_queue_submit;
+   queue->sync.exact_prior =
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
-   queue->drm.id = agx_create_command_queue(&dev->dev, drm_priority);
+   queue->drm.id = UINT32_MAX;
    queue->drm.virt_ring_idx = drm_priority + 1;
 
    if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
       mesa_loge("drmSyncobjCreate() failed %d\n", errno);
-      agx_destroy_command_queue(&dev->dev, queue->drm.id);
       vk_queue_finish(&queue->vk);
+      vk_free(&dev->vk.alloc, queue);
 
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
                        "DRM_IOCTL_SYNCOBJ_CREATE failed: %m");
@@ -990,6 +1386,32 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
                        "DRM_IOCTL_TIMELINE_SYNCOBJ_SIGNAL failed: %m");
    }
 
+   /* Point 1 is already signalled.  Keep the software cursor in lockstep so
+    * the first real submit advances to point 2 instead of reusing the
+    * completed bootstrap point.  QueueWaitIdle transfers from this cursor;
+    * reusing point 1 lets it return before the first submit has completed. */
+   queue->drm.timeline_value = initial_value;
+
+   if (dev->dev.chip == AGX_CHIP_G17P &&
+       dev->vk.enabled_features.sparseBinding) {
+      queue->g17p_sstt_flush_bo =
+         agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "SSTT flush stream");
+      if (!queue->g17p_sstt_flush_bo) {
+         hk_queue_finish(dev, queue);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+
+      uint8_t *stream = agx_bo_map(queue->g17p_sstt_flush_bo);
+      if (!stream ||
+          !agx3_cdm_sstt_flush_invalidate_pack(AGX_CHIP_G17P, stream) ||
+          !agx3_cdm_stream_terminate_pack(
+             AGX_CHIP_G17P,
+             stream + AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE)) {
+         hk_queue_finish(dev, queue);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+   }
+
    return VK_SUCCESS;
 }
 
@@ -997,7 +1419,9 @@ void
 hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
-   agx_destroy_command_queue(&dev->dev, queue->drm.id);
+   if (queue->drm.id != UINT32_MAX)
+      agx_destroy_command_queue(&dev->dev, queue->drm.id);
+   agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
    vk_queue_finish(&queue->vk);
    vk_free(&dev->vk.alloc, queue);
 }

@@ -9,10 +9,14 @@
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_instance.h"
+#include "hk_image.h"
+#include "hk_native_sampler.h"
 #include "hk_physical_device.h"
 
 #include "vk_format.h"
 #include "vk_sampler.h"
+
+#include "util/u_atomic.h"
 
 #include "asahi/genxml/agx_pack.h"
 
@@ -86,7 +90,8 @@ uses_border(const VkSamplerCreateInfo *info)
 }
 
 static enum agx_border_colour
-is_border_color_custom(VkBorderColor color, bool workaround_rgba4)
+is_border_color_custom(VkBorderColor color, bool workaround_rgba4,
+                       bool int_border_custom)
 {
    switch (color) {
    case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
@@ -95,6 +100,16 @@ is_border_color_custom(VkBorderColor color, bool workaround_rgba4)
        * formats to worry about.
        */
       return workaround_rgba4;
+
+   case VK_BORDER_COLOR_INT_OPAQUE_WHITE:
+   case VK_BORDER_COLOR_INT_OPAQUE_BLACK:
+      /* Native scaled views sample a normalized twin and rescale in the
+       * shader; the hardware's opaque white there is the format maximum,
+       * while the integer border means the texel value one
+       * (pipeline.*.sampler.*.a2r10g10b10_uscaled_pack32.*clamp_to_border*).
+       * Emulate like a custom border so the shader applies the recorded
+       * integer value. */
+      return int_border_custom;
 
    case VK_BORDER_COLOR_INT_CUSTOM_EXT:
    case VK_BORDER_COLOR_FLOAT_CUSTOM_EXT:
@@ -108,9 +123,9 @@ is_border_color_custom(VkBorderColor color, bool workaround_rgba4)
 /* Translate an American VkBorderColor into a Canadian agx_border_colour */
 static enum agx_border_colour
 translate_border_color(VkBorderColor color, bool custom_to_1,
-                       bool workaround_rgba4)
+                       bool workaround_rgba4, bool int_border_custom)
 {
-   if (is_border_color_custom(color, workaround_rgba4)) {
+   if (is_border_color_custom(color, workaround_rgba4, int_border_custom)) {
       return custom_to_1 ? AGX_BORDER_COLOUR_OPAQUE_WHITE
                          : AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
    }
@@ -133,42 +148,77 @@ translate_border_color(VkBorderColor color, bool custom_to_1,
    }
 }
 
-static void
+static enum hk_sampler_reduction_mode
+translate_reduction_mode(VkSamplerReductionMode mode)
+{
+   switch (mode) {
+   case VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE:
+      return HK_SAMPLER_REDUCTION_WEIGHTED_AVERAGE;
+   case VK_SAMPLER_REDUCTION_MODE_MIN:
+      return HK_SAMPLER_REDUCTION_MINIMUM;
+   case VK_SAMPLER_REDUCTION_MODE_MAX:
+      return HK_SAMPLER_REDUCTION_MAXIMUM;
+   default:
+      return (enum hk_sampler_reduction_mode)~0u;
+   }
+}
+
+static bool
 pack_sampler(const struct hk_physical_device *pdev,
              const struct VkSamplerCreateInfo *info, bool custom_to_1,
-             bool workaround_rgba4, struct agx_sampler_packed *out)
+             bool workaround_rgba4, bool int_border_custom,
+             VkSamplerReductionMode reduction_mode,
+             struct hk_native_sampler_descriptor *out)
 {
-   agx_pack(out, SAMPLER, cfg) {
-      cfg.minimum_lod = info->minLod;
-      cfg.maximum_lod = info->maxLod;
-      cfg.magnify = translate_filter(info->magFilter);
-      cfg.minify = translate_filter(info->minFilter);
-      cfg.mip_filter = translate_mipfilter(info->mipmapMode);
-      cfg.wrap_s = translate_address_mode(info->addressModeU);
-      cfg.wrap_t = translate_address_mode(info->addressModeV);
-      cfg.wrap_r = translate_address_mode(info->addressModeW);
-      cfg.pixel_coordinates = info->unnormalizedCoordinates;
+   const struct hk_native_sampler_state state = {
+      .minimum_lod = info->minLod,
+      .maximum_lod = info->maxLod,
+      .lod_bias = info->mipLodBias,
+      .maximum_anisotropy =
+         info->anisotropyEnable
+            ? util_next_power_of_two(MAX2(info->maxAnisotropy, 1))
+            : 1,
+      .magnify = translate_filter(info->magFilter),
+      .minify = translate_filter(info->minFilter),
+      .mip_filter = translate_mipfilter(info->mipmapMode),
+      .wrap_s = translate_address_mode(info->addressModeU),
+      .wrap_t = translate_address_mode(info->addressModeV),
+      .wrap_r = translate_address_mode(info->addressModeW),
+      .compare_func = info->compareEnable
+                         ? translate_texsamp_compare_op(info->compareOp)
+                         : AGX_COMPARE_FUNC_LEQUAL,
+      .border_colour =
+         uses_border(info)
+            ? translate_border_color(info->borderColor, custom_to_1,
+                                     workaround_rgba4, int_border_custom)
+            : AGX_BORDER_COLOUR_TRANSPARENT_BLACK,
+      .reduction_mode = translate_reduction_mode(reduction_mode),
+      .pixel_coordinates = info->unnormalizedCoordinates,
+      .compare_enable = info->compareEnable,
+      .seamful_cube_maps =
+         info->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT,
+   };
 
-      cfg.seamful_cube_maps =
-         info->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
+   return hk_pack_native_sampler(pdev->dev.chip, out, &state);
+}
 
-      if (info->compareEnable) {
-         cfg.compare_func = translate_texsamp_compare_op(info->compareOp);
-         cfg.compare_enable = true;
-      }
-
-      if (info->anisotropyEnable) {
-         cfg.maximum_anisotropy =
-            util_next_power_of_two(MAX2(info->maxAnisotropy, 1));
-      } else {
-         cfg.maximum_anisotropy = 1;
-      }
-
-      if (uses_border(info)) {
-         cfg.border_colour = translate_border_color(
-            info->borderColor, custom_to_1, workaround_rgba4);
-      }
-   }
+/* hk_pack_native_sampler() only reports success, so print the full sampler
+ * state when the chip's packer refuses one. */
+static VkResult
+hk_sampler_pack_error(struct hk_device *dev, const VkSamplerCreateInfo *info,
+                      VkSamplerReductionMode reduction, const char *which)
+{
+   return vk_errorf(
+      dev, VK_ERROR_FEATURE_NOT_PRESENT,
+      "%s cannot pack a sampler (%s): mag=%u min=%u mip=%u wrap=%u/%u/%u "
+      "aniso=%u/%f lod=%f..%f bias=%f compare=%u/%u border=%u reduction=%u "
+      "unnorm=%u flags=0x%x",
+      agx_chip_name(dev->dev.chip), which, info->magFilter, info->minFilter,
+      info->mipmapMode, info->addressModeU, info->addressModeV,
+      info->addressModeW, info->anisotropyEnable, info->maxAnisotropy,
+      info->minLod, info->maxLod, info->mipLodBias, info->compareEnable,
+      info->compareOp, info->borderColor, reduction,
+      info->unnormalizedCoordinates, info->flags);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -185,10 +235,55 @@ hk_CreateSampler(VkDevice device,
    if (!sampler)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   bool workaround_rgba4 = dev->vk.enabled_features.customBorderColors;
+   sampler->min_filter = info->minFilter;
+   sampler->mag_filter = info->magFilter;
+   sampler->mip_lod_bias = info->mipLodBias;
+   if (sampler->vk.ycbcr_conversion) {
+      sampler->ycbcr = sampler->vk.ycbcr_conversion->state;
+      /* This is a lowering switch on our private copy of the conversion
+       * state, not an echo of the API's forceExplicitReconstruction, and it
+       * stays even though G17P no longer advertises either
+       * CHROMA_RECONSTRUCTION_EXPLICIT bit for these formats.
+       *
+       * On G17P a packed 4:2:2 view is programmed as a plain four-component
+       * word texture -- R8G8B8A8_UNORM or R16G16B16A16_UNORM, see
+       * hk_image_view.c -- because the texture unit does not reconstruct
+       * these formats for us.  Every luma and chroma sample therefore comes
+       * out of hk_shader.c's lowering, and that lowering is reached only
+       * through lower_ycbcr_explicit(), which this flag gates:
+       * lower_packed_ycbcr_center() fires on the txl taps that pass emits,
+       * and the common nir_vk_lower_ycbcr_tex() deliberately skips packed
+       * formats.  Clear the flag and an application's texture() would sample
+       * raw packed words as RGBA with no conversion at all.
+       *
+       * Withdrawing the format features is therefore not a promise that we
+       * stopped reconstructing at luma texel centres; it is a statement that
+       * we no longer guarantee it, which is what "reconstruction is
+       * implementation-defined" means.
+       */
+      if (agx_native_graphics(&dev->dev) && hk_packed_ycbcr_bits(sampler->ycbcr.format))
+         sampler->ycbcr.force_explicit_reconstruction = true;
+      /* Explicit nearest chroma maps luma (i,j) to (i/2,j/2), independent
+       * of chroma location. Linear reconstruction retains the offset. */
+      if (sampler->ycbcr.force_explicit_reconstruction &&
+          sampler->ycbcr.chroma_filter == VK_FILTER_NEAREST)
+         sampler->ycbcr.chroma_reconstruction = false;
+   }
+
+   bool workaround_rgba4 = dev->vk.enabled_features.customBorderColors ||
+                           agx_native_graphics(&dev->dev);
+   bool int_border_custom = agx_native_graphics(&dev->dev);
    bool custom_border =
       uses_border(info) &&
-      is_border_color_custom(info->borderColor, workaround_rgba4);
+      is_border_color_custom(info->borderColor, workaround_rgba4,
+                             int_border_custom);
+
+   /* Shaders compiled from now on emulate the border colour, and shaders
+    * compiled before switch to their emulating twins when bound or drawn
+    * with. Publish before the sampler can reach a descriptor. */
+   if (custom_border && !HK_PERF(dev, NOBORDER) &&
+       !p_atomic_read(&pdev->border_emulation))
+      p_atomic_set(&pdev->border_emulation, 1);
 
    /* Sanity check the noborder setting. There's no way to recover from it being
     * wrong but at least we can make noise to lint for errors in the driconf.
@@ -209,14 +304,25 @@ hk_CreateSampler(VkDevice device,
       warned_custom_border = true;
    }
 
-   struct agx_sampler_packed samp;
-   pack_sampler(pdev, info, true, workaround_rgba4, &samp);
+   struct hk_native_sampler_descriptor samp;
+   if (!pack_sampler(pdev, info, true, workaround_rgba4, int_border_custom,
+                     sampler->vk.reduction_mode, &samp)) {
+      hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
+      return hk_sampler_pack_error(dev, info, sampler->vk.reduction_mode,
+                                   "base plane");
+   }
 
-   /* LOD bias passed in the descriptor set */
-   sampler->lod_bias_fp16 = _mesa_float_to_half(info->mipLodBias);
+   /* Gen4 has no bias field, so shaders fetch it from the descriptor set.
+    * HAL200/Gen5 carry it in the hardware sampler and must see a zero software
+    * bias or the API bias would be applied twice. */
+   sampler->lod_bias_fp16 =
+      agx_chip_sampler_generation(pdev->dev.chip) ==
+            AGX_SAMPLER_GENERATION_GEN4
+         ? _mesa_float_to_half(info->mipLodBias)
+         : _mesa_float_to_half(0.0f);
 
-   result =
-      hk_sampler_heap_add(dev, samp, &sampler->planes[sampler->plane_count].hw);
+   result = hk_sampler_heap_add(
+      dev, &samp, &sampler->planes[sampler->plane_count].hw);
    if (result != VK_SUCCESS) {
       hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
       return result;
@@ -233,7 +339,10 @@ hk_CreateSampler(VkDevice device,
     * then just copy the last sampler plane out as far as we need to fill the
     * number of image planes.
     */
-   if (sampler->vk.ycbcr_conversion) {
+   /* Packed conversion fetches raw words; chroma filtering runs in the
+    * shader and does not consume a second sampler/descriptor plane. */
+   if (sampler->vk.ycbcr_conversion &&
+       !(agx_native_graphics(&dev->dev) && hk_packed_ycbcr_bits(sampler->ycbcr.format))) {
       assert(!uses_border(info) &&
              "consequence of VUID-VkSamplerCreateInfo-addressModeU-01646");
 
@@ -245,9 +354,17 @@ hk_CreateSampler(VkDevice device,
          plane2_info.magFilter = chroma_filter;
          plane2_info.minFilter = chroma_filter;
 
-         pack_sampler(pdev, &plane2_info, false, workaround_rgba4, &samp);
+         if (!pack_sampler(pdev, &plane2_info, false, workaround_rgba4,
+                          int_border_custom,
+                           sampler->vk.reduction_mode, &samp)) {
+            hk_DestroySampler(device, hk_sampler_to_handle(sampler),
+                              pAllocator);
+            return hk_sampler_pack_error(dev, &plane2_info,
+                                         sampler->vk.reduction_mode,
+                                         "chroma plane");
+         }
          result = hk_sampler_heap_add(
-            dev, samp, &sampler->planes[sampler->plane_count].hw);
+            dev, &samp, &sampler->planes[sampler->plane_count].hw);
 
          if (result != VK_SUCCESS) {
             hk_DestroySampler(device, hk_sampler_to_handle(sampler),
@@ -261,8 +378,13 @@ hk_CreateSampler(VkDevice device,
       /* If the sampler uses custom border colours, we need both clamp-to-1
        * and clamp-to-0 variants. We treat these as planes.
        */
-      pack_sampler(pdev, info, false, workaround_rgba4, &samp);
-      result = hk_sampler_heap_add(dev, samp,
+      if (!pack_sampler(pdev, info, false, workaround_rgba4, int_border_custom,
+                        sampler->vk.reduction_mode, &samp)) {
+         hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
+         return hk_sampler_pack_error(dev, info, sampler->vk.reduction_mode,
+                                      "custom border clamp-to-0 plane");
+      }
+      result = hk_sampler_heap_add(dev, &samp,
                                    &sampler->planes[sampler->plane_count].hw);
 
       if (result != VK_SUCCESS) {
@@ -291,6 +413,7 @@ hk_CreateSampler(VkDevice device,
 
       sampler->custom_border = bc;
       sampler->has_border = true;
+      sampler->border_is_int = vk_border_color_is_int(info->borderColor);
    }
 
    *pSampler = hk_sampler_to_handle(sampler);

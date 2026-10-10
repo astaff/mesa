@@ -45,6 +45,17 @@ struct hk_descriptor_set_binding_layout {
 struct hk_descriptor_set_layout {
    struct vk_descriptor_set_layout vk;
 
+   /* Selects both hardware descriptor size and the surrounding Honeykrisp
+    * software descriptor ABI.  This is persistent pipeline-layout state, not
+    * a property that may be inferred from sizeof(agx_texture_packed).
+    */
+   uint8_t descriptor_generation;
+
+   /* G17P native heap indices are zero-based. Other chips retain AGX2's
+    * software descriptor bias; descriptor generation alone does not select
+    * this ABI because Gen9 covers several distinct chips. */
+   bool native_sampler_indices;
+
    /* Size of the descriptor buffer for this descriptor set */
    /* Does not contain the size needed for variable count descriptors */
    uint32_t non_variable_descriptor_buffer_size;
@@ -56,6 +67,13 @@ struct hk_descriptor_set_layout {
    struct hk_descriptor_set_binding_layout binding[0];
 };
 
+static inline uint16_t
+hk_sampler_descriptor_index(const struct hk_descriptor_set_layout *layout,
+                            uint16_t heap_index)
+{
+   return heap_index + (layout->native_sampler_indices ? 0 : 28);
+}
+
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_descriptor_set_layout, vk.base,
                                VkDescriptorSetLayout,
                                VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)
@@ -64,6 +82,8 @@ void hk_descriptor_stride_align_for_type(
    const struct hk_physical_device *pdev, VkDescriptorType type,
    const VkMutableDescriptorTypeListEXT *type_list, uint32_t *stride,
    uint32_t *alignment);
+
+void hk_descriptor_set_layout_hash(struct hk_descriptor_set_layout *layout);
 
 static inline struct hk_descriptor_set_layout *
 vk_to_hk_descriptor_set_layout(struct vk_descriptor_set_layout *layout)
