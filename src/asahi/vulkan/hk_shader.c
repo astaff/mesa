@@ -1583,8 +1583,6 @@ lower_scaled_sample(nir_builder *b, nir_tex_instr *tex, void *data)
       return false;
    b->cursor = nir_before_instr(&tex->instr);
    nir_def *desc = nir_load_from_texture_handle_agx(b, tex->src[handle].src.ssa);
-   const unsigned offset = 32 +
-      offsetof(struct hk_sampled_image_descriptor_sw, scaled_conversion);
    /* Read scaled_conversion through an aligned 32-bit load.
     *
     * MEASURED on G17P: as a 16-bit load at descriptor offset 50 this returned
@@ -3347,8 +3345,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        shader->b.info.stage == MESA_SHADER_VERTEX) {
       struct hk_agx3_g17p_vertex_compile_info compiler_info;
       hk_g17p_vertex_compile_info_init(shader, vs_cprog, &compiler_info);
-      const bool state_ok = hk_agx3_g17p_vertex_program_info(
-         dev->dev.chip, &compiler_info, &shader->agx3_vdm_state_update);
+      /* On failure the program info is cleared, so the draw paths see no
+       * vertex program variant and refuse the shader there. */
+      hk_agx3_g17p_vertex_program_info(dev->dev.chip, &compiler_info,
+                                       &shader->agx3_vdm_state_update);
    }
 
    if (nir->constant_data_size > 0) {

@@ -150,7 +150,6 @@ hk_encode_as(VkCommandBuffer commandBuffer,
              const struct vk_acceleration_structure_build_state *state,
              VkPipelineLayout layout)
 {
-   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(vk_acceleration_structure, dst,
                   state->build_info->dstAccelerationStructure);
 
