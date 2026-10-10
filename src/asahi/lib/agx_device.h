@@ -16,6 +16,7 @@
 #include "util/simple_mtx.h"
 #include "util/sparse_array.h"
 #include "util/timespec.h"
+#include "util/u_atomic.h"
 #include "util/u_printf.h"
 #include "util/vma.h"
 
@@ -233,7 +234,7 @@ struct agx_device {
       size_t size;
 
       /* Optional frontend-wide accounting, shared by logical devices. */
-      uint64_t *size_counter;
+      p_atomic_uint64_t *size_counter;
 
       /* Number of hits/misses for the BO cache */
       uint64_t hits, misses;

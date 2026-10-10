@@ -1585,7 +1585,7 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
    for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
       const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
       uint64_t used = p_atomic_read(&heap->used) +
-                         p_atomic_read(&heap->cached);
+                         p_atomic_read(&heap->cached.value);
       total_used += used;
    }
 
@@ -1890,7 +1890,7 @@ hk_GetPhysicalDeviceMemoryProperties2(
          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
             const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
             uint64_t used = p_atomic_read(&heap->used) +
-                            p_atomic_read(&heap->cached);
+                            p_atomic_read(&heap->cached.value);
 
             /* From the Vulkan 1.3.278 spec:
              *

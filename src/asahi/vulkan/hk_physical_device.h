@@ -17,10 +17,6 @@
 struct hk_instance;
 struct hk_physical_device;
 
-/* Hidden qualification switch for complete G17P code paths that still need
- * their final hardware oracle.  This is shared with format capability code so
- * a feature bit and every format it promises are exposed atomically. */
-
 struct hk_queue_family {
    VkQueueFlags queue_flags;
    uint32_t queue_count;
@@ -29,7 +25,7 @@ struct hk_queue_family {
 struct hk_memory_heap {
    uint64_t size;
    uint64_t used;
-   uint64_t cached;
+   p_atomic_uint64_t cached;
    VkMemoryHeapFlags flags;
 };
 
