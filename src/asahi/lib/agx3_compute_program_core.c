@@ -1,0 +1,477 @@
+/*
+ * Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "agx3_compute_program_core.h"
+
+#include "asahi/genxml/agx3_cmdstream.h"
+
+#include <string.h>
+
+_Static_assert(AGX3_G17S_MINIMAL_COMPUTE_DISPATCH_SIZE ==
+                  AGX3_CDM_DIRECT_LAUNCH_SIZE + AGX3_CDM_BARRIER_SIZE,
+               "G17S dispatch size must cover launch plus barrier");
+_Static_assert(AGX3_G17P_DIRECT_ADD3_DISPATCH_SIZE ==
+                  AGX3_CDM_DIRECT_LAUNCH_SIZE + AGX3_CDM_BARRIER_SIZE,
+               "G17P dispatch size must cover launch plus barrier");
+_Static_assert(AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE ==
+                  AGX3_CDM_DIRECT_LAUNCH_SIZE + AGX3_CDM_BARRIER_SIZE,
+               "G17P native dispatch size must cover launch plus barrier");
+_Static_assert(AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE ==
+                  AGX3_CDM_INDIRECT_LAUNCH_SIZE,
+               "G17P indirect launch must be the grounded compact record");
+_Static_assert(AGX3_G17P_NATIVE_INDIRECT_MAIN_SIZE ==
+                  AGX3_CDM_INDIRECT_LAUNCH_SIZE + AGX3_CDM_BARRIER_SIZE,
+               "G17P indirect dispatch size must cover launch plus barrier");
+_Static_assert(AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE == 72,
+               "G17P indirect dispatch must cover the 44+28-byte pair");
+
+bool
+agx3_g17p_native_compute_program_bind(
+   const struct agx3_g17p_native_compute_program_desc *desc,
+   struct agx3_compute_program *program)
+{
+   if (!desc || !program || desc->program_va == 0 || desc->shader_va == 0 ||
+       desc->program_va > UINT64_C(0xffffffffffff) ||
+       desc->shader_va > UINT64_C(0xffffffffffff) ||
+       (desc->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
+       (desc->shader_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0)
+      return false;
+
+   struct agx3_cdm_direct_template launch_template;
+   if (!agx3_cdm_direct_template_build_from_sources(&desc->launch_sources,
+                                                    &launch_template))
+      return false;
+
+   *program = (struct agx3_compute_program){
+      .chip = AGX_CHIP_G17P,
+      .program_va = desc->program_va,
+      .shader_va = desc->shader_va,
+      .launch_template = launch_template,
+      .g17p_native_compute_live_bound = true,
+   };
+   return true;
+}
+
+static bool
+agx3_g17p_native_compute_launch_pack(
+   const struct agx3_compute_program *program,
+   const struct agx3_compute_direct_grid *grid,
+   uint8_t packed[AGX3_CDM_DIRECT_LAUNCH_SIZE])
+{
+   if (!packed)
+      return false;
+
+   memset(packed, 0, AGX3_CDM_DIRECT_LAUNCH_SIZE);
+   if (!program || !grid || program->chip != AGX_CHIP_G17P ||
+       program->program_va == 0 ||
+       program->program_va > UINT64_C(0xffffffffffff) ||
+       (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
+       program->launch_template.word0 >= (UINT32_C(1) << 29) ||
+       program->launch_template.word1 >= (UINT32_C(1) << 22) ||
+       grid->dimensions == 0 || grid->dimensions > 3 ||
+       grid->g15x_has_multiple_agcs)
+      return false;
+
+   uint32_t global_size[3];
+   if (!agx3_cdm_direct_grid_resolve(grid->source, grid->size,
+                                     grid->local_size, global_size))
+      return false;
+
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      if (global_size[axis] == 0 || grid->local_size[axis] == 0 ||
+          (axis >= grid->dimensions &&
+           (global_size[axis] != 1 || grid->local_size[axis] != 1)))
+         return false;
+   }
+
+   /* The output-positive A18 Pro add3 record stores the Ioto program pointer
+    * as a low VA>>6 word followed by 0x40000000 | VA[47:40].  Word 1 still
+    * carries the upper pointer bits and must be derived from the VA, not
+    * hard-coded -- see the note on the store below. */
+   agx3_cmdstream_store_le32(packed, program->launch_template.word0);
+   /* Word 1 bits 22..31 carry program_va[47:38]; the hardware reconstructs
+    * pipeline = ((word1 >> 22) << 38) | (word@+8 << 6). */
+   agx3_cmdstream_store_le32(
+      packed + 4,
+      (uint32_t)(((program->program_va >> 38) & 0x3ff) << 22) |
+         program->launch_template.word1);
+   agx3_cmdstream_store_le32(packed + 8,
+                             (uint32_t)(program->program_va >> 6));
+   /* Word 3's low byte carries program_va[47:40]; bit 30 is the record's own
+    * flag.  This is m1n1's `encode_shader_pointer` (g17p_compute.py:925-939),
+    * the encoder that produced every hardware-positive G17P compute stream:
+    * the +8/+12 pair is ONE pointer descriptor, `low = (va >> 6) & 0xffffffff`
+    * and `control = 0x40000000 | (va >> 40)`.
+    *
+    * Word 1 bits 22..31 (bits 47:38) and this byte (bits 47:40) overlap, and
+    * on every witness VA they contribute the SAME 2^40 -- 0x100000a8000 gives
+    * `va >> 38 == 4` and `va >> 40 == 1`, and `4 << 38 == 1 << 40`.  An OR of
+    * the two is therefore indistinguishable on the witness, which is why
+    * hard-coding either one "reproduces" it.  Hardware has already settled
+    * which way the redundancy resolves: with word 1 hard-coded to 0x01000000
+    * and word 3 VA-derived, the GPU fetched 0x111fffac100 for a program at
+    * 0x11fffac100 -- FAULT_ADDR 0x447ffeb04, exactly +2^40.  Hard-coding word
+    * 3 to 0x40000001 instead re-injects the same 2^40 through the other half
+    * of the descriptor.  Derive BOTH from the VA: for a bit-40-clear USC
+    * window address both fields are zero and no model of the OR can add
+    * anything, and for the witness VA the record is byte-identical. */
+   agx3_cmdstream_store_le32(
+      packed + 12,
+      UINT32_C(0x40000000) | (uint32_t)((program->program_va >> 40) & 0xff));
+
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      agx3_cmdstream_store_le32(packed + 16 + axis * 4, global_size[axis]);
+      agx3_cmdstream_store_le32(packed + 28 + axis * 4,
+                                grid->local_size[axis]);
+   }
+
+   return true;
+}
+
+bool
+agx3_g17p_native_compute_dispatch_append_with_barrier(
+   const struct agx3_compute_program *program,
+   const struct agx3_compute_direct_grid *grid,
+   uint8_t barrier_flags,
+   struct agx3_compute_dispatch_sink *sink)
+{
+   if (!program || !grid || !sink ||
+       (sink->capacity != 0 && !sink->data) || sink->length > sink->capacity ||
+       AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE >
+          sink->capacity - sink->length ||
+       program->chip != AGX_CHIP_G17P ||
+       !program->g17p_native_compute_live_bound)
+      return false;
+
+   uint8_t staged[AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE];
+   if (!agx3_g17p_native_compute_launch_pack(program, grid, staged))
+      return false;
+
+   const struct agx3_cdm_barrier_info barrier = {
+      .chip = AGX_CHIP_G17P,
+      .flags = barrier_flags,
+   };
+   if (!agx3_cdm_barrier_pack(&barrier,
+                              staged + AGX3_CDM_DIRECT_LAUNCH_SIZE))
+      return false;
+
+   memcpy(sink->data + sink->length, staged, sizeof(staged));
+   sink->length += sizeof(staged);
+   return true;
+}
+
+bool
+agx3_g17p_native_compute_dispatch_append(
+   const struct agx3_compute_program *program,
+   const struct agx3_compute_direct_grid *grid,
+   struct agx3_compute_dispatch_sink *sink)
+{
+   return agx3_g17p_native_compute_dispatch_append_with_barrier(
+      program, grid, 0, sink);
+}
+
+static void
+agx3_g17p_store_native_program_pointer(uint8_t *packed, uint64_t program_va)
+{
+   agx3_cmdstream_store_le32(packed, (uint32_t)(program_va >> 6));
+   /* Same pointer descriptor as the direct path: `low = va >> 6`,
+    * `control = 0x40000000 | va[47:40]` (m1n1 `encode_shader_pointer`).  A
+    * hard-coded 0x40000001 here injects 2^40 into every helper/indirect
+    * program fetch whose VA has bit 40 clear -- i.e. every address in Mesa's
+    * USC window -- which is the same defect the direct path took. */
+   agx3_cmdstream_store_le32(
+      packed + 4,
+      UINT32_C(0x40000000) | (uint32_t)((program_va >> 40) & 0xff));
+}
+
+/* The six-word indirect launch.  Words 0..3 are the same program header the
+ * direct record uses; mode 2 then replaces the direct record's own three
+ * global and three local size words with words 4..5, the 48-bit address of a
+ * six-u32 grid the GPU reads for itself (three global THREAD counts followed
+ * by three local sizes).  That is why the record is 24 bytes where the direct
+ * one is 40: the pinned performEnqueueKernel emitter at G17P 0x216ac876c
+ * stores exactly these six words and advances its write cursor by 0x18. */
+static bool
+agx3_g17p_native_indirect_launch_pack(
+   const struct agx3_compute_program *program, uint64_t geometry_va,
+   uint8_t packed[AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE])
+{
+   if (!packed)
+      return false;
+
+   memset(packed, 0, AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE);
+   if (!program || program->chip != AGX_CHIP_G17P ||
+       !program->g17p_native_compute_live_bound || program->program_va == 0 ||
+       program->program_va > UINT64_C(0xffffffffffff) ||
+       (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
+       !geometry_va || geometry_va >= (UINT64_C(1) << 48) ||
+       (geometry_va & 3) != 0 ||
+       program->launch_template.word0 >= (UINT32_C(1) << 27) ||
+       program->launch_template.word1 >= (UINT32_C(1) << 22))
+      return false;
+
+   agx3_cmdstream_store_le32(
+      packed, program->launch_template.word0 | AGX3_G17P_NATIVE_INDIRECT_MODE);
+   agx3_cmdstream_store_le32(
+      packed + 4,
+      (uint32_t)(((program->program_va >> 38) & 0x3ff) << 22) |
+         program->launch_template.word1);
+   agx3_g17p_store_native_program_pointer(packed + 8, program->program_va);
+   agx3_cmdstream_store_le32(packed + 16, (uint32_t)(geometry_va >> 32));
+   agx3_cmdstream_store_le32(packed + 20, (uint32_t)geometry_va);
+   return true;
+}
+
+bool
+agx3_g17p_native_indirect_compute_launch_append(
+   const struct agx3_compute_program *program, uint64_t geometry_va,
+   uint8_t barrier_flags, struct agx3_compute_dispatch_sink *sink)
+{
+   if (!sink || (sink->capacity != 0 && !sink->data) ||
+       sink->length > sink->capacity ||
+       AGX3_G17P_NATIVE_INDIRECT_MAIN_SIZE > sink->capacity - sink->length)
+      return false;
+
+   uint8_t staged[AGX3_G17P_NATIVE_INDIRECT_MAIN_SIZE];
+   if (!agx3_g17p_native_indirect_launch_pack(program, geometry_va, staged))
+      return false;
+
+   const struct agx3_cdm_barrier_info barrier = {
+      .chip = AGX_CHIP_G17P,
+      .flags = barrier_flags,
+   };
+   if (!agx3_cdm_barrier_pack(&barrier,
+                              staged + AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE))
+      return false;
+
+   memcpy(sink->data + sink->length, staged, sizeof(staged));
+   sink->length += sizeof(staged);
+   return true;
+}
+
+bool
+agx3_g17p_native_indirect_compute_dispatch_append(
+   const struct agx3_compute_program *program,
+   const struct agx3_g17p_native_indirect_dispatch *dispatch,
+   struct agx3_compute_dispatch_sink *sink)
+{
+   if (!program || !dispatch || !dispatch->helper_program || !sink ||
+       (sink->capacity != 0 && !sink->data) || sink->length > sink->capacity ||
+       AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE >
+          sink->capacity - sink->length ||
+       program->chip != AGX_CHIP_G17P ||
+       !program->g17p_native_compute_live_bound || program->program_va == 0 ||
+       program->program_va > UINT64_C(0xffffffffffff) ||
+       (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
+       !dispatch->geometry_va || dispatch->geometry_va >= (UINT64_C(1) << 48) ||
+       (dispatch->geometry_va & 3) != 0 ||
+       program->launch_template.word0 >= (UINT32_C(1) << 27) ||
+       dispatch->helper_program->launch_template.word0 >=
+          (UINT32_C(1) << 27) ||
+       program->launch_template.word1 >= (UINT32_C(1) << 22))
+      return false;
+
+   uint8_t staged[AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE] = {0};
+   struct agx3_compute_dispatch_sink helper_sink = {
+      .data = staged,
+      .capacity = sizeof(staged),
+   };
+   const struct agx3_compute_direct_grid helper_grid = {
+      .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
+      .size = {1, 1, 1},
+      .local_size = {1, 1, 1},
+      .dimensions = 1,
+   };
+   /* The 44-byte record is a direct dispatch, not a deferred application
+    * launch. Bit 23 belongs to the program template; it is not indirect mode.
+    * Run the one-invocation geometry producer with its own resource template. */
+   if (!agx3_g17p_native_compute_dispatch_append(
+          dispatch->helper_program, &helper_grid, &helper_sink))
+      return false;
+
+   /* Exactly the standalone record, appended after the helper: there is one
+    * encoder for the six words so the coupled and uncoupled forms cannot
+    * drift apart. */
+   if (!agx3_g17p_native_indirect_compute_launch_append(
+          program, dispatch->geometry_va, 0, &helper_sink))
+      return false;
+
+   memcpy(sink->data + sink->length, staged, sizeof(staged));
+   sink->length += sizeof(staged);
+   return true;
+}
+
+bool
+agx3_g17s_minimal_compute_program_prepare(
+   const struct agx3_g17s_minimal_compute_program_desc *desc, void *output,
+   size_t capacity, size_t *written, struct agx3_compute_program *program)
+{
+   if (!desc || !output || !written || !program)
+      return false;
+
+   /* G17S live witness, ProgramVariantESLState::ProgramVariantESLState
+    * +12508 -> EslBuilder::loadFromUserBuffer.  Exact arguments are
+    * (w1..w6) = (4, 1, 0, 0x20000001, 0, 0).  The binding tag is constructed
+    * from user-buffer index one; keep only caller-visible/raw UniformData
+    * axes here and fail closed on every other layout. */
+   if (desc->root_uniform.user_buffer_binding != 1 ||
+       desc->root_uniform.byte_offset != 0 ||
+       desc->root_uniform.uniform_data_destination != 4 ||
+       desc->root_uniform.uniform_data_count != 1 ||
+       desc->root_uniform.temporary_base != 0)
+      return false;
+
+   struct agx3_cdm_direct_template launch_template;
+   if (!agx3_cdm_direct_template_build_from_sources(&desc->launch_sources,
+                                                    &launch_template))
+      return false;
+
+   size_t staged_written;
+   if (!agx_ioto_g17s_minimal_compute_program_compose(
+          desc->program_va, desc->shader_va, output, capacity,
+          &staged_written))
+      return false;
+
+   *program = (struct agx3_compute_program){
+      .chip = AGX_CHIP_G17S,
+      .program_va = desc->program_va,
+      .shader_va = desc->shader_va,
+      .launch_template = launch_template,
+   };
+   *written = staged_written;
+   return true;
+}
+
+/* Narrow production condition for the independently witnessed G17S minimal
+ * root-uniform program.  This does not imply chip-wide Ioto load readiness. */
+static bool
+agx3_g17s_minimal_compute_dispatch_ready(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17S;
+}
+
+bool
+agx3_g17s_minimal_compute_dispatch_append(
+   const struct agx3_compute_program *program,
+   const struct agx3_compute_direct_grid *grid,
+   struct agx3_compute_dispatch_sink *sink)
+{
+   if (!program || !grid || !sink ||
+       (sink->capacity != 0 && !sink->data) || sink->length > sink->capacity ||
+       AGX3_G17S_MINIMAL_COMPUTE_DISPATCH_SIZE >
+          sink->capacity - sink->length ||
+       !agx3_g17s_minimal_compute_dispatch_ready(program->chip) ||
+       !program->g17s_minimal_live_admitted)
+      return false;
+
+   uint8_t staged[AGX3_G17S_MINIMAL_COMPUTE_DISPATCH_SIZE];
+   if (!agx3_compute_program_pack_direct_launch(program, grid, staged))
+      return false;
+
+   const struct agx3_cdm_barrier_info barrier = {
+      .chip = AGX_CHIP_G17S,
+      .flags = 5,
+   };
+   if (!agx3_cdm_barrier_pack(&barrier,
+                              staged + AGX3_CDM_DIRECT_LAUNCH_SIZE))
+      return false;
+
+   memcpy(sink->data + sink->length, staged, sizeof(staged));
+   sink->length += sizeof(staged);
+   return true;
+}
+
+bool
+agx3_g17s_minimal_compute_program_upload_prepare(
+   enum agx_chip chip,
+   const struct agx3_g17s_minimal_compute_program_desc *desc,
+   const struct agx3_compute_program_upload *upload, size_t *written,
+   struct agx3_compute_program *program)
+{
+   if (chip != AGX_CHIP_G17S || !desc || !upload || !upload->cpu ||
+       !written || !program ||
+       ((uintptr_t)upload->cpu & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
+       upload->gpu_va != desc->program_va)
+      return false;
+
+   return agx3_g17s_minimal_compute_program_prepare(
+      desc, upload->cpu, upload->capacity, written, program);
+}
+
+bool
+agx3_g17s_minimal_compute_program_live_upload_prepare(
+   enum agx_chip chip,
+   const struct agx3_g17s_minimal_compute_program_desc *desc,
+   const struct agx_ioto_g17s_minimal_compute_resources *resources,
+   const struct agx3_compute_program_upload *upload, size_t *written,
+   struct agx3_compute_program *program)
+{
+   if (chip != AGX_CHIP_G17S || !desc || !resources || !upload ||
+       !upload->cpu || !written || !program ||
+       ((uintptr_t)upload->cpu & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
+       upload->gpu_va != desc->program_va ||
+       desc->root_uniform.user_buffer_binding != 1 ||
+       desc->root_uniform.byte_offset != 0 ||
+       desc->root_uniform.uniform_data_destination != 4 ||
+       desc->root_uniform.uniform_data_count != 1 ||
+       desc->root_uniform.temporary_base != 0)
+      return false;
+
+   struct agx3_cdm_direct_template launch_template;
+   if (!agx3_cdm_direct_template_build_from_sources(&desc->launch_sources,
+                                                    &launch_template))
+      return false;
+
+   size_t staged_written;
+   if (!agx_ioto_g17s_minimal_compute_program_compose_resources(
+          desc->program_va, desc->shader_va, resources, upload->cpu,
+          upload->capacity, &staged_written))
+      return false;
+
+   *program = (struct agx3_compute_program){
+      .chip = AGX_CHIP_G17S,
+      .program_va = desc->program_va,
+      .shader_va = desc->shader_va,
+      .launch_template = launch_template,
+      .g17s_minimal_live_admitted = true,
+   };
+   *written = staged_written;
+   return true;
+}
+
+bool
+agx3_compute_program_pack_direct_launch(
+   const struct agx3_compute_program *program,
+   const struct agx3_compute_direct_grid *grid,
+   uint8_t packed[AGX3_CDM_DIRECT_LAUNCH_SIZE])
+{
+   if (!packed)
+      return false;
+
+   memset(packed, 0, AGX3_CDM_DIRECT_LAUNCH_SIZE);
+   if (!program || !grid ||
+       !agx3_cdm_direct_launch_target_grounded(program->chip) ||
+       program->program_va > UINT64_C(0xffffffffffff) ||
+       (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0)
+      return false;
+
+   uint32_t global_size[3];
+   if (!agx3_cdm_direct_grid_resolve(grid->source, grid->size, grid->local_size,
+                                     global_size))
+      return false;
+
+   const struct agx3_cdm_direct_launch_info launch = {
+      .chip = program->chip,
+      .template_words = program->launch_template,
+      .pipeline = program->program_va,
+      .dimensions = grid->dimensions,
+      .g15x_has_multiple_agcs = grid->g15x_has_multiple_agcs,
+      .global_size = {global_size[0], global_size[1], global_size[2]},
+      .local_size = {grid->local_size[0], grid->local_size[1],
+                     grid->local_size[2]},
+   };
+
+   return agx3_cdm_direct_launch_pack(&launch, packed);
+}

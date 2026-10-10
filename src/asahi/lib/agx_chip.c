@@ -1,0 +1,362 @@
+/*
+ * Copyright 2026 The Asahi Linux Contributors
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "agx_chip.h"
+
+#include <stddef.h>
+
+enum agx_chip
+agx_chip_from_params(const struct drm_asahi_params_global *params)
+{
+   if (params->num_clusters_total == 0 ||
+       params->num_clusters_total > DRM_ASAHI_MAX_CLUSTERS)
+      return AGX_CHIP_UNKNOWN;
+
+   /* These are command-stream architecture identities, not an ordering.
+    *
+    * Generations 15 and up are recognised so diagnostics can name the part and
+    * its command-stream generation. agx_chip_driver_supported decides whether
+    * the driver proceeds; agx_chip_codegen_supported covers only the shader
+    * packer.
+    *
+    * The variant character is load-bearing. Cluster count cannot distinguish
+    * G17P (A18 Pro, AGX3b) from G17G (M5, AGX3c), and G15P is an AGX2 part in
+    * the same numeric generation as AGX3 M3. The kernel already publishes the
+    * exact P/G/S/C/D/A character, so use it directly.
+    */
+   switch (params->gpu_generation) {
+   case 13:
+      switch (params->gpu_variant) {
+      case 'G': return AGX_CHIP_G13G;
+      case 'S':
+      case 'C':
+      case 'D': return AGX_CHIP_G13X;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 14:
+      switch (params->gpu_variant) {
+      case 'G': return AGX_CHIP_G14G;
+      case 'S':
+      case 'C':
+      case 'D': return AGX_CHIP_G14X;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 15:
+      switch (params->gpu_variant) {
+      case 'P': return AGX_CHIP_G15P;
+      case 'G': return AGX_CHIP_G15G;
+      case 'S': return AGX_CHIP_G15S;
+      case 'C': return AGX_CHIP_G15C;
+      case 'D': return AGX_CHIP_G15D;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 16:
+      switch (params->gpu_variant) {
+      case 'P': return AGX_CHIP_G16P;
+      case 'G': return AGX_CHIP_G16G;
+      case 'S': return AGX_CHIP_G16S;
+      case 'C': return AGX_CHIP_G16C;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 17:
+      switch (params->gpu_variant) {
+      case 'P': return AGX_CHIP_G17P;
+      case 'A': return AGX_CHIP_G17A;
+      case 'G': return AGX_CHIP_G17G;
+      case 'S': return AGX_CHIP_G17S;
+      case 'C': return AGX_CHIP_G17C;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   default:
+      return AGX_CHIP_UNKNOWN;
+   }
+}
+
+enum agx_isa
+agx_chip_isa(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G13G:
+   case AGX_CHIP_G13X:
+   case AGX_CHIP_G14G:
+   case AGX_CHIP_G14X:
+   case AGX_CHIP_G15P:
+      return AGX_ISA_AGX2;
+
+   case AGX_CHIP_G15G:
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+   case AGX_CHIP_G15D:
+   case AGX_CHIP_G16P:
+   case AGX_CHIP_G16G:
+   case AGX_CHIP_G16S:
+   case AGX_CHIP_G16C:
+   case AGX_CHIP_G17P:
+   case AGX_CHIP_G17A:
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
+   case AGX_CHIP_G17C:
+      return AGX_ISA_AGX3;
+
+   case AGX_CHIP_UNKNOWN:
+   default:
+      return AGX_ISA_UNKNOWN;
+   }
+}
+
+enum agx_isa_encoding
+agx_chip_isa_encoding(enum agx_chip chip)
+{
+   /*
+    * Which encoder table a part uses. Apple's own tables decode each family
+    * 100% under exactly one of these and essentially 0% under the other, so
+    * this is a measurement rather than a reading of the naming scheme.
+    *
+    * gpu_gen and gpu_var are a string split of the kernel core-name table, so
+    * they map directly. P/A are not Mac performance tiers: G15P is AGX2 and
+    * G17P/G17A remain on the AGX3b/HAL200 side while the G17 Mac parts use
+    * AGX3c/HAL300.
+    */
+   switch (chip) {
+   case AGX_CHIP_G13G:
+   case AGX_CHIP_G13X:
+   case AGX_CHIP_G14G:
+   case AGX_CHIP_G14X:
+   case AGX_CHIP_G15P:
+      return AGX_ISA_ENCODING_AGX2;
+
+   case AGX_CHIP_G15G:
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+   case AGX_CHIP_G15D:
+   case AGX_CHIP_G16P:
+   case AGX_CHIP_G16G:
+   case AGX_CHIP_G16S:
+   case AGX_CHIP_G16C:
+   case AGX_CHIP_G17P:
+   case AGX_CHIP_G17A:
+      return AGX_ISA_ENCODING_AGX3B;
+
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
+   case AGX_CHIP_G17C:
+      return AGX_ISA_ENCODING_AGX3C;
+
+   case AGX_CHIP_UNKNOWN:
+   default:
+      return AGX_ISA_ENCODING_UNKNOWN;
+   }
+}
+
+static enum agx_submission_model
+agx_chip_submission_model(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G13G:
+   case AGX_CHIP_G13X:
+   case AGX_CHIP_G14G:
+   case AGX_CHIP_G14X:
+   case AGX_CHIP_G15G:
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+   case AGX_CHIP_G15D:
+   case AGX_CHIP_G16G:
+      return AGX_SUBMISSION_MODEL_CLASSIC;
+
+   case AGX_CHIP_G16S:
+   case AGX_CHIP_G16C:
+   case AGX_CHIP_G17P:
+      return AGX_SUBMISSION_MODEL_DUAL;
+
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
+   case AGX_CHIP_G17C:
+      return AGX_SUBMISSION_MODEL_SKSM;
+
+   /* No corresponding accelerator class was present in the Mac corpus. */
+   case AGX_CHIP_G15P:
+   case AGX_CHIP_G16P:
+   case AGX_CHIP_G17A:
+   case AGX_CHIP_UNKNOWN:
+   default:
+      return AGX_SUBMISSION_MODEL_UNKNOWN;
+   }
+}
+
+bool
+agx_chip_codegen_supported(enum agx_chip chip)
+{
+   /*
+    * Two independent packers exist, one per encoding family:
+    *
+    *   AGX2         -> agx_pack.c            (AGX2.xml)
+    *   AGX3b/AGX3c  -> agx3_pack_binary.c    (agx3_compose/, AGX3{b,c}.xml)
+    *
+    * The AGX3 side is a real encoder, not a decoder: agx3_compose
+    * reproduces Apple's instructions byte-exactly, and agx3_pack_binary
+    * emits compute, vertex and fragment shaders end to end.
+    *
+    * "Has a code generator" is all this predicate claims. Instruction
+    * coverage is explicit: an AGX3 shader outside the grounded domain makes
+    * agx_compile_shader_nir return false rather than emit wrong code. The
+    * runnable device set is tracked separately by
+    * agx_chip_driver_supported.
+    *
+    * UNKNOWN remains unsupported: without an encoding there is no packer.
+    */
+   const enum agx_isa_encoding encoding = agx_chip_isa_encoding(chip);
+
+   return encoding == AGX_ISA_ENCODING_AGX2 ||
+          encoding == AGX_ISA_ENCODING_AGX3B ||
+          encoding == AGX_ISA_ENCODING_AGX3C;
+}
+
+bool
+agx_chip_driver_supported(enum agx_chip chip)
+{
+   /*
+    * Codegen is necessary, not sufficient. G17P is admitted as one exact
+    * bring-up identity because its HAL200 VDM/PPP records, Gen9 descriptors,
+    * HAL200 sampler layout, dual queue model, no-resource graphics programs,
+    * and RT0 clear/reload/store programs are all wired into Honeykrisp. Other
+    * AGX3 identities still lack at least one of those pieces.
+    */
+   if (!agx_chip_codegen_supported(chip))
+      return false;
+
+   if (agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2) {
+      return agx_chip_descriptor_generation(chip) !=
+                AGX_DESCRIPTOR_GENERATION_UNKNOWN &&
+             agx_chip_sampler_generation(chip) !=
+                AGX_SAMPLER_GENERATION_UNKNOWN;
+   }
+
+   return chip == AGX_CHIP_G17P &&
+          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200 &&
+          agx_chip_descriptor_generation(chip) == AGX_DESCRIPTOR_GENERATION_9 &&
+          agx_chip_sampler_generation(chip) ==
+             AGX_SAMPLER_GENERATION_GEN4_HAL200 &&
+          agx_chip_sampler_heap_element_size(chip) == 32 &&
+          agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_DUAL;
+}
+
+bool
+agx_params_driver_supported(const struct drm_asahi_params_global *params)
+{
+   if (!params)
+      return false;
+
+   const enum agx_chip chip = agx_chip_from_params(params);
+   if (!agx_chip_driver_supported(chip))
+      return false;
+
+   if (chip == AGX_CHIP_G17P) {
+      /* Honeykrisp's first AGX3 path is the exact T8140/A18 Pro contract.
+       * Do not let the shared G17P ISA name admit another SoC or topology. */
+      return params->chip_id == 0x8140 && params->num_dies == 1 &&
+             params->num_clusters_total == 1 &&
+             params->usc_generation == AGX_ISA_AGX3 &&
+             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
+   }
+
+   return true;
+}
+
+const char *
+agx_chip_exact_product_name(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G17P:
+      return "A18 Pro";
+   default:
+      return NULL;
+   }
+}
+
+bool
+agx_chip_uses_legacy_precompiled_programs(enum agx_chip chip)
+{
+   return agx_chip_driver_supported(chip) &&
+          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2;
+}
+
+/*
+ * Whether the compiler must insert explicit scheduling stalls.
+ *
+ * The M3 base part needs them and nothing else does: stripping its stall words
+ * leaves an instruction stream 99.5% identical in count and 85.1%
+ * byte-identical to M4's, with a further 7.4% differing only by branch
+ * displacements shifted by exactly the removed padding.
+ *
+ * This is a property of one chip's scheduler, not of its encoding -- G15G
+ * shares the agx3b encoder table with every other variant-0 part. It is a
+ * codegen obligation, so it is only meaningful for a chip this driver can
+ * generate code for.
+ */
+static bool
+agx_chip_needs_scheduling_stalls(enum agx_chip chip)
+{
+   /* The M3 base part alone. Not a property of its encoding: G15G shares the
+    * agx3b table with G15S/C/D, every G16 part, and G17P/A, none of which
+    * pad. */
+   return chip == AGX_CHIP_G15G;
+}
+
+const char *
+agx_chip_name(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G13G: return "G13G";
+   case AGX_CHIP_G13X: return "G13X";
+   case AGX_CHIP_G14G: return "G14G";
+   case AGX_CHIP_G14X: return "G14X";
+   case AGX_CHIP_G15P: return "G15P";
+   case AGX_CHIP_G15G: return "G15G";
+   case AGX_CHIP_G15S: return "G15S";
+   case AGX_CHIP_G15C: return "G15C";
+   case AGX_CHIP_G15D: return "G15D";
+   case AGX_CHIP_G16P: return "G16P";
+   case AGX_CHIP_G16G: return "G16G";
+   case AGX_CHIP_G16S: return "G16S";
+   case AGX_CHIP_G16C: return "G16C";
+   case AGX_CHIP_G17P: return "G17P";
+   case AGX_CHIP_G17A: return "G17A";
+   case AGX_CHIP_G17G: return "G17G";
+   case AGX_CHIP_G17S: return "G17S";
+   case AGX_CHIP_G17C: return "G17C";
+   case AGX_CHIP_UNKNOWN:
+   default: return "unknown";
+   }
+}
+
+const char *
+agx_isa_name(enum agx_isa isa)
+{
+   switch (isa) {
+   case AGX_ISA_AGX2: return "AGX2";
+   case AGX_ISA_AGX3: return "AGX3";
+   case AGX_ISA_UNKNOWN:
+   default: return "unknown";
+   }
+}
+
+const char *
+agx_command_stream_generation_name(
+   enum agx_command_stream_generation generation)
+{
+   switch (generation) {
+   case AGX_CS_GENERATION_AGX2:
+      return "AGX2";
+   case AGX_CS_GENERATION_G15:
+      return "G15";
+   case AGX_CS_GENERATION_HAL200:
+      return "HAL200";
+   case AGX_CS_GENERATION_HAL300:
+      return "HAL300";
+   case AGX_CS_GENERATION_UNKNOWN:
+   default:
+      return "unknown";
+   }
+}

@@ -4,11 +4,18 @@
  */
 
 #include "agx_linker.h"
+#include "agx_bytes.h"
+#include <inttypes.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "util/macros.h"
 #include "util/ralloc.h"
 #include "agx_abi.h"
+#include "agx3_code_container_core.h"
 #include "agx_compile.h"
+#include "agx_debug.h"
+#include "agx3_fltnorm_core.h"
+#include "agx3_pixel_core.h"
 #include "agx_device.h"
 #include "agx_pack.h"
 #include "agx_scratch.h"
@@ -30,6 +37,27 @@
  */
 
 static_assert(AGX_ABI_FIN_SAMPLE_MASK == 2, "r1l known");
+
+void
+agx_fs_epilog_apply_device_policy(enum agx_chip chip,
+                                  struct agx_fs_epilog_key *key)
+{
+   if (!key)
+      return;
+
+   const bool g17p = chip == AGX_CHIP_G17P;
+   key->preserve_zero_mask = g17p;
+   key->g17p_tile_formats = g17p;
+}
+
+bool
+agx_fs_epilog_may_discard(const struct agx_fs_epilog_link_info *link,
+                          bool alpha_to_coverage,
+                          bool nontrivial_force_early)
+{
+   return !nontrivial_force_early &&
+          (alpha_to_coverage || (link && (link->write_z || link->write_s)));
+}
 
 /* clang-format off */
 static const uint8_t sample_loop_header[] = {
@@ -79,16 +107,180 @@ static const uint8_t sample_loop_footer[] = {
 #define SAMPLE_LOOP_FOOTER_COUNT_SHIFT (4)
 /* clang-format on */
 
+/*
+ * Apple's AGX3 code container.
+ *
+ * On G17P the LDSHDR record names an entry point INSIDE a container, not the
+ * base of an executable allocation, and the shader loader reads container
+ * metadata at fixed negative offsets from that entry.  The m1n1 add3 witness
+ * (proxyclient/experiments/g17p_add3_code.py) lays it out as:
+ *
+ *   +0x000  dword 0x340                 size of the leading block
+ *   +0x040  0x0006 filler .. +0x340
+ *   +0x100  helper record table
+ *   +0x200  helper record table (identical)
+ *   +0x340  dword block_size            == entry - 0x80, the CODE block size
+ *   +0x380  constant program (0x40)     == entry - 0x40
+ *   +0x3C0  main program                <- LDSHDR points here
+ *
+ * block_size = 0x40 (its own header) + 0x40 (constant program) +
+ * align64(code).  For the witness's 56-byte main program that is
+ * 0x40 + 0x40 + 0x40 = 0xC0, which is the dword the capture actually
+ * contains, and the container ends at 0x340 + 0xC0 = 0x400 -- exactly the
+ * 1 KiB closure the witness proved on hardware.  So this rule reproduces the
+ * witness byte for byte rather than merely resembling it.
+ *
+ * Honeykrisp's compute path guarantees no preamble, so the constant program
+ * is the witness's minimal terminating one.
+ */
+#define AGX3_CONTAINER_LEAD        0x340u
+#define AGX3_CONTAINER_ENTRY       0x3C0u
+#define AGX3_CONTAINER_BLOCK_HDR   0x40u
+#define AGX3_CONTAINER_CONST_PROG  0x40u
+
+/* "0f 00 54 <opcode> 00 x6 06 00 06 00 06 00" per record, then two terminals. */
+static void
+agx3_fill_helper_table(uint8_t *image, size_t base)
+{
+   static const uint8_t opcodes[] = {0x60, 0x50, 0x40, 0x30, 0x20, 0x10};
+   static const uint8_t terminal[16] = {
+      0xf7, 0x03, 0xaa, 0x00, 0x8f, 0x02, 0x54, 0x01,
+      0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(opcodes); ++i) {
+      uint8_t *record = image + base + i * 0x10;
+
+      memset(record, 0, 0x10);
+      record[0] = 0x0f;
+      record[2] = 0x54;
+      record[3] = opcodes[i];
+      for (unsigned h = 10; h < 16; h += 2) {
+         record[h] = 0x06;
+         record[h + 1] = 0x00;
+      }
+   }
+   memcpy(image + base + 0x60, terminal, sizeof(terminal));
+   memcpy(image + base + 0x70, terminal, sizeof(terminal));
+}
+
+/* Total container bytes for `code_size` bytes of executable. */
+static size_t
+agx3_container_size(size_t code_size)
+{
+   return AGX3_CONTAINER_LEAD + AGX3_CONTAINER_BLOCK_HDR +
+          AGX3_CONTAINER_CONST_PROG + ALIGN_POT(code_size, 64);
+}
+
+/* The container's leading block: dword 0x340, 0x0006 filler, two helper
+ * tables. Identical in both captured Apple code images, so it is a fixed
+ * prologue rather than anything workload-specific. */
 void
+agx3_build_container_lead(uint8_t *image)
+{
+   memset(image, 0, AGX3_CONTAINER_LEAD);
+   agx_store_le32(image, AGX3_CONTAINER_LEAD);
+   for (size_t offset = 0x40; offset < AGX3_CONTAINER_LEAD; offset += 2) {
+      image[offset] = 0x06;
+      image[offset + 1] = 0x00;
+   }
+   agx3_fill_helper_table(image, 0x100);
+   agx3_fill_helper_table(image, 0x200);
+}
+
+static void
+agx3_build_container(uint8_t *image, size_t code_size, bool fragment,
+                     bool sampled_fragment)
+{
+   memset(image, 0, agx3_container_size(code_size));
+   agx3_build_container_lead(image);
+
+   agx_store_le32(image + AGX3_CONTAINER_LEAD,
+                 AGX3_CONTAINER_BLOCK_HDR + AGX3_CONTAINER_CONST_PROG +
+                    ALIGN_POT(code_size, 64));
+
+   uint8_t *constant = image + AGX3_CONTAINER_LEAD + AGX3_CONTAINER_BLOCK_HDR;
+   agx3_build_container_constant_program(constant, fragment,
+                                         sampled_fragment);
+}
+
+static bool
+agx3_uses_code_container(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P;
+}
+
+bool
 agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
               bool fragment, struct agx_shader_part *main,
               struct agx_shader_part *prolog, struct agx_shader_part *epilog,
               unsigned nr_samples_shaded)
 {
+   /* These literal loop fragments are AGX2 machine code. G17P exposes only
+    * one sample and its Vulkan path folds sample shading before split-FS
+    * lowering; fail closed if a caller ever bypasses that canonicalization. */
+   if (dev->chip == AGX_CHIP_G17P && nr_samples_shaded) {
+      fprintf(stderr,
+              "agx_fast_link: external sample loop is not AGX3 machine code\n");
+      return false;
+   }
+
+   uint8_t fused_colour[AGX3_COLOUR_LINK_SIZE];
+   const bool colour_fused = dev->chip == AGX_CHIP_G17P && fragment &&
+      !prolog && !nr_samples_shaded && main && epilog &&
+      agx3_fuse_colour_parts(&main->info.agx3_colour_link,
+                              &epilog->info.agx3_colour_link, fused_colour);
+   /* A native fragment enters its pixel transaction once across all linked
+    * parts.  A sample-mask prolog already opens it, so retaining the main
+    * shader's second entry resets the coverage state immediately before its
+    * forced-early wait.  Keep the first gate and remove every later one.  A
+    * gate at offset zero is outside all of that part's branches; otherwise
+    * retain the older branch-free proof that no branch spans the bytes. */
+   struct agx_shader_part *parts[] = {prolog, main, epilog};
+   bool drop_entry[ARRAY_SIZE(parts)] = {false};
+   bool entry_seen = false;
+   if (dev->chip == AGX_CHIP_G17P && fragment && !nr_samples_shaded &&
+       !colour_fused) {
+      for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
+         struct agx_shader_part *part = parts[i];
+         if (!part || !part->info.agx3_colour_link.entry_emitted)
+            continue;
+
+         const uint32_t off = part->info.agx3_colour_link.entry_offset;
+         if (entry_seen) {
+            if (off != 0 && !part->info.agx3_colour_link.branch_free)
+               return false;
+            drop_entry[i] = true;
+         } else {
+            entry_seen = true;
+         }
+      }
+
+      for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
+         if (!drop_entry[i])
+            continue;
+         struct agx_shader_part *part = parts[i];
+         const uint32_t off = part->info.agx3_colour_link.entry_offset;
+         uint8_t gate[AGX3_PIXEL_MAX_LENGTH], gate_size;
+         if ((off & 1) || off > part->info.main_size ||
+             part->info.main_size - off < AGX3_PIXEL_MAX_LENGTH ||
+             !agx3_pixel_colour_entry(AGX_ISA_ENCODING_AGX3B, gate,
+                                      &gate_size) ||
+             gate_size != AGX3_PIXEL_MAX_LENGTH ||
+             memcmp((const uint8_t *)part->binary + part->info.main_offset +
+                       off,
+                    gate, gate_size))
+            return false;
+      }
+   }
    size_t size = 0;
-   unsigned nr_gprs = 0, scratch_size = 0;
+   unsigned nr_gprs = 0, scratch_size = 0, agx3_spectpr_scratch_size = 0;
+   unsigned staging_halfs = 0;
+   unsigned colour_classes = 0;
+   bool staging_known = true;
    bool reads_tib = false, writes_sample_mask = false,
         disable_tri_merging = false, tag_write_disable = true;
+   bool sampled_fragment = false;
 
    if (nr_samples_shaded) {
       size += sizeof(sample_loop_header);
@@ -99,8 +291,6 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          size += sizeof(stop);
    }
 
-   struct agx_shader_part *parts[] = {prolog, main, epilog};
-
    for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
       struct agx_shader_part *part = parts[i];
       if (!part)
@@ -109,27 +299,100 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       size += part->info.main_size;
 
       nr_gprs = MAX2(nr_gprs, part->info.nr_gprs);
+      staging_halfs = MAX2(staging_halfs, part->info.agx3_staging_halfs);
+      staging_known &= part->info.agx3_staging_known;
       scratch_size = MAX2(scratch_size, part->info.scratch_size);
+      agx3_spectpr_scratch_size =
+         MAX2(agx3_spectpr_scratch_size,
+              part->info.agx3_spectpr_scratch_size);
       reads_tib |= part->info.reads_tib;
       writes_sample_mask |= part->info.writes_sample_mask;
       disable_tri_merging |= part->info.disable_tri_merging;
       linked->uses_base_param |= part->info.uses_base_param;
       linked->uses_txf |= part->info.uses_txf;
+      sampled_fragment |= part->info.g17p_sampled_fragment;
       tag_write_disable &= part->info.tag_write_disable;
+      if (part->info.agx3_colour_link.colour_classes &
+          ~BITFIELD_MASK(AGX3_G17P_MAX_COLOUR_PARTITIONS))
+         return false;
+      colour_classes |= part->info.agx3_colour_link.colour_classes;
    }
+
+   if (colour_fused)
+      size = sizeof(fused_colour);
+   else
+      for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i)
+         size -= drop_entry[i] ? AGX3_PIXEL_MAX_LENGTH : 0;
 
    assert(size > 0 && "must stop");
 
-   linked->bo = agx_bo_create(dev, size, 0, AGX_BO_EXEC | AGX_BO_LOW_VA,
-                              "Linked executable");
-   uint8_t *linked_map = agx_bo_map(linked->bo);
+   /* The staging accounting is per instruction, so a linked software vertex
+    * shader (a compute-stage main behind the vertex prolog) is described the
+    * same way as a hardware vertex or fragment program. */
+   if (dev->chip == AGX_CHIP_G17P &&
+       (main->info.stage == MESA_SHADER_VERTEX ||
+        main->info.stage == MESA_SHADER_FRAGMENT ||
+        main->info.stage == MESA_SHADER_COMPUTE) &&
+       staging_known && !linked->g17p_compiler_d_valid) {
+      linked->g17p_compiler_d_valid = true;
+      linked->g17p_compiler_d = staging_halfs * 2;
+   }
+
+   const bool container = agx3_uses_code_container(dev);
+   const size_t alloc_size = container ? agx3_container_size(size) : size;
+
+   uint32_t code_offset = 0;
+   linked->bo = dev->code_alloc
+                   ? dev->code_alloc(dev, alloc_size, &code_offset)
+                   : agx_bo_create(dev, alloc_size, 0,
+                                   AGX_BO_EXEC | AGX_BO_LOW_VA,
+                                   "Linked executable");
+   linked->size = size;
+   linked->entry_offset =
+      code_offset + (container ? AGX3_CONTAINER_ENTRY : 0);
+   if (!linked->bo) {
+      fprintf(stderr,
+              "agx_fast_link: executable low-VA allocation of %zu bytes "
+              "failed (shader base 0x%" PRIx64 ")\n",
+              size, dev->shader_base);
+      return false;
+   }
+
+   uint8_t *container_map = agx_bo_map(linked->bo);
+   if (container_map)
+      container_map += code_offset;
+   uint8_t *linked_map =
+      container_map ? container_map + (linked->entry_offset - code_offset)
+                    : NULL;
+   if (!linked_map) {
+      fprintf(stderr,
+              "agx_fast_link: executable BO mapping failed (size %zu, "
+              "VA 0x%" PRIx64 ", handle %u)\n",
+              size, linked->bo->va ? linked->bo->va->addr : 0,
+              (unsigned)linked->bo->handle);
+      agx_bo_unreference(dev, linked->bo);
+      linked->bo = NULL;
+      return false;
+   }
+
+   if (container)
+      agx3_build_container(container_map, size, fragment,
+                           fragment && sampled_fragment);
 
    size_t offset = 0;
+   if (colour_fused) {
+      memcpy(linked_map, fused_colour, sizeof(fused_colour));
+      offset = sizeof(fused_colour);
+   }
 
    /* FS prolog happens per-pixel, outside the sample loop */
    if (prolog) {
       size_t sz = prolog->info.main_size;
       memcpy(linked_map + offset, prolog->binary, sz);
+      if (dev->chip == AGX_CHIP_G17P && fragment &&
+          !agx3_fltnorm_relocate_start(linked_map + offset, sz,
+                                       prolog->info.agx3_fltnorm_start, offset))
+         goto invalid_start_marker;
       offset += sz;
    }
 
@@ -142,13 +405,27 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    size_t sample_loop_begin = offset;
 
    /* Main shader and epilog happen in the sample loop, so start from i=1 */
-   for (unsigned i = 1; i < ARRAY_SIZE(parts); ++i) {
+   for (unsigned i = 1; !colour_fused && i < ARRAY_SIZE(parts); ++i) {
       struct agx_shader_part *part = parts[i];
       if (!part)
          continue;
 
       size_t sz = part->info.main_size;
-      memcpy(linked_map + offset, part->binary + part->info.main_offset, sz);
+      const uint8_t *part_code = (const uint8_t *)part->binary + part->info.main_offset;
+      if (drop_entry[i]) {
+         const unsigned gate = part->info.agx3_colour_link.entry_offset;
+         memcpy(linked_map + offset, part_code, gate);
+         memcpy(linked_map + offset + gate, part_code + gate + AGX3_PIXEL_MAX_LENGTH,
+                sz - gate - AGX3_PIXEL_MAX_LENGTH);
+         sz -= AGX3_PIXEL_MAX_LENGTH;
+      } else {
+         memcpy(linked_map + offset, part_code, sz);
+      }
+      if (dev->chip == AGX_CHIP_G17P && fragment &&
+          !agx3_fltnorm_relocate_start(linked_map + offset, sz,
+                                       part->info.agx3_fltnorm_start, offset))
+         goto invalid_start_marker;
+
       offset += sz;
    }
 
@@ -181,8 +458,15 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
 
    assert(offset == size);
 
+   linked->scratch_size = scratch_size;
+   linked->agx3_spectpr_scratch_size = agx3_spectpr_scratch_size;
+   linked->nr_gprs = nr_gprs;
+   linked->g17p_colour_classes = colour_classes;
+
+   agx_bo_assert_range(linked->bo, code_offset, alloc_size);
+
    agx_pack(&linked->shader, USC_SHADER, cfg) {
-      cfg.code = agx_usc_addr(dev, linked->bo->va->addr);
+      cfg.code = agx_usc_addr(dev, linked->bo->va->addr + linked->entry_offset);
       cfg.unk_2 = fragment ? 2 : 3;
 
       if (fragment)
@@ -253,4 +537,12 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          cfg.frag_coord_z = linked->cf.reads_z;
       }
    }
+
+   return true;
+
+invalid_start_marker:
+   fprintf(stderr, "agx_fast_link: invalid G17P part-start FLTNORM marker\n");
+   agx_bo_unreference(dev, linked->bo);
+   linked->bo = NULL;
+   return false;
 }

@@ -34,6 +34,7 @@ struct ctx {
    nir_def *layer, *viewport;
    nir_cursor after_layer_viewport;
    struct agx_unlinked_uvs_layout *layout;
+   bool layer_as_varying;
 };
 
 static enum uvs_group
@@ -47,6 +48,29 @@ group_for_varying(gl_varying_slot loc)
    default:
       return UVS_VARYINGS;
    }
+}
+
+static nir_def *
+upconvert_uvs_value(nir_builder *b, nir_intrinsic_instr *intr, nir_def *value)
+{
+   /* Native ST_VARY stores a 32-bit component.  A mediump producer may still
+    * be 16-bit even when the logical store_output type is 32-bit, so perform
+    * the type-correct conversion before replacing the generic IO intrinsic.
+    * Passing the 16-bit value straight through makes the backend allocate a
+    * 16-bit register, and the always-live ST_VARY pack assertion then fires
+    * inside whatever process asked for the shader.
+    */
+   if (value->bit_size == 32)
+      return value;
+
+   assert(value->bit_size == 16);
+
+   nir_alu_type type =
+      nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
+   assert(type == nir_type_float || type == nir_type_int ||
+          type == nir_type_uint);
+
+   return nir_convert_to_bit_size(b, value, type, 32);
 }
 
 static bool
@@ -64,6 +88,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *value = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
 
+   value = upconvert_uvs_value(b, intr, value);
+
    /* If there is only 1 user varying, it is at the base of the varying section.
     * This saves us an indirection on simple separate shaders.
     */
@@ -79,7 +105,13 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_def *index = nir_iadd(b, nir_iadd_imm(b, base, component),
                              nir_imul_imm(b, nir_u2u16(b, offset), 4));
 
-   if (sem.location != VARYING_SLOT_LAYER)
+   /* LAYER is consumed only by the shared fixed-function scalar. VIEWPORT
+    * additionally needs an ordinary flat varying only when the next shader
+    * reads it. nir_opt_varyings marks the fixed-function-only case with
+    * no_varying; emitting both stores there disagrees with Apple's native UVS
+    * layout and overstates the VertexProgramVariant output size. */
+   if ((sem.location != VARYING_SLOT_LAYER || ctx->layer_as_varying) &&
+       (sem.location != VARYING_SLOT_VIEWPORT || !sem.no_varying))
       nir_store_uvs_agx(b, value, index);
 
    /* Insert clip distance sysval writes, and gather layer/viewport writes so we
@@ -101,10 +133,10 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       unsigned c = 4 * (sem.location - VARYING_SLOT_CLIP_DIST0) + component;
 
       if (c < b->shader->info.clip_distance_array_size) {
-         nir_def *index = nir_iadd_imm(
+         nir_def *clip_index = nir_iadd_imm(
             b, nir_imul_imm(b, nir_u2u16(b, offset), 4), clip_base + c);
 
-         nir_store_uvs_agx(b, value, index);
+         nir_store_uvs_agx(b, value, clip_index);
       }
    }
 
@@ -124,8 +156,12 @@ write_layer_viewport_sysval(struct ctx *ctx)
    nir_def *layer = ctx->layer ? nir_u2u16(&b, ctx->layer) : zero;
    nir_def *viewport = ctx->viewport ? nir_u2u16(&b, ctx->viewport) : zero;
 
+   /* render_target_array_index is the low half and viewport_array_index the
+    * high half on every generation, G17P included. */
+   nir_def *packed = nir_pack_32_2x16_split(&b, layer, viewport);
+
    nir_store_uvs_agx(
-      &b, nir_pack_32_2x16_split(&b, layer, viewport),
+      &b, packed,
       nir_imm_int(&b, ctx->layout->group_offs[UVS_LAYER_VIEWPORT]));
 }
 
@@ -138,6 +174,12 @@ gather_components(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
    unsigned component = nir_intrinsic_component(intr);
+
+   /* VIEWPORT remains a fixed-function output when it is not consumed by the
+    * next shader. In that case only the packed layer/viewport scalar below is
+    * allocated; it is not also a user varying. */
+   if (sem.location == VARYING_SLOT_VIEWPORT && sem.no_varying)
+      return false;
 
    if (nir_src_is_const(intr->src[1])) {
       unsigned loc = sem.location + nir_src_as_uint(intr->src[1]);
@@ -152,7 +194,25 @@ gather_components(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 }
 
 bool
-agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout)
+agx_nir_lower_default_layer(nir_shader *s)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   if (s->info.outputs_written & VARYING_BIT_LAYER)
+      return nir_no_progress(impl);
+
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_store_output(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                    .src_type = nir_type_uint32,
+                    .io_semantics = {.location = VARYING_SLOT_LAYER,
+                                     .num_slots = 1},
+                    .write_mask = 1);
+   s->info.outputs_written |= VARYING_BIT_LAYER;
+   return nir_progress(true, impl, nir_metadata_control_flow);
+}
+
+bool
+agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout,
+                  bool layer_as_varying)
 {
    bool progress = false;
 
@@ -174,7 +234,8 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout)
 
    for (unsigned i = 0; i < ARRAY_SIZE(layout->components); ++i) {
       if (i != VARYING_SLOT_POS && i != VARYING_SLOT_PSIZ &&
-          i != VARYING_SLOT_LAYER && layout->components[i]) {
+          (i != VARYING_SLOT_LAYER || layer_as_varying) &&
+          layout->components[i]) {
 
          layout->written |= BITFIELD64_BIT(i);
          sizes[UVS_VARYINGS] += layout->components[i];
@@ -191,7 +252,10 @@ agx_nir_lower_uvs(nir_shader *s, struct agx_unlinked_uvs_layout *layout)
    layout->user_size = sizes[UVS_VARYINGS];
 
    /* Now lower in terms of the unlinked layout */
-   struct ctx ctx = {.layout = layout};
+   struct ctx ctx = {
+      .layout = layout,
+      .layer_as_varying = layer_as_varying,
+   };
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, lower,
             nir_metadata_control_flow, &ctx);
 

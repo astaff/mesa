@@ -21,6 +21,11 @@
 #include "nir_lower_blend.h"
 #include "shader_enums.h"
 
+static bool drop_unit_range_source_clamps(nir_shader *s);
+
+/* Mesa's "every sample" spelling, shared with agx_nir_lower_tilebuffer. */
+#define ALL_SAMPLES 0xFF
+
 /*
  * Insert code into a fragment shader to lower polygon stipple. The stipple is
  * passed in a sideband, rather than requiring a texture binding. This is
@@ -58,48 +63,121 @@ agx_nir_lower_poly_stipple(nir_shader *s)
 }
 
 static int
-map_vs_part_uniform(nir_intrinsic_instr *intr, unsigned nr_attribs)
+map_vs_part_uniform(nir_intrinsic_instr *intr, unsigned nr_attribs,
+                    unsigned uniform_base)
 {
+   int uniform;
    switch (intr->intrinsic) {
    case nir_intrinsic_load_vbo_base_agx:
-      return AGX_ABI_VUNI_VBO_BASE(nir_src_as_uint(intr->src[0]));
+      uniform = AGX_ABI_VUNI_VBO_BASE(nir_src_as_uint(intr->src[0]));
+      break;
 
    case nir_intrinsic_load_attrib_clamp_agx:
-      return AGX_ABI_VUNI_VBO_CLAMP(nr_attribs, nir_src_as_uint(intr->src[0]));
+      uniform =
+         AGX_ABI_VUNI_VBO_CLAMP(nr_attribs, nir_src_as_uint(intr->src[0]));
+      break;
 
    case nir_intrinsic_load_first_vertex:
-      return AGX_ABI_VUNI_FIRST_VERTEX(nr_attribs);
+      uniform = AGX_ABI_VUNI_FIRST_VERTEX(nr_attribs);
+      break;
 
    case nir_intrinsic_load_base_instance:
-      return AGX_ABI_VUNI_BASE_INSTANCE(nr_attribs);
+      uniform = AGX_ABI_VUNI_BASE_INSTANCE(nr_attribs);
+      break;
 
    case nir_intrinsic_load_vertex_param_buffer_poly:
-      return AGX_ABI_VUNI_VERTEX_PARAMS(nr_attribs);
+      uniform = AGX_ABI_VUNI_VERTEX_PARAMS(nr_attribs);
+      break;
+
+   default:
+      return -1;
+   }
+
+   return uniform_base + uniform;
+}
+
+static int
+map_fs_part_uniform(nir_intrinsic_instr *intr,
+                    const struct agx_fs_epilog_key *key)
+{
+   const unsigned blend_base = key && key->blend_constant_base
+                                  ? key->blend_constant_base
+                                  : AGX_ABI_FUNI_BLEND_R;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_blend_const_color_r_float:
+      return blend_base;
+
+   case nir_intrinsic_load_blend_const_color_g_float:
+      return blend_base + 2;
+
+   case nir_intrinsic_load_blend_const_color_b_float:
+      return blend_base + 4;
+
+   case nir_intrinsic_load_blend_const_color_a_float:
+      return blend_base + 6;
 
    default:
       return -1;
    }
 }
 
-static int
-map_fs_part_uniform(nir_intrinsic_instr *intr)
+static bool
+lower_native_emrt_handle(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   switch (intr->intrinsic) {
-   case nir_intrinsic_load_blend_const_color_r_float:
-      return AGX_ABI_FUNI_BLEND_R;
+   if (intr->intrinsic != nir_intrinsic_load_texture_handle_agx)
+      return false;
 
-   case nir_intrinsic_load_blend_const_color_g_float:
-      return AGX_ABI_FUNI_BLEND_G;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *index = intr->src[0].ssa;
+   nir_def *rt = nir_ushr_imm(b, index, 1);
+   nir_def *offset = nir_iadd(b, nir_imul_imm(b, rt, AGX_G17P_EMRT_DESCRIPTOR_SIZE),
+                            nir_ishl_imm(b, nir_iand_imm(b, index, 1), 5));
+   nir_def_replace(&intr->def, nir_bindless_image_agx(b, offset, .desc_set = 0));
+   return true;
+}
 
-   case nir_intrinsic_load_blend_const_color_b_float:
-      return AGX_ABI_FUNI_BLEND_B;
+static bool
+lower_native_emrt_uniforms(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct agx_fs_epilog_key *key = data;
+   b->cursor = nir_before_instr(&intr->instr);
 
-   case nir_intrinsic_load_blend_const_color_a_float:
-      return AGX_ABI_FUNI_BLEND_A;
-
-   default:
-      return -1;
+   if (intr->intrinsic == nir_intrinsic_bindless_image_store) {
+      nir_def *value = intr->src[3].ssa;
+      nir_alu_type type = nir_alu_type_get_base_type(nir_intrinsic_src_type(intr));
+      if (value->bit_size < 32) {
+         value = type == nir_type_float ? nir_f2f32(b, value) :
+                 type == nir_type_int ? nir_i2i32(b, value) : nir_u2u32(b, value);
+         nir_src_rewrite(&intr->src[3], value);
+         nir_intrinsic_set_src_type(intr, type | 32);
+      }
+      /* G17P's existing bindless store consumes native 32-byte PBE records,
+       * not byte offsets. Descriptor crawls retain their byte handles. */
+      nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
+      assert(handle && handle->intrinsic == nir_intrinsic_bindless_image_agx);
+      nir_src_rewrite(&intr->src[0], nir_bindless_image_agx(
+         b, nir_ushr_imm(b, handle->src[0].ssa, 5),
+         .desc_set = key->emrt_heap_base));
+      return true;
    }
+
+   if (intr->intrinsic == nir_intrinsic_load_descriptor_set_agx) {
+      assert(nir_intrinsic_desc_set(intr) == 0);
+      nir_def_replace(&intr->def,
+         nir_load_preamble(b, 1, 64, .base = key->emrt_heap_base));
+      return true;
+   }
+
+   if (intr->intrinsic == nir_intrinsic_load_from_texture_handle_agx) {
+      nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
+      assert(handle && handle->intrinsic == nir_intrinsic_bindless_image_agx);
+      nir_def_replace(&intr->def, nir_iadd(b,
+         nir_load_preamble(b, 1, 64, .base = key->emrt_heap_base),
+         nir_u2u64(b, handle->src[0].ssa)));
+      return true;
+   }
+   return false;
 }
 
 static bool
@@ -108,10 +186,14 @@ lower_non_monolithic_uniforms(nir_builder *b, nir_intrinsic_instr *intr,
 {
    int unif;
    if (b->shader->info.stage == MESA_SHADER_VERTEX) {
-      unsigned *nr_attribs = data;
-      unif = map_vs_part_uniform(intr, *nr_attribs);
+      const struct agx_vs_prolog_key *layout = data;
+      unif = map_vs_part_uniform(intr,
+                                 DIV_ROUND_UP(BITSET_LAST_BIT(
+                                                 layout->component_mask),
+                                              4),
+                                 layout->uniform_base);
    } else {
-      unif = map_fs_part_uniform(intr);
+      unif = map_fs_part_uniform(intr, data);
    }
 
    if (unif >= 0) {
@@ -134,8 +216,12 @@ lower_non_monolithic_uniforms(nir_builder *b, nir_intrinsic_instr *intr,
 bool
 agx_nir_lower_non_monolithic_uniforms(nir_shader *nir, unsigned nr)
 {
+   struct agx_vs_prolog_key layout = {0};
+   if (nr)
+      BITSET_SET_COUNT(layout.component_mask, 0, nr * 4);
+
    return nir_shader_intrinsics_pass(nir, lower_non_monolithic_uniforms,
-                                     nir_metadata_control_flow, &nr);
+                                     nir_metadata_control_flow, &layout);
 }
 
 static bool
@@ -168,8 +254,8 @@ lower_adjacency(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-void
-agx_nir_vs_prolog(nir_builder *b, const void *key_)
+static void
+agx_nir_vs_prolog_impl(nir_builder *b, const void *key_, bool native_raw)
 {
    const struct agx_vs_prolog_key *key = key_;
    b->shader->info.stage = MESA_SHADER_VERTEX;
@@ -206,7 +292,10 @@ agx_nir_vs_prolog(nir_builder *b, const void *key_)
 
    /* Now lower the resulting program using the key */
    if (!key->static_vi) {
-      agx_nir_lower_vbo(b->shader, key->attribs, key->robustness, false);
+      if (native_raw)
+         agx_nir_lower_vbo_raw(b->shader, key->attribs, key->robustness, false);
+      else
+         agx_nir_lower_vbo(b->shader, key->attribs, key->robustness, false);
 
       /* Clean up redundant vertex ID loads */
       if (!key->hw || key->adjacency) {
@@ -226,9 +315,57 @@ agx_nir_vs_prolog(nir_builder *b, const void *key_)
                      key->sw_index_size_B);
 
    /* Finally, lower uniforms according to our ABI */
-   unsigned nr = DIV_ROUND_UP(BITSET_LAST_BIT(key->component_mask), 4);
-   agx_nir_lower_non_monolithic_uniforms(b->shader, nr);
+   nir_shader_intrinsics_pass(b->shader, lower_non_monolithic_uniforms,
+                              nir_metadata_control_flow, (void *)key);
    b->shader->info.io_lowered = true;
+}
+
+void
+agx_nir_vs_prolog(nir_builder *b, const void *key)
+{
+   agx_nir_vs_prolog_impl(b, key, false);
+}
+
+void
+agx_nir_vs_prolog_raw(nir_builder *b, const void *key)
+{
+   agx_nir_vs_prolog_impl(b, key, true);
+}
+
+/*
+ * Map a lowered load_input to its slot in the vertex input ABI.
+ *
+ * The prolog publishes every attribute component as a full 32-bit value in
+ * its own pair of half-registers: agx_nir_vs_prolog_impl() fetches with
+ * nir_load_input(b, 4, 32, ...) and exports each channel at
+ * AGX_ABI_VIN_ATTRIB(4 * attrib + comp) = 2 * (8 + i), two halves apart.
+ * struct agx_vs_prolog_key carries no bit sizes at all -- only a component
+ * mask in these same 32-bit slot units -- so the prolog cannot publish
+ * anything narrower even in principle.
+ *
+ * A main shader may still declare a narrower input, since we advertise
+ * VK_KHR_16bit_storage's storageInputOutput16. That does not change the slot
+ * arithmetic: lowered NIR IO keeps nir_intrinsic_component() in 32-bit slot
+ * components even for 16-bit loads (nir_validate asserts component +
+ * num_components <= 4), and the only way two 16-bit values share one
+ * component is nir_io_semantics::high_16bits, which nir_lower_io never sets
+ * and which is produced for varyings alone (nir_lower_mediump's 16-bit
+ * varying slots and nir_opt_vectorize_io, neither of which we run). So one
+ * declared component is still exactly one 32-bit ABI slot, and all the main
+ * shader has to do is narrow the value the prolog handed it.
+ */
+static unsigned
+vs_input_abi_slot(nir_intrinsic_instr *intr)
+{
+   ASSERTED nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   assert(!sem.high_16bits && "VS inputs never share a 32-bit slot");
+   assert(intr->def.bit_size <= 32 && "64-bit attributes need two ABI slots");
+
+   unsigned idx = nir_src_as_uint(intr->src[0]) + nir_intrinsic_base(intr);
+   unsigned comp = nir_intrinsic_component(intr);
+   assert(comp + intr->def.num_components <= 4);
+
+   return 4 * idx + comp;
 }
 
 static bool
@@ -237,17 +374,15 @@ gather_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (intr->intrinsic != nir_intrinsic_load_input)
       return false;
 
-   unsigned idx = nir_src_as_uint(intr->src[0]) + nir_intrinsic_base(intr);
-   unsigned comp = nir_intrinsic_component(intr);
-
-   assert(intr->def.bit_size == 32 && "todo: push conversions up?");
-   unsigned base = 4 * idx + comp;
+   unsigned base = vs_input_abi_slot(intr);
 
    b->cursor = nir_before_instr(&intr->instr);
    BITSET_WORD *comps_read = data;
    nir_component_mask_t mask = nir_def_components_read(&intr->def);
 
    u_foreach_bit(c, mask) {
+      assert(base + c < AGX_MAX_ATTRIBS * 4 &&
+             "attribute slot beyond component mask capacity");
       BITSET_SET(comps_read, base + c);
    }
 
@@ -267,16 +402,33 @@ lower_input_to_prolog(nir_builder *b, nir_intrinsic_instr *intr, void *_data)
    if (intr->intrinsic != nir_intrinsic_load_input)
       return false;
 
-   unsigned idx = nir_src_as_uint(intr->src[0]) + nir_intrinsic_base(intr);
-   unsigned comp = nir_intrinsic_component(intr);
-
-   assert(intr->def.bit_size == 32 && "todo: push conversions up?");
-   unsigned base = 4 * idx + comp;
+   unsigned base = vs_input_abi_slot(intr);
 
    b->cursor = nir_before_instr(&intr->instr);
-   nir_def *val =
-      nir_load_exported_agx(b, intr->def.num_components, intr->def.bit_size,
-                            .base = AGX_ABI_VIN_ATTRIB(base));
+
+   /* Always read the ABI slot at its published width. Loading at the narrow
+    * width would be silently wrong rather than merely slow: agx_load_exported
+    * strides the base by the DESTINATION size, so a 16-bit load would take
+    * component 1 out of component 0's high half.
+    */
+   nir_def *val = nir_load_exported_agx(b, intr->def.num_components, 32,
+                                        .base = AGX_ABI_VIN_ATTRIB(base));
+
+   if (intr->def.bit_size != 32) {
+      /* The prolog's vertex fetch already converted the attribute into the
+       * 32-bit slot with the format's own numeric type (agx_nir_lower_vbo
+       * emits f2f32/i2i32/u2u32), so narrowing by the declared base type
+       * recovers the value exactly.
+       */
+      nir_alu_type base_type =
+         nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr));
+
+      assert((base_type == nir_type_float || base_type == nir_type_int ||
+              base_type == nir_type_uint) &&
+             "narrow vertex input without a numeric type");
+
+      val = nir_convert_to_bit_size(b, val, base_type, intr->def.bit_size);
+   }
 
    nir_def_replace(&intr->def, val);
    return true;
@@ -360,18 +512,140 @@ copy_colour(nir_builder *b, const struct agx_fs_epilog_key *key,
 {
    unsigned size = (key->link.size_32 & BITFIELD_BIT(in_loc)) ? 32 : 16;
 
-   nir_def *value =
-      nir_load_exported_agx(b, 4, size, .base = AGX_ABI_FOUT_COLOUR(in_loc));
+   struct agx_g17p_colour_layout layout;
+   agx_g17p_colour_layout_init(&layout, key->link.loc_written,
+                               key->link.size_32, key->link.colour_comps,
+                               key->link.packed_colour);
+
+   /* Packed colours hold only the components the main fragment exported.
+    * Everything past them is undefined in the API too, so read what is there
+    * and leave the rest undefined rather than reading the next location's
+    * registers -- a location with no components of its own shares its base
+    * with the next one. The ABI layout keeps all four components and is
+    * unchanged. */
+   const unsigned nr = layout.comps[in_loc];
+   nir_def *value = NULL;
+
+   if (nr > 0) {
+      value = nir_load_exported_agx(
+         b, nr, size, .base = agx_g17p_sample_colour_base(&layout, 0, in_loc));
+   }
+
+   if (nr < 4) {
+      nir_def *comps[4];
+
+      for (unsigned c = 0; c < 4; ++c)
+         comps[c] = c < nr ? nir_channel(b, value, c) : nir_undef(b, 1, size);
+
+      value = nir_vec(b, comps, 4);
+   }
 
    if (key->link.loc0_w_1 && in_loc == 0) {
       value =
          nir_vector_insert_imm(b, value, nir_imm_floatN_t(b, 1.0, size), 3);
    }
 
+   if (key->smooth_line_alpha && in_loc == 0 && !dual_src) {
+      nir_def *alpha = nir_fmul_imm(b, nir_channel(b, value, 3), 0.5);
+      value = nir_vector_insert_imm(b, value, alpha, 3);
+   }
+
    nir_store_output(b, value, nir_imm_int(b, 0),
                     .io_semantics.location = FRAG_RESULT_DATA0 + out_rt,
                     .io_semantics.dual_source_blend_index = dual_src,
                     .src_type = nir_type_float | size);
+}
+
+/* Blend in the API format, then restore the wider physical store shape.
+ * Padding is never observable through a public view or image transfer. */
+static bool
+pad_blended_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct agx_fs_epilog_key *key = data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location < FRAG_RESULT_DATA0 || sem.location > FRAG_RESULT_DATA7)
+      return false;
+
+   unsigned rt = sem.location - FRAG_RESULT_DATA0;
+   if (key->blend_formats[rt] == PIPE_FORMAT_NONE &&
+       key->scaled_formats[rt] == PIPE_FORMAT_NONE)
+      return false;
+
+   unsigned comps = util_format_get_nr_components(key->rt_formats[rt]);
+   if (intr->num_components >= comps)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[0], nir_pad_vector(b, intr->src[0].ssa, comps));
+   intr->num_components = comps;
+   return true;
+}
+
+/* Scaled Vulkan attachments have floating-point shader semantics and integer
+ * physical storage. Convert after blending and before tilebuffer lowering. */
+static bool
+convert_scaled_output(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct agx_fs_epilog_key *key = data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location < FRAG_RESULT_DATA0 || sem.location > FRAG_RESULT_DATA7)
+      return false;
+
+   const unsigned rt = sem.location - FRAG_RESULT_DATA0;
+   const enum pipe_format format = key->scaled_formats[rt];
+   if (format == PIPE_FORMAT_NONE)
+      return false;
+
+   const struct util_format_description *desc =
+      util_format_description(format);
+   const bool is_signed = desc->channel[0].type == UTIL_FORMAT_TYPE_SIGNED;
+   unsigned component_bits[4];
+   for (unsigned c = 0; c < intr->num_components; ++c) {
+      /* Meta fragment shaders may carry a fourth value into a three-component
+       * attachment. Constant format swizzles need no special range, so retain
+       * the format's uniform channel width for that otherwise-unobservable
+       * lane. Packed formats map all four logical components to real channels. */
+      const unsigned channel = desc->swizzle[c] < PIPE_SWIZZLE_0
+                                  ? desc->swizzle[c]
+                                  : 0;
+      if (desc->channel[channel].normalized ||
+          desc->channel[channel].type != desc->channel[0].type)
+         return false;
+
+      component_bits[c] = desc->channel[channel].size;
+      if (component_bits[c] == 0 || component_bits[c] >= 32)
+         return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *upper_components[4];
+   nir_def *lower_components[4];
+   for (unsigned c = 0; c < intr->num_components; ++c) {
+      const unsigned bits = component_bits[c];
+      nir_def *limit = nir_imm_float(b, 1u << bits);
+      nir_def *signed_limit = nir_fmul_imm(b, limit, 0.5);
+      upper_components[c] = nir_fadd_imm(
+         b, is_signed ? signed_limit : limit, -1);
+      lower_components[c] =
+         is_signed ? nir_fneg(b, signed_limit) : nir_imm_float(b, 0);
+   }
+
+   nir_def *upper = nir_vec(b, upper_components, intr->num_components);
+   nir_def *lower = nir_vec(b, lower_components, intr->num_components);
+   nir_def *rounded = nir_fround_even(b, intr->src[0].ssa);
+   nir_def *clamped = nir_fmin(b, nir_fmax(b, rounded, lower), upper);
+   nir_src_rewrite(&intr->src[0],
+                   is_signed ? nir_f2i32(b, clamped)
+                             : nir_f2u32(b, clamped));
+   nir_intrinsic_set_src_type(intr, is_signed ? nir_type_int32
+                                               : nir_type_uint32);
+   return true;
 }
 
 void
@@ -381,11 +655,79 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
    b->shader->info.stage = MESA_SHADER_FRAGMENT;
    b->shader->info.name = "FS epilog";
 
+   struct agx_tilebuffer_layout tib = agx_build_tilebuffer_layout_with_limits(
+      key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples, true,
+      key->max_sample_size_B, key->max_bytes_per_tile, key->max_samples_per_tile);
+
+   unsigned rt_order[AGX_MAX_RENDER_TARGETS];
+   for (unsigned rt = 0; rt < ARRAY_SIZE(rt_order); ++rt)
+      rt_order[rt] = rt;
+
+   if (key->native_spills && agx_tilebuffer_spills(&tib)) {
+      /* Spill stores introduce conditional image accesses. Emit those first,
+       * then the resident attachments, so every sample finishes its tile
+       * stores in one block. These outputs address distinct attachments;
+       * sorting before blend lowering keeps each destination load with its
+       * own store and does not move accesses across sample iterations. */
+      for (unsigned i = 0; i < ARRAY_SIZE(rt_order); ++i) {
+         for (unsigned j = i + 1; j < ARRAY_SIZE(rt_order); ++j) {
+            unsigned a = rt_order[i], c = rt_order[j];
+            if ((!tib.spilled[a] && tib.spilled[c]) ||
+                (!tib.spilled[a] && !tib.spilled[c] &&
+                 agx_tilebuffer_offset_B(&tib, a) <
+                    agx_tilebuffer_offset_B(&tib, c)))
+               SWAP(rt_order[i], rt_order[j]);
+         }
+      }
+   }
+
+   /* Import masks before the colour stores: alpha-to-coverage is inserted
+    * before those stores and must be dominated by the imported write mask. */
+   nir_def *sample_id = NULL, *write_samples = NULL;
+   if (key->link.sample_shading) {
+      sample_id =
+         nir_load_exported_agx(b, 1, 16, .base = AGX_ABI_FOUT_SAMPLE_MASK);
+   }
+
+   if (key->link.sample_mask_after_force_early) {
+      write_samples =
+         nir_load_exported_agx(b, 1, 16, .base = AGX_ABI_FOUT_WRITE_SAMPLES);
+   }
+
+   if (key->defer_api_sample_mask) {
+      nir_def *api_mask = nir_imm_intN_t(b, key->api_sample_mask, 16);
+      write_samples = write_samples ? nir_iand(b, write_samples, api_mask)
+                                    : api_mask;
+   }
+
    /* First, construct a passthrough shader reading each colour and outputting
     * the value.
     */
-   for (unsigned rt = 0; rt < ARRAY_SIZE(key->remap); ++rt) {
+   for (unsigned i = 0; i < ARRAY_SIZE(key->remap); ++i) {
+      unsigned rt = rt_order[i];
       int location = key->remap[rt];
+
+      /* A write-disabled attachment stores its own tile value back; blending
+       * cannot express this for pure-integer formats (nir_lower_blend skips
+       * them: dynamic_rendering.*.local_read.interaction_with_color_write_
+       * enable on r32_uint). */
+      if ((key->preserve_rt & BITFIELD_BIT(rt)) &&
+          key->rt_formats[rt] != PIPE_FORMAT_NONE) {
+         nir_io_semantics sem = {
+            .location = FRAG_RESULT_DATA0 + rt,
+            .num_slots = 1,
+            .fb_fetch_output = true,
+         };
+         b->shader->info.outputs_read |= BITFIELD64_BIT(sem.location);
+         b->shader->info.fs.uses_fbfetch_output = true;
+         nir_def *dst = nir_load_output(b, 4, 32, nir_imm_int(b, 0),
+                                        .dest_type = nir_type_float32,
+                                        .io_semantics = sem);
+         nir_store_output(b, dst, nir_imm_int(b, 0),
+                          .io_semantics.location = FRAG_RESULT_DATA0 + rt,
+                          .src_type = nir_type_float32);
+         continue;
+      }
 
       /* Negative remaps indicate the attachment isn't written. */
       if (location >= 0 && key->link.loc_written & BITFIELD_BIT(location)) {
@@ -407,22 +749,7 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
       }
    }
 
-   /* Grab registers early, this has to happen in the first block. */
-   nir_def *sample_id = NULL, *write_samples = NULL;
-   if (key->link.sample_shading) {
-      sample_id =
-         nir_load_exported_agx(b, 1, 16, .base = AGX_ABI_FOUT_SAMPLE_MASK);
-   }
-
-   if (key->link.sample_mask_after_force_early) {
-      write_samples =
-         nir_load_exported_agx(b, 1, 16, .base = AGX_ABI_FOUT_WRITE_SAMPLES);
-   }
-
    /* Now lower the resulting program using the key */
-   struct agx_tilebuffer_layout tib = agx_build_tilebuffer_layout(
-      key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples, true);
-
    if (key->force_small_tile)
       tib.tile_size = 16 * 16;
 
@@ -441,7 +768,9 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
             agx_unpack_blend_advanced(key->blend.rt[i].mode);
 
          opts.rt[i] = (nir_lower_blend_rt){
-            .format = key->rt_formats[i],
+            .format = key->blend_formats[i] != PIPE_FORMAT_NONE
+                         ? key->blend_formats[i]
+                         : key->rt_formats[i],
             .advanced_blend = true,
             .colormask = key->blend.rt[i].colormask,
             .blend_mode = blend.op,
@@ -454,7 +783,9 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
             agx_unpack_blend_standard(key->blend.rt[i].mode);
 
          opts.rt[i] = (nir_lower_blend_rt){
-            .format = key->rt_formats[i],
+            .format = key->blend_formats[i] != PIPE_FORMAT_NONE
+                         ? key->blend_formats[i]
+                         : key->rt_formats[i],
 
             .rgb.src_factor = blend.rgb_src_factor,
             .rgb.dst_factor = blend.rgb_dst_factor,
@@ -479,7 +810,16 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
       if (key->rt_formats[i] == PIPE_FORMAT_NONE)
          continue;
 
-      if (agx_tilebuffer_supports_mask(&tib, i)) {
+      if (key->blend.rt[i].colormask == 0) {
+         /* Writing nothing needs no masked store, so this costs nothing even
+          * where the tilebuffer cannot mask -- and it must go this way. Left
+          * to nir_lower_blend, a mask of zero deletes the store outright, and
+          * a covered fragment that stores nothing loses the tile it was drawn
+          * over: agx_nir_lower_tilebuffer preserves the destination instead.
+          */
+         colormasks[i] = 0;
+         opts.rt[i].colormask = (uint8_t)BITFIELD_MASK(4);
+      } else if (agx_tilebuffer_supports_mask(&tib, i)) {
          colormasks[i] = key->blend.rt[i].colormask;
          opts.rt[i].colormask = (uint8_t)BITFIELD_MASK(4);
       } else {
@@ -502,13 +842,104 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
       NIR_PASS(_, b->shader, nir_lower_alpha_to_coverage, false,
                NULL);
 
+   /* Native late SampleMask writes cross the main/epilog split in a register.
+    * Combine them with alpha coverage before the one test-triggering update,
+    * as Apple's G17P sample-mask + alpha-coverage fragment does. Applying the
+    * mask only to the tile store would still update depth for killed samples.
+    * Early-tested shaders must not run the tests again.
+    *
+    * At two and four samples the G17P depth/stencil write names the surviving
+    * samples in its own per-sample coverage words, so it already excludes the
+    * killed ones and needs no coverage update of its own. Issuing one anyway
+    * makes the hardware run the depth/stencil test on each surviving sample
+    * twice -- measured as four INCREMENT_AND_WRAP steps where the API asked
+    * for two, on renderpasses.*.multisample.d32_sfloat_s8_uint.samples_4. At
+    * one sample the write's word has no mask field at all, so there the kill
+    * is the only thing that can hold the test back, as
+    * fragment_operations.early_fragment.discard_no_early_fragment_tests_stencil
+    * depends on. A deferred epilog is cloned per sample after this point and
+    * coalesces its kills itself (agx_nir_hoist_g17p_zs_writes), so leave that
+    * shape alone. */
+   const bool zs_carries_write_samples =
+      (key->link.write_z || key->link.write_s) && key->nr_samples > 1 &&
+      !key->defer_monolithic_msaa;
+
+   /* already_ran_zs says the main shader has already triggered the
+    * depth/stencil tests, so the epilog must not trigger them again.  It does
+    * not say the main shader's coverage has been applied: a forced-early
+    * shader runs the tests at its start with only the API mask
+    * (hk_g17p_apply_api_mask_to_force_early) and exports the coverage its
+    * discards and SampleMask writes produced in FOUT_WRITE_SAMPLES for us.
+    * Gating this block on the flag dropped that mask on the floor and stored
+    * colour for killed samples -- query_pool.discard.early.*.{discard,
+    * sample_mask} saw white where the discard should have left the target
+    * untouched.
+    *
+    * Applying it here does not re-run the tests: lower_tests_zs() below
+    * substitutes 0 for load_shader_part_tests_zs_agx when already_ran_zs, and
+    * run_tests_after_last_discard() then builds `sample_mask killed, ~killed`,
+    * which kills without testing.  So keep the two decisions separate --
+    * always honour the exported coverage, and let the flag govern only
+    * whether the kill also triggers the tests. */
+   if (write_samples) {
+      bool kills = false;
+      nir_foreach_block(block, b->impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_demote_samples)
+               continue;
+            nir_builder mask_b = nir_builder_at(nir_before_instr(instr));
+            nir_def *killed = nir_ixor(
+               &mask_b, write_samples, nir_imm_intN_t(&mask_b, ALL_SAMPLES, 16));
+            killed = nir_u2uN(&mask_b, killed, intr->src[0].ssa->bit_size);
+            nir_src_rewrite(&intr->src[0],
+                            nir_ior(&mask_b, intr->src[0].ssa, killed));
+            kills = true;
+         }
+      }
+      if (!kills && !zs_carries_write_samples) {
+         nir_instr *imported = nir_def_instr(write_samples);
+         nir_builder mask_b = nir_builder_at(nir_after_instr(imported));
+
+         /* Two builders sharing one insertion point emit in reverse order.
+          * `b` is parked on the imported mask itself whenever no colour was
+          * copied, so without carrying it past the kill everything `b`
+          * appends next -- the depth/stencil write below among it -- is
+          * threaded in *ahead* of the kill, and a coverage update after the
+          * write that triggered the tests is far too late. */
+         const bool b_shares_cursor = b->cursor.option == nir_cursor_after_instr &&
+                                      b->cursor.instr == imported;
+
+         nir_demote_samples(&mask_b,
+                            nir_ixor(&mask_b, write_samples,
+                                      nir_imm_intN_t(&mask_b, ALL_SAMPLES, 16)));
+         if (b_shares_cursor)
+            b->cursor = mask_b.cursor;
+
+         kills = true;
+      }
+
+      /* Colour stores keep their own copy of the mask either way, through
+       * agx_nir_lower_tilebuffer. */
+      if (kills)
+         b->shader->info.fs.uses_discard = true;
+   }
+
    /* Depth/stencil writes must be deferred until after all discards,
     * particularly alpha-to-coverage.
     */
    if (key->link.write_z || key->link.write_s) {
+      nir_def *zs_samples =
+         write_samples ? nir_iand(b, write_samples,
+                                  nir_load_active_samples_agx(b))
+                       : nir_imm_intN_t(b, 0xFF, 16);
+      nir_def *depth =
+         nir_load_exported_agx(b, 1, 32, .base = AGX_ABI_FOUT_Z);
+
       nir_store_zs_agx(
-         b, nir_imm_intN_t(b, 0xFF, 16),
-         nir_load_exported_agx(b, 1, 32, .base = AGX_ABI_FOUT_Z),
+         b, zs_samples, depth,
          nir_load_exported_agx(b, 1, 16, .base = AGX_ABI_FOUT_S),
          .base = (key->link.write_z ? 1 : 0) | (key->link.write_s ? 2 : 0));
 
@@ -524,12 +955,26 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
       NIR_PASS(_, b->shader, nir_lower_alpha_to_one);
 
    NIR_PASS(_, b->shader, nir_lower_blend, &opts);
+   if (key->colour_unit_range)
+      NIR_PASS(_, b->shader, drop_unit_range_source_clamps);
+   nir_shader_intrinsics_pass(b->shader, convert_scaled_output,
+                              nir_metadata_control_flow, (void *)key);
+   nir_shader_intrinsics_pass(b->shader, pad_blended_output,
+                              nir_metadata_control_flow, (void *)key);
 
    unsigned rt_spill = key->link.rt_spill_base;
    NIR_PASS(_, b->shader, agx_nir_lower_tilebuffer, &tib, colormasks, &rt_spill,
-            write_samples, &force_translucent);
-   NIR_PASS(_, b->shader, agx_nir_lower_texture);
-   NIR_PASS(_, b->shader, agx_nir_lower_multisampled_image_store);
+            write_samples, &force_translucent, key->preserve_zero_mask,
+            key->g17p_tile_formats);
+   const bool native_spills = key->native_spills && agx_tilebuffer_spills(&tib);
+   if (native_spills) {
+      NIR_PASS(_, b->shader, nir_shader_intrinsics_pass, lower_native_emrt_handle,
+               nir_metadata_control_flow, NULL);
+   }
+   NIR_PASS(_, b->shader, agx_nir_lower_texture_for_generation,
+            native_spills ? 9 : 0);
+   NIR_PASS(_, b->shader, agx_nir_lower_multisampled_image_store_for_generation,
+            native_spills ? 9 : 0);
 
    /* If the API shader runs once per sample, then the epilog runs once per
     * sample as well, so we need to lower our code to run for a single sample.
@@ -544,7 +989,7 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
        * the pixel shaded path. Must be done before agx_nir_lower_to_per_sample
        * to avoid duplicating tests.
        */
-      if (key->blend.alpha_to_coverage) {
+      if (b->shader->info.fs.uses_discard) {
          NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
       }
 
@@ -557,13 +1002,34 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
        */
       b->cursor = nir_after_impl(b->impl);
       nir_export_agx(b, sample_id, .base = AGX_ABI_FIN_SAMPLE_MASK);
-   } else {
+   } else if (!key->defer_monolithic_msaa) {
       NIR_PASS(_, b->shader, agx_nir_lower_monolithic_msaa, key->nr_samples);
+   } else if (b->shader->info.fs.uses_discard) {
+      /* G17P can keep a pixel-shaded multisample blend as one tile
+       * load/store pair carrying the live coverage register. Lower the
+       * alpha discard while the epilog's test intrinsics are still available;
+       * doing it after this function leaves a newly introduced test query
+       * past divergence analysis. */
+      NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
+   }
+
+   if (native_spills) {
+      /* The generated loop has exactly two or four iterations. G17P's MRT
+       * transaction is specialized for those sample groups; do not let the
+       * general cost heuristic leave a dynamic loop around the spill crawl. */
+      foreach_list_typed(nir_cf_node, node, node, &b->impl->body) {
+         if (node->type == nir_cf_node_loop)
+            nir_cf_node_as_loop(node)->control = nir_loop_control_unroll;
+      }
+      NIR_PASS(_, b->shader, nir_opt_constant_folding);
+      NIR_PASS(_, b->shader, agx_nir_lower_g17p_indexed_samplers);
+      NIR_PASS(_, b->shader, nir_shader_intrinsics_pass, lower_native_emrt_uniforms,
+               nir_metadata_control_flow, (void *)key);
    }
 
    /* Finally, lower uniforms according to our ABI */
    nir_shader_intrinsics_pass(b->shader, lower_non_monolithic_uniforms,
-                              nir_metadata_control_flow, NULL);
+                              nir_metadata_control_flow, (void *)key);
 
    /* There is no shader part after the epilog, so we're always responsible for
     * running our own tests, unless the fragment shader forced early tests.
@@ -575,9 +1041,198 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
    b->shader->info.fs.uses_sample_shading = key->link.sample_shading;
 }
 
+/*
+ * AGX_G17P_UNIT_RANGE_BLEND.
+ *
+ * Apple's inline blend for the throughput fragment shader has no source
+ * clamp: its compiler knows float(v & 63) / 255 lies in [0, 1]
+ * (native fragment 0x106..0x1b4). Honeykrisp's split epilog cannot see the
+ * main shader's values, so nir_lower_blend clamps every UNORM blend source
+ * (four f32add.sat per RGBA8 pixel). The main shader proves the bound here;
+ * the epilog key carries it; the epilog then drops fsat of the exported
+ * colour. Only fsat whose operand is the exported colour itself is removed.
+ */
+static bool
+unit_bound(nir_shader *s, struct hash_table *ht, nir_scalar v, double *lo,
+           double *hi, unsigned depth)
+{
+   if (depth > 24)
+      return false;
+
+   v = nir_scalar_chase_movs(v);
+   if (nir_scalar_is_const(v)) {
+      if (v.def->bit_size != 16 && v.def->bit_size != 32)
+         return false;
+      const double c = nir_scalar_as_float(v);
+      if (isnan(c) || isinf(c))
+         return false;
+      *lo = *hi = c;
+      return true;
+   }
+
+   if (!nir_scalar_is_alu(v))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(v);
+   double a0, a1, b0, b1, c0, c1;
+   switch (op) {
+   case nir_op_fsat:
+      *lo = 0.0;
+      *hi = 1.0;
+      return true;
+
+   case nir_op_u2f32:
+   case nir_op_u2f16: {
+      const uint32_t ub = nir_unsigned_upper_bound(
+         s, ht, nir_scalar_chase_alu_src(v, 0));
+      /* Keep the conversion exact so the bound is not rounded up. */
+      if (ub > (op == nir_op_u2f16 ? 2048u : (1u << 24)))
+         return false;
+      *lo = 0.0;
+      *hi = ub;
+      return true;
+   }
+
+   case nir_op_f2f32:
+   case nir_op_f2f16:
+      return unit_bound(s, ht, nir_scalar_chase_alu_src(v, 0), lo, hi,
+                        depth + 1);
+
+   case nir_op_fmul:
+   case nir_op_fmulz:
+   case nir_op_ffma:
+   case nir_op_ffmaz: {
+      if (!unit_bound(s, ht, nir_scalar_chase_alu_src(v, 0), &a0, &a1,
+                      depth + 1) ||
+          !unit_bound(s, ht, nir_scalar_chase_alu_src(v, 1), &b0, &b1,
+                      depth + 1))
+         return false;
+      /* Only non-negative factors: the product bound is then its corners
+       * and no sign or zero-times-infinity case arises. */
+      if (a0 < 0.0 || b0 < 0.0)
+         return false;
+      *lo = a0 * b0;
+      *hi = a1 * b1;
+      if (op == nir_op_ffma || op == nir_op_ffmaz) {
+         if (!unit_bound(s, ht, nir_scalar_chase_alu_src(v, 2), &c0, &c1,
+                         depth + 1))
+            return false;
+         *lo += c0;
+         *hi += c1;
+      }
+      return true;
+   }
+
+   case nir_op_fadd:
+      if (!unit_bound(s, ht, nir_scalar_chase_alu_src(v, 0), &a0, &a1,
+                      depth + 1) ||
+          !unit_bound(s, ht, nir_scalar_chase_alu_src(v, 1), &b0, &b1,
+                      depth + 1))
+         return false;
+      *lo = a0 + b0;
+      *hi = a1 + b1;
+      return true;
+
+   case nir_op_fmin:
+   case nir_op_fmax:
+      if (!unit_bound(s, ht, nir_scalar_chase_alu_src(v, 0), &a0, &a1,
+                      depth + 1) ||
+          !unit_bound(s, ht, nir_scalar_chase_alu_src(v, 1), &b0, &b1,
+                      depth + 1))
+         return false;
+      *lo = op == nir_op_fmin ? MIN2(a0, b0) : MAX2(a0, b0);
+      *hi = op == nir_op_fmin ? MIN2(a1, b1) : MAX2(a1, b1);
+      return true;
+
+   case nir_op_bcsel:
+      if (!unit_bound(s, ht, nir_scalar_chase_alu_src(v, 1), &a0, &a1,
+                      depth + 1) ||
+          !unit_bound(s, ht, nir_scalar_chase_alu_src(v, 2), &b0, &b1,
+                      depth + 1))
+         return false;
+      *lo = MIN2(a0, b0);
+      *hi = MAX2(a1, b1);
+      return true;
+
+   default:
+      return false;
+   }
+}
+
+bool
+agx_nir_fs_colour_outputs_unit_range(nir_shader *s)
+{
+   if (s->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+
+   struct hash_table *ht = _mesa_pointer_hash_table_create(NULL);
+   bool any = false, all = true;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+            const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+            if (sem.location != FRAG_RESULT_COLOR &&
+                sem.location < FRAG_RESULT_DATA0)
+               continue;
+
+            nir_def *vec = intr->src[0].ssa;
+            if (vec->bit_size != 16 && vec->bit_size != 32) {
+               all = false;
+               continue;
+            }
+            u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
+               double lo, hi;
+               nir_scalar chan = nir_scalar_chase_movs(nir_get_scalar(vec, c));
+               any = true;
+               /* Margin covers f16/f32 rounding of each bounded step. */
+               if (!unit_bound(s, ht, nir_get_scalar(vec, c), &lo, &hi, 0) ||
+                   lo < 0.0 || hi > 0.99)
+                  all = false;
+            }
+         }
+      }
+   }
+   _mesa_hash_table_destroy(ht, NULL);
+   return any && all;
+}
+
+static bool
+drop_unit_range_source_clamp(nir_builder *b, nir_alu_instr *alu,
+                             UNUSED void *data)
+{
+   if (alu->op != nir_op_fsat)
+      return false;
+
+   for (unsigned c = 0; c < alu->def.num_components; ++c) {
+      nir_scalar src = nir_scalar_chase_movs(
+         nir_get_scalar(alu->src[0].src.ssa, alu->src[0].swizzle[c]));
+      if (!nir_def_is_intrinsic(src.def) ||
+          nir_scalar_intrinsic_op(src) != nir_intrinsic_load_exported_agx)
+         return false;
+   }
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def_replace(&alu->def, nir_mov_alu(b, alu->src[0],
+                                          alu->def.num_components));
+   return true;
+}
+
+static bool
+drop_unit_range_source_clamps(nir_shader *s)
+{
+   return nir_shader_alu_pass(s, drop_unit_range_source_clamp,
+                              nir_metadata_control_flow, NULL);
+}
+
 struct lower_epilog_ctx {
    struct agx_fs_epilog_link_info *info;
    nir_variable *masked_samples;
+   bool preserve_early_demote;
 };
 
 static bool
@@ -604,7 +1259,19 @@ lower_output_to_epilog(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    if (intr->intrinsic == nir_intrinsic_demote_samples &&
-       b->shader->info.fs.early_fragment_tests) {
+       (b->shader->info.fs.early_fragment_tests ||
+        (ctx->preserve_early_demote &&
+         (b->shader->info.writes_memory ||
+          (!b->shader->info.fs.uses_sample_shading &&
+           (b->shader->info.outputs_written &
+            BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK))))))) {
+
+      /* G17P carries the discard mask across the split for both early and
+       * late tests. LSTCOL consumes it directly, and late DEPTHF must use it
+       * too: MOVMSK does not make a split epilog's reconstructed depth word
+       * retain the main shader's discard predicate. Late per-pixel SampleMask
+       * outputs must also combine with alpha coverage before triggering tests.
+       * Keep ordinary discard-only shaders on their existing lowering. */
 
       if (!ctx->masked_samples) {
          b->cursor = nir_before_impl(nir_shader_get_entrypoint(b->shader));
@@ -619,8 +1286,12 @@ lower_output_to_epilog(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       b->cursor = nir_before_instr(&intr->instr);
 
       nir_def *mask = nir_load_var(b, ctx->masked_samples);
-      nir_def *mask_2 =
-         nir_ixor(b, intr->src[0].ssa, nir_imm_intN_t(b, 0xff, 16));
+      /* The demoted-sample mask arrives as 16-bit from the sample-mask
+       * lowering but as 32-bit when it comes straight from gl_SampleMask
+       * (fragment_operations.early_fragment.samplemask_*). Coverage is eight
+       * bits, so narrow it before combining with the 16-bit accumulator. */
+      nir_def *demoted = nir_u2uN(b, intr->src[0].ssa, 16);
+      nir_def *mask_2 = nir_ixor(b, demoted, nir_imm_intN_t(b, 0xff, 16));
 
       mask = nir_iand(b, mask, mask_2);
       nir_store_var(b, ctx->masked_samples, mask, nir_component_mask(1));
@@ -668,9 +1339,19 @@ lower_output_to_epilog(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    uint32_t one_f = (vec->bit_size == 32 ? fui(1.0) : _mesa_float_to_half(1.0));
    unsigned comp = nir_intrinsic_component(intr);
 
+   /* Record the whole write mask, including a W the loc0_w_1 case elides
+    * below: the epilog materializes that component into the loaded vector, so
+    * the slot has to be there to insert it into. */
+   info->colour_comps |=
+      (uint32_t)((nir_intrinsic_write_mask(intr) << comp) & 0xf) << (4 * loc);
+
    u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
       nir_scalar s = nir_scalar_resolved(vec, c);
-      if (loc == 0 && c == 3 && nir_scalar_is_const(s) &&
+      /* G17P's mixed-width MRT epilog cannot materialize the elided alpha
+       * through AGX2's 16-bit immediate move. Keep it in the ordinary export
+       * ABI, which is also what native multi-target shaders use. */
+      if (!ctx->preserve_early_demote && loc == 0 && c == 3 &&
+          nir_scalar_is_const(s) &&
           nir_scalar_as_uint(s) == one_f) {
 
          info->loc0_w_1 = true;
@@ -685,11 +1366,14 @@ lower_output_to_epilog(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-bool
-agx_nir_lower_fs_output_to_epilog(nir_shader *s,
-                                  struct agx_fs_epilog_link_info *out)
+static bool
+lower_fs_output_to_epilog(nir_shader *s, struct agx_fs_epilog_link_info *out,
+                          bool preserve_early_demote)
 {
-   struct lower_epilog_ctx ctx = {.info = out};
+   struct lower_epilog_ctx ctx = {
+      .info = out,
+      .preserve_early_demote = preserve_early_demote,
+   };
 
    nir_shader_intrinsics_pass(s, lower_output_to_epilog,
                               nir_metadata_control_flow, &ctx);
@@ -712,6 +1396,269 @@ agx_nir_lower_fs_output_to_epilog(nir_shader *s,
 
    out->sample_shading = s->info.fs.uses_sample_shading;
    return true;
+}
+
+bool
+agx_nir_lower_fs_output_to_epilog(nir_shader *s,
+                                  struct agx_fs_epilog_link_info *out)
+{
+   return lower_fs_output_to_epilog(s, out, false);
+}
+
+bool
+agx_nir_lower_fs_output_to_epilog_for_device(
+   nir_shader *s, enum agx_chip chip, struct agx_fs_epilog_link_info *out)
+{
+   return lower_fs_output_to_epilog(s, out, chip == AGX_CHIP_G17P);
+}
+
+static bool
+pack_colour_export(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct agx_g17p_colour_layout *layout = data;
+
+   if (intr->intrinsic != nir_intrinsic_export_agx &&
+       intr->intrinsic != nir_intrinsic_load_exported_agx)
+      return false;
+
+   /* Depth, stencil and the masks live below the first colour. */
+   const unsigned base = nir_intrinsic_base(intr);
+   if (base < AGX_ABI_FOUT_COLOUR(0))
+      return false;
+
+   const unsigned loc = (base - AGX_ABI_FOUT_COLOUR(0)) / 8;
+   assert(loc < 8 && "colour exports name a render target");
+
+   /* Only the location's base moves; a component's place inside it does not */
+   const unsigned half = base - AGX_ABI_FOUT_COLOUR(loc);
+   nir_intrinsic_set_base(
+      intr, agx_g17p_sample_colour_base(layout, 0, loc) + half);
+
+   return true;
+}
+
+/*
+ * Move a fragment's colour exports onto the packed layout, which gives each
+ * location the components it writes instead of the ABI's four. Record it, so
+ * the epilog reads the registers the main fragment wrote.
+ */
+bool
+agx_nir_pack_g17p_colour_exports(nir_shader *s,
+                                 struct agx_fs_epilog_link_info *link)
+{
+   struct agx_g17p_colour_layout layout;
+   agx_g17p_colour_layout_init(&layout, link->loc_written, link->size_32,
+                               link->colour_comps, true);
+
+   link->packed_colour = true;
+
+   return nir_shader_intrinsics_pass(s, pack_colour_export,
+                                     nir_metadata_control_flow, &layout);
+}
+
+/*
+ * What lower_fs_output_to_epilog() would record for this shader, without
+ * lowering it. A caller deciding whether a fragment's per-sample exports can
+ * fit the register file needs the layout before the split happens.
+ *
+ * Anything this cannot account for is reported as a full four-component
+ * 32-bit location, which is the ABI's own slot, so the answer is never
+ * smaller than what the lowering goes on to produce.
+ */
+void
+agx_nir_gather_fs_colour_exports(const nir_shader *s_, uint8_t *loc_written,
+                                 uint8_t *size_32, uint32_t *colour_comps)
+{
+   nir_shader *s = (nir_shader *)s_;
+
+   *loc_written = 0;
+   *size_32 = 0;
+   *colour_comps = 0;
+
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+
+            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+            unsigned location = sem.location;
+
+            if (location == FRAG_RESULT_COLOR)
+               location = FRAG_RESULT_DATA0;
+
+            /* Sample mask and depth/stencil do not go through the epilog */
+            if (location < FRAG_RESULT_DATA0)
+               continue;
+
+            if (!nir_src_is_const(intr->src[1])) {
+               /* The lowering requires a constant index. Give up exactly */
+               *loc_written = BITFIELD_MASK(8);
+               *size_32 = BITFIELD_MASK(8);
+               *colour_comps = ~0u;
+               return;
+            }
+
+            unsigned loc = (location - FRAG_RESULT_DATA0) +
+                           nir_src_as_uint(intr->src[1]);
+
+            if (sem.dual_source_blend_index)
+               loc = 1;
+
+            if (loc >= 8)
+               continue;
+
+            *loc_written |= BITFIELD_BIT(loc);
+
+            if (intr->src[0].ssa->bit_size == 32)
+               *size_32 |= BITFIELD_BIT(loc);
+
+            *colour_comps |=
+               (uint32_t)((nir_intrinsic_write_mask(intr)
+                           << nir_intrinsic_component(intr)) &
+                          0xf)
+               << (4 * loc);
+         }
+      }
+   }
+}
+
+/*
+ * Give a G17P tile access the sample-mask source its hardware form actually
+ * takes.
+ *
+ * At one sample the operand is the whole-pixel immediate, which is what Mesa
+ * already spells as ALL_SAMPLES, so nothing has to happen.
+ *
+ * At two or four samples there is no immediate form at all. Apple's compiler
+ * reads the live coverage word out of a special register and passes that
+ * register as the mask -- raw for a per-pixel shader ("every sample this
+ * fragment covers"), ANDed with a one-hot bit for each iteration of an
+ * unrolled per-sample shader. Reproduce exactly those two shapes.
+ *
+ * A non-constant mask is already an expression in a register, so it is left
+ * alone and reaches the packer as the register form by itself. An epilog
+ * unrolled per sample (agx_nir_unroll_g17p_samples) has folded each sample's
+ * `mask & active_samples` to that sample's one-hot constant beforehand, so it
+ * too becomes coverage ANDed with the sample's bit.
+ */
+struct g17p_tile_sample_state {
+   unsigned samples;
+   nir_def *coverage;
+   nir_block *block;
+};
+
+static bool
+lower_g17p_tile_sample(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct g17p_tile_sample_state *state = data;
+   unsigned src;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_local_pixel_agx:
+      src = 0;
+      break;
+   case nir_intrinsic_store_local_pixel_agx:
+      src = 1;
+      break;
+   default:
+      /* Coverage changes at depth/stencil writes, demotes and interlocks.
+       * Conservatively end the local reuse window at any side effect. */
+      if (!(nir_intrinsic_infos[intr->intrinsic].flags &
+            NIR_INTRINSIC_CAN_ELIMINATE))
+         state->coverage = NULL;
+      return false;
+   }
+
+   const unsigned samples = state->samples;
+   if (samples == 1) {
+      /* Per-sample epilogs still carry a dynamic active-sample mask, but
+       * there is only sample zero. The native 1x tile instruction takes the
+       * whole-pixel immediate; preserve its form for these epilogs. */
+      if (nir_src_is_const(intr->src[src]) &&
+          nir_src_as_uint(intr->src[src]) == ALL_SAMPLES)
+         return false;
+
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_src_rewrite(&intr->src[src],
+                      nir_imm_intN_t(b, ALL_SAMPLES, 16));
+      return true;
+   }
+
+   /* Already a live expression: the per-sample lowerings have ANDed the mask
+    * with an active-sample register, which is the register form. */
+   if (!nir_src_is_const(intr->src[src]))
+      return false;
+
+   const unsigned mask = nir_src_as_uint(intr->src[src]);
+   if (mask == 0) {
+      /* Static unrolling can prove that the API mask excludes this sample.
+       * A zero-coverage tile access is dead, and keeping it would turn one
+       * surviving sample into an unsupported mixed zero/nonzero protocol. */
+      b->cursor = nir_before_instr(&intr->instr);
+      if (intr->intrinsic == nir_intrinsic_load_local_pixel_agx) {
+         nir_def_rewrite_uses(
+            &intr->def,
+            nir_undef(b, intr->def.num_components, intr->def.bit_size));
+      }
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   if (mask != ALL_SAMPLES &&
+       mask >= (1u << samples))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   /* active_samples_agx is a loop system value: NIR may CSE it across
+    * depth/stencil writes. At this point we need the hardware's *current*
+    * coverage, including the tests for this particular unrolled sample.
+    * load_sample_mask is ordered and lowers to the same G17P SR39 read. */
+   if (!state->coverage || state->block != intr->instr.block) {
+      state->coverage = nir_u2u16(b, nir_load_sample_mask(b));
+      state->block = intr->instr.block;
+   }
+   nir_def *coverage = state->coverage;
+   nir_def *sel = (mask == ALL_SAMPLES)
+                     ? coverage
+                     : nir_iand(b, coverage, nir_imm_intN_t(b, mask, 16));
+
+   nir_src_rewrite(&intr->src[src], sel);
+   return true;
+}
+
+bool
+agx_nir_lower_g17p_tile_samples(nir_shader *s, unsigned nr_samples)
+{
+   if (nr_samples != 1 && nr_samples != 2 && nr_samples != 4)
+      return false;
+
+   struct g17p_tile_sample_state state = {.samples = nr_samples};
+   return nir_shader_intrinsics_pass(s, lower_g17p_tile_sample,
+                                     nir_metadata_control_flow, &state);
+}
+
+bool
+agx_nir_lower_g17p_1x_sample_shading(nir_shader *s)
+{
+   assert(s->info.stage == MESA_SHADER_FRAGMENT);
+
+   const bool sample_shading = s->info.fs.uses_sample_shading;
+   nir_lower_single_sampled_options options = {
+      .lower_sample_mask_in = true,
+   };
+   const bool progress = nir_lower_single_sampled(s, &options);
+
+   /* With one rasterization sample, per-sample and per-pixel invocation are
+    * identical. Leaving this set makes agx_fast_link append its AGX2 sample
+    * loop header/footer (including 0x0088 STOP) to AGX3 code, whereas G17P's
+    * grounded terminator is 0x0000000e. */
+   s->info.fs.uses_sample_shading = false;
+   return progress || sample_shading;
 }
 
 bool
@@ -765,6 +1712,16 @@ agx_nir_fs_prolog(nir_builder *b, const void *key_)
 
    if (key->polygon_stipple) {
       NIR_PASS(_, b->shader, agx_nir_lower_poly_stipple);
+   }
+
+   /* A read-only early-reject prolog has no coverage to change: it only asks
+    * the depth/stencil unit to test the complete incoming mask.  Ordinarily a
+    * prolog runs tests while lowering its API-mask or cull-distance demotes;
+    * make the all-live form explicit so a later shader-part discard can stay
+    * deferred without also deferring rejection. */
+   if (key->run_zs_tests && !b->shader->info.fs.uses_discard) {
+      nir_def *all = nir_imm_intN_t(b, 0xff, 16);
+      nir_sample_mask_agx(b, all, all);
    }
 
    /* Then, lower the prolog */

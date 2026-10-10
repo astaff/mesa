@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include "util/os_misc.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
@@ -18,6 +19,12 @@
 #include <agx_pack.h>
 
 #include "asahi/isa/disasm.h"
+#include "agx3_cdm_decode_core.h"
+#include "agx3_cdm_direct_launch_semantic_core.h"
+#include "agx_ioto_core.h"
+#include "agx_ppp_decode_core.h"
+#include "agx_va_runtime_hole.h"
+#include "agx_vdm_decode_core.h"
 #include "util/u_hexdump.h"
 #include "decode.h"
 
@@ -94,7 +101,8 @@ _agxdecode_grab_mapped(struct agxdecode_ctx *ctx, uint64_t gpu_va, void **buf,
       fprintf(stderr, "Access to unknown memory %" PRIx64 " in %s:%d\n", gpu_va,
               filename, line);
       fflush(agxdecode_dump_stream);
-      assert(0);
+      *buf = NULL;
+      return 0;
    }
 
    uint32_t offset = gpu_va - mem->va->addr;
@@ -171,15 +179,119 @@ __agxdecode_fetch_gpu_mem(struct agxdecode_ctx *ctx, const struct agx_bo *mem,
 
 typedef struct drm_asahi_params_global decoder_params;
 
+/* Keep command-stream selection on the kernel's explicit generation/variant
+ * identity.  Cluster count cannot distinguish A18 Pro (G17P/AGX3b) from M5
+ * (G17G/AGX3c), and must never be used as an architecture proxy.  This local
+ * form avoids making the standalone decoder library depend on libasahi_lib;
+ * agx_chip_from_params() is the equivalent device-open mapping. */
+static enum agx_chip
+agxdecode_chip_from_params(const decoder_params *params)
+{
+   if (!params)
+      return AGX_CHIP_UNKNOWN;
+
+   switch (params->gpu_generation) {
+   case 13:
+      switch (params->gpu_variant) {
+      case 'G': return AGX_CHIP_G13G;
+      case 'S':
+      case 'C':
+      case 'D': return AGX_CHIP_G13X;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 14:
+      switch (params->gpu_variant) {
+      case 'G': return AGX_CHIP_G14G;
+      case 'S':
+      case 'C':
+      case 'D': return AGX_CHIP_G14X;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 15:
+      switch (params->gpu_variant) {
+      case 'P': return AGX_CHIP_G15P;
+      case 'G': return AGX_CHIP_G15G;
+      case 'S': return AGX_CHIP_G15S;
+      case 'C': return AGX_CHIP_G15C;
+      case 'D': return AGX_CHIP_G15D;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 16:
+      switch (params->gpu_variant) {
+      case 'P': return AGX_CHIP_G16P;
+      case 'G': return AGX_CHIP_G16G;
+      case 'S': return AGX_CHIP_G16S;
+      case 'C': return AGX_CHIP_G16C;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   case 17:
+      switch (params->gpu_variant) {
+      case 'P': return AGX_CHIP_G17P;
+      case 'A': return AGX_CHIP_G17A;
+      case 'G': return AGX_CHIP_G17G;
+      case 'S': return AGX_CHIP_G17S;
+      case 'C': return AGX_CHIP_G17C;
+      default: return AGX_CHIP_UNKNOWN;
+      }
+   default:
+      return AGX_CHIP_UNKNOWN;
+   }
+}
+
+static bool
+agxdecode_chip_uses_agx3(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G15G:
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+   case AGX_CHIP_G15D:
+   case AGX_CHIP_G16P:
+   case AGX_CHIP_G16G:
+   case AGX_CHIP_G16S:
+   case AGX_CHIP_G16C:
+   case AGX_CHIP_G17P:
+   case AGX_CHIP_G17A:
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
+   case AGX_CHIP_G17C:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static const char *
+agxdecode_chip_name(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G15G: return "G15G";
+   case AGX_CHIP_G15S: return "G15S";
+   case AGX_CHIP_G15C: return "G15C";
+   case AGX_CHIP_G15D: return "G15D";
+   case AGX_CHIP_G16P: return "G16P";
+   case AGX_CHIP_G16G: return "G16G";
+   case AGX_CHIP_G16S: return "G16S";
+   case AGX_CHIP_G16C: return "G16C";
+   case AGX_CHIP_G17P: return "G17P";
+   case AGX_CHIP_G17A: return "G17A";
+   case AGX_CHIP_G17G: return "G17G";
+   case AGX_CHIP_G17S: return "G17S";
+   case AGX_CHIP_G17C: return "G17C";
+   default: return "unknown";
+   }
+}
+
 /* Abstraction for command stream parsing */
 typedef unsigned (*decode_cmd)(struct agxdecode_ctx *ctx, const uint8_t *map,
-                               uint64_t *link, bool verbose,
+                               size_t available, uint64_t *link, bool verbose,
                                decoder_params *params, void *data);
 
 #define STATE_DONE (0xFFFFFFFFu)
 #define STATE_LINK (0xFFFFFFFEu)
 #define STATE_CALL (0xFFFFFFFDu)
 #define STATE_RET  (0xFFFFFFFCu)
+#define STATE_ERROR (0xFFFFFFFBu)
 
 static void
 agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
@@ -193,7 +305,12 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
    size_t size = sizeof(buf);
    if (!lib_config.read_gpu_mem) {
       struct agx_bo *alloc = agxdecode_find_mapped_gpu_mem_containing(ctx, va);
-      assert(alloc != NULL && "nonexistent object");
+      if (!alloc) {
+         fprintf(agxdecode_dump_stream,
+                 "%s (%" PRIx64 ") is not mapped; skipping decode\n", label,
+                 va);
+         return;
+      }
       fprintf(agxdecode_dump_stream, "%s (%" PRIx64 ", handle %u)\n", label, va,
               alloc->handle);
       size = MIN2(size, alloc->size - (va - alloc->va->addr));
@@ -217,7 +334,8 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
          return;
       }
 
-      unsigned count = decoder(ctx, map, &link, verbose, params, data);
+      unsigned count =
+         decoder(ctx, map, (size_t)left, &link, verbose, params, data);
 
       /* If we fail to decode, default to a hexdump (don't hang) */
       if (count == 0) {
@@ -248,6 +366,10 @@ agxdecode_stateful(struct agxdecode_ctx *ctx, uint64_t va, const char *label,
          fprintf(agxdecode_dump_stream, "Returning to 0x%" PRIx64 "\n\n", va);
          left = len = agxdecode_fetch_gpu_array(ctx, va, buf);
          map = buf;
+      } else if (count == STATE_ERROR) {
+         fprintf(agxdecode_dump_stream,
+                 "Stopping at a non-canonical command record\n");
+         break;
       } else {
          va += count;
          map += count;
@@ -292,7 +414,8 @@ agxdecode_texture_pbe(struct agxdecode_ctx *ctx, const void *map)
 
 static unsigned
 agxdecode_usc(struct agxdecode_ctx *ctx, const uint8_t *map,
-              UNUSED uint64_t *link, UNUSED bool verbose,
+              UNUSED size_t available, UNUSED uint64_t *link,
+              UNUSED bool verbose,
               decoder_params *params, UNUSED void *data)
 {
    enum agx_sampler_states *sampler_states = data;
@@ -323,7 +446,8 @@ agxdecode_usc(struct agxdecode_ctx *ctx, const uint8_t *map,
       size_t size =
          agxdecode_grab_mapped(ctx, decode_usc(ctx, ctrl.code), &buf);
 
-      agx_disassemble(buf, size, agxdecode_dump_stream);
+      if (size)
+         agx_disassemble(buf, size, agxdecode_dump_stream);
       return STATE_DONE;
    }
 
@@ -336,7 +460,8 @@ agxdecode_usc(struct agxdecode_ctx *ctx, const uint8_t *map,
       size_t size =
          agxdecode_grab_mapped(ctx, decode_usc(ctx, ctrl.code), &buf);
 
-      agx_disassemble(buf, size, agxdecode_dump_stream);
+      if (size)
+         agx_disassemble(buf, size, agxdecode_dump_stream);
       agxdecode_log("\n");
 
       return AGX_USC_SHADER_LENGTH;
@@ -538,9 +663,191 @@ agxdecode_record(struct agxdecode_ctx *ctx, uint64_t va, size_t size,
 }
 
 static unsigned
-agxdecode_cdm(struct agxdecode_ctx *ctx, const uint8_t *map, uint64_t *link,
-              bool verbose, decoder_params *params, UNUSED void *data)
+agxdecode_ioto(UNUSED struct agxdecode_ctx *ctx, const uint8_t *map,
+               size_t available, UNUSED uint64_t *link, bool verbose,
+               decoder_params *params, UNUSED void *data)
 {
+   const enum agx_chip chip = agxdecode_chip_from_params(params);
+   struct agx_ioto_program_record record;
+   size_t consumed = 0;
+
+   if (!agx_ioto_decode_program_record(chip, map, available, &record,
+                                       &consumed)) {
+      fprintf(agxdecode_dump_stream,
+              "Unknown or non-canonical AGX3 Ioto record for %s\n",
+              agxdecode_chip_name(chip));
+      return STATE_ERROR;
+   }
+
+   switch (record.kind) {
+   case AGX_IOTO_PROGRAM_RECORD_IOTO:
+      fprintf(agxdecode_dump_stream, "AGX3 Ioto record kind %u (%zu bytes)\n",
+              (unsigned)record.ioto.kind, consumed);
+      break;
+   case AGX_IOTO_PROGRAM_RECORD_GPU0_INLINE_LDDEV:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Ioto inline device load (%zu bytes)\n", consumed);
+      break;
+   case AGX_IOTO_PROGRAM_RECORD_TERMINATE:
+      agxdecode_log("AGX3 Ioto program terminate\n");
+      return STATE_DONE;
+   case AGX_IOTO_PROGRAM_RECORD_INVALID:
+   default:
+      return STATE_ERROR;
+   }
+
+   if (verbose)
+      u_hexdump(agxdecode_dump_stream, record.bytes, consumed, false);
+   return (unsigned)consumed;
+}
+
+static unsigned
+agxdecode_cdm_agx3(struct agxdecode_ctx *ctx, const uint8_t *map,
+                   size_t available, uint64_t *link, bool verbose,
+                   decoder_params *params, enum agx_chip chip)
+{
+   struct agx3_cdm_decoded_record record;
+
+   if (available < sizeof(uint32_t))
+      return STATE_ERROR;
+
+   /* Type zero has three witnessed lengths (24/36/40 bytes), and word 0's
+    * mode field is what separates them -- 0 direct, 1 the nine-word indirect
+    * form, 2 the compact one -- so the record decoder can size any of them
+    * without guessing.  The direct SEMANTIC unpack is a stricter thing: it
+    * also demands word 3 be a canonical dimension word.  The native compute
+    * path derives word 3 from the program VA instead, which hardware settled
+    * (see agx3_g17p_native_compute_launch_pack), so a mismatch there is a
+    * note about an unresolved field, not a reason to abandon the stream. */
+   if ((map[3] >> 5) == AGX_CDM_BLOCK_TYPE_LAUNCH &&
+       ((map[3] >> 3) & 3) == 0) {
+      struct agx3_cdm_direct_launch_info direct;
+      if (!agx3_cdm_direct_launch_unpack(chip, map, available, &direct)) {
+         fprintf(agxdecode_dump_stream,
+                 "Note: AGX3 launch is not the canonical direct form for %s\n",
+                 agxdecode_chip_name(chip));
+         u_hexdump(agxdecode_dump_stream, map,
+                   MIN2(available, (size_t)AGX3_CDM_DIRECT_LAUNCH_SIZE), false);
+      }
+   }
+
+   if (!agx3_cdm_decode_one(chip, map, available, &record)) {
+      fprintf(agxdecode_dump_stream,
+              "Unknown or non-canonical AGX3 CDM record for %s\n",
+              agxdecode_chip_name(chip));
+      return STATE_ERROR;
+   }
+
+   switch (record.kind) {
+   case AGX3_CDM_RECORD_LAUNCH:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Compute\n"
+              "  Word 0 payload = 0x%08" PRIx32 "\n"
+              "  Word 1 payload = 0x%08" PRIx32 "\n"
+              "  Pipeline = 0x%012" PRIx64 "\n"
+              "  Opaque word 3 = 0x%08" PRIx32 "\n"
+              "  Global size = (%" PRIu32 ", %" PRIu32 ", %" PRIu32 ")\n"
+              "  Local size = (%" PRIu32 ", %" PRIu32 ", %" PRIu32 ")\n",
+              record.data.launch.word0_payload,
+              record.data.launch.word1_payload, record.data.launch.pipeline,
+              record.data.launch.opaque_word3,
+              record.data.launch.global_size[0],
+              record.data.launch.global_size[1],
+              record.data.launch.global_size[2],
+              record.data.launch.local_size[0],
+              record.data.launch.local_size[1],
+              record.data.launch.local_size[2]);
+      if (record.data.launch.pipeline != 0)
+         agxdecode_stateful(ctx, record.data.launch.pipeline, "Ioto pipeline",
+                            agxdecode_ioto, verbose, params, NULL);
+      return record.length;
+
+   case AGX3_CDM_RECORD_INDIRECT_LAUNCH_36:
+   case AGX3_CDM_RECORD_INDIRECT_LAUNCH:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Compute (indirect, %u bytes)\n"
+              "  Word 0 payload = 0x%08" PRIx32 "\n"
+              "  Word 1 payload = 0x%08" PRIx32 "\n"
+              "  Pipeline = 0x%012" PRIx64 "\n"
+              "  Opaque word 3 = 0x%08" PRIx32 "\n"
+              "  Word 4 payload = 0x%04" PRIx16 "\n"
+              "  Parameters = 0x%012" PRIx64 "\n",
+              (unsigned)record.length,
+              record.data.indirect_launch.word0_payload,
+              record.data.indirect_launch.word1_payload,
+              record.data.indirect_launch.pipeline,
+              record.data.indirect_launch.opaque_word3,
+              record.data.indirect_launch.word4_payload,
+              record.data.indirect_launch.parameters);
+      if (record.kind == AGX3_CDM_RECORD_INDIRECT_LAUNCH_36) {
+         fprintf(agxdecode_dump_stream,
+                 "  Trailing = (0x%08" PRIx32 ", 0x%08" PRIx32
+                 ", 0x%08" PRIx32 ")\n",
+                 record.data.indirect_launch.trailing_words[0],
+                 record.data.indirect_launch.trailing_words[1],
+                 record.data.indirect_launch.trailing_words[2]);
+      }
+      if (record.data.indirect_launch.pipeline != 0)
+         agxdecode_stateful(ctx, record.data.indirect_launch.pipeline,
+                            "Ioto pipeline", agxdecode_ioto, verbose, params,
+                            NULL);
+      return record.length;
+
+   case AGX3_CDM_RECORD_STREAM_LINK:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Stream Link\n  Target = 0x%012" PRIx64
+              "\n  With return = %s\n",
+              record.data.stream_link.target,
+              record.data.stream_link.with_return ? "true" : "false");
+      *link = record.data.stream_link.target;
+      return record.data.stream_link.with_return ? STATE_CALL : STATE_LINK;
+
+   case AGX3_CDM_RECORD_LINK_PADDING:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Link Padding\n  Count = %u\n",
+              record.data.link_padding.count);
+      return record.length;
+
+   case AGX3_CDM_RECORD_BARRIER:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Barrier\n  Flags = 0x%x\n", record.data.barrier.flags);
+      return record.length;
+
+   case AGX3_CDM_RECORD_SSTT_FLUSH_INVALIDATE:
+      agxdecode_log("AGX3 SSTT Flush Invalidate\n");
+      return record.length;
+
+   case AGX3_CDM_RECORD_SUBSTREAM_BARRIER:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Substream Barrier\n  Flags = 0x%x\n  Substream = %u\n",
+              record.data.substream_barrier.flags,
+              record.data.substream_barrier.substream);
+      return record.length;
+
+   case AGX3_CDM_RECORD_SECONDARY_BARRIER:
+      agxdecode_log("AGX3 Secondary Barrier\n");
+      return record.length;
+
+   case AGX3_CDM_RECORD_STREAM_TERMINATE:
+      agxdecode_log("AGX3 Stream Terminate\n");
+      return STATE_DONE;
+
+   case AGX3_CDM_RECORD_UNKNOWN:
+   default:
+      return STATE_ERROR;
+   }
+}
+
+static unsigned
+agxdecode_cdm(struct agxdecode_ctx *ctx, const uint8_t *map,
+              UNUSED size_t available, uint64_t *link, bool verbose,
+              decoder_params *params, UNUSED void *data)
+{
+   const enum agx_chip chip = agxdecode_chip_from_params(params);
+   if (agxdecode_chip_uses_agx3(chip))
+      return agxdecode_cdm_agx3(ctx, map, available, link, verbose, params,
+                                chip);
+
    /* Bits 29-31 contain the block type */
    enum agx_cdm_block_type block_type = (map[3] >> 5);
 
@@ -620,10 +927,302 @@ agxdecode_cdm(struct agxdecode_ctx *ctx, const uint8_t *map, uint64_t *link,
    }
 }
 
-static unsigned
-agxdecode_vdm(struct agxdecode_ctx *ctx, const uint8_t *map, uint64_t *link,
-              bool verbose, decoder_params *params, UNUSED void *data)
+static void
+agxdecode_ppp_agx3(struct agxdecode_ctx *ctx, enum agx_chip chip, uint64_t va,
+                   size_t size, bool verbose)
 {
+   uint8_t payload[AGX_PPP_VIEWPORT_PAYLOAD_MAX_LENGTH];
+   if (size == 0 || size > sizeof(payload)) {
+      fprintf(agxdecode_dump_stream,
+              "AGX3 PPP payload size %zu is outside the bounded grammar\n",
+              size);
+      return;
+   }
+
+   if (!lib_config.read_gpu_mem &&
+       !agxdecode_find_mapped_gpu_mem_containing(ctx, va)) {
+      fprintf(agxdecode_dump_stream,
+              "AGX3 PPP payload 0x%012" PRIx64 " is not mapped\n", va);
+      return;
+   }
+
+   const int read = agxdecode_fetch_gpu_mem(ctx, va, size, payload);
+   if (read < 0 || (size_t)read != size) {
+      fprintf(agxdecode_dump_stream,
+              "Failed to read AGX3 PPP payload at 0x%012" PRIx64 "\n", va);
+      return;
+   }
+
+   struct agx_ppp_decoded_record record;
+   if (!agx_ppp_decode_one(chip, payload, size, &record)) {
+      fprintf(agxdecode_dump_stream,
+              "Unsupported or non-canonical AGX3 PPP payload for %s "
+              "(%zu bytes)\n",
+              agxdecode_chip_name(chip), size);
+      if (verbose)
+         u_hexdump(agxdecode_dump_stream, payload, size, false);
+      return;
+   }
+
+   switch (record.kind) {
+   case AGX_PPP_DECODED_RECORD_W_CLAMP_CULL2:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 PPP W-clamp/Cull-2\n"
+              "  W-clamp raw = 0x%08" PRIx32 "\n"
+              "  Cull-2 raw = 0x%08" PRIx32 "\n",
+              record.data.w_clamp_cull2.w_clamp_raw,
+              record.data.w_clamp_cull2.cull2_raw);
+      break;
+   case AGX_PPP_DECODED_RECORD_VIEWPORT:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 PPP Viewports\n"
+              "  Count = %u\n"
+              "  Control raw = 0x%08" PRIx32 "\n",
+              record.data.viewport.viewport_count,
+              record.data.viewport.viewport_control_raw);
+      break;
+   case AGX_PPP_DECODED_RECORD_HAL300_DEPTH_STENCIL:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 HAL300 PPP Depth/Stencil\n"
+              "  Fragment control raw = 0x%08" PRIx32 "\n"
+              "  Front face raw = 0x%08" PRIx32 "\n"
+              "  Back face raw = 0x%08" PRIx32 "\n"
+              "  Front stencil raw = 0x%08" PRIx32 "\n"
+              "  Back stencil raw = 0x%08" PRIx32 "\n",
+              record.data.hal300_depth_stencil.fragment_control_raw,
+              record.data.hal300_depth_stencil.fragment_front_face_raw,
+              record.data.hal300_depth_stencil.fragment_back_face_raw,
+              record.data.hal300_depth_stencil.fragment_front_stencil_raw,
+              record.data.hal300_depth_stencil.fragment_back_stencil_raw);
+      break;
+   case AGX_PPP_DECODED_RECORD_HAL300_DEPTH_BIAS_SCISSOR_BASES:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 HAL300 PPP Depth-bias/Scissor bases\n"
+              "  Depth-bias base = 0x%012" PRIx64 "\n"
+              "  Scissor base = 0x%012" PRIx64 "\n",
+              record.data.hal300_depth_bias_scissor_bases.depth_bias_base,
+              record.data.hal300_depth_bias_scissor_bases.scissor_base);
+      break;
+   case AGX_PPP_DECODED_RECORD_INVALID:
+   default:
+      break;
+   }
+}
+
+/* G17P carries PPP payload pointers as offsets from the render-context base.
+ * Resolve that address only for decoder memory fetches; keep the raw packet
+ * value visible so diagnostics cannot accidentally hide an encoder bug. */
+static uint64_t
+agxdecode_g17p_ppp_fetch_address(enum agx_chip chip, uint64_t wire_pointer)
+{
+   if (chip == AGX_CHIP_G17P &&
+       wire_pointer < AGX_G17P_VDM_USER_SIZE)
+      return AGX_G17P_VDM_USER_BASE + wire_pointer;
+
+   return wire_pointer;
+}
+
+static unsigned
+agxdecode_vdm_agx3(struct agxdecode_ctx *ctx, const uint8_t *map,
+                   size_t available, uint64_t *link, bool verbose,
+                   decoder_params *params, enum agx_chip chip)
+{
+   struct agx_vdm_decoded_record record;
+
+   if (!agx_vdm_decode_one(chip, map, available, &record)) {
+      fprintf(agxdecode_dump_stream,
+              "Unknown or non-canonical AGX3 VDM record for %s\n",
+              agxdecode_chip_name(chip));
+      return STATE_ERROR;
+   }
+
+   switch (record.kind) {
+   case AGX_VDM_RECORD_PPP_STATE_UPDATE: {
+      const uint64_t fetch_pointer = agxdecode_g17p_ppp_fetch_address(
+         chip, record.data.ppp_state_update.pointer);
+
+      fprintf(agxdecode_dump_stream,
+              "AGX3 PPP State Update\n"
+              "  Wire pointer = 0x%012" PRIx64 "\n"
+              "  Fetch pointer = 0x%012" PRIx64 "\n"
+              "  Size = %" PRIu32 " words\n",
+              record.data.ppp_state_update.pointer,
+              fetch_pointer,
+              record.data.ppp_state_update.size_words);
+      agxdecode_ppp_agx3(ctx, chip, fetch_pointer,
+                         (size_t)record.data.ppp_state_update.size_words * 4,
+                         verbose);
+      return record.length;
+   }
+
+   case AGX_VDM_RECORD_BARRIER:
+      agxdecode_log("AGX3 VDM Barrier\n");
+      return record.length;
+
+   case AGX_VDM_RECORD_STATE_UPDATE:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 VDM State Update\n"
+              "  Vertex shader word 0 = 0x%08" PRIx32 "\n"
+              "  Pipeline = 0x%012" PRIx64 "\n"
+              "  Pipeline template = 0x%08" PRIx32 "\n"
+              "  Vertex outputs = { 0x%08" PRIx32 ", 0x%08" PRIx32
+              " }\n"
+              "  Vertex unknown = 0x%08" PRIx32 "\n",
+              record.data.state_update.raw_vertex_shader_word0,
+              record.data.state_update.pipeline,
+              record.data.state_update.raw_pipeline_template,
+              record.data.state_update.raw_vertex_outputs[0],
+              record.data.state_update.raw_vertex_outputs[1],
+              record.data.state_update.raw_vertex_unknown);
+      if (record.data.state_update.pipeline != 0)
+         agxdecode_stateful(ctx, record.data.state_update.pipeline,
+                            "Vertex Ioto pipeline", agxdecode_ioto, verbose,
+                            params, NULL);
+      return record.length;
+
+   case AGX_VDM_RECORD_INDEX_LIST_NONINDEXED:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Direct Non-indexed Draw\n"
+              "  Primitive = %u\n"
+              "  Count = %" PRIu32 "\n"
+              "  Instances = %" PRIu32 "\n"
+              "  Start = %" PRIu32 "\n",
+              record.data.index_list_nonindexed.primitive,
+              record.data.index_list_nonindexed.count,
+              record.data.index_list_nonindexed.instances,
+              record.data.index_list_nonindexed.start);
+      return record.length;
+
+   case AGX_VDM_RECORD_INDEX_LIST_INDEXED:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Direct Indexed Draw\n"
+              "  Primitive = %u\n"
+              "  Restart = %s\n"
+              "  Index size = %u\n"
+              "  Index buffer = 0x%012" PRIx64 "\n"
+              "  Count = %" PRIu32 "\n"
+              "  Instances = %" PRIu32 "\n"
+              "  Start = %" PRIu32 "\n"
+              "  Index buffer size word = 0x%08" PRIx32 "\n",
+              record.data.index_list_indexed.primitive,
+              record.data.index_list_indexed.restart_enable ? "true" :
+                                                              "false",
+              record.data.index_list_indexed.index_size,
+              record.data.index_list_indexed.index_buffer,
+              record.data.index_list_indexed.count,
+              record.data.index_list_indexed.instances,
+              record.data.index_list_indexed.start,
+              record.data.index_list_indexed.index_buffer_size_word);
+      return record.length;
+
+   case AGX_VDM_RECORD_INDEX_LIST_INDIRECT_NONINDEXED:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Indirect Non-indexed Draw\n"
+              "  Primitive = %u\n"
+              "  Indirect buffer = 0x%012" PRIx64 "\n",
+              record.data.index_list_indirect_nonindexed.primitive,
+              record.data.index_list_indirect_nonindexed.indirect_buffer);
+      return record.length;
+
+   case AGX_VDM_RECORD_INDEX_LIST_INDIRECT_INDEXED:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Indirect Indexed Draw\n"
+              "  Primitive = %u\n"
+              "  Restart = %s\n"
+              "  Index size = %u\n"
+              "  Index buffer = 0x%012" PRIx64 "\n"
+              "  Indirect buffer = 0x%012" PRIx64 "\n"
+              "  Restart index = 0x%08" PRIx32 "\n"
+              "  Index buffer size word = 0x%08" PRIx32 "\n",
+              record.data.index_list_indirect_indexed.primitive,
+              record.data.index_list_indirect_indexed.restart_enable
+                 ? "true"
+                 : "false",
+              record.data.index_list_indirect_indexed.index_size,
+              record.data.index_list_indirect_indexed.index_buffer,
+              record.data.index_list_indirect_indexed.indirect_buffer,
+              record.data.index_list_indirect_indexed.restart_index,
+              record.data.index_list_indirect_indexed.index_buffer_size_word);
+      return record.length;
+
+   case AGX_VDM_RECORD_STREAM_LINK:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 VDM Stream Link\n  Target = 0x%012" PRIx64 "\n",
+              record.data.stream_link.target);
+      *link = record.data.stream_link.target;
+      return STATE_LINK;
+
+   case AGX_VDM_RECORD_STREAM_TERMINATE:
+      agxdecode_log("AGX3 VDM Stream Terminate\n");
+      return STATE_DONE;
+
+   case AGX_VDM_RECORD_TESSELLATE_DIRECT:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Direct Tessellate\n"
+              "  Factor buffer = 0x%012" PRIx64 "\n"
+              "  Patch count = %" PRIu32 "\n"
+              "  Instance count = %" PRIu32 "\n"
+              "  Base patch = %" PRIu32 "\n"
+              "  Base instance = %" PRIu32 "\n"
+              "  Instance stride word = 0x%08" PRIx32 "\n"
+              "  Factor buffer size minus one = 0x%08" PRIx32 "\n",
+              record.data.tessellate_direct.factor_buffer,
+              record.data.tessellate_direct.patch_count,
+              record.data.tessellate_direct.instance_count,
+              record.data.tessellate_direct.base_patch,
+              record.data.tessellate_direct.base_instance,
+              record.data.tessellate_direct.instance_stride_word,
+              record.data.tessellate_direct.factor_buffer_size_minus_one);
+      return record.length;
+
+   case AGX_VDM_RECORD_TESSELLATE_INDIRECT:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Indirect Tessellate\n"
+              "  Factor buffer = 0x%012" PRIx64 "\n"
+              "  Indirect buffer = 0x%012" PRIx64 "\n"
+              "  Instance stride word = 0x%08" PRIx32 "\n"
+              "  Factor buffer size minus one = 0x%08" PRIx32 "\n",
+              record.data.tessellate_indirect.factor_buffer,
+              record.data.tessellate_indirect.indirect_buffer,
+              record.data.tessellate_indirect.instance_stride_word,
+              record.data.tessellate_indirect.factor_buffer_size_minus_one);
+      return record.length;
+
+   case AGX_VDM_RECORD_TESSELLATION_STATE:
+      fprintf(agxdecode_dump_stream,
+              "AGX3 Tessellation State\n"
+              "  Partition = %u\n"
+              "  Counter-clockwise = %u\n"
+              "  Maximum factor = %u\n"
+              "  Quads = %u\n"
+              "  Float factors = %u\n"
+              "  Step function = %u\n"
+              "  Scale = 0x%04x\n",
+              record.data.tessellation_state.partition,
+              record.data.tessellation_state.counterclockwise,
+              record.data.tessellation_state.max_factor,
+              record.data.tessellation_state.quads,
+              record.data.tessellation_state.float_factors,
+              record.data.tessellation_state.step,
+              record.data.tessellation_state.scale_half);
+      return record.length;
+
+   case AGX_VDM_RECORD_UNKNOWN:
+   default:
+      return STATE_ERROR;
+   }
+}
+
+static unsigned
+agxdecode_vdm(struct agxdecode_ctx *ctx, const uint8_t *map,
+              size_t available, uint64_t *link, bool verbose,
+              decoder_params *params, UNUSED void *data)
+{
+   const enum agx_chip chip = agxdecode_chip_from_params(params);
+   if (agxdecode_chip_uses_agx3(chip))
+      return agxdecode_vdm_agx3(ctx, map, available, link, verbose, params,
+                                chip);
+
    /* Bits 29-31 contain the block type */
    enum agx_vdm_block_type block_type = (map[3] >> 5);
 
@@ -810,6 +1409,10 @@ agxdecode_drm_cmd_render(struct agxdecode_ctx *ctx,
                          struct drm_asahi_params_global *params,
                          struct drm_asahi_cmd_render *c, bool verbose)
 {
+   const enum agx_chip chip = agxdecode_chip_from_params(params);
+   decode_cmd graphics_program_decoder =
+      chip == AGX_CHIP_G17P ? agxdecode_ioto : agxdecode_usc;
+
    DUMP_FIELD(c, "%x", flags);
    DUMP_FIELD(c, "0x%llx", vdm_ctrl_stream_base);
    agxdecode_stateful(ctx, c->vdm_ctrl_stream_base, "Encoder", agxdecode_vdm,
@@ -837,21 +1440,21 @@ agxdecode_drm_cmd_render(struct agxdecode_ctx *ctx,
    DUMP_FIELD(c, "0x%x", bg.usc);
    DUMP_FIELD(c, "0x%x", bg.rsrc_spec);
    agxdecode_stateful(ctx, decode_usc(ctx, c->bg.usc & ~0x7), "Load pipeline",
-                      agxdecode_usc, verbose, params, NULL);
+                      graphics_program_decoder, verbose, params, NULL);
    DUMP_FIELD(c, "0x%x", eot.usc);
    DUMP_FIELD(c, "0x%x", eot.rsrc_spec);
    agxdecode_stateful(ctx, decode_usc(ctx, c->eot.usc & ~0x7), "Store pipeline",
-                      agxdecode_usc, verbose, params, NULL);
+                      graphics_program_decoder, verbose, params, NULL);
    DUMP_FIELD(c, "0x%x", partial_bg.usc);
    DUMP_FIELD(c, "0x%x", partial_bg.rsrc_spec);
    agxdecode_stateful(ctx, decode_usc(ctx, c->partial_bg.usc & ~0x7),
-                      "Partial reload pipeline", agxdecode_usc, verbose, params,
-                      NULL);
+                      "Partial reload pipeline", graphics_program_decoder,
+                      verbose, params, NULL);
    DUMP_FIELD(c, "0x%x", partial_eot.usc);
    DUMP_FIELD(c, "0x%x", partial_eot.rsrc_spec);
    agxdecode_stateful(ctx, decode_usc(ctx, c->partial_eot.usc & ~0x7),
-                      "Partial store pipeline", agxdecode_usc, verbose, params,
-                      NULL);
+                      "Partial store pipeline", graphics_program_decoder,
+                      verbose, params, NULL);
 
    DUMP_FIELD(c, "0x%x", isp_zls_pixels);
    DUMP_FIELD(c, "0x%x", isp_bgobjdepth);
@@ -989,8 +1592,13 @@ void
 agxdecode_track_alloc(struct agxdecode_ctx *ctx, struct agx_bo *alloc)
 {
    util_dynarray_foreach(&ctx->mmap_array, struct agx_bo, it) {
-      bool match = (it->handle == alloc->handle);
-      assert(!match && "tried to alloc already allocated BO");
+      if (it->handle == alloc->handle) {
+         /* PRIME can hand the same shared BO back to a client repeatedly.
+          * Keep one current decoder view instead of aborting the application
+          * for an otherwise valid, idempotent import. */
+         *it = *alloc;
+         return;
+      }
    }
 
    util_dynarray_append(&ctx->mmap_array, *alloc);
@@ -999,18 +1607,12 @@ agxdecode_track_alloc(struct agxdecode_ctx *ctx, struct agx_bo *alloc)
 void
 agxdecode_track_free(struct agxdecode_ctx *ctx, struct agx_bo *bo)
 {
-   bool found = false;
-
    util_dynarray_foreach(&ctx->mmap_array, struct agx_bo, it) {
       if (it->handle == bo->handle) {
-         assert(!found && "mapped multiple times!");
-         found = true;
-
          memset(it, 0, sizeof(*it));
+         return;
       }
    }
-
-   assert(found && "freed unmapped memory");
 }
 
 static int agxdecode_dump_frame_count = 0;
@@ -1030,8 +1632,8 @@ agxdecode_dump_file_open(void)
       agxdecode_dump_stream = stderr;
    else {
       char buffer[1024];
-      snprintf(buffer, sizeof(buffer), "%s.%04d", dump_file_base,
-               agxdecode_dump_frame_count);
+      snprintf(buffer, sizeof(buffer), "%s.%ld.%04d", dump_file_base,
+               (long)getpid(), agxdecode_dump_frame_count);
       printf("agxdecode: dump command stream to file %s\n", buffer);
       agxdecode_dump_stream = fopen(buffer, "w");
       if (!agxdecode_dump_stream) {

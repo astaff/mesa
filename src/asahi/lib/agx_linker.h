@@ -6,15 +6,51 @@
 #pragma once
 
 #include "agx_bo.h"
+#include "agx_ioto_program_core.h"
 #include "agx_compile.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_pack.h"
 #include "nir_lower_blend.h"
 #include "util/macros.h"
 
+struct agx_g17p_graphics_template;
+
 struct agx_linked_shader {
    /* Mapped executable memory */
    struct agx_bo *bo;
+
+   /* Gallium-owned, bounded Ioto template cache. Entries are ralloc children
+    * of this linked shader and contain no live batch allocations. */
+   struct agx_g17p_graphics_template *g17p_graphics_templates;
+
+   /* Exact executable byte count. BO allocations are page-rounded, so the
+    * BO size is not a safe disassembler bound. */
+   size_t size;
+
+   /* Byte offset of the entry point inside `bo`.
+    *
+    * Zero everywhere except G17P, where the executable is wrapped in Apple's
+    * AGX3 code container and the entry sits at +0x3C0.  The shader loader
+    * reads the container's block-size dword at `entry - 0x80`, so the entry
+    * address handed to LDSHDR is `bo->va->addr + entry_offset`, never the BO
+    * base -- a shader at offset 0 has nothing mapped in front of it and the
+    * loader's first read takes a GMMU page fault. */
+   uint32_t entry_offset;
+
+   /* Aggregated main-program resources after fast linking. */
+   uint32_t scratch_size;
+   uint32_t agx3_spectpr_scratch_size;
+   uint16_t nr_gprs;
+
+   /* Apple's compiler ProgramVariant field 38 describes staging bytes,
+    * independently of GPR count. Valid only for accounted-for staging paths.
+    */
+   bool g17p_compiler_d_valid;
+   uint32_t g17p_compiler_d;
+
+   /* Compiler-proven G17P colour pixel classes consumed by the linked parts,
+    * bit n for the tile partitions n, n + 3, ... */
+   uint8_t g17p_colour_classes;
 
    /* Set if the linked SW vertex shader reads base vertex/instance. The VS
     * prolog can read base instance even when the API VS does not, which is why
@@ -41,7 +77,11 @@ struct agx_linked_shader {
    struct agx_fragment_control_packed fragment_control;
 };
 
-void agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
+/* Write the AGX3 code container's fixed leading block. Its size lives in
+ * agx_ioto_program_core.h so decoders can share it. */
+void agx3_build_container_lead(uint8_t *image);
+
+bool agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
                    bool fragment, struct agx_shader_part *main,
                    struct agx_shader_part *prolog,
                    struct agx_shader_part *epilog, unsigned nr_samples_shaded);
@@ -62,6 +102,11 @@ struct agx_vs_prolog_key {
 
    /* Whether running as a hardware vertex shader (versus compute) */
    bool hw;
+
+   /* First uniform half of the ordinary vertex ABI. G17P reserves the
+    * preceding halves for texture/sampler table pointers when the VS samples
+    * textures. */
+   uint8_t uniform_base;
 
    /* Whether the shader uses static vertex input and the prolog just fixes up
     * the vertex ID.
@@ -93,6 +138,9 @@ struct agx_fs_prolog_key {
 
    /* If we discard, whether we need to run Z/S tests */
    bool run_zs_tests;
+
+   /* G17P rasterization samples its coverage updates are compiled for */
+   uint8_t nr_samples;
 
    /* If we emulate cull distance, the base offset for our allocated coefficient
     * registers so we don't interfere with the main shader.
@@ -237,15 +285,31 @@ struct agx_fs_epilog_link_info {
     */
    bool sample_mask_after_force_early : 1;
 
-   unsigned padding : 1;
+   /* If set, the colour exports are packed by the components each location
+    * actually writes rather than laid out on the fragment ABI's
+    * four-component slots (struct agx_g17p_colour_layout). A G17P fragment
+    * unrolled per sample repeats this layout once per sample, so the packing
+    * is what decides whether its exports fit the register file.
+    */
+   unsigned packed_colour : 1;
+
+   /* Components each colour location exports, four bits per location. Only
+    * consulted for the packing above.
+    */
+   uint32_t colour_comps;
 };
-static_assert(sizeof(struct agx_fs_epilog_link_info) == 4, "packed");
+static_assert(sizeof(struct agx_fs_epilog_link_info) == 8, "packed");
 
 struct agx_fs_epilog_key {
    struct agx_fs_epilog_link_info link;
 
    /* Blend state. Blending happens in the epilog. */
    struct agx_blend_key blend;
+
+   /* AGX has no native smooth-line rasterizer. Drivers may request the
+    * conservative two-pixel fallback and attenuate the fragment alpha in
+    * this epilog before ordinary API blending. */
+   bool smooth_line_alpha;
 
    /* Colour attachment remapping for Vulkan. Negative values indicate that an
     * attachment is discarded. Positive values indicate the output location we
@@ -255,11 +319,67 @@ struct agx_fs_epilog_key {
 
    /* Tilebuffer configuration */
    enum pipe_format rt_formats[8];
+   /* Optional API format when the tile storage has additional channels. */
+   enum pipe_format blend_formats[8];
+   /* Optional scaled API format stored through an integer tilebuffer. */
+   enum pipe_format scaled_formats[8];
    uint8_t nr_samples;
+   /* agx_tilebuffer_layout::max_sample_size_B of the render pass. */
+   uint8_t max_sample_size_B;
+   uint16_t max_bytes_per_tile;
+   uint16_t max_samples_per_tile;
    bool force_small_tile;
+   bool preserve_zero_mask;
+   /* G17P tile storage: sRGB as U8NORM bytes converted by the native packs,
+    * R11G11B10/RGB9E5 as one raw 32-bit word. */
+   bool g17p_tile_formats;
+   bool native_spills;
+   /* Absolute uniform-half address of the private native spill table. */
+   uint16_t emrt_heap_base;
+
+   /* G17P's pre-main MOVMSK also runs depth/stencil tests. For late-tests
+    * shaders, defer the API sample mask to the epilog so it can be combined
+    * with shader and alpha-to-coverage masks before any output is committed.
+    */
+   bool defer_api_sample_mask;
+   uint8_t api_sample_mask;
+
+   /* Leave pixel-shaded MSAA lowering to a caller that will unroll the
+    * per-sample epilog itself. Used by the G17P sample-shaded path.
+    */
+   bool defer_monolithic_msaa;
+
+   /* Absolute uniform-half base for dynamic blend constants. Zero selects
+    * the standard fragment ABI at AGX_ABI_FUNI_BLEND_R. HAL200 resource
+    * pointers occupy that standard range, so a linked G17P epilog may place
+    * the constants after the main shader's uniform footprint instead. */
+   uint16_t blend_constant_base;
+
+   /* Render targets whose tile value must be stored back unchanged (colour
+    * write disabled while raster coverage still makes the tile nonempty).
+    * Independent of blending, so it also holds for pure-integer formats. */
+   uint8_t preserve_rt;
+
+   /* Every colour the main shader exports is
+    * provably in [0, 1] (agx_nir_fs_colour_outputs_unit_range), so the blend
+    * source clamp nir_lower_blend inserts for UNORM targets is an identity
+    * and is dropped. Occupies the key's former tail padding byte. */
+   uint8_t colour_unit_range;
 };
 
+/* Apply framebuffer rules which are properties of the hardware generation,
+ * not API state. Keep Gallium and Honeykrisp on the same epilog contract. */
+void agx_fs_epilog_apply_device_policy(enum agx_chip chip,
+                                       struct agx_fs_epilog_key *key);
+
+/* Depth/stencil exports run tests in the epilog just like alpha-to-coverage
+ * can discard there. Forced-early main shaders have already run those tests. */
+bool agx_fs_epilog_may_discard(const struct agx_fs_epilog_link_info *link,
+                               bool alpha_to_coverage,
+                               bool nontrivial_force_early);
+
 void agx_nir_vs_prolog(struct nir_builder *b, const void *key_);
+void agx_nir_vs_prolog_raw(struct nir_builder *b, const void *key_);
 void agx_nir_fs_epilog(struct nir_builder *b, const void *key_);
 void agx_nir_fs_prolog(struct nir_builder *b, const void *key_);
 
@@ -270,6 +390,30 @@ bool agx_nir_lower_vs_input_to_prolog(nir_shader *s);
 
 bool agx_nir_lower_fs_output_to_epilog(nir_shader *s,
                                        struct agx_fs_epilog_link_info *out);
+
+/* True if every colour output component of this (not yet lowered) fragment
+ * shader is a float provably in [0, 1]. Conservative: unknown is false. */
+bool agx_nir_fs_colour_outputs_unit_range(nir_shader *s);
+bool agx_nir_lower_fs_output_to_epilog_for_device(
+   nir_shader *s, enum agx_chip chip, struct agx_fs_epilog_link_info *out);
+
+/* Pack the colour exports of a fragment already split for its epilog, so a
+ * G17P per-sample unroll costs only the components each location writes. */
+bool agx_nir_pack_g17p_colour_exports(nir_shader *s,
+                                      struct agx_fs_epilog_link_info *link);
+
+/* The colour layout the split above would record, read off an unlowered
+ * shader and rounded up wherever it cannot be read exactly. */
+void agx_nir_gather_fs_colour_exports(const nir_shader *s,
+                                      uint8_t *loc_written, uint8_t *size_32,
+                                      uint32_t *colour_comps);
+
+bool agx_nir_lower_g17p_tile_samples(nir_shader *s, unsigned nr_samples);
+
+/* G17P currently exposes only single-sample rasterization. Collapse API
+ * sample shading before split FS lowering so fast-linking never needs the
+ * legacy AGX2 external sample-loop byte sequences. */
+bool agx_nir_lower_g17p_1x_sample_shading(nir_shader *s);
 
 bool agx_nir_lower_fs_active_samples_to_register(nir_shader *s);
 

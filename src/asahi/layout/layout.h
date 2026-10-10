@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "layout_core.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "util/format/u_format.h"
 #include "util/macros.h"
@@ -35,17 +36,17 @@ enum ail_tiling {
     * Fully twiddled.
     */
    AIL_TILING_TWIDDLED,
-};
 
-/*
- * Represents the dimensions of a single tile. Used to describe tiled layouts.
- * Width and height are in units of elements, not pixels, to model compressed
- * textures corrects.
- *
- * Invariant: width_el and height_el are powers of two.
- */
-struct ail_tile {
-   unsigned width_el, height_el;
+   /**
+    * G17P Interchange (descriptor Layout 3): 16x16-element macroblocks in
+    * row-major order, row pitch ceil(width / 16) * 256 * blocksize; inside a
+    * macroblock, 8x4 blocks in row-major order, each x-first Morton
+    * (AGXMetalG17P InterchangeTiledMemory).  This is the layout the display
+    * coprocessor scans out as an address-format-5 surface.  Always lossless
+    * compressed (8 bytes of metadata per macroblock, as for GPU tiling).
+    * Single level, single layer, single sample, 32-bit formats only.
+    */
+   AIL_TILING_INTERCHANGE,
 };
 
 /*
@@ -57,6 +58,9 @@ struct ail_layout {
 
    /** Number of samples per pixel. 1 if multisampling is disabled. */
    uint8_t sample_count_sa;
+
+   /** Hardware-family allocation policy; zero preserves the legacy ABI. */
+   enum ail_layout_policy policy;
 
    /** Number of miplevels. 1 if no mipmapping is used. */
    uint8_t levels;
@@ -171,6 +175,15 @@ struct ail_layout {
    bool renderable;
 };
 
+/* Bytes per row of 16x16 macroblocks of an interchange layout. */
+static inline uint32_t
+ail_get_interchange_stride_B(const struct ail_layout *layout)
+{
+   assert(layout->tiling == AIL_TILING_INTERCHANGE && "Invalid usage");
+   return DIV_ROUND_UP(layout->width_px, 16) * 256 *
+          util_format_get_blocksize(layout->format);
+}
+
 static inline uint32_t
 ail_get_linear_stride_B(const struct ail_layout *layout, ASSERTED uint8_t level)
 {
@@ -195,6 +208,8 @@ ail_get_wsi_stride_B(const struct ail_layout *layout, unsigned level)
 
    if (layout->tiling == AIL_TILING_LINEAR)
       return ail_get_linear_stride_B(layout, level);
+   else if (layout->tiling == AIL_TILING_INTERCHANGE)
+      return ail_get_interchange_stride_B(layout);
    else
       return util_format_get_stride(layout->format, layout->width_px);
 }
@@ -302,16 +317,27 @@ ail_get_twiddled_block_B(const struct ail_layout *layout, unsigned level,
    return ail_get_layer_level_B(layout, z_px, level) + tile_offset_B;
 }
 
-static inline unsigned
-ail_effective_width_sa(unsigned width_px, unsigned sample_count_sa)
+/* Byte offset of one element in a GPU-tiled image. Coordinates are in format
+ * elements (compressed blocks for block formats), not pixels. */
+static inline uint32_t
+ail_get_tiled_element_B(const struct ail_layout *layout, unsigned level,
+                        uint32_t x_el, uint32_t y_el, uint32_t z_px)
 {
-   return width_px * (sample_count_sa == 4 ? 2 : 1);
-}
+   assert(layout->tiling == AIL_TILING_GPU);
+   assert(level < layout->levels);
 
-static inline unsigned
-ail_effective_height_sa(unsigned height_px, unsigned sample_count_sa)
-{
-   return height_px * (sample_count_sa >= 2 ? 2 : 1);
+   const struct ail_tile tile = layout->tilesize_el[level];
+   const unsigned tiles_per_row =
+      DIV_ROUND_UP(layout->stride_el[level], tile.width_el);
+   const unsigned tile_idx =
+      (y_el / tile.height_el) * tiles_per_row + (x_el / tile.width_el);
+   const unsigned in_tile =
+      ail_space_bits(MOD_POT(x_el, tile.width_el)) |
+      (ail_space_bits(MOD_POT(y_el, tile.height_el)) << 1);
+
+   return ail_get_layer_level_B(layout, z_px, level) +
+          (tile_idx * tile.width_el * tile.height_el + in_tile) *
+             ail_get_blocksize_B(layout);
 }
 
 static inline unsigned
@@ -319,7 +345,12 @@ ail_metadata_width_tl(struct ail_layout *layout, unsigned level)
 {
    unsigned px = u_minify(layout->width_px, level);
    uint32_t sa = ail_effective_width_sa(px, layout->sample_count_sa);
-   return DIV_ROUND_UP(sa, 16);
+   const struct ail_tile tile =
+      layout->policy == AIL_LAYOUT_POLICY_M5 && !layout->mipmapped_z
+         ? ail_m5_compression_tile_size(
+              util_format_get_blocksize(layout->format))
+         : (struct ail_tile){16, 16};
+   return DIV_ROUND_UP(sa, tile.width_el);
 }
 
 static inline unsigned
@@ -327,7 +358,12 @@ ail_metadata_height_tl(struct ail_layout *layout, unsigned level)
 {
    unsigned px = u_minify(layout->height_px, level);
    uint32_t sa = ail_effective_height_sa(px, layout->sample_count_sa);
-   return DIV_ROUND_UP(sa, 16);
+   const struct ail_tile tile =
+      layout->policy == AIL_LAYOUT_POLICY_M5 && !layout->mipmapped_z
+         ? ail_m5_compression_tile_size(
+              util_format_get_blocksize(layout->format))
+         : (struct ail_tile){16, 16};
+   return DIV_ROUND_UP(sa, tile.height_el);
 }
 
 /*
@@ -373,8 +409,6 @@ ail_is_level_twiddled_uncompressed(const struct ail_layout *layout,
       return layout->tiling != AIL_TILING_LINEAR;
    }
 }
-
-struct ail_tile ail_get_max_tile_size(unsigned blocksize_B);
 
 void ail_make_miptree(struct ail_layout *layout);
 
@@ -444,7 +478,8 @@ static inline bool
 ail_can_compress(enum pipe_format format, unsigned w_px, unsigned h_px,
                  unsigned sample_count_sa)
 {
-   assert(sample_count_sa == 1 || sample_count_sa == 2 || sample_count_sa == 4);
+   assert(sample_count_sa == 1 || sample_count_sa == 2 ||
+          sample_count_sa == 4 || sample_count_sa == 8);
 
    /* We compress via the PBE, so we can only compress PBE-writeable formats. */
    if (ail_pixel_format[format].renderable == PIPE_FORMAT_NONE &&
@@ -556,6 +591,16 @@ ail_is_view_compatible(struct ail_layout *layout, enum pipe_format view)
  * We generally use ail enums instead of DRM format modifiers. These helpers
  * bridges the gap.
  */
+/*
+ * Aurora-private modifier for AIL_TILING_INTERCHANGE (always compressed): one
+ * memory plane, row pitch ail_get_interchange_stride_B(), the compression
+ * metadata right after the macroblocks.  Must equal appledrm's definition.
+ */
+#ifndef DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED
+#define DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED                            \
+   fourcc_mod_code(APPLE, 0x415552000003ULL)
+#endif
+
 static inline enum ail_tiling
 ail_drm_modifier_to_tiling(uint64_t modifier)
 {
@@ -565,6 +610,8 @@ ail_drm_modifier_to_tiling(uint64_t modifier)
    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
    case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
       return AIL_TILING_GPU;
+   case DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED:
+      return AIL_TILING_INTERCHANGE;
    default:
       UNREACHABLE("Unsupported modifier");
    }
@@ -578,6 +625,7 @@ ail_is_drm_modifier_compressed(uint64_t modifier)
    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
       return false;
    case DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED:
+   case DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED:
       return true;
    default:
       UNREACHABLE("Unsupported modifier");

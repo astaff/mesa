@@ -89,6 +89,10 @@ ref_access_tiled(uint8_t *tiled, uint8_t *linear, struct ail_layout *layout,
          unsigned twiddled_offs_B =
             blocksize_B * tiled_offset_el(layout, 0, tiled_x_el, tiled_y_el);
 
+         EXPECT_EQ(ail_get_tiled_element_B(layout, 0, tiled_x_el, tiled_y_el,
+                                           0),
+                   twiddled_offs_B);
+
          /* While we're at it, check that ail_get_twiddled_block_B does the
           * right thing where it is defined (at tile boundaries). We can't
           * otherwise use it here as it is part of the routine under test.
@@ -212,6 +216,7 @@ TEST(Twiddling, ETC)
 {
    /* Block alignment assumed */
    test_ldst(32, 32, 0, 0, 32, 32, 512, PIPE_FORMAT_ETC1_RGB8);
+   test_ldst(32, 32, 0, 0, 32, 32, 512, PIPE_FORMAT_ETC2_RGBA8);
    test_ldst(32, 256, 0, 0, 32, 256, 512, PIPE_FORMAT_ETC2_RGB8A1);
    test_ldst(32, 512, 0, 0, 32, 512, 512, PIPE_FORMAT_ETC2_RG11_SNORM);
 }
@@ -220,8 +225,29 @@ TEST(Twiddling, PartialETC)
 {
    /* Block alignment assumed */
    test_ldst(32, 32, 4, 8, 16, 12, 512, PIPE_FORMAT_ETC1_RGB8);
+   test_ldst(32, 32, 4, 8, 16, 12, 512, PIPE_FORMAT_ETC2_RGBA8);
    test_ldst(32, 32, 4, 8, 16, 12, 512, PIPE_FORMAT_ETC2_RGB8A1);
    test_ldst(32, 32, 4, 8, 16, 12, 512, PIPE_FORMAT_ETC2_RG11_SNORM);
+}
+
+/*
+ * Every block-compressed case above assumes block alignment. KHR-GL33's
+ * packed_pixels.varied_rectangle does not: it round-trips 10x10 and 15x15
+ * compressed textures, which are 3 and 4 blocks wide with a partial last
+ * block in each direction.
+ */
+TEST(Twiddling, UnalignedCompressed)
+{
+   /* 8-byte blocks: 10px -> 3 blocks, 15px -> 4 blocks */
+   test_ldst(10, 10, 0, 0, 10, 10, 3 * 8, PIPE_FORMAT_RGTC1_UNORM);
+   test_ldst(15, 15, 0, 0, 15, 15, 4 * 8, PIPE_FORMAT_RGTC1_UNORM);
+   test_ldst(10, 10, 0, 0, 10, 10, 3 * 8, PIPE_FORMAT_RGTC1_SNORM);
+   test_ldst(15, 15, 0, 0, 15, 15, 4 * 8, PIPE_FORMAT_DXT1_RGB);
+
+   /* 16-byte blocks */
+   test_ldst(10, 10, 0, 0, 10, 10, 3 * 16, PIPE_FORMAT_RGTC2_UNORM);
+   test_ldst(15, 15, 0, 0, 15, 15, 4 * 16, PIPE_FORMAT_RGTC2_UNORM);
+   test_ldst(10, 10, 0, 0, 10, 10, 3 * 16, PIPE_FORMAT_DXT5_RGBA);
 }
 
 TEST(Twiddling, DXT)

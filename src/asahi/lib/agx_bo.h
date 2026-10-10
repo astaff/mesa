@@ -37,6 +37,11 @@ enum agx_bo_flags {
    /* BO is read-only from the GPU side
     */
    AGX_BO_READONLY = 1 << 5,
+
+   /* Fresh kernel allocations are already zeroed. If a BO is recycled from
+    * the userspace cache, clear it before returning it to the caller. */
+   AGX_BO_ZERO_ON_REUSE = 1 << 6,
+
 };
 
 enum agx_va_flags {
@@ -45,6 +50,9 @@ enum agx_va_flags {
 
    /* VA must be fixed, otherwise allocated by the driver. */
    AGX_VA_FIXED = (1 << 1),
+
+   /* Ordinary allocations never occupy the capture/replay address region. */
+   AGX_VA_CAPTURE_REPLAY = (1 << 2),
 };
 
 struct agx_va {
@@ -74,6 +82,11 @@ struct agx_bo {
    /* The time this BO was used last, so we can evict stale BOs. */
    time_t last_used;
 
+   /* When the BO entered the cache, and whether the kernel was since told
+    * it is not needed (GEM_MADVISE). */
+   int64_t cached_ns;
+   bool purgeable;
+
    /* Creation attributes */
    enum agx_bo_flags flags;
    size_t size;
@@ -82,8 +95,20 @@ struct agx_bo {
    /* Mapping */
    struct agx_va *va;
 
+   /* Gallium's compact G17P command address. Protected by vma_lock and
+    * retained through BO-cache reuse; released with the final GEM handle. */
+   uint64_t g17p_vdm_alias;
+
    /* Suffixed to force agx_bo_map access */
    void *_map;
+
+   /* Bytes actually mapped at `_map`, which is NOT always `size`.  A placed
+    * map (VK_EXT_map_memory_placed) covers only the VkDeviceMemory's
+    * allocationSize, while the BO behind it comes from the cache and is
+    * routinely larger; unmapping `size` would reach into address space the
+    * application owns.  Zero means "the whole BO", the ordinary non-placed
+    * case. */
+   size_t _map_size;
 
    /* Process-local index */
    uint32_t handle;
@@ -130,12 +155,16 @@ struct agx_bo *agx_bo_create(struct agx_device *dev, size_t size,
 
 void agx_bo_reference(struct agx_bo *bo);
 void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);
+
 struct agx_bo *agx_bo_import(struct agx_device *dev, int fd);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
-void agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
+bool agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
 
 void agx_bo_free(struct agx_device *dev, struct agx_bo *bo);
+uint64_t agx_bo_get_g17p_vdm_alias(struct agx_device *dev, struct agx_bo *bo);
 struct agx_bo *agx_bo_cache_fetch(struct agx_device *dev, size_t size,
                                   size_t align, uint32_t flags,
                                   const bool dontwait);
 void agx_bo_cache_evict_all(struct agx_device *dev);
+void agx_bo_cache_start_idle_trim(struct agx_device *dev);
+void agx_bo_cache_stop_idle_trim(struct agx_device *dev);

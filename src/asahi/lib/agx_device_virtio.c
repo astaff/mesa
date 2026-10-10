@@ -95,10 +95,10 @@ agx_virtio_bo_alloc(struct agx_device *dev, size_t size, size_t align,
       return NULL;
    }
 
-   pthread_mutex_lock(&dev->bo_map_lock);
+   simple_mtx_lock(&dev->bo_map_lock);
    bo = agx_lookup_bo(dev, handle);
-   dev->max_handle = MAX2(dev->max_handle, handle);
-   pthread_mutex_unlock(&dev->bo_map_lock);
+   agx_include_bo_handle(dev, handle);
+   simple_mtx_unlock(&dev->bo_map_lock);
 
    /* Fresh handle */
    assert(!memcmp(bo, &((struct agx_bo){}), sizeof(*bo)));
@@ -191,11 +191,14 @@ agx_virtio_bo_unbind_object(struct agx_device *dev, uint32_t object_handle)
 }
 
 static void
-agx_virtio_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr)
+agx_virtio_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
+                   UNUSED size_t length)
 {
+   bo->_map_size = bo->size;
    bo->_map = vdrm_bo_map(dev->vdrm, bo->handle, bo->size, fixed_addr);
    if (bo->_map == MAP_FAILED) {
       bo->_map = NULL;
+      bo->_map_size = 0;
       fprintf(stderr, "mmap failed: result=%p size=0x%llx fd=%i\n", bo->_map,
               (long long)bo->size, dev->fd);
    }
@@ -281,10 +284,21 @@ const agx_device_ops_t agx_virtio_device_ops = {
    .bo_alloc = agx_virtio_bo_alloc,
    .bo_bind = agx_virtio_bo_bind,
    .bo_mmap = agx_virtio_bo_mmap,
+   .bo_mmap_independent = true,
    .get_params = agx_virtio_get_params,
    .submit = agx_virtio_submit,
    .bo_bind_object = agx_virtio_bo_bind_object,
    .bo_unbind_object = agx_virtio_bo_unbind_object,
+   /*
+    * honeykrisp-h1-execution.md SS1/SS2.1: same Linux-generic bodies as
+    * agx_device_drm_ops (agx_device.c) -- asahi_simple_ioctl already
+    * dispatches on dev->is_virtio internally, and GEM_CLOSE/munmap are
+    * DRM-core/OS behavior on the local guest fd, unaffected by whether the
+    * asahi-specific ioctls above are vdrm-forwarded.
+    */
+   .simple_ioctl = asahi_simple_ioctl,
+   .bo_munmap = agx_drm_bo_munmap,
+   .bo_free = agx_drm_bo_close,
 };
 
 bool
