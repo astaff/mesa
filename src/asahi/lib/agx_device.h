@@ -503,3 +503,17 @@ agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
       .cdm_barrier = barrier_cdm,
    };
 }
+
+/* Size of the render command passed to the kernel. drm_asahi_cmd_render grew
+ * the high words of the background/EOT resource specifiers for G17P, and
+ * kernels that predate them reject the longer packet with EINVAL. Every other
+ * chip keeps the original layout, as Honeykrisp does in
+ * hk_drm_render_command_size().
+ */
+static inline uint16_t
+agx_render_command_size(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P
+             ? sizeof(struct drm_asahi_cmd_render)
+             : offsetof(struct drm_asahi_cmd_render, bg_eot_rsrc_spec_hi);
+}
