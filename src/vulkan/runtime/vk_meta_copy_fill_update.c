@@ -1062,7 +1062,7 @@ build_buffer_to_image_fs(const struct vk_meta_device *meta,
    assert(blk_sz % comp_count == 0);
    unsigned comp_sz = (blk_sz / comp_count) * 8;
 
-   coords = nir_iadd(b, coords, img_offs);
+   coords = nir_isub(b, coords, img_offs);
 
    /* Helper invocations just outside an unaligned rectangle can have negative
     * copy-relative coordinates. The unsigned byte offset would then wrap and
