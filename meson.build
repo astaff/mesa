@@ -739,7 +739,7 @@ if with_gallium_d3d12 and not _with_gallium_d3d12_video.disabled()
   pre_args += '-DHAVE_GALLIUM_D3D12_VIDEO'
 endif
 
-with_bvh = with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk
+with_bvh = with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk or with_asahi_vk
 _glslang_preamble_version = '12.2'
 
 # GLSL has interesting version output and Meson doesn't parse it correctly as of
@@ -1031,7 +1031,8 @@ endif
 
 with_driver_using_cl = [
   with_gallium_iris, with_gallium_crocus, with_intel_vk, with_intel_hasvk,
-  with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+  with_gallium_asahi, with_asahi_vk,
+  with_tools.contains('asahi'),
   with_gallium_panfrost, with_panfrost_vk,
   with_gallium_rusticl,
   with_nouveau_vk, with_imagination_vk,
