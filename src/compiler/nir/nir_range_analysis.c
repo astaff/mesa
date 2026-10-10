@@ -2244,7 +2244,9 @@ bool
 nir_is_op_nuw(nir_shader *shader, struct hash_table *range_ht, nir_op op, nir_scalar src0, nir_scalar src1)
 {
    assert(src0.def->bit_size <= 32);
-   assert(src0.def->bit_size == src1.def->bit_size);
+   /* A shift count is always 32-bit, whatever the size of the value. */
+   assert(op == nir_op_ishl ? src1.def->bit_size == 32
+                            : src0.def->bit_size == src1.def->bit_size);
 
    uint32_t ub0 = nir_unsigned_upper_bound(shader, range_ht, src0);
    uint32_t ub1 = nir_unsigned_upper_bound(shader, range_ht, src1);
