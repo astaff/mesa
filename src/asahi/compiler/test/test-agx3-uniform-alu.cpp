@@ -270,10 +270,11 @@ TEST(AGX3UniformALU, MinmaxBoundariesAndNoWaitAliasing)
                   ASSERT_EQ(ok, (wait & (wait - 1)) == 0)
                      << "half=" << half << " uniform=" << uniform
                      << " reg=" << reg;
-                  if (ok)
+                  if (ok) {
                      EXPECT_TRUE(
                         encodings.insert(std::string((char *)bytes, length))
                            .second);
+                  }
                }
             }
          }

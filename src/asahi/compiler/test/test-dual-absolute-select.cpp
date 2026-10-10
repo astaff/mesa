@@ -84,10 +84,11 @@ TEST(DualAbsoluteSelect, CapturedHardwareOpcode)
       agx3_encoded_end end;
       ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
       expected.insert(expected.end(), end.bytes, end.bytes + end.length);
-      if (ok)
+      if (ok) {
          EXPECT_EQ(std::vector<uint8_t>((uint8_t *)binary.data,
                                         (uint8_t *)binary.data + binary.size),
                    expected);
+      }
       ralloc_free(mem);
    }
 }
