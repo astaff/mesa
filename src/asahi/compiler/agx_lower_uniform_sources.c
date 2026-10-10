@@ -362,6 +362,26 @@ agx_lower_uniform_sources(agx_context *ctx)
       unsigned materialized = 0;
 
       agx_foreach_src(I, s) {
+         /* A selected uniform may already have been copied for the
+          * comparison. Reuse that value even when the selected operand
+          * could read the uniform directly, preserving min/max operand ties. */
+         if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             I->op == AGX_OPCODE_FCMPSEL &&
+             I->src[s].type == AGX_INDEX_UNIFORM) {
+            agx_index idx = I->src[s];
+            idx.abs = idx.neg = false;
+            bool reused = false;
+            for (unsigned m = 0; m < materialized; ++m) {
+               if (agx_is_equiv(materialized_from[m], idx) &&
+                   materialized_from[m].size == idx.size) {
+                  agx_replace_src(I, s, materialized_to[m]);
+                  reused = true;
+                  break;
+               }
+            }
+            if (reused)
+               continue;
+         }
          const bool copy_minmax = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             I->op == AGX_OPCODE_FCMPSEL &&
             (!native_minmax || (both_minmax_uniform && !(s & 1)));
