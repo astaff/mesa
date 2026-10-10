@@ -443,6 +443,9 @@ struct agx_batch {
    uint32_t clear, draw, load, resolve, feedback;
    bool initialized;
 
+   /* Only a loader-provided resolve may seed the multisample tile reload. */
+   bool g17p_resolve_reload;
+
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
    double clear_depth;

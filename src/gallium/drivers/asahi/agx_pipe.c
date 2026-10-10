@@ -1468,7 +1468,11 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
     *
     * This case matters a LOT for performance in workloads that split batches.
     */
-   if (batch->clear & batch->resolve)
+   /* A direct resolve also writes a different image: loaded samples in
+    * tiles without geometry must reach that destination. */
+   if ((batch->clear & batch->resolve) ||
+       (dev->chip == AGX_CHIP_G17P && batch->key.resolve &&
+        (batch->load & PIPE_CLEAR_COLOR0)))
       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 
    if (batch->vs_scratch) {

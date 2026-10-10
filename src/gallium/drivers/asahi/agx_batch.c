@@ -153,6 +153,7 @@ agx_batch_init(struct agx_context *ctx,
 
    batch->ctx = ctx;
    util_copy_framebuffer_state(&batch->key, key);
+   batch->g17p_resolve_reload = key->resolve != NULL;
    batch->seqnum = ++ctx->batches.seqnum;
    batch->g17p_fragment_program = 0;
    batch->g17p_fragment_shader = NULL;

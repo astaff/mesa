@@ -4939,9 +4939,13 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
    /* Construct the key */
    struct agx_bg_eot_key key = {
       .tib = batch->tilebuffer_layout,
+      /* An API resolve target contains the output, not necessarily the
+       * previous multisample contents. Only the loader's explicit seed uses
+       * that image as a background source. */
       .single_sample_reload =
          dev->chip == AGX_CHIP_G17P && !store && !partial_render &&
-         batch->tilebuffer_layout.nr_samples > 1 && batch->key.resolve,
+         batch->tilebuffer_layout.nr_samples > 1 && batch->key.resolve &&
+         batch->g17p_resolve_reload,
       /* A persistent attachment or partial render must keep each sample.
        * Resolving it here would discard data needed by the next reload. */
       .multisample_store =
@@ -5318,10 +5322,18 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                agx_chip_sampler_heap_element_size(dev->chip);
             if (sampler_size != AGX_GALLIUM_SAMPLER_AGX3_SIZE)
                agx_native_descriptor_rejected(dev, "background sampler geometry");
-            struct agx_ptr sampler =
-               agx_pool_alloc_aligned(&batch->pool, sampler_size, 64);
+            /* Staged multisample texel fetches select sampler one. Ordinary
+             * reloads use zero; both entries have the native txf state. */
+            const unsigned sampler_count =
+               key.tib.nr_samples > 1 && !key.single_sample_reload ? 2 : 1;
+            struct agx_ptr sampler = agx_pool_alloc_aligned(
+               &batch->pool, sampler_count * sampler_size, 64);
             if (!agx_gallium_pack_g17p_txf_sampler(dev->chip, sampler.cpu))
                agx_native_descriptor_rejected(dev, "background texel-fetch sampler");
+
+            if (sampler_count > 1)
+               memcpy((uint8_t *)sampler.cpu + sampler_size, sampler.cpu,
+                      sampler_size);
 
             const uint64_t pointers[2] = {textures.gpu, sampler.gpu};
             const uint64_t table = agx_pool_upload_aligned(

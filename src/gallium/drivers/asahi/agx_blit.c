@@ -798,9 +798,14 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * the tile directly back to the WSI image when the swap resolve arrives.
     */
    if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P &&
-       agx_g17p_direct_resolve_blit_shape(info, false))
-      (void)agx_g17p_attach_direct_resolve(ctx, info->dst.resource,
-                                          info->src.resource);
+       agx_g17p_direct_resolve_blit_shape(info, false)) {
+      if (agx_g17p_attach_direct_resolve(ctx, info->dst.resource,
+                                       info->src.resource)) {
+         struct agx_batch *batch =
+            agx_writer_get(ctx, agx_resource(info->dst.resource)->bo->handle);
+         batch->g17p_resolve_reload = true;
+      }
+   }
 }
 
 static bool
