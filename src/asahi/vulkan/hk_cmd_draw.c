@@ -991,6 +991,21 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
    compact_info.pColorAttachments = attachments;
    key = &compact_key;
    info = &compact_info;
+   if (!store && !partial_render && active_count == 1) {
+      const VkRenderingAttachmentInfo *att = &attachments[0];
+      const struct hk_rendering_state *render = &cmd->state.gfx.render;
+      const bool partial_area = render->area.offset.x || render->area.offset.y ||
+         render->area.extent.width < render->cr.width ||
+         render->area.extent.height < render->cr.height;
+      /* The EOT resolve writes full tiles. Merge the destination outside the
+       * API rectangle before that store, retaining native MSAA resolution. */
+      key->preserve_resolve_outside = partial_area &&
+         hk_agx3_g17p_direct_color_resolve_supported(
+            &key->tib, active_count,
+            att->resolveImageView != VK_NULL_HANDLE,
+            att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
+            att->storeOp == VK_ATTACHMENT_STORE_OP_STORE);
+   }
    if (!hk_agx3_g17p_rt0_tile_layout_supported(&key->tib)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return (struct hk_bg_eot){0};
@@ -1436,6 +1451,21 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
             key->tib.layered ? iview->planes[0].layered_background
                              : iview->planes[0].background,
          };
+         if (key->preserve_resolve_outside) {
+            const struct hk_image_view *resolve = color_att[0].resolve_iview;
+            textures[2] = key->tib.layered ? resolve->planes[0].layered_background
+                                          : resolve->planes[0].background;
+            const VkRect2D area = cmd->state.gfx.render.area;
+            const uint32_t bounds[4] = {
+               area.offset.x, area.offset.y,
+               area.offset.x + area.extent.width,
+               area.offset.y + area.extent.height,
+            };
+            desc.resolve_bounds_va = hk_g17p_bg_eot_upload(
+               cmd, dc, bounds, sizeof(bounds), 16);
+            if (!desc.resolve_bounds_va)
+               return (struct hk_bg_eot){0};
+         }
          if (dual_mrt_active)
             textures[2] = key->tib.layered
                              ? iview1->planes[0].layered_background
@@ -1444,7 +1474,8 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
             for (unsigned rt = 1; rt < attachment_count; ++rt)
                textures[2 * rt] = color_att[rt].iview->planes[0].background;
          }
-         const size_t texture_size = multi_mrt_active
+         const size_t texture_size = key->preserve_resolve_outside
+            ? 3 * AGX_TEXTURE_GEN9_LENGTH : multi_mrt_active
             ? (2 * attachment_count - 1) * AGX_TEXTURE_GEN9_LENGTH : dual_mrt_active
             ? 3 * AGX_TEXTURE_GEN9_LENGTH : AGX_TEXTURE_GEN9_LENGTH;
          const uint64_t texture_va =
@@ -1645,6 +1676,7 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
     * clear included, was lost.
     */
    key.single_sample_reload = false;
+
 
    bool needs_textures_for_spilled_rts =
       agx_tilebuffer_spills(&render->tilebuffer) && !partial_render && !store;

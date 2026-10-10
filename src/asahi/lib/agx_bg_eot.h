@@ -60,6 +60,8 @@ struct agx_bg_eot_key {
    unsigned reserved_preamble;
    /* Replicate a single-sample WSI colour into every multisample tile lane. */
    bool single_sample_reload;
+   /* Partial direct resolve: retain destination pixels outside its area. */
+   bool preserve_resolve_outside;
    /* Store the multisample tile unresolved into a multisample target rather
     * than resolving it through a single-sample one. Only meaningful when
     * tib.nr_samples > 1; the caller decides, because storeOp = STORE is the

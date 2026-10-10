@@ -101,7 +101,10 @@ hk_upload_rodata(struct hk_device *dev)
                        agx_chip_name(dev->dev.chip));
 
    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   const size_t rodata_size = align(sampler_size, sizeof(uint64_t));
+   /* Background reloads use the same two native texel-fetch selectors as
+    * ordinary shaders: staged multisample reads name entry one. */
+   const unsigned sampler_count = dev->dev.chip == AGX_CHIP_G17P ? 2 : 1;
+   const size_t rodata_size = align(sampler_count * sampler_size, sizeof(uint64_t));
    dev->rodata.bo =
       agx_bo_create(&dev->dev, rodata_size, 0, 0, "Read only data");
 
@@ -132,8 +135,9 @@ hk_upload_rodata(struct hk_device *dev)
                           agx_chip_name(dev->dev.chip));
       goto fail;
    }
-   memcpy(map + offs, &txf, sampler_size);
-   offs += sampler_size;
+   for (unsigned i = 0; i < sampler_count; ++i)
+      memcpy(map + offs + i * sampler_size, &txf, sampler_size);
+   offs += sampler_count * sampler_size;
 
    if (dev->dev.chip == AGX_CHIP_G17P) {
       const uint64_t pointers[2] = {

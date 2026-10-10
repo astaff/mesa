@@ -124,6 +124,8 @@ struct agx3_g17p_rt0_bg_program_desc {
    uint64_t clear_value_va;
    uint64_t texture_pointer_va;
    uint64_t sampler_pointer_va;
+   /* Optional x0,y0,x1,y1 at uniform halves8..15 for partial resolves. */
+   uint64_t resolve_bounds_va;
    uint32_t shader_binary_size;
    uint32_t scratch_size;
    uint16_t nr_gprs;

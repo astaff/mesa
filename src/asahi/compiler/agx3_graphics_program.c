@@ -656,7 +656,7 @@ agx3_g17p_rt0_bg_shader_resources_match(enum agx3_g17p_rt0_bg_op op,
               agx3_g17p_wide_mrt_clear_push_halfs(push_count)) &&
              !uses_txf;
    case AGX3_G17P_RT0_BG_RELOAD:
-      return push_count == 0 && uses_txf;
+      return (push_count == 0 || push_count == 16) && uses_txf;
    case AGX3_G17P_RT0_BG_CLEAR_RELOAD:
       return (push_count == AGX3_G17P_RGBA8_MRT_CLEAR_PUSH_HALFS ||
               push_count == AGX3_G17P_TRIPLE_CLEAR_PUSH_HALFS ||
@@ -674,6 +674,10 @@ agx3_g17p_rt0_bg_program_generate(
    struct agx3_g17p_rt0_bg_program *program)
 {
    if (!program || chip != AGX_CHIP_G17P || !desc)
+      return false;
+
+   if (desc->resolve_bounds_va &&
+       (desc->op != AGX3_G17P_RT0_BG_RELOAD || (desc->resolve_bounds_va & 15)))
       return false;
 
    struct agx3_ioto_uniform_range ranges[3];
@@ -716,6 +720,13 @@ agx3_g17p_rt0_bg_program_generate(
          .address = desc->sampler_pointer_va,
       };
       range_count = 2;
+      if (desc->resolve_bounds_va) {
+         ranges[2] = (struct agx3_ioto_uniform_range){
+            .start_halfs = 8, .size_halfs = 8,
+            .address = desc->resolve_bounds_va,
+         };
+         range_count = 3;
+      }
       break;
    case AGX3_G17P_RT0_BG_CLEAR_RELOAD:
       /* Texture and sampler pointers occupy halves 0..7 and each target's

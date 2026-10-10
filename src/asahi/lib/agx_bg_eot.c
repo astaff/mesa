@@ -350,9 +350,23 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
          continue;
       }
 
+      nir_def *color = build_background_op(
+         &b, key->op[rt], rt, nr, source_msaa, layered,
+         cache->dev->chip == AGX_CHIP_G17P);
+      if (key->preserve_resolve_outside) {
+         assert(rt == 0 && key->op[rt] == AGX_BG_LOAD);
+         nir_def *xy = nir_u2u32(&b, nir_load_pixel_coord(&b));
+         nir_def *rect = nir_load_preamble(&b, 4, 32, 8);
+         nir_def *inside = nir_iand(&b,
+            nir_ball(&b, nir_uge(&b, xy, nir_channels(&b, rect, 0x3))),
+            nir_ball(&b, nir_ult(&b, xy, nir_channels(&b, rect, 0xc))));
+         nir_def *saved = build_background_op(
+            &b, AGX_BG_LOAD, 1, nr, false, layered, true);
+         color = nir_bcsel(&b, inside, color, saved);
+      }
+
       nir_store_output(
-         &b, build_background_op(&b, key->op[rt], rt, nr, source_msaa, layered,
-                                 cache->dev->chip == AGX_CHIP_G17P),
+         &b, color,
          nir_imm_int(&b, 0), .write_mask = BITFIELD_MASK(nr),
          .src_type = nir_type_uint32,
          .io_semantics.location = FRAG_RESULT_DATA0 + rt,
