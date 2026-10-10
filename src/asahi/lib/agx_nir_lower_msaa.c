@@ -511,20 +511,15 @@ agx_block_runs_once(nir_function_impl *impl, nir_block *block)
 }
 
 /*
- * An unrolled epilog writes each sample's depth or stencil, and applies each
- * sample's share of the API sample mask, in its own copy, between the colour
- * stores of the samples around it. Apple's fragments take class 1 once: one
- * testing coverage update (MOVMSK), any depth writes with it, all before the
- * first colour wait, and never again after releasing it. Move every such
- * write and kill, with the constant and exported values it reads, to the
- * start of the epilog, where the kills combine into one update that precedes
- * the depth transaction.
+ * Coalesce each sample's kill into one coverage update. Keep a complete,
+ * disjoint depth-only sample set in its original order: native G17P fragments
+ * test a sample immediately before accessing that sample's colour. Hoisting
+ * all depth operations ahead of all colour accesses loses that ordering.
  *
- * Re-acquiring class 1 per sample, after the pixel's colour classes are held,
- * is a shape no native fragment has. On G17P it hangs the 3D pipeline once
- * several processes' fragment passes share the hardware (4x, two spilled
- * RGBA32 targets and a gl_SampleMask write: stamp-blamed recovery within a
- * second at six processes).
+ * Other depth/stencil shapes retain the established hoist. The binary packer
+ * recognizes the interleaved form and holds depth and colour classes together
+ * until the final colour store; it never reacquires depth per sample while
+ * holding colour classes.
  */
 bool
 agx_nir_hoist_g17p_zs_writes(nir_shader *shader)
@@ -583,6 +578,21 @@ agx_nir_hoist_g17p_zs_writes(nir_shader *shader)
          writes[count++] = intr;
       }
    }
+   /* A sample's colour accesses must observe that sample's depth result.
+    * Keep a complete, disjoint depth-only sample set in its original
+    * sample order, including zero-colour epilogs. Kills still coalesce below.
+    * The packer retains one shared
+    * depth/colour transaction, so this does not reacquire class 1 per sample. */
+   bool per_sample_depth = count == 2 || count == 4;
+   unsigned targets = 0;
+   for (unsigned w = 0; w < count; ++w) {
+      const unsigned target = possible_sample_targets(writes[w]->src[0].ssa);
+      per_sample_depth &= nir_intrinsic_base(writes[w]) == 1 &&
+                          util_bitcount(target) == 1 && !(targets & target);
+      targets |= target;
+   }
+   if (per_sample_depth && targets == BITFIELD_MASK(count))
+      count = 0;
 
    if (tests_samples) {
       /* Do not combine testing updates with DEPTHF, or test one sample

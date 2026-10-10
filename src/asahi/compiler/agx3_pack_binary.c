@@ -6569,9 +6569,31 @@ agx3_g17p_mrt_refused(void)
    return (struct agx3_g17p_mrt_protocol){0};
 }
 
+bool
+agx3_g17p_interleaved_zs(const agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT ||
+       (ctx->key->fs.nr_samples != 2 && ctx->key->fs.nr_samples != 4))
+      return false;
+   unsigned writes = 0;
+   bool tile_seen = false, interleaved = false;
+   agx_foreach_instr_global(ctx, I) {
+      tile_seen |= I->op == AGX_OPCODE_ST_TILE;
+      if (I->op == AGX_OPCODE_ZS_EMIT_AGX3) {
+         if (I->zs != 1)
+            return false;
+         writes++;
+         interleaved |= tile_seen;
+      }
+   }
+   return interleaved && writes == ctx->key->fs.nr_samples;
+}
+
 static struct agx3_g17p_mrt_protocol
 agx3_g17p_mrt_protocol(agx_context *ctx)
 {
+   const bool interleaved_zs = agx3_g17p_interleaved_zs(ctx);
    struct agx3_g17p_mrt_protocol p = {0};
    agx_block *tail = agx_reconverged_mrt_tail(ctx);
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
@@ -6612,7 +6634,7 @@ agx3_g17p_mrt_protocol(agx_context *ctx)
          if ((!ctx->key->g17p_emrt && agx3_is_cf_op(I)) ||
              (I->op == AGX_OPCODE_SIGNAL_PIX &&
               (!depth_written || I->writeout != 1 ||
-               (tile_ops && !ctx->key->g17p_emrt))))
+               (tile_ops && !ctx->key->g17p_emrt && !interleaved_zs))))
             return agx3_g17p_mrt_refused();
          if (I->op != AGX_OPCODE_LD_TILE && I->op != AGX_OPCODE_ST_TILE)
             continue;
@@ -6658,8 +6680,8 @@ agx3_g17p_mrt_protocol(agx_context *ctx)
    const bool single_target_emrt =
       ctx->key->fs.nr_samples > 1 && ctx->key->g17p_emrt;
 
-   if (!p.count || (p.count == 1 && p.targets[0] == 0 &&
-                    !single_target_blend && !single_target_emrt))
+   if (!p.count || (p.count == 1 && p.targets[0] == 0 && !single_target_blend &&
+                    !single_target_emrt && !interleaved_zs))
       return agx3_g17p_mrt_refused();
 
    /* A background of four or more targets keeps the constructors' ascending,
@@ -6702,7 +6724,11 @@ agx3_g17p_mrt_protocol(agx_context *ctx)
 
       if (I->op != AGX_OPCODE_LD_TILE && I->op != AGX_OPCODE_ST_TILE) {
          if (stores_started && !ctx->key->g17p_emrt &&
-             (!p.multisample || !agx_opcodes_info[I->op].can_eliminate))
+             (!p.multisample ||
+              (!agx_opcodes_info[I->op].can_eliminate &&
+               !(interleaved_zs &&
+                 (I->op == AGX_OPCODE_ZS_EMIT_AGX3 ||
+                  (I->op == AGX_OPCODE_SIGNAL_PIX && I->writeout == 1))))))
             return agx3_g17p_mrt_refused();
          continue;
       }
@@ -8828,6 +8854,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       goto fail;
 
    k = 0;
+   const bool interleaved_zs =
+      agx3_g17p_interleaved_zs(ctx) && enc == AGX_ISA_ENCODING_AGX3B &&
+      ctx->stage == MESA_SHADER_FRAGMENT && has_zs_emit && g17p_mrt.valid &&
+      g17p_mrt.multisample_combined &&
+      (g17p_mrt.combined_classes == 12 || g17p_mrt.combined_classes == 48 ||
+       g17p_mrt.combined_classes == 60 || g17p_mrt.combined_classes == 192 ||
+       g17p_mrt.combined_classes == 252);
    unsigned vertex_loads_seen = 0;
    unsigned loop_depth = 0;
    /* f63 on F32INTERP and f48 on LDCF are two encodings of the same native
@@ -8866,6 +8899,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       fragment_input_started = true;
    }
 
+   if (interleaved_zs) {
+      uint8_t bytes[AGX3_PIXEL_MAX_LENGTH], len;
+      if (!agx3_pixel_wait(enc, g17p_mrt.combined_classes | 1, 0, bytes,
+                           &len) ||
+          !agx3_append(emission, bytes, len))
+         goto fail;
+      g17p_mrt_acquired = true;
+   }
 
    agx_foreach_block(ctx, block) {
       block->offset = emission->size;
@@ -9737,12 +9778,22 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          if (I->op == AGX_OPCODE_WAIT_PIX ||
              I->op == AGX_OPCODE_SIGNAL_PIX) {
+            if (interleaved_zs && I->op == AGX_OPCODE_SIGNAL_PIX) {
+               if (!agx3_retire_slots_noop(emission, enc, wait))
+                  AGX3_REFUSE(I);
+               continue;
+            }
             /* A late depth test for fragment memory side effects stages the
              * pass-through Z value before acquiring class 1 in Apple's fresh
              * G17P atomic fragment. Hold this wait until ZS_EMIT can reproduce
              * that ordering; SIGNAL_PIX remains in its original position. */
             if (has_zs_emit && I->op == AGX_OPCODE_WAIT_PIX &&
                 I->writeout == 1) {
+               if (interleaved_zs && g17p_zs_writes > 0) {
+                  if (!agx3_retire_slots_noop(emission, enc, wait))
+                     AGX3_REFUSE(I);
+                  continue;
+               }
                if (g17p_deferred_zs_wait || wait != 0)
                   AGX3_REFUSE(I);
                g17p_deferred_zs_wait = I;
@@ -9885,7 +9936,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 * second time inside it. */
                const bool single_blend =
                   g17p_mrt.count == 1 && g17p_mrt.targets[0] == 0 &&
-                  g17p_mrt.has_loads && !ctx->key->g17p_emrt;
+                  g17p_mrt.has_loads && !ctx->key->g17p_emrt && !interleaved_zs;
                const bool acquire = single_blend
                   ? (load ? first : g17p_mrt_stores_seen == 0)
                   : !g17p_mrt_acquired &&
@@ -9903,19 +9954,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   g17p_colour_open = true;
                }
                if ((acquire &&
-                    (!agx3_pixel_wait(enc, acquire_classes, 0,
-                                      bytes, &len) ||
+                    (!agx3_pixel_wait(enc, acquire_classes, 0, bytes, &len) ||
                      !agx3_append(emission, bytes, len))) ||
-                   !agx3_emit_tile(emission, enc, I, slot, wait, false, false,
-                                   g17p_mrt.raw32_store,
-                                   /* Native per-sample exports use halves
-                                    * 0..31 even for one/two targets. */
-                                   true,
-                                   ctx->key->g17p_emrt && !load &&
-                                      I->src[0].value >= 16) ||
+                   !agx3_emit_tile(
+                      emission, enc, I, slot, wait, false, false,
+                      g17p_mrt.raw32_store,
+                      /* Native per-sample exports use halves
+                       * 0..31 even for one/two targets. */
+                      true,
+                      ctx->key->g17p_emrt && !load && I->src[0].value >= 16) ||
                    (!load && last &&
-                    (!agx3_pixel_release(enc, g17p_mrt.combined_classes, true,
-                                         0, bytes, &len) ||
+                    (!agx3_pixel_release(
+                        enc, interleaved_zs ? 0 : g17p_mrt.combined_classes,
+                        true, 0, bytes, &len) ||
                      !agx3_append(emission, bytes, len))))
                   AGX3_REFUSE(I);
                g17p_mrt_stores_seen += !load;
@@ -10172,9 +10223,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                            bytes, &len) ||
                  !agx3_append(emission, bytes, len)))
                AGX3_REFUSE(I);
-            if (g17p_deferred_zs_wait &&
-                !agx3_emit_pixel(emission, enc, g17p_deferred_zs_wait, 0,
-                                 false, 0))
+            if (g17p_deferred_zs_wait && !interleaved_zs &&
+                !agx3_emit_pixel(emission, enc, g17p_deferred_zs_wait, 0, false,
+                                 0))
                AGX3_REFUSE(I);
             g17p_deferred_zs_wait = NULL;
 

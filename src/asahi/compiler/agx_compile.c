@@ -8210,7 +8210,9 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
              * sample's colour accesses. The generated eMRT epilog has the
              * same lifetime even when its whole layout fits in the tile. */
             if (depth_ops == 1 ||
-                (depth_ops == 2 && !(ctx->key->g17p_emrt && multisample_stores)))
+                (depth_ops == 2 &&
+                 !((ctx->key->g17p_emrt || agx3_g17p_interleaved_zs(ctx)) &&
+                   multisample_stores)))
                return false;
             if (!first_wait)
                first_wait = I;

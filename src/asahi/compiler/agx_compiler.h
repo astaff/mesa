@@ -1243,6 +1243,7 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
  * never aborting -- on any op or operand outside the grounded subset.
  * The AGX2 path above is unaffected; callers select on the device
  * encoding. */
+bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
 
 #ifndef NDEBUG

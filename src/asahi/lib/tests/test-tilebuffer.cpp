@@ -7,7 +7,13 @@
 #include "agx_tilebuffer.h"
 #include "agx_bg_eot_key.h"
 
+#include <vector>
 #include <gtest/gtest.h>
+
+extern "C" {
+#include "asahi/compiler/agx_compile.h"
+#include "compiler/nir/nir_builder.h"
+}
 
 struct test {
    const char *name;
@@ -695,4 +701,83 @@ TEST(Tilebuffer, IndependentNativeStorageAndSampleLimits)
    EXPECT_TRUE(spilling.spilled[2]);
    EXPECT_FALSE(spilling.spilled[0]);
    EXPECT_FALSE(spilling.spilled[1]);
+}
+
+class SampleDepthOrder : public ::testing::Test {
+ protected:
+   SampleDepthOrder()
+   {
+      glsl_type_singleton_init_or_ref();
+   }
+   ~SampleDepthOrder()
+   {
+      glsl_type_singleton_decref();
+   }
+};
+static std::vector<char>
+zs_tile_order(unsigned samples, bool overlap, bool stencil)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "sample depth order");
+   for (unsigned i = 0; i < samples; ++i) {
+      nir_def *mask = nir_imm_intN_t(&b, 1u << (overlap ? 0 : i), 16);
+      nir_sample_mask_agx(&b, mask, nir_imm_intN_t(&b, 0, 16));
+      auto *zs =
+         nir_store_zs_agx(&b, mask, nir_imm_float(&b, float(i) / samples),
+                          nir_imm_intN_t(&b, i, 16));
+      nir_intrinsic_set_base(zs, stencil ? 2 : 1);
+      auto *tile = nir_store_local_pixel_agx(&b, nir_imm_int(&b, i), mask,
+                                             nir_undef(&b, 2, 16));
+      nir_intrinsic_set_base(tile, 0);
+      nir_intrinsic_set_write_mask(tile, 1);
+      nir_intrinsic_set_format(tile, PIPE_FORMAT_R32_UINT);
+   }
+   agx_nir_hoist_g17p_zs_writes(b.shader);
+   nir_validate_shader(b.shader, "sample depth ordering");
+   std::vector<char> order;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+         case nir_intrinsic_sample_mask_agx:
+            order.push_back('K');
+            break;
+         case nir_intrinsic_store_zs_agx:
+            order.push_back('Z');
+            break;
+         case nir_intrinsic_store_local_pixel_agx:
+            order.push_back('T');
+            break;
+         default:
+            break;
+         }
+      }
+   }
+   ralloc_free(b.shader);
+   return order;
+}
+
+TEST_F(SampleDepthOrder, KeepDisjointDepthWithItsSampleColour)
+{
+   for (unsigned samples : {2u, 4u}) {
+      std::vector<char> expected{'K'};
+      for (unsigned i = 0; i < samples; ++i) {
+         expected.push_back('Z');
+         expected.push_back('T');
+      }
+      EXPECT_EQ(zs_tile_order(samples, false, false), expected);
+   }
+}
+
+TEST_F(SampleDepthOrder, OverlappingDepthSamplesKeepExistingHoist)
+{
+   EXPECT_EQ(zs_tile_order(2, true, false),
+             (std::vector<char>{'K', 'Z', 'Z', 'T', 'T'}));
+}
+
+TEST_F(SampleDepthOrder, StencilSamplesKeepExistingHoist)
+{
+   EXPECT_EQ(zs_tile_order(2, false, true),
+             (std::vector<char>{'K', 'Z', 'Z', 'T', 'T'}));
 }

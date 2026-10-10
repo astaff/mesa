@@ -163,8 +163,8 @@ agx3_pixel_wait(enum agx_isa_encoding enc, uint32_t writeout,
 {
    /* Every writeout mask Apple's fragment corpus emitted on pixwait, less the
     * f15-gated shader-entry form (512). */
-   static const uint32_t witnessed[] = {1,  4,  8,   12,  16, 32,
-                                        48, 60, 64, 128, 192, 252};
+   static const uint32_t witnessed[] = {1,   4,   8,   12, 16, 32, 48,  60, 64,
+                                        128, 192, 252, 13, 49, 61, 193, 253};
 
    if (out == NULL || len == NULL)
       return false;
