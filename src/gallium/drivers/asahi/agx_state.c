@@ -6227,7 +6227,8 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
    };
    const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
       .w_clamp_raw = 0,
-      .cull2_raw = UINT32_C(0x80),
+      .cull2_raw = UINT32_C(0x80) |
+                   (batch->generate_primitive_id ? UINT32_C(0x1000) : 0),
    };
    struct agx_ppp_w_clamp_cull2_core w_cull2;
    if (!agx_ppp_hal200_graphics_core_pack(
@@ -6328,6 +6329,7 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
             dev->chip == AGX_CHIP_G17P ? t.gpu : agx_usc_addr(dev, t.gpu);
       } else {
          batch->varyings = 0;
+         batch->generate_primitive_id = false;
       }
 
       varyings_dirty = true;
@@ -6360,15 +6362,16 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
             .pipeline = pipeline,
             .raw_pipeline_template = 0,
             .raw_vertex_outputs = {
-               vs->uvs.vdm.opaque[0],
-               ctx->rast->base.rasterizer_discard ? 0x30 + provoking
-                                                   : provoking,
+               vs->uvs.vdm.opaque[0] +
+                  (batch->generate_primitive_id ? UINT32_C(0x100) : 0),
+               (ctx->rast->base.rasterizer_discard ? 0x30 + provoking
+                                                  : provoking) |
+                  (batch->generate_primitive_id ? UINT32_C(0x40) : 0),
             },
             .raw_vertex_unknown = 0,
          };
          struct agx_vdm_state_update encoded;
          const bool packed =
-            !batch->generate_primitive_id &&
             agx_vdm_state_update_pack(dev->chip, &info, &encoded);
          assert(packed);
          if (!packed)
