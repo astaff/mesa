@@ -48,7 +48,7 @@ cost_instr(agx_instr *I)
  */
 static uint32_t
 cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
-             agx_block *target, bool skip_to_end_of_target)
+             agx_block *target, bool skip_to_end_of_target, bool *must_skip)
 {
    uint32_t cost = 0;
 
@@ -60,6 +60,8 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
              J == agx_last_instr(target))
             break;
 
+         *must_skip |= ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                       J->op == AGX_OPCODE_SAMPLE_MASK_AGX3 && (J->imm & 2);
          cost += cost_instr(J);
       }
    }
@@ -79,6 +81,8 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
          if (block == target && I == agx_last_instr(target))
             break;
 
+         *must_skip |= ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                       I->op == AGX_OPCODE_SAMPLE_MASK_AGX3 && (I->imm & 2);
          cost += cost_instr(I);
       }
 
@@ -122,10 +126,13 @@ try_insert_jmp(agx_context *ctx, agx_block *from, agx_instr *from_I,
     *
     *    C < J / P(all threads inactive).
     */
+   /* Testing coverage operations must be skipped with empty EXEC even when
+    * the block is too short to justify a jump on instruction cost alone. */
+   bool must_skip = false;
    uint32_t cost_instructions =
-      cost_between(ctx, from, from_I, target, skip_to_end_of_target);
+      cost_between(ctx, from, from_I, target, skip_to_end_of_target, &must_skip);
 
-   if (cost_instructions < COST_JMP * inverse_probability)
+   if (!must_skip && cost_instructions < COST_JMP * inverse_probability)
       return;
 
    /* It looks like inserting a jump will be a win. Do so. */

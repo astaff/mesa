@@ -441,3 +441,57 @@ TEST(AGX3ArrayStaging, ReusedCompletionSlotRetainsCoordinateConsumer)
    util_dynarray_fini(&binary);
    ralloc_free(mem);
 }
+
+TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingBlocks)
+{
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (unsigned mode : {0u, 2u}) {
+         void *mem = ralloc_context(NULL);
+         agx_shader_key key = {};
+         key.dev.encoding = encoding;
+         key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P : AGX_CHIP_G16G;
+         agx_builder *b = agx_test_builder(mem);
+         b->shader->key = &key;
+         b->shader->stage = MESA_SHADER_FRAGMENT;
+         agx_block *entry = list_first_entry(&b->shader->blocks, agx_block, link);
+         agx_block *body = agx_test_block(b->shader);
+         agx_block *end = agx_test_block(b->shader);
+         agx_if_icmp(b, agx_register(0, AGX_SIZE_16), agx_immediate(0),
+                     1, AGX_ICOND_UEQ, true, end);
+         agx_builder middle = agx_init_builder(b->shader, agx_after_block(body));
+         agx_sample_mask_agx3(&middle, agx_register(0, AGX_SIZE_16),
+                              agx_register(2, AGX_SIZE_32), mode);
+         agx_builder last = agx_init_builder(b->shader, agx_after_block(end));
+         agx_stop(&last);
+         agx_opt_jmp_none(b->shader);
+         agx_instr *jump = agx_last_instr(entry);
+         bool required = encoding == AGX_ISA_ENCODING_AGX3B && mode == 2;
+         EXPECT_EQ(jump->op == AGX_OPCODE_JMP_EXEC_NONE, required);
+         if (required)
+            EXPECT_EQ(jump->target, end);
+         ralloc_free(mem);
+      }
+   }
+}
+
+TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingElse)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   agx_block *body = list_first_entry(&b->shader->blocks, agx_block, link);
+   agx_instr *else_ = agx_else_fcmp(b, agx_zero(), agx_zero(), 1,
+                                  AGX_FCOND_EQ, false, body);
+   agx_sample_mask_agx3(b, agx_register(0, AGX_SIZE_16),
+                        agx_register(2, AGX_SIZE_32), 2);
+   agx_pop_exec(b, 1);
+   agx_opt_jmp_none(b->shader);
+   agx_instr *jump = list_entry(else_->link.next, agx_instr, link);
+   EXPECT_EQ(jump->op, AGX_OPCODE_JMP_EXEC_NONE_AFTER);
+   EXPECT_EQ(jump->target, body);
+   ralloc_free(mem);
+}

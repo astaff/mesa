@@ -214,3 +214,97 @@ TEST(MRTTerminalTail, EligibilityRejectsUnprovenPrefixOrExit)
       EXPECT_EQ(agx_reconverged_mrt_tail(f.ctx), nullptr);
    }
 }
+
+TEST(MRTTerminalTail, MultisampleEpilogCoverageReconvergesBeforeColour)
+{
+   for (unsigned samples : {2u, 4u}) {
+      for (unsigned mode : {0u, 2u}) {
+         TailFixture f;
+         f.key.secondary = true;
+         f.key.fs.nr_samples = samples;
+         f.op(f.prefix, AGX_OPCODE_SAMPLE_MASK_AGX3)->imm = mode;
+         EXPECT_EQ(agx_reconverged_mrt_tail(f.ctx), f.tail);
+      }
+      for (enum agx_opcode op :
+           {AGX_OPCODE_ST_TILE, AGX_OPCODE_LD_TILE, AGX_OPCODE_WAIT_PIX,
+            AGX_OPCODE_SIGNAL_PIX, AGX_OPCODE_ZS_EMIT_AGX3,
+            AGX_OPCODE_DEVICE_STORE}) {
+         TailFixture f;
+         f.key.secondary = true;
+         f.key.fs.nr_samples = samples;
+         f.op(f.prefix, op);
+         EXPECT_EQ(agx_reconverged_mrt_tail(f.ctx), nullptr);
+      }
+      TailFixture f;
+      f.key.secondary = true;
+      f.key.fs.nr_samples = samples;
+      f.op(f.prefix, AGX_OPCODE_SAMPLE_MASK_AGX3)->imm = 3;
+      EXPECT_EQ(agx_reconverged_mrt_tail(f.ctx), nullptr);
+   }
+}
+
+TEST(MRTTerminalTail, MultisampleEpilogOrdersPreservedTargets)
+{
+   for (unsigned samples : {2u, 4u}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "masked MRT epilog");
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.secondary = true;
+      key.g17p_emrt = true;
+      key.fs.nr_samples = samples;
+      nir_def *mask = agx_test_load_preamble(&b, 1, 16, 7);
+      nir_sample_mask_agx(&b, nir_imm_intN_t(&b, 0xff, 16), mask);
+      nir_def *value = agx_test_load_preamble(&b, 4, 32, 8);
+      for (unsigned i = 0; i < 4; ++i) {
+         nir_def *v = value;
+         if (i) {
+            v = nir_load_local_pixel_agx(&b, 4, 32, mask);
+            nir_intrinsic_instr *load = nir_def_as_intrinsic(v);
+            nir_intrinsic_set_base(load, 8 * i);
+            nir_intrinsic_set_format(load, PIPE_FORMAT_R16_UNORM);
+            nir_intrinsic_set_target(load, i);
+         }
+         agx_test_store_local_pixel_agx(
+            &b, v, mask, nir_undef(&b, 2, 16), 8 * i, 0xf,
+            PIPE_FORMAT_R16_UNORM);
+         BITSET_SET(key.g17p_tile_partitions, 8 * i);
+         b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + i);
+      }
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(MRTTerminalTail, MultisampleEpilogStoresEachSampleAfterCoverage)
+{
+   for (unsigned samples : {2u, 4u}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "sample mask epilog");
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.secondary = true;
+      key.fs.nr_samples = samples;
+      nir_def *mask = agx_test_load_preamble(&b, 1, 16, 7);
+      nir_sample_mask_agx(&b, nir_imm_intN_t(&b, 0xff, 16), mask);
+      for (unsigned i = 0; i < samples; ++i) {
+         nir_def *value = agx_test_load_preamble(&b, 4, 32, 8 + 8 * i);
+         agx_test_store_local_pixel_agx(
+            &b, value, nir_iand_imm(&b, mask, 1u << i),
+            nir_undef(&b, 2, 16), 0, 0xf, PIPE_FORMAT_R8_UNORM);
+      }
+      b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}

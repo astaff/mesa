@@ -41,11 +41,15 @@ agx_negate_src_index(agx_instr *I)
 agx_block *
 agx_reconverged_mrt_tail(agx_context *ctx)
 {
+   const bool multisample_epilog = ctx->key->secondary &&
+      (ctx->key->fs.nr_samples == 2 || ctx->key->fs.nr_samples == 4);
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
-       ctx->key->secondary || ctx->key->no_stop ||
-       ctx->key->fs.ignore_tib_dependencies || ctx->key->g17p_emrt ||
-       ctx->key->fs.nr_samples > 1 || list_length(&ctx->blocks) <= 1 ||
+       (ctx->key->secondary && !multisample_epilog) || ctx->key->no_stop ||
+       ctx->key->fs.ignore_tib_dependencies ||
+       (ctx->key->g17p_emrt && !multisample_epilog) ||
+       (ctx->key->fs.nr_samples > 1 && !multisample_epilog) ||
+       list_length(&ctx->blocks) <= 1 ||
        !ctx->nir || !ctx->indexed_nir_blocks)
       return NULL;
 
@@ -97,9 +101,11 @@ agx_reconverged_mrt_tail(agx_context *ctx)
                return NULL;
             break;
          case AGX_OPCODE_SAMPLE_MASK_AGX3:
-            /* Demotion before colour acquisition only removes lanes; it
-             * does not enter or release a pixel transaction. */
-            if (tile || (early_wait && I->imm != 3))
+            /* Pure kills do not acquire a pixel class. A testing update
+             * acquires and releases class 1 within its own instruction, so
+             * either may precede the reconverged colour transaction. */
+            if (tile || (early_wait && I->imm != 3) ||
+                (multisample_epilog && I->imm != 0 && I->imm != 2))
                return NULL;
             early_tested |= early_wait && I->imm == 3;
             early_wait = false;

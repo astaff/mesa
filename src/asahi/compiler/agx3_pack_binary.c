@@ -6392,10 +6392,11 @@ agx3_g17p_colour_writeout(uint32_t writeout, unsigned pair)
 static unsigned
 agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
 {
+   agx_block *tail = colour ? agx_reconverged_mrt_tail(ctx) : NULL;
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
        ctx->key->fs.ignore_tib_dependencies == colour ||
-       list_length(&ctx->blocks) != 1)
+       (list_length(&ctx->blocks) != 1 && !tail))
       return 0;
 
    /* Post-RA, the definition that reaches each store is the most recent write
@@ -6420,7 +6421,8 @@ agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
     * 3 released. */
    unsigned depth = 0;
 
-   agx_foreach_instr_global(ctx, I) {
+   agx_block *store_block = tail ? tail : agx_start_block(ctx);
+   agx_foreach_instr_in_block(store_block, I) {
       if (stopped)
          return 0;
 
@@ -10351,7 +10353,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          if (I->op == AGX_OPCODE_SAMPLE_MASK_AGX3) {
             if (enc != AGX_ISA_ENCODING_AGX3B || ctx->stage != MESA_SHADER_FRAGMENT ||
                 I->nr_dests || I->nr_srcs != 2 ||
-                !agx3_src_is_register(I->src[0]) || I->src[0].memory ||
+                !(agx3_src_is_register(I->src[0]) ||
+                  (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+                   I->src[0].value == 1)) || I->src[0].memory ||
                 I->src[0].size != AGX_SIZE_16 || agx_channels(I->src[0]) != 1 ||
                 !agx3_vary_reg32(I->src[1]) || agx_channels(I->src[1]) != 1)
                AGX3_REFUSE(I);

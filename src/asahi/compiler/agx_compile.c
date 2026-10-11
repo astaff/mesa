@@ -2791,6 +2791,14 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
           * coverage operation. */
          const unsigned samples = MAX2(b->shader->key->fs.nr_samples, 1);
          const unsigned all = BITFIELD_MASK(samples);
+         if (samples > 1 && no_tests && nir_src_is_const(instr->src[0]) &&
+             nir_src_is_const(instr->src[1]) &&
+             (nir_src_as_uint(instr->src[0]) & all) == all &&
+             nir_src_as_uint(instr->src[1]) == 0) {
+            return agx_sample_mask_agx3(
+               b, agx_mov_imm(b, 16, 1),
+               agx_mov_imm(b, 32, UINT32_C(0xffffff00)), 0);
+         }
          agx_index target_in = agx_src_index(&instr->src[0]);
          agx_index live_in = agx_src_index(&instr->src[1]);
          agx_index target, keep, mid;
@@ -8112,10 +8120,11 @@ agx3_fuse_vertex_output_alu(agx_context *ctx)
 static bool
 agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
 {
+   agx_block *tail = agx_reconverged_mrt_tail(ctx);
    if (ctx->key->g17p_emrt && ctx->key->secondary &&
        ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        ctx->stage == MESA_SHADER_FRAGMENT && ctx->key->fs.nr_samples >= 1 &&
-       list_length(&ctx->blocks) > 1) {
+       list_length(&ctx->blocks) > 1 && !tail) {
       /* Keep each sample within its block. Sorting stores before that
        * group's final anchor preserves SSA dominance and never moves a
        * value across conditional image accesses in another block. */
@@ -8167,7 +8176,6 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
       return true;
    }
 
-   agx_block *tail = agx_reconverged_mrt_tail(ctx);
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
        ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
        (!ctx->key->secondary && !ctx->key->fs.ignore_tib_dependencies &&
@@ -11254,6 +11262,38 @@ agx_rte_fma_boundary(nir_builder *b, nir_instr *instr, void *data)
    return nir_if_phi(b, fixed, unchanged);
 }
 
+/* Separate pure kills from testing updates before lowering their different
+ * pixel-class lifetimes. The testing arm needs a real empty-EXEC skip. */
+static bool
+agx_nir_split_g17p_sample_tests(nir_builder *b, nir_intrinsic_instr *intr,
+                                void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_sample_mask_agx ||
+       nir_src_is_const(intr->src[1]))
+      return false;
+
+   unsigned all = BITFIELD_MASK(*(unsigned *)data);
+   nir_def *target = intr->src[0].ssa;
+   nir_def *live = intr->src[1].ssa;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *tests = nir_iand_imm(b, nir_iand(b, target, live), all);
+   nir_push_if(b, nir_ine_imm(b, tests, 0));
+   nir_sample_mask_agx(b, target, live);
+   nir_push_else(b, NULL);
+   nir_def *active = nir_iand_imm(b, target, all);
+   nir_push_if(b, nir_ieq_imm(b, active, all));
+   nir_sample_mask_agx(b, nir_imm_intN_t(b, all, 16),
+                       nir_imm_intN_t(b, 0, 16));
+   nir_push_else(b, NULL);
+   nir_push_if(b, nir_ine_imm(b, active, 0));
+   nir_sample_mask_agx(b, target, nir_imm_intN_t(b, 0, 16));
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 bool
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
@@ -11310,6 +11350,14 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
        nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_indirect_fs_input,
                nir_metadata_none, NULL);
+   }
+
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       nir->info.stage == MESA_SHADER_FRAGMENT &&
+       key->fs.nr_samples > 1 && !key->fs.inside_sample_loop) {
+      unsigned samples = key->fs.nr_samples;
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_nir_split_g17p_sample_tests,
+               nir_metadata_none, &samples);
    }
 
    NIR_PASS(_, nir, nir_lower_frag_coord_to_pixel_coord);
