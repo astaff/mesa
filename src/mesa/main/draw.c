@@ -1621,11 +1621,13 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
     * because that's what switches it between tc_draw_vbo and u_vbuf_draw_vbo.
     */
    struct st_context *st = st_context(ctx);
+   bool prepared = false;
    if (index_bo && ctx->Driver.DrawGallium == st_draw_gallium &&
        ctx->DrawID == 0) {
       st_prepare_stipple_input_prim(ctx->st, mode);
       ST_PIPELINE_RENDER_STATE_MASK(mask);
       st_prepare_draw(ctx, mask);
+      prepared = true;
 
       if (st->cso_context->draw_vbo == tc_draw_vbo) {
          assert(!st->draw_needs_minmax_index);
@@ -1697,7 +1699,17 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
    if (!validate_index_bounds(ctx, &info, &draw, 1))
       return;
 
-   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
+   if (prepared) {
+      /* The threaded-context fast path already validated this draw.  If
+       * vertex conversion or a non-threaded driver prevents that fast path,
+       * submit through the selected CSO draw function without validating a
+       * second time.  Winsys framebuffer validation may have marked
+       * _NEW_BUFFERS for the next draw while acquiring a new back buffer.
+       */
+      cso_draw_vbo(st->cso_context, &info, ctx->DrawID, NULL, &draw, 1);
+   } else {
+      ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
+   }
 
    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {
       _mesa_flush(ctx);
