@@ -7393,12 +7393,16 @@ agx_get_passthrough_gs(struct agx_context *ctx,
     * fragment shader, so it inherits what linking told the vertex shader
     * about the fragment interpolation qualifiers. The copy program derived
     * from it can then inline its UVS indices like the vertex shader does,
-    * which the AGX3 vertex writeout requires.
+    * which the AGX3 vertex writeout requires. Other chips keep the generic
+    * passthrough program: there, inheriting the qualifiers breaks flat
+    * varyings drawn through transform feedback.
     */
-   gs->info.known_interpolation_qualifiers =
-      prev->info.known_interpolation_qualifiers;
-   gs->info.linear_varyings = prev->info.linear_varyings;
-   gs->info.perspective_varyings = prev->info.perspective_varyings;
+   if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P) {
+      gs->info.known_interpolation_qualifiers =
+         prev->info.known_interpolation_qualifiers;
+      gs->info.linear_varyings = prev->info.linear_varyings;
+      gs->info.perspective_varyings = prev->info.perspective_varyings;
+   }
 
    ralloc_free(prev);
 
