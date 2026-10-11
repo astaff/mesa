@@ -468,8 +468,9 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingBlocks)
          agx_instr *jump = agx_last_instr(entry);
          bool required = encoding == AGX_ISA_ENCODING_AGX3B && mode == 2;
          EXPECT_EQ(jump->op == AGX_OPCODE_JMP_EXEC_NONE, required);
-         if (required)
+         if (required) {
             EXPECT_EQ(jump->target, end);
+         }
          ralloc_free(mem);
       }
    }
