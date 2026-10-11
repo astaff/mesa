@@ -298,14 +298,14 @@ pass(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          : raw_srgb ? (enum pipe_format)AIL_ISA_FORMAT_U8NORM : format;
 
    if (intr->intrinsic == nir_intrinsic_store_output) {
-      ctx->outputs_written |= BITFIELD_BIT(rt);
-
       /* Only write components that actually exist */
       uint16_t write_mask = (uint16_t)BITFIELD_MASK(comps);
 
       /* Delete stores to nonexistent render targets */
       if (logical_format == PIPE_FORMAT_NONE)
          return NIR_LOWER_INSTR_PROGRESS_REPLACE;
+
+      ctx->outputs_written |= BITFIELD_BIT(rt);
 
       /* Only write colours masked by the blend state */
       if (ctx->colormasks)

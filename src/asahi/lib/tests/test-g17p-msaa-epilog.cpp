@@ -229,3 +229,54 @@ TEST_F(G17PMSAAEpilog, SingleSampleCollapsePreservesHelperCoverage)
    EXPECT_EQ(coverage, 1u);
    ralloc_free(b.shader);
 }
+
+TEST_F(G17PMSAAEpilog, BroadcastNoopPreservesBoundTargets)
+{
+   for (unsigned samples : {1u, 2u, 4u}) {
+      for (unsigned targets : {1u, 2u, 4u}) {
+         SCOPED_TRACE(::testing::Message() << samples << " samples, "
+                                           << targets << " targets");
+         agx_fs_epilog_key fs = {};
+         fs.nr_samples = samples;
+         fs.max_sample_size_B = AGX_G17P_MAX_BYTES_PER_SAMPLE;
+         fs.max_bytes_per_tile = 32768;
+         fs.max_samples_per_tile = 2048;
+         fs.link.loc_written = 1;
+         fs.link.size_32 = 1;
+         fs.link.colour_comps = 15;
+         fs.link.broadcast_rt0 = true;
+         fs.blend.logicop_enable = true;
+         fs.blend.logicop_func = PIPE_LOGICOP_NOOP;
+         agx_fs_epilog_apply_device_policy(AGX_CHIP_G17P, &fs);
+         for (unsigned rt = 0; rt < targets; ++rt) {
+            fs.rt_formats[rt] = PIPE_FORMAT_R8G8B8A8_UNORM;
+            fs.blend.rt[rt].colormask = 15;
+            fs.blend.rt[rt].mode = agx_pack_blend_standard(
+               PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+               PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+         }
+
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options, "broadcast noop epilog");
+         agx_nir_fs_epilog_g17p(&b, &fs);
+         agx_preprocess_nir(b.shader);
+         agx_nir_lower_g17p_tile_samples(b.shader, samples);
+         unsigned loads = 0, stores = 0;
+         nir_foreach_function_impl(impl, b.shader) {
+            nir_foreach_block(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_intrinsic)
+                     continue;
+                  nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+                  loads += op == nir_intrinsic_load_local_pixel_agx;
+                  stores += op == nir_intrinsic_store_local_pixel_agx;
+               }
+            }
+         }
+         EXPECT_EQ(loads, targets);
+         EXPECT_EQ(stores, targets);
+         EXPECT_TRUE(b.shader->info.fs.uses_fbfetch_output);
+         ralloc_free(b.shader);
+      }
+   }
+}
