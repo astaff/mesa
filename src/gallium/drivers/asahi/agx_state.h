@@ -318,6 +318,7 @@ struct agx_uncompiled_shader {
       bool has_edgeflags;
       bool uses_fbfetch;
       bool uses_sample_shading;
+      bool needs_sample_count;
       bool writes_memory;
 
       /* Number of bindful textures, images used */
@@ -434,6 +435,7 @@ struct agx_batch {
 
    /* Executable storage is owned by this batch's pipeline pool. */
    uint64_t g17p_fragment_program;
+   uint64_t g17p_emrt_heap;
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
 

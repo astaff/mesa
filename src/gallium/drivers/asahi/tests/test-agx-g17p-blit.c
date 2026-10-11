@@ -173,7 +173,7 @@ build_webgl_shadow_fs(enum glsl_sampler_dim dim, bool array)
    tex->src[0] = nir_tex_src_for_ssa(
       nir_tex_src_coord,
       nir_fmul_imm(&b, nir_channels(&b, frag,
-                                    BITFIELD_MASK(coord_components)),
+                                    (nir_component_mask_t)BITFIELD_MASK(coord_components)),
                    1.0f / 64.0f));
    tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
                                      nir_channel(&b, frag, 2));

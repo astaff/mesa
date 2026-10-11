@@ -1139,6 +1139,16 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
       return;
 
    unsigned fastclear = buffers & ~(batch->draw | batch->load);
+   if (agx_device(pctx->screen)->chip == AGX_CHIP_G17P) {
+      agx_batch_init_state(batch);
+      const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
+      for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+         if (tib->spilled[rt] ||
+             (tib->nr_samples > 1 && tib->sample_size_B >
+                AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE))
+            fastclear &= ~(PIPE_CLEAR_COLOR0 << rt);
+      }
+   }
    unsigned slowclear = buffers & ~fastclear;
 
    assert(scissor_state == NULL &&

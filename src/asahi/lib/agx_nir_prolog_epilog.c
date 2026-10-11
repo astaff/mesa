@@ -1732,3 +1732,73 @@ agx_nir_fs_prolog(nir_builder *b, const void *key_)
 
    b->shader->info.io_lowered = true;
 }
+
+void
+agx_nir_fs_epilog_g17p(nir_builder *b, const void *key_)
+{
+   const struct agx_fs_epilog_key *key = key_;
+   if (key->link.sample_shading) {
+      /* The main fragment exported every sample's colours. Build the per-pixel
+       * epilog, then store and blend each sample from its own colours. */
+      struct agx_fs_epilog_key pixel = *key;
+      pixel.link.sample_shading = false;
+      pixel.defer_monolithic_msaa = true;
+      agx_nir_fs_epilog(b, &pixel);
+
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, key->link.loc_written,
+                                  key->link.size_32, key->link.colour_comps,
+                                  key->link.packed_colour);
+
+      NIR_PASS(_, b->shader, agx_nir_lower_to_per_sample);
+      NIR_PASS(_, b->shader, agx_nir_unroll_g17p_samples_layout,
+               key->nr_samples, &layout);
+      bool opt_progress;
+      do {
+         opt_progress = false;
+         NIR_PASS(opt_progress, b->shader, nir_opt_constant_folding);
+         NIR_PASS(opt_progress, b->shader, nir_opt_algebraic);
+      } while (opt_progress);
+      NIR_PASS(_, b->shader, agx_nir_hoist_g17p_zs_writes);
+   } else {
+      /* G17P's tile operations carry the live coverage register. With
+       * alpha-to-coverage, Apple's 2x/4x blended fragments therefore issue
+       * one masked tile load/store pair rather than cloning the blend once
+       * per sample. Keep the ordinary per-sample lowering for every other
+       * pixel-shaded epilog. */
+      struct agx_fs_epilog_key pixel = *key;
+      pixel.defer_monolithic_msaa = key->blend.alpha_to_coverage &&
+                                    key->nr_samples > 1;
+      agx_nir_fs_epilog(b, &pixel);
+   }
+
+   NIR_PASS(_, b->shader, agx_nir_lower_g17p_tile_samples, key->nr_samples);
+}
+
+/* Both API frontends use the same bounded register ABI for an unrolled main
+ * and its epilog. Keep layout selection and the register-file limit together.
+ */
+bool
+agx_nir_lower_g17p_sample_shading(nir_shader *nir,
+                                  struct agx_fs_epilog_link_info *link,
+                                  unsigned samples)
+{
+   if (samples != 2 && samples != 4)
+      return false;
+
+   struct agx_g17p_colour_layout layout;
+   agx_g17p_colour_layout_init(&layout, link->loc_written, link->size_32,
+                               link->colour_comps, false);
+   if (agx_g17p_sample_exports_end(&layout, samples) > AGX3B_NUM_REGS) {
+      NIR_PASS(_, nir, agx_nir_pack_g17p_colour_exports, link);
+      agx_g17p_colour_layout_init(&layout, link->loc_written, link->size_32,
+                                  link->colour_comps, true);
+   }
+   if (agx_g17p_sample_exports_end(&layout, samples) > AGX3B_NUM_REGS)
+      return false;
+
+   NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
+   NIR_PASS(_, nir, agx_nir_unroll_g17p_samples_layout, samples, &layout);
+   nir->info.fs.uses_sample_shading = false;
+   return true;
+}

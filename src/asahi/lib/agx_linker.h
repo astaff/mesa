@@ -13,6 +13,10 @@
 #include "nir_lower_blend.h"
 #include "util/macros.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct agx_g17p_graphics_template;
 
 struct agx_linked_shader {
@@ -41,6 +45,8 @@ struct agx_linked_shader {
    uint32_t scratch_size;
    uint32_t agx3_spectpr_scratch_size;
    uint16_t nr_gprs;
+   uint16_t g17p_emrt_heap_base;
+   uint16_t g17p_blend_constant_base;
 
    /* Apple's compiler ProgramVariant field 38 describes staging bytes,
     * independently of GPR count. Valid only for accounted-for staging paths.
@@ -381,6 +387,9 @@ bool agx_fs_epilog_may_discard(const struct agx_fs_epilog_link_info *link,
 void agx_nir_vs_prolog(struct nir_builder *b, const void *key_);
 void agx_nir_vs_prolog_raw(struct nir_builder *b, const void *key_);
 void agx_nir_fs_epilog(struct nir_builder *b, const void *key_);
+void agx_nir_fs_epilog_g17p(struct nir_builder *b, const void *key);
+bool agx_nir_lower_g17p_sample_shading(
+   nir_shader *nir, struct agx_fs_epilog_link_info *link, unsigned samples);
 void agx_nir_fs_prolog(struct nir_builder *b, const void *key_);
 
 bool agx_nir_gather_vs_inputs(nir_shader *s,
@@ -418,3 +427,7 @@ bool agx_nir_lower_g17p_1x_sample_shading(nir_shader *s);
 bool agx_nir_lower_fs_active_samples_to_register(nir_shader *s);
 
 bool agx_nir_lower_non_monolithic_uniforms(nir_shader *nir, unsigned nr);
+
+#ifdef __cplusplus
+} /* extern C */
+#endif

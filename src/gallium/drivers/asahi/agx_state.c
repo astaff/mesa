@@ -1713,6 +1713,18 @@ agx_nir_lower_point_sprite_zw(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+static struct agx_tilebuffer_layout
+agx_gallium_tilebuffer_layout(const struct agx_device *dev,
+                              const enum pipe_format *formats,
+                              unsigned count, unsigned samples, bool layered)
+{
+   const bool g17p = dev->chip == AGX_CHIP_G17P;
+   return agx_build_tilebuffer_layout_with_limits(
+      formats, count, samples, layered,
+      g17p ? AGX_G17P_MAX_BYTES_PER_SAMPLE : 0,
+      g17p ? 32768 : 0, g17p ? 2048 : 0);
+}
+
 /*
  * Compile a NIR shader. The only lowering left at this point is sysvals. The
  * shader key should have already been applied. agx_compile_variant may call
@@ -1722,7 +1734,9 @@ static struct agx_compiled_shader *
 agx_compile_nir(struct agx_device *dev, nir_shader *nir,
                 struct util_debug_callback *debug, mesa_shader_stage stage,
                 bool internal_kernel, bool terminal, bool secondary,
-                unsigned cf_base, BITSET_WORD *attrib_components_read)
+                unsigned cf_base, unsigned nr_samples,
+                const struct agx_fs_epilog_key *epilog,
+                BITSET_WORD *attrib_components_read)
 {
    struct agx_compiled_shader *compiled = CALLOC_STRUCT(agx_compiled_shader);
    compiled->stage = stage;
@@ -1743,6 +1757,7 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
          !(dev->chip == AGX_CHIP_G17P && stage == MESA_SHADER_FRAGMENT),
       .no_stop = !terminal,
       .secondary = secondary,
+      .g17p_emrt = epilog && epilog->native_spills,
        /* G17P binds the linked executable through a native Ioto program with
         * no executable preshader contract. Keep all stages monolithic,
         * including geometry/tessellation lowered to compute: `stage` still
@@ -1796,6 +1811,38 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       key.fs.cf_base = cf_base;
+      key.fs.nr_samples = nr_samples;
+   }
+
+   if (epilog) {
+      const struct agx_tilebuffer_layout tib = agx_build_tilebuffer_layout_with_limits(
+         epilog->rt_formats, ARRAY_SIZE(epilog->rt_formats), nr_samples, true,
+         epilog->max_sample_size_B, epilog->max_bytes_per_tile,
+         epilog->max_samples_per_tile);
+      for (unsigned rt = 0; rt < ARRAY_SIZE(epilog->rt_formats); ++rt) {
+         if (tib.logical_format[rt] != PIPE_FORMAT_NONE && !tib.spilled[rt])
+            BITSET_SET(key.g17p_tile_partitions, tib._offset_B[rt]);
+      }
+      if (BITSET_COUNT(key.g17p_tile_partitions) < 2)
+         BITSET_ZERO(key.g17p_tile_partitions);
+   }
+
+   if (key.g17p_emrt) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      nir_metadata_require(impl, nir_metadata_dominance);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if ((op == nir_intrinsic_store_local_pixel_agx ||
+                 op == nir_intrinsic_load_local_pixel_agx) &&
+                !nir_block_dominates(block, nir_impl_last_block(impl))) {
+               key.g17p_emrt = false;
+               mesa_loge("asahi: G17P eMRT has conditional resident tile access");
+            }
+         }
+      }
    }
 
    if (!agx_compile_shader_nir(nir, &key, &compiled->b)) {
@@ -1939,7 +1986,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
        * for the linker to splice and asking for one would drop the draw
        * outright. hk_shader.c does the same on the Vulkan side. Do it before
        * the epilog split, so the link key records the collapse too. */
-      if (dev->chip == AGX_CHIP_G17P && key->nr_samples == 1 &&
+      if (dev->chip == AGX_CHIP_G17P && key->nr_samples <= 1 &&
           nir->info.fs.uses_sample_shading) {
          NIR_PASS(_, nir, agx_nir_lower_g17p_1x_sample_shading);
       }
@@ -1977,8 +2024,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       }
 
       if (nir->info.fs.uses_fbfetch_output) {
-         struct agx_tilebuffer_layout tib = agx_build_tilebuffer_layout(
-            key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples,
+         struct agx_tilebuffer_layout tib = agx_gallium_tilebuffer_layout(
+            dev, key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples,
             true);
 
          if (dev->debug & AGX_DBG_SMALLTILE)
@@ -1998,6 +2045,22 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          /* Nothing is left for the linker to wrap. */
          nir->info.fs.uses_sample_shading = false;
          epilog_key.sample_shading = false;
+      } else if (nir->info.fs.uses_sample_shading &&
+                 dev->chip == AGX_CHIP_G17P) {
+         /* Use the same export layout and static sample copies as Vulkan.
+          * The epilog consumes each sample's exports in the matching order.
+          */
+         NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
+         if (!agx_nir_lower_g17p_sample_shading(nir, &epilog_key,
+                                                key->nr_samples)) {
+            mesa_loge("asahi: G17P per-sample colour exports exceed the register file");
+            struct agx_compiled_shader *failed = CALLOC_STRUCT(agx_compiled_shader);
+            failed->stage = so->type;
+            failed->so = so;
+            failed->failed = true;
+            ralloc_free(nir);
+            return failed;
+         }
       } else if (nir->info.fs.uses_sample_shading) {
          /* Ensure the sample ID is preserved in register */
          nir_builder b =
@@ -2021,7 +2084,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
 
    struct agx_compiled_shader *compiled = agx_compile_nir(
       dev, nir, &pctx->debug, so->type, false, so->type != MESA_SHADER_FRAGMENT,
-      false, 0, attrib_components_read);
+      false, 0, so->type == MESA_SHADER_FRAGMENT ? key_->fs.nr_samples : 0,
+      NULL, attrib_components_read);
    compiled->g17p_custom_border_emulation = custom_borders;
 
    if (so->type == MESA_SHADER_FRAGMENT) {
@@ -2040,14 +2104,14 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
    /* Compile auxiliary programs */
    if (gs_count) {
       compiled->gs_count = agx_compile_nir(
-         dev, gs_count, &pctx->debug, so->type, false, true, false, 0, NULL);
+         dev, gs_count, &pctx->debug, so->type, false, true, false, 0, 0, NULL, NULL);
       compiled->gs_count->so = so;
    }
 
    if (pre_gs) {
       compiled->pre_gs =
          agx_compile_nir(dev, pre_gs, &pctx->debug, MESA_SHADER_COMPUTE, false,
-                         true, false, 0, NULL);
+                         true, false, 0, 0, NULL, NULL);
    }
 
    if (gs_copy) {
@@ -2068,7 +2132,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
 
       compiled->gs_copy =
          agx_compile_nir(dev, gs_copy, &pctx->debug, MESA_SHADER_GEOMETRY,
-                         false, true, false, 0, NULL);
+                         false, true, false, 0, 0, NULL, NULL);
       compiled->gs_copy->so = so;
       compiled->gs_copy->stage = so->type;
       compiled->gs_copy->uvs = uvs;
@@ -2329,6 +2393,9 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, agx_nir_lower_sample_intrinsics, true);
+      so->info.uses_sample_shading = nir->info.fs.uses_sample_shading;
+      so->info.needs_sample_count = dev->chip == AGX_CHIP_G17P &&
+                                    agx_nir_needs_sample_count(nir);
    }
 
    so->type = nir->info.stage;
@@ -2683,12 +2750,9 @@ build_fs_prolog(nir_builder *b, const void *key)
  * resolving it yields a quarter of the drawn colour.
  */
 static void
-build_g17p_fs_epilog(nir_builder *b, const void *key_)
+build_g17p_fs_epilog(nir_builder *b, const void *key)
 {
-   const struct agx_fs_epilog_key *key = key_;
-   agx_nir_fs_epilog(b, key);
-
-   NIR_PASS(_, b->shader, agx_nir_lower_g17p_tile_samples, key->nr_samples);
+   agx_nir_fs_epilog_g17p(b, key);
 }
 
 static struct agx_linked_shader *
@@ -2760,6 +2824,11 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
                       key->nr_samples_shaded)) {
       ralloc_free(linked);
       return NULL;
+   }
+
+   if (so->type == MESA_SHADER_FRAGMENT) {
+      linked->g17p_emrt_heap_base = key->epilog.fs.emrt_heap_base;
+      linked->g17p_blend_constant_base = key->epilog.fs.blend_constant_base;
    }
 
    /* Cache the fast linked program */
@@ -2988,7 +3057,8 @@ agx_update_fs(struct agx_batch *batch)
    /* A fragment shader that runs per sample is unrolled over the sample count
     * when it is compiled -- G17P has no loop to wrap it in -- so the count
     * belongs in its variant key, exactly as a tilebuffer fetch's does. */
-   if (ctx->stage[MESA_SHADER_FRAGMENT].shader->info.uses_fbfetch ||
+   if (ctx->stage[MESA_SHADER_FRAGMENT].shader->info.needs_sample_count ||
+       ctx->stage[MESA_SHADER_FRAGMENT].shader->info.uses_fbfetch ||
        ctx->stage[MESA_SHADER_FRAGMENT].shader->info.uses_sample_shading) {
       key.nr_samples = nr_samples;
    }
@@ -3005,6 +3075,12 @@ agx_update_fs(struct agx_batch *batch)
    /* Fast link with prolog/epilog */
    bool msaa = ctx->rast->base.multisample;
    unsigned sample_mask = ctx->sample_mask & BITFIELD_MASK(nr_samples);
+   const bool nontrivial_force_early =
+      ctx->fs->b.info.early_fragment_tests &&
+      (ctx->fs->b.info.writes_sample_mask ||
+       (ctx->fs->so && ctx->fs->so->info.writes_memory));
+   const bool defer_api_sample_mask = dev->chip == AGX_CHIP_G17P && msaa &&
+      sample_mask != BITFIELD_MASK(nr_samples) && !nontrivial_force_early;
 
    struct agx_fast_link_key link_key = {
       .prolog.fs.statistics =
@@ -3019,16 +3095,24 @@ agx_update_fs(struct agx_batch *batch)
             MESA_PRIM_TRIANGLES,
 
       .prolog.fs.api_sample_mask =
-         (msaa && nr_samples > 1 && sample_mask != BITFIELD_MASK(nr_samples))
+         (msaa && nr_samples > 1 && sample_mask != BITFIELD_MASK(nr_samples) &&
+          !defer_api_sample_mask)
             ? sample_mask
             : 0xff,
 
+      .prolog.fs.nr_samples = dev->chip == AGX_CHIP_G17P ? nr_samples : 0,
       .epilog.fs.nr_samples = nr_samples,
+      .epilog.fs.max_sample_size_B = batch->tilebuffer_layout.max_sample_size_B,
+      .epilog.fs.max_bytes_per_tile = batch->tilebuffer_layout.max_bytes_per_tile,
+      .epilog.fs.max_samples_per_tile = batch->tilebuffer_layout.max_samples_per_tile,
+      .epilog.fs.defer_api_sample_mask = defer_api_sample_mask,
+      .epilog.fs.api_sample_mask = sample_mask,
       .epilog.fs.link = ctx->fs->epilog_key,
       .epilog.fs.force_small_tile = dev->debug & AGX_DBG_SMALLTILE,
 
       .main = ctx->fs,
-      .nr_samples_shaded = ctx->fs->epilog_key.sample_shading ? nr_samples : 0,
+      .nr_samples_shaded = dev->chip != AGX_CHIP_G17P &&
+                            ctx->fs->epilog_key.sample_shading ? nr_samples : 0,
    };
    agx_fs_epilog_apply_device_policy(dev->chip, &link_key.epilog.fs);
 
@@ -3056,6 +3140,22 @@ agx_update_fs(struct agx_batch *batch)
       return true;
    }
 
+   link_key.epilog.fs.native_spills = dev->chip == AGX_CHIP_G17P &&
+                                      agx_tilebuffer_spills(&batch->tilebuffer_layout);
+   if (link_key.epilog.fs.native_spills) {
+      uint16_t base;
+      if (!agx_g17p_fragment_blend_constant_base(ctx->fs, &base) ||
+          ALIGN_POT(base, 4) > 512 - 12) {
+         mesa_loge("asahi: G17P spill table exceeds the native uniform file");
+         ctx->linked.fs = NULL;
+         return true;
+      }
+      link_key.epilog.fs.emrt_heap_base = ALIGN_POT(base, 4);
+      link_key.epilog.fs.blend_constant_base =
+         link_key.epilog.fs.emrt_heap_base + 4;
+      link_key.epilog.fs.link.rt_spill_base = 0;
+   }
+
    /* Normalize */
    if (!agx_tilebuffer_spills(&batch->tilebuffer_layout))
       link_key.epilog.fs.link.rt_spill_base = 0;
@@ -3079,10 +3179,6 @@ agx_update_fs(struct agx_batch *batch)
    link_key.epilog.fs.blend.alpha_to_coverage &= msaa;
 
    /* The main shader must not run tests if the epilog will */
-   const bool nontrivial_force_early =
-      ctx->fs->b.info.early_fragment_tests &&
-      (ctx->fs->b.info.writes_sample_mask ||
-       (ctx->fs->so && ctx->fs->so->info.writes_memory));
    bool epilog_discards = agx_fs_epilog_may_discard(
       &link_key.epilog.fs.link,
       link_key.epilog.fs.blend.alpha_to_coverage, nontrivial_force_early);
@@ -3326,11 +3422,28 @@ agx_build_meta_shader_internal(struct agx_context *ctx,
       NIR_PASS(_, b.shader, agx_nir_lower_multisampled_image_store);
    }
 
+   /* Match the compiler's sample protocol to the epilog's tile operands.
+    * Preprocessing may expose literal masks while unrolling a sample loop;
+    * lower them after that transformation, as the Vulkan path does.
+    */
+   unsigned nr_samples = 0;
+   if (builder == build_g17p_fs_epilog) {
+      const struct agx_fs_epilog_key *fs = data;
+      nr_samples = fs->nr_samples;
+      if (!fs->link.sample_shading)
+         NIR_PASS(_, b.shader, agx_nir_hoist_g17p_zs_writes);
+      NIR_PASS(_, b.shader, agx_nir_lower_g17p_tile_samples, nr_samples);
+   } else if (builder == build_fs_prolog && dev->chip == AGX_CHIP_G17P) {
+      nr_samples = ((const struct agx_fs_prolog_key *)data)->nr_samples;
+   }
+
    struct agx_compiled_shader *shader = agx_compile_nir(
-      dev, b.shader, NULL, MESA_SHADER_COMPUTE, internal_kernel,
-      !prolog && !(b.shader->info.stage == MESA_SHADER_FRAGMENT &&
+      dev, b.shader, NULL, b.shader->info.stage, internal_kernel,
+      !prolog && !(dev->chip != AGX_CHIP_G17P &&
+                   b.shader->info.stage == MESA_SHADER_FRAGMENT &&
                    b.shader->info.fs.uses_sample_shading),
-      prolog || epilog, cf_base, NULL);
+      prolog || epilog, cf_base, nr_samples,
+      builder == build_g17p_fs_epilog ? data : NULL, NULL);
 
    ralloc_free(b.shader);
 
@@ -3478,7 +3591,7 @@ agx_upload_spilled_rt_descriptors(void *out, struct agx_batch *batch,
 static void
 agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
                            const struct pipe_image_view *view,
-                           unsigned texture_index)
+                           unsigned texture_index, bool emrt)
 {
    STATIC_ASSERT(AGX_G17P_IMAGE_ATOMIC_SW_OFFSET + sizeof(uint64_t) <=
                  3 * AGX_GALLIUM_DESCRIPTOR_AGX3_SIZE);
@@ -3508,7 +3621,7 @@ agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
              sizeof(address));
       return;
    }
-   if (!rsrc->layout.writeable_image)
+   if (!rsrc->layout.writeable_image && !emrt)
       return;
 
    const struct ail_layout *layout = &rsrc->layout;
@@ -3533,6 +3646,29 @@ agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
           linear ? 1 : layout->tilesize_el[view->u.tex.level].height_el,
           layout->layer_stride_B, samples, &sw))
       memcpy(tail + AGX_G17P_IMAGE_ATOMIC_SW_OFFSET - base, &sw, sizeof(sw));
+}
+
+static uint64_t
+agx_upload_g17p_spilled_rt_table(struct agx_batch *batch, const void *pairs,
+                                 unsigned texture_base)
+{
+   uint8_t entries[PIPE_MAX_COLOR_BUFS][AGX_G17P_EMRT_DESCRIPTOR_SIZE] = {0};
+   for (unsigned rt = 0; rt < batch->key.nr_cbufs; ++rt) {
+      if (!batch->tilebuffer_layout.spilled[rt])
+         continue;
+      const struct pipe_surface *surf = &batch->key.cbufs[rt];
+      if (!surf->texture)
+         return 0;
+      struct pipe_image_view view = image_view_for_surface(surf);
+      const uint32_t texture_index = texture_base + 2 * rt;
+      memcpy(entries[rt], (const uint8_t *)pairs + 64 * rt, 64);
+      agx_g17p_fill_storage_tail(entries[rt] + 64, 32, &view, texture_index, true);
+      memcpy(entries[rt] + AGX_G17P_SAMPLED_HEAP_INDEX_OFFSET,
+             &texture_index, sizeof(texture_index));
+   }
+   const uint64_t address = agx_pool_upload_aligned(
+      &batch->pool, entries, batch->key.nr_cbufs * sizeof(entries[0]), 32);
+   return address ? agx_pool_upload_aligned(&batch->pool, &address, 8, 8) : 0;
 }
 
 static void
@@ -3650,7 +3786,7 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
          agx_native_descriptor_rejected(dev, "storage PBE");
 
       if (tail)
-         agx_g17p_fill_storage_tail(tail, descriptor_size, view, image);
+         agx_g17p_fill_storage_tail(tail, descriptor_size, view, image, false);
    }
 
    if (stage == MESA_SHADER_FRAGMENT &&
@@ -3661,6 +3797,12 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
          (descriptor_size * agx_nr_tex_descriptors_without_spilled_rts(cs));
 
       agx_upload_spilled_rt_descriptors(out, batch, descriptor_generation);
+      if (dev->chip == AGX_CHIP_G17P) {
+         batch->g17p_emrt_heap = agx_upload_g17p_spilled_rt_table(
+            batch, out, agx_nr_tex_descriptors_without_spilled_rts(cs));
+         if (!batch->g17p_emrt_heap)
+            agx_native_descriptor_rejected(dev, "native spilled-RT table");
+      }
    }
 
    batch->texture_count[stage] = nr_tex_descriptors;
@@ -4043,10 +4185,9 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          push->uniform == AGX_ABI_FUNI_BLEND_R && push->length == 8;
 
       if (blend_constants) {
-         uint16_t blend_base;
-         if (!agx_g17p_fragment_blend_constant_base(cs, &blend_base))
+         if (!linked->g17p_blend_constant_base)
             return 0;
-         start = blend_base;
+         start = linked->g17p_blend_constant_base;
       } else if (resource_pair && start < 8) {
          const unsigned end = start + length;
          if (end <= 8)
@@ -4089,6 +4230,16 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          .start_halfs = rodata->base_uniform,
          .size_halfs = rodata->size_16,
          .address = cs->bo->va->addr + rodata->offset,
+      };
+   }
+
+   if (stage == MESA_SHADER_FRAGMENT && linked->g17p_emrt_heap_base) {
+      if (!batch->g17p_emrt_heap || count == ARRAY_SIZE(ranges))
+         return 0;
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = linked->g17p_emrt_heap_base,
+         .size_halfs = 4,
+         .address = batch->g17p_emrt_heap,
       };
    }
 
@@ -4964,7 +5115,9 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
       if (surf->texture == NULL)
          continue;
 
-      if (store) {
+      if (dev->chip == AGX_CHIP_G17P && batch->tilebuffer_layout.spilled[rt]) {
+         key.op[rt] = AGX_BG_EOT_NONE;
+      } else if (store) {
          /* TODO: Suppress stores to discarded render targets */
          key.op[rt] = AGX_EOT_STORE;
       } else if (batch->tilebuffer_layout.spilled[rt] && partial_render) {
@@ -4993,10 +5146,22 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
    }
 
    if (dev->chip == AGX_CHIP_G17P) {
+      if (agx_tilebuffer_spills(&key.tib)) {
+         bool active = false;
+         for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+            active |= key.op[rt] != AGX_BG_EOT_NONE;
+            if (key.tib.spilled[rt]) {
+               key.tib.logical_format[rt] = PIPE_FORMAT_NONE;
+               key.tib.spilled[rt] = false;
+               key.tib._offset_B[rt] = 0;
+            }
+         }
+         if (active)
+            return agx_g17p_build_mixed_bg_eot(batch, &key, store);
+      }
       /* Match each admitted tile layout to its complete background/EOT
        * program and argument layout. */
-      if (!agx_gallium_g17p_tile_layout_supported(
-             &batch->tilebuffer_layout)) {
+      if (!agx_gallium_g17p_tile_layout_supported(&key.tib)) {
          const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
          mesa_loge("asahi: G17P tile layout is unproven: %u samples, "
                    "%u B/sample, %u px tile, layered=%u",
@@ -5664,8 +5829,8 @@ agx_batch_init_state(struct agx_batch *batch)
       formats[i] = batch->key.cbufs[i].format;
    }
 
-   batch->tilebuffer_layout = agx_build_tilebuffer_layout(
-      formats, batch->key.nr_cbufs,
+   batch->tilebuffer_layout = agx_gallium_tilebuffer_layout(
+      agx_device(batch->ctx->base.screen), formats, batch->key.nr_cbufs,
       util_framebuffer_get_num_samples(&batch->key),
       util_framebuffer_get_num_layers(&batch->key) > 1);
 

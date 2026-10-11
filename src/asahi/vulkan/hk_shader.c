@@ -3000,48 +3000,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          assert(key && (key->fs.g17p_samples == 2 ||
                         key->fs.g17p_samples == 4));
 
-         struct agx_fs_epilog_link_info *link = &shader->info.fs.epilog_key;
-         struct agx_g17p_colour_layout layout;
-
-         /* Pack the colours only where the ABI's slots do not fit the
-          * register file, which hk_g17p_unrolls_sample_shading() has already
-          * admitted this shader on. Every shape that fits keeps the layout
-          * and the code it has today. */
-         agx_g17p_colour_layout_init(&layout, link->loc_written,
-                                     link->size_32, link->colour_comps,
-                                     false);
-
-         if (agx_g17p_sample_exports_end(&layout, key->fs.g17p_samples) >
-             AGX3B_NUM_REGS) {
-            NIR_PASS(_, nir, agx_nir_pack_g17p_colour_exports, link);
-            agx_g17p_colour_layout_init(&layout, link->loc_written,
-                                        link->size_32, link->colour_comps,
-                                        true);
-         }
-
-         /* hk_g17p_unrolls_sample_shading() charges every location it could
-          * not read exactly the ABI's whole slot, so the layout the split
-          * recorded is never larger than the one it admitted. Fail the shader
-          * rather than name export registers outside the file if that ever
-          * stops holding: halves 192..255 fit the encoding but crash the
-          * co-processor. */
-         if (agx_g17p_sample_exports_end(&layout, key->fs.g17p_samples) >
-             AGX3B_NUM_REGS) {
+         if (!agx_nir_lower_g17p_sample_shading(
+                nir, &shader->info.fs.epilog_key, key->fs.g17p_samples)) {
             assert(!"the gate admitted a fragment whose exports do not fit");
             ralloc_free(nir);
             return vk_errorf(dev, VK_ERROR_UNKNOWN,
-                             "G17P: %u-sample colour exports need %u halves "
-                             "of a %u-half register file",
-                             key->fs.g17p_samples,
-                             agx_g17p_sample_exports_end(&layout,
-                                                         key->fs.g17p_samples),
-                             (unsigned)AGX3B_NUM_REGS);
+                             "G17P: %u-sample colour exports exceed the register file",
+                             key->fs.g17p_samples);
          }
-
-         NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
-         NIR_PASS(_, nir, agx_nir_unroll_g17p_samples_layout,
-                  key->fs.g17p_samples, &layout);
-         nir->info.fs.uses_sample_shading = false;
       } else if (nir->info.fs.uses_sample_shading) {
          /* Ensure the sample mask is preserved in register */
          nir_builder b =

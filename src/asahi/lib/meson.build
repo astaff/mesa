@@ -187,12 +187,14 @@ if with_tests
       files(
         'tests/test-packing.cpp',
         'tests/test-tilebuffer.cpp',
+        'tests/test-g17p-msaa-epilog.cpp',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies: [
         idep_gtest, idep_agx_pack, idep_mesautil, idep_nir,
       ],
+      include_directories: [inc_asahi],
       link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
     ),
     suite : ['asahi'],

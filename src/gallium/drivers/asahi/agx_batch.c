@@ -156,6 +156,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_resolve_reload = key->resolve != NULL;
    batch->seqnum = ++ctx->batches.seqnum;
    batch->g17p_fragment_program = 0;
+   batch->g17p_emrt_heap = 0;
    batch->g17p_fragment_shader = NULL;
    batch->g17p_fragment_linked = NULL;
 

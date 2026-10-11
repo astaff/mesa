@@ -15,6 +15,9 @@
 #include "util/u_tristate.h"
 #include "shader_enums.h"
 
+/* G17P's register file: halves 0..191. */
+#define AGX3B_NUM_REGS (192)
+
 struct agx_cf_binding {
    /* Base coefficient register */
    uint8_t cf_base;

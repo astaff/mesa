@@ -1,0 +1,198 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#include <gtest/gtest.h>
+#include "asahi/compiler/agx_compile.h"
+#include "compiler/nir/nir_builder.h"
+#include "agx_tilebuffer.h"
+#include "agx_linker.h"
+extern "C" {
+#include "asahi/compiler/agx_nir.h"
+#include "asahi/compiler/agx_debug.h"
+}
+
+
+class G17PMSAAEpilog : public ::testing::Test {
+ protected:
+   G17PMSAAEpilog() { glsl_type_singleton_init_or_ref(); }
+   ~G17PMSAAEpilog() { glsl_type_singleton_decref(); }
+};
+
+TEST_F(G17PMSAAEpilog, PerSampleColourImportsCompile)
+{
+   for (unsigned samples : {2u, 4u}) {
+      for (unsigned targets : {1u, 4u}) {
+         for (bool blend : {false, true}) {
+            for (bool depth : {false, true}) {
+               for (unsigned mask : {1u, 5u, 15u}) {
+                  SCOPED_TRACE(::testing::Message() << samples << " samples, "
+                     << targets << " targets, blend=" << blend << " depth="
+                     << depth << " mask=" << mask);
+                  agx_fs_epilog_key fs = {};
+                  fs.nr_samples = samples;
+                  fs.max_sample_size_B = AGX_G17P_MAX_BYTES_PER_SAMPLE;
+                  fs.max_bytes_per_tile = 32768;
+                  fs.max_samples_per_tile = 2048;
+                  fs.link.loc_written = (uint8_t)BITFIELD_MASK(targets);
+                  fs.link.size_32 = (uint8_t)BITFIELD_MASK(targets);
+                  fs.link.colour_comps = BITFIELD_MASK(4 * targets);
+                  fs.link.sample_shading = true;
+                  fs.link.write_z = depth;
+                  fs.defer_api_sample_mask = true;
+                  fs.api_sample_mask = mask & BITFIELD_MASK(samples);
+                  agx_fs_epilog_apply_device_policy(AGX_CHIP_G17P, &fs);
+                  for (unsigned rt = 0; rt < targets; ++rt) {
+                     fs.rt_formats[rt] = PIPE_FORMAT_R8G8B8A8_UNORM;
+                     fs.remap[rt] = rt;
+                     fs.blend.rt[rt].colormask = 0xf;
+                     fs.blend.rt[rt].mode = agx_pack_blend_standard(
+                        PIPE_BLEND_ADD, blend ? PIPE_BLENDFACTOR_SRC_ALPHA : PIPE_BLENDFACTOR_ONE,
+                        blend ? PIPE_BLENDFACTOR_INV_SRC_ALPHA : PIPE_BLENDFACTOR_ZERO,
+                        PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+                  }
+                  nir_builder b = nir_builder_init_simple_shader(
+                     MESA_SHADER_FRAGMENT, &agx_nir_options, "G17P sample epilog");
+                  agx_nir_fs_epilog_g17p(&b, &fs);
+                  agx_preprocess_nir(b.shader);
+                  agx_nir_lower_g17p_tile_samples(b.shader, samples);
+                  agx_shader_key key = {};
+                  key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+                  key.dev.chip = AGX_CHIP_G17P;
+                  key.no_preamble = true;
+                  key.secondary = true;
+                  key.fs.nr_samples = samples;
+                  for (unsigned rt = 0; rt < targets; ++rt)
+                     BITSET_SET(key.g17p_tile_partitions, 4 * rt);
+                  agx_shader_part part = {};
+                  EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part)) << agx_last_compile_refusal();
+                  free(part.binary);
+                  ralloc_free(b.shader);
+               }
+            }
+         }
+      }
+   }
+}
+
+TEST_F(G17PMSAAEpilog, PerSampleMainExportsCompile)
+{
+   for (unsigned samples : {2u, 4u}) {
+      for (unsigned targets : {1u, 4u, 8u}) {
+         for (unsigned components : {2u, 4u}) {
+            SCOPED_TRACE(::testing::Message() << samples << " samples, "
+               << targets << " targets, " << components << " components");
+            nir_builder b = nir_builder_init_simple_shader(
+               MESA_SHADER_FRAGMENT, &agx_nir_options, "G17P sample main");
+            b.shader->info.fs.uses_sample_shading = true;
+            nir_def *sample = nir_u2f32(&b, nir_load_sample_id(&b));
+            nir_def *color = components == 2 ? nir_vec2(&b, sample, sample)
+               : nir_vec4(&b, sample, sample, sample, sample);
+            for (unsigned rt = 0; rt < targets; ++rt) {
+               nir_intrinsic_instr *store =
+                  nir_intrinsic_instr_create(b.shader, nir_intrinsic_store_output);
+               store->num_components = components;
+               store->src[0] = nir_src_for_ssa(color);
+               store->src[1] = nir_src_for_ssa(nir_imm_int(&b, 0));
+               nir_intrinsic_set_base(store, rt);
+               nir_intrinsic_set_write_mask(store, (1u << components) - 1);
+               nir_intrinsic_set_src_type(store, nir_type_float32);
+               nir_io_semantics sem = {};
+               sem.location = FRAG_RESULT_DATA0 + rt;
+               sem.num_slots = 1;
+               nir_intrinsic_set_io_semantics(store, sem);
+               nir_builder_instr_insert(&b, &store->instr);
+               b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + rt);
+            }
+            agx_fs_epilog_link_info link = {};
+            agx_nir_lower_fs_output_to_epilog_for_device(b.shader, AGX_CHIP_G17P, &link);
+            bool fits = agx_nir_lower_g17p_sample_shading(b.shader, &link, samples);
+            if (samples == 4 && targets == 8 && components == 4) {
+               EXPECT_FALSE(fits);
+               ralloc_free(b.shader);
+               continue;
+            }
+            ASSERT_TRUE(fits);
+            EXPECT_TRUE(link.sample_shading);
+            EXPECT_FALSE(b.shader->info.fs.uses_sample_shading);
+            if (samples == 4 && targets == 8)
+               EXPECT_TRUE(link.packed_colour);
+            agx_preprocess_nir(b.shader);
+            agx_shader_key key = {};
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+            key.dev.chip = AGX_CHIP_G17P;
+            key.no_preamble = true;
+            key.no_stop = true;
+            key.fs.nr_samples = samples;
+            agx_shader_part part = {};
+            EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part)) << agx_last_compile_refusal();
+            free(part.binary);
+            ralloc_free(b.shader);
+         }
+      }
+   }
+}
+
+TEST_F(G17PMSAAEpilog, NativeSpillEpilogsCompile)
+{
+   for (unsigned samples : {2u, 4u}) {
+      for (unsigned targets : {4u, 8u}) {
+         for (bool blend : {false, true}) {
+            agx_fs_epilog_key fs = {};
+            fs.nr_samples = samples;
+            fs.max_sample_size_B = AGX_G17P_MAX_BYTES_PER_SAMPLE;
+            fs.max_bytes_per_tile = 32768;
+            fs.max_samples_per_tile = 2048;
+            fs.native_spills = true;
+            fs.emrt_heap_base = 16;
+            fs.blend_constant_base = 20;
+            fs.link.loc_written = (uint8_t)BITFIELD_MASK(targets);
+            fs.link.size_32 = (uint8_t)BITFIELD_MASK(targets);
+            fs.link.colour_comps = BITFIELD_MASK(4 * targets);
+            fs.link.write_z = true;
+            fs.defer_api_sample_mask = true;
+            fs.api_sample_mask = 5 & BITFIELD_MASK(samples);
+            agx_fs_epilog_apply_device_policy(AGX_CHIP_G17P, &fs);
+            for (unsigned rt = 0; rt < targets; ++rt) {
+               fs.rt_formats[rt] = PIPE_FORMAT_R32G32B32A32_FLOAT;
+               fs.remap[rt] = rt;
+               fs.blend.rt[rt].colormask = 0xf;
+               fs.blend.rt[rt].mode = agx_pack_blend_standard(
+                  PIPE_BLEND_ADD,
+                  blend ? PIPE_BLENDFACTOR_CONST_COLOR : PIPE_BLENDFACTOR_ONE,
+                  blend ? PIPE_BLENDFACTOR_INV_CONST_COLOR : PIPE_BLENDFACTOR_ZERO,
+                  PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+            }
+            const agx_tilebuffer_layout tib = agx_build_tilebuffer_layout_with_limits(
+               fs.rt_formats, targets, samples, false, fs.max_sample_size_B,
+               fs.max_bytes_per_tile, fs.max_samples_per_tile);
+            if (!agx_tilebuffer_spills(&tib))
+               continue;
+            SCOPED_TRACE(::testing::Message() << samples << " samples, "
+                         << targets << " targets, blend=" << blend);
+            nir_builder b = nir_builder_init_simple_shader(
+               MESA_SHADER_FRAGMENT, &agx_nir_options, "G17P spilled MRT epilog");
+            agx_nir_fs_epilog_g17p(&b, &fs);
+            agx_preprocess_nir(b.shader);
+            agx_nir_hoist_g17p_zs_writes(b.shader);
+            agx_nir_lower_g17p_tile_samples(b.shader, samples);
+            agx_shader_key key = {};
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+            key.dev.chip = AGX_CHIP_G17P;
+            key.no_preamble = true;
+            key.secondary = true;
+            key.g17p_emrt = true;
+            for (unsigned rt = 0; rt < targets; ++rt) {
+               if (!tib.spilled[rt])
+                  BITSET_SET(key.g17p_tile_partitions, tib._offset_B[rt]);
+            }
+            if (BITSET_COUNT(key.g17p_tile_partitions) < 2)
+               BITSET_ZERO(key.g17p_tile_partitions);
+            key.fs.nr_samples = samples;
+            agx_shader_part part = {};
+            EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part)) << agx_last_compile_refusal();
+            free(part.binary);
+            ralloc_free(b.shader);
+         }
+      }
+   }
+}
