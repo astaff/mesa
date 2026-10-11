@@ -3226,7 +3226,8 @@ agx_update_fs(struct agx_batch *batch)
    /* The main shader must not run tests if the epilog will */
    bool epilog_discards = agx_fs_epilog_may_discard(
       &link_key.epilog.fs.link,
-      link_key.epilog.fs.blend.alpha_to_coverage, nontrivial_force_early);
+      link_key.epilog.fs.blend.alpha_to_coverage, nontrivial_force_early) ||
+      defer_api_sample_mask;
    batch->uniforms.no_epilog_discard = !epilog_discards ? ~0 : 0;
 
    bool prolog_discards = (link_key.prolog.fs.api_sample_mask != 0xff ||

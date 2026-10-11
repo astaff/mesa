@@ -1292,6 +1292,8 @@ check_discard_main_sample_key(struct pipe_context *pctx)
    nir_builder fs = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "discard main raster sample key");
    fs.shader->info.internal = false;
+   const bool force_early = getenv("AGX_TEST_MAIN_SAMPLE_EARLY") != NULL;
+   fs.shader->info.fs.early_fragment_tests = force_early;
    nir_def *x = nir_channel(&fs, nir_load_frag_coord(&fs), 0);
    nir_demote_if(&fs, nir_flt(&fs, x, nir_imm_float(&fs, 8.0)));
    nir_store_output(&fs, nir_imm_vec4(&fs, 1, 0, 0, 0.5), nir_imm_int(&fs, 0),
@@ -1324,8 +1326,8 @@ check_discard_main_sample_key(struct pipe_context *pctx)
    const unsigned sequence[] = {1, 4, 2, 1};
    struct agx_compiled_shader *variants[5] = {0};
    bool ok = true;
-   for (unsigned alpha = 0; alpha < 2; ++alpha) {
-      struct pipe_blend_state blend = {.rt[0].colormask = 0xf, .alpha_to_coverage = alpha};
+   for (unsigned alpha = 0; alpha < 4; ++alpha) {
+      struct pipe_blend_state blend = {.rt[0].colormask = 0xf, .alpha_to_coverage = alpha & 1};
       void *blend_cso = pctx->create_blend_state(pctx, &blend);
       pctx->bind_blend_state(pctx, blend_cso);
       for (unsigned step = 0; step < ARRAY_SIZE(sequence); ++step) {
@@ -1343,6 +1345,9 @@ check_discard_main_sample_key(struct pipe_context *pctx)
             .cbufs[0] = {.texture = color, .format = templ.format},
          };
          pctx->set_framebuffer_state(pctx, &fb);
+         const unsigned full_mask = (1u << samples) - 1;
+         const unsigned mask = (alpha & 2) && samples > 1 ? (samples == 4 ? 5u : 2u) : full_mask;
+         pctx->set_sample_mask(pctx, mask);
          const struct pipe_draw_info info = {.mode = MESA_PRIM_TRIANGLES, .instance_count = 1};
          const struct pipe_draw_start_count_bias draw = {.count = 3};
          pctx->draw_vbo(pctx, &info, 0, NULL, &draw, 1);
@@ -1358,6 +1363,11 @@ check_discard_main_sample_key(struct pipe_context *pctx)
                          ctx->skipped_no_program == 0 && ctx->batch && ctx->batch->draws;
          if (variants[samples]) phase_ok &= variants[samples] == ctx->fs;
          variants[samples] = ctx->fs;
+         const bool main_may_test = force_early || (!(alpha & 1) && mask == full_mask);
+         const bool actual_main_test = ctx->batch && ctx->batch->uniforms.no_epilog_discard;
+         phase_ok &= actual_main_test == main_may_test;
+         printf("test-owner alpha=%u mask=%x samples=%u main=%u expected=%u\n",
+                alpha & 1, mask, samples, actual_main_test, main_may_test);
          printf("sample-key alpha=%u samples=%u actual=%u main_size=%u result=%s\n",
                 alpha, samples, keyed_samples, ctx->fs ? ctx->fs->b.info.main_size : 0,
                 phase_ok ? "PASS" : "FAIL");
