@@ -1633,20 +1633,8 @@ agx_bind_vertex_elements_state(struct pipe_context *pctx, void *cso)
 
 DERIVE_HASH_TABLE(asahi_vs_shader_key);
 DERIVE_HASH_TABLE(asahi_fs_shader_key);
+DERIVE_HASH_TABLE(asahi_cs_shader_key);
 DERIVE_HASH_TABLE(agx_fast_link_key);
-
-/* No compute variants */
-static uint32_t
-asahi_cs_shader_key_hash(const void *key)
-{
-   return 0;
-}
-
-static bool
-asahi_cs_shader_key_equal(const void *a, const void *b)
-{
-   return true;
-}
 
 /* Dynamic lowered I/O version of nir_lower_clip_halfz */
 static bool
@@ -1915,7 +1903,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       ((so->type == MESA_SHADER_FRAGMENT && key_->fs.custom_borders) ||
        ((so->type == MESA_SHADER_VERTEX ||
          so->type == MESA_SHADER_TESS_EVAL) &&
-        key_->vs.custom_borders));
+        key_->vs.custom_borders) ||
+       (so->type == MESA_SHADER_COMPUTE && key_->cs.custom_borders));
    if (custom_borders)
       NIR_PASS(_, nir, agx_nir_lower_custom_border_g17p);
 
@@ -2188,6 +2177,8 @@ agx_get_shader_variant(struct agx_screen *screen, struct pipe_context *pctx,
    } else if (so->type == MESA_SHADER_VERTEX ||
               so->type == MESA_SHADER_TESS_EVAL) {
       memcpy(cloned_key, key, sizeof(struct asahi_vs_shader_key));
+   } else if (so->type == MESA_SHADER_COMPUTE) {
+      memcpy(cloned_key, key, sizeof(struct asahi_cs_shader_key));
    } else {
       /* No key */
    }
@@ -3568,8 +3559,6 @@ agx_gallium_g17p_tile_layout_supported(struct agx_tilebuffer_layout *tib)
     * that allocation through the same bounded RT0 contract Honeykrisp uses. */
    struct agx_tilebuffer_layout physical = *tib;
    physical.layered = false;
-   if (tib->layered && agx_g17p_rgba8_mrt_mask(&physical) > 1)
-      return false;
    return agx_g17p_rt0_tile_layout_supported(&physical);
 }
 
@@ -5234,6 +5223,12 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
 
       const enum agx_g17p_mrt_layout mrt =
          agx_g17p_classify_mrt(&key.tib);
+      if (key.tib.layered && mrt == AGX_G17P_MRT_MIXED) {
+         for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
+            if (key.op[rt] != AGX_BG_EOT_NONE)
+               return agx_g17p_build_mixed_bg_eot(batch, &key, store);
+         }
+      }
       const bool wboit_mrt =
          !key.tib.layered && mrt == AGX_G17P_MRT_WBOIT;
       const bool rgba8_mrt =
@@ -8494,7 +8489,8 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
          if (!cs->g17p_texture_resources ||
              !batch->stage_uniforms[stage].texture_base ||
              !batch->samplers[stage] ||
-             batch->ctx->stage[stage].custom_borders)
+             (batch->ctx->stage[stage].custom_borders &&
+              !cs->g17p_custom_border_emulation))
             agx_native_descriptor_rejected(dev,
                                            "compute texture resources");
 
@@ -8640,9 +8636,13 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    struct agx_uncompiled_shader *uncompiled =
       ctx->stage[MESA_SHADER_COMPUTE].shader;
 
-   /* There is exactly one variant, get it */
+   union asahi_shader_key key = {
+      .cs.custom_borders =
+         agx_device(pipe->screen)->chip == AGX_CHIP_G17P &&
+         ctx->stage[MESA_SHADER_COMPUTE].custom_borders,
+   };
    struct agx_compiled_shader *cs =
-      _mesa_hash_table_next_entry(uncompiled->variants, NULL)->data;
+      agx_get_shader_variant(agx_screen(pipe->screen), pipe, uncompiled, &key);
 
    struct agx_grid grid;
    if (indirect && agx_device(pipe->screen)->chip == AGX_CHIP_G17P) {

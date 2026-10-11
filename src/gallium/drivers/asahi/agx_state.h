@@ -568,9 +568,14 @@ struct asahi_fs_shader_key {
 };
 static_assert(sizeof(struct asahi_fs_shader_key) == 40, "no holes");
 
+struct asahi_cs_shader_key {
+   bool custom_borders;
+};
+
 union asahi_shader_key {
    struct asahi_vs_shader_key vs;
    struct asahi_fs_shader_key fs;
+   struct asahi_cs_shader_key cs;
 };
 
 enum agx_dirty {
