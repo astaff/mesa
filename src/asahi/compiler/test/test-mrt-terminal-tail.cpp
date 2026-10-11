@@ -243,7 +243,8 @@ TEST(MRTTerminalTail, MultisampleEpilogCoverageReconvergesBeforeColour)
    }
 }
 
-TEST(MRTTerminalTail, MultisampleEpilogOrdersPreservedTargets)
+static void
+compile_multisample_preserved_targets(bool distinct_masks)
 {
    for (unsigned samples : {2u, 4u}) {
       nir_builder b = nir_builder_init_simple_shader(
@@ -260,15 +261,20 @@ TEST(MRTTerminalTail, MultisampleEpilogOrdersPreservedTargets)
       nir_def *value = agx_test_load_preamble(&b, 4, 32, 8);
       for (unsigned i = 0; i < 4; ++i) {
          nir_def *v = value;
+         nir_def *target_mask = mask;
+         if (distinct_masks) {
+            target_mask = nir_iand(
+               &b, mask, agx_test_load_preamble(&b, 1, 16, 32 + i));
+         }
          if (i) {
-            v = nir_load_local_pixel_agx(&b, 4, 32, mask);
+            v = nir_load_local_pixel_agx(&b, 4, 32, target_mask);
             nir_intrinsic_instr *load = nir_def_as_intrinsic(v);
             nir_intrinsic_set_base(load, 8 * i);
             nir_intrinsic_set_format(load, PIPE_FORMAT_R16_UNORM);
             nir_intrinsic_set_target(load, i);
          }
          agx_test_store_local_pixel_agx(
-            &b, v, mask, nir_undef(&b, 2, 16), 8 * i, 0xf,
+            &b, v, target_mask, nir_undef(&b, 2, 16), 8 * i, 0xf,
             PIPE_FORMAT_R16_UNORM);
          BITSET_SET(key.g17p_tile_partitions, 8 * i);
          b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + i);
@@ -279,6 +285,19 @@ TEST(MRTTerminalTail, MultisampleEpilogOrdersPreservedTargets)
       free(part.binary);
       ralloc_free(b.shader);
    }
+}
+
+TEST(MRTTerminalTail, MultisampleEpilogOrdersPreservedTargets)
+{
+   compile_multisample_preserved_targets(false);
+}
+
+TEST(MRTTerminalTail, MultisampleEpilogOrdersDistinctMaskDependencies)
+{
+   /* Each tile load has a separate mask expression. CSE of repeated uniform
+    * copies alone cannot make these definitions dominate the reordered loads.
+    */
+   compile_multisample_preserved_targets(true);
 }
 
 TEST(MRTTerminalTail, MultisampleEpilogStoresEachSampleAfterCoverage)
@@ -301,6 +320,45 @@ TEST(MRTTerminalTail, MultisampleEpilogStoresEachSampleAfterCoverage)
             nir_undef(&b, 2, 16), 0, 0xf, PIPE_FORMAT_R8_UNORM);
       }
       b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(MRTTerminalTail, SparseMultisampleBlendGroups)
+{
+   for (unsigned enabled = 1; enabled < 16; ++enabled) {
+      SCOPED_TRACE(enabled);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "sparse MSAA blend");
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.secondary = true;
+      key.fs.nr_samples = 4;
+      nir_def *coverage = agx_test_load_preamble(&b, 1, 16, 7);
+      for (unsigned sample = 0; sample < 4; ++sample) {
+         if (!(enabled & (1u << sample)))
+            continue;
+         nir_def *mask = nir_iand_imm(&b, coverage, 1u << sample);
+         for (unsigned rt = 0; rt < 4; ++rt) {
+            nir_def *v = nir_load_local_pixel_agx(&b, 4, 32, mask);
+            nir_intrinsic_instr *load = nir_def_as_intrinsic(v);
+            nir_intrinsic_set_base(load, 4 * rt);
+            nir_intrinsic_set_format(load, PIPE_FORMAT_R8_UNORM);
+            nir_intrinsic_set_target(load, rt);
+            v = nir_fadd(&b, v, agx_test_load_preamble(&b, 4, 32, 8 + 8 * rt));
+            agx_test_store_local_pixel_agx(
+               &b, v, mask, nir_undef(&b, 2, 16), 4 * rt, 0xf,
+               PIPE_FORMAT_R8_UNORM);
+            BITSET_SET(key.g17p_tile_partitions, 4 * rt);
+            b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0 + rt);
+         }
+      }
       agx_preprocess_nir(b.shader);
       agx_shader_part part = {};
       EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));

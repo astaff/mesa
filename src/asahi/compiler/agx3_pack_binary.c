@@ -6785,7 +6785,7 @@ agx3_g17p_mrt_protocol(agx_context *ctx)
    if (!stored_partitions ||
        (stores_per_partition != 1 &&
         !(p.multisample &&
-          stores_per_partition == ctx->key->fs.nr_samples)) ||
+          stores_per_partition <= ctx->key->fs.nr_samples)) ||
        store_instr_count != stored_partitions * stores_per_partition)
       return agx3_g17p_mrt_refused();
 

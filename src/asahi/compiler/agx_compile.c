@@ -8104,6 +8104,71 @@ agx3_fuse_vertex_output_alu(agx_context *ctx)
    return progress;
 }
 
+/* Reordering tile loads must not move them above their sample-mask definitions.
+ * Uniform-source legalization can leave separate MOV/SPLIT chains next to each
+ * load, even when every load uses the same logical mask. Move only the pure
+ * dependencies within this group, in their original SSA order. In particular,
+ * an ordered coverage read must stay at its original execution point.
+ */
+static bool
+agx3_hoist_tile_load_sources(agx_context *ctx, agx_instr **loads, unsigned count)
+{
+   BITSET_WORD *needed = calloc(BITSET_WORDS(ctx->alloc), sizeof(*needed));
+   agx_instr **hoist = calloc(ctx->alloc, sizeof(*hoist));
+   unsigned nr_hoist = 0;
+   bool valid = true;
+
+   for (unsigned i = 0; i < count; ++i) {
+      agx_foreach_ssa_src(loads[i], s)
+         BITSET_SET(needed, loads[i]->src[s].value);
+   }
+
+   /* The input array is still in program order. Build the complete movement
+    * plan before changing the list, so an immovable dependency leaves it alone.
+    */
+   struct list_head *end = loads[0]->link.prev;
+   for (struct list_head *node = &loads[count - 1]->link; node != end;
+        node = node->prev) {
+      agx_instr *I = list_entry(node, agx_instr, link);
+      bool required = false;
+      agx_foreach_ssa_dest(I, d)
+         required |= BITSET_TEST(needed, I->dest[d].value);
+
+      if (!required)
+         continue;
+
+      const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
+      if (!info->can_eliminate || !info->can_reorder ||
+          info->schedule_class != AGX_SCHEDULE_CLASS_NONE) {
+         valid = false;
+         break;
+      }
+
+      agx_foreach_src(I, s) {
+         if (I->src[s].type == AGX_INDEX_REGISTER)
+            valid = false;
+      }
+      if (!valid)
+         break;
+
+      agx_foreach_ssa_src(I, s)
+         BITSET_SET(needed, I->src[s].value);
+      hoist[nr_hoist++] = I;
+   }
+
+   if (valid) {
+      while (nr_hoist) {
+         agx_instr *I = hoist[--nr_hoist];
+         list_del(&I->link);
+         list_addtail(&I->link, &loads[0]->link);
+      }
+   }
+
+   free(hoist);
+   free(needed);
+   return valid;
+}
+
 /* Apple's G17P multi-RT fragments finish colour partitions in descending
  * order and make partition zero the final release.  This holds for both the
  * opaque two-RGBA8 witness (offsets 4, 0) and the mixed RGBA16F+R8 witnesses
@@ -8360,6 +8425,18 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
    if (load_count && !first_wait)
       return false;
 
+   /* Constant sample masks can remove any subset of the unrolled samples.
+    * Count the complete surviving target sets, not the framebuffer samples.
+    * Their masks and relative sample order remain unchanged.
+    */
+   const unsigned partition_count =
+      __bitset_count(written, ARRAY_SIZE(written));
+   if (!partition_count || store_count % partition_count)
+      return false;
+   const unsigned sample_groups = store_count / partition_count;
+   if (sample_groups > (multisample_stores ? ctx->key->fs.nr_samples : 1))
+      return false;
+
    /* Native acquires and loads higher partitions first.  Move only the tile
     * loads themselves; their SSA consumers stay in place and RA extends the
     * values' physical lifetimes safely. */
@@ -8381,11 +8458,7 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
          load_anchor = loads[i];
       }
    } else if (load_count) {
-      const unsigned partition_count =
-         __bitset_count(written, ARRAY_SIZE(written));
-      const unsigned samples =
-         store_count == partition_count * ctx->key->fs.nr_samples
-            ? ctx->key->fs.nr_samples : 1;
+      const unsigned samples = sample_groups;
       if (load_count % samples)
          return false;
 
@@ -8407,6 +8480,8 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
             }
             continue;
          }
+         if (!agx3_hoist_tile_load_sources(ctx, group_loads, group_size))
+            return false;
          struct list_head *anchor = group_loads[0]->link.prev;
 
          for (unsigned i = 0; i < group_size; ++i) {
@@ -8436,16 +8511,8 @@ agx3_order_g17p_mrt_tile_ops(agx_context *ctx)
     * sample-shaded epilog is unrolled into one complete target set per
     * sample. Keep those sample sets separate while giving each the native
     * descending partition order. */
-   const unsigned partition_count =
-      __bitset_count(written, ARRAY_SIZE(written));
-   const bool unrolled_samples = multisample_stores && partition_count &&
-      store_count == partition_count * ctx->key->fs.nr_samples;
-   if (multisample_stores && store_count != partition_count &&
-       !unrolled_samples)
-      return false;
-
-   const unsigned group_count = unrolled_samples
-                                   ? ctx->key->fs.nr_samples : 1;
+   const bool unrolled_samples = multisample_stores && sample_groups > 1;
+   const unsigned group_count = sample_groups;
    const unsigned group_size = store_count / group_count;
    struct list_head *group_anchor[4] = {0};
    for (unsigned group = 0; group < group_count; ++group) {
