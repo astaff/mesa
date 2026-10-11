@@ -87,9 +87,10 @@ g17p_sample_shape(const nir_tex_instr *tex)
        nir_tex_instr_src_index(tex, nir_tex_src_backend2) >= 0);
    const int level_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
    const int bias_src = nir_tex_instr_src_index(tex, nir_tex_src_bias);
-   /* Native G17P compute depthcube/depth2d_array sample_compare(level(0))
-    * keeps the ordinary face/layer staging and selects SMP f139=2. */
-   const bool shadow_level_zero = tex->is_shadow && !cube_array &&
+   /* Native G17P depthcube, depthcube_array and depth2d_array level-zero
+    * comparisons retain the ordinary face/layer staging and select SMP
+    * f139=2. Keep descriptor legalization aligned with the binary packer. */
+   const bool shadow_level_zero = tex->is_shadow &&
       tex->op == nir_texop_txl && level_src >= 0 &&
       nir_src_is_const(tex->src[level_src].src) &&
       nir_src_as_float(tex->src[level_src].src) == 0.0;

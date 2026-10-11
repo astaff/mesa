@@ -903,7 +903,10 @@ update_qbo(struct zink_context *ctx, struct zink_query *q)
                                     * - Chapter 18. Queries
                                     */
                                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-         if (!is_timestamp)
+         /* All component pools describe the same logical query ranges.
+          * Count each range once, or a two-pool emulated primitives query
+          * advances start_offset past the next range after a partial copy. */
+         if (!is_timestamp && i == 0)
             q->curr_qbo->num_results += num_merged_copies;
          start_offset += num_merged_copies;
       }
@@ -1323,6 +1326,21 @@ zink_query_update_gs_states(struct zink_context *ctx)
       }
    }
    if (suspendall) {
+     /* TC can start a query outside rendering when its API end does not split
+      * the pass. A GS/XFB transition still needs a new emulation segment: end
+      * rendering before closing such a query, preserving Vulkan's requirement
+      * that its begin and end have the same render-pass scope. Queries begun
+      * inside rendering are suspended by the normal pass-end path first. */
+     if (ctx->in_rp) {
+        set_foreach(&ctx->bs->active_queries, entry) {
+           struct zink_query *active = (void *)entry->key;
+           if (active->active && !is_time_query(active) &&
+               !active->started_in_rp) {
+              zink_batch_no_rp(ctx);
+              break;
+           }
+        }
+     }
      zink_suspend_queries(ctx);
      zink_resume_queries(ctx);
    }

@@ -5575,6 +5575,12 @@ agx3_g17p_vertex_output_count(agx_context *ctx, enum agx_isa_encoding enc)
                 I->sr != AGX_SR_INSTANCE_ID)
                return 0;
             break;
+         case AGX_OPCODE_SCOPED_BARRIER_AGX3:
+            /* A memory fence does not overwrite vertex staging. The
+             * nonterminal output path retires each COPY before it, and the
+             * normal barrier encoder preserves the requested memory scope.
+             */
+            break;
          default:
             /* Once writeout begins only ST_VARY followed by STOP is safe.
              * Before it begins, side-effecting instructions are fine: they

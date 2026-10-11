@@ -910,14 +910,12 @@ hk_get_device_properties(const struct agx_device *dev,
    const VkSampleCountFlagBits sample_counts =
       VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
 
-   /* G17P renders, resolves and stores multisample colour and depth: on an
-    * A18 Pro the g17p-vulkan-msaa-resolve2/4, -store-fetch4 and -depth4
-    * probes read back exact resolved values, per-sample colour and per-sample
-    * depth coverage. Integer and storage images stay single-sample there:
-    * multisample tiles are built only for 8-bit UNORM colour, and storage
-    * images have no multisample descriptor.
+   /* Integer colour attachments and sampled multisample images use the same
+    * native tile store/reload and texel-fetch paths as other colour formats.
+    * Storage-image multisampling is an independent capability: keep its
+    * G17P restriction until that image descriptor path is qualified.
     */
-   const VkSampleCountFlagBits other_sample_counts =
+   const VkSampleCountFlagBits storage_sample_counts =
       dev->chip == AGX_CHIP_G17P ? VK_SAMPLE_COUNT_1_BIT : sample_counts;
 
    uint64_t os_page_size = 16384;
@@ -1092,10 +1090,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .framebufferStencilSampleCounts = sample_counts,
       .maxColorAttachments = HK_MAX_RTS,
       .sampledImageColorSampleCounts = sample_counts,
-      .sampledImageIntegerSampleCounts = other_sample_counts,
+      .sampledImageIntegerSampleCounts = sample_counts,
       .sampledImageDepthSampleCounts = sample_counts,
       .sampledImageStencilSampleCounts = sample_counts,
-      .storageImageSampleCounts = other_sample_counts,
+      .storageImageSampleCounts = storage_sample_counts,
       .maxSampleMaskWords = 1,
       .timestampComputeAndGraphics = true,
       /* FIXME: Is timestamp period actually 1? */
@@ -1205,7 +1203,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .filterMinmaxSingleComponentFormats = instance->drirc.misc.fake_minmax,
       .filterMinmaxImageComponentMapping = false,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
-      .framebufferIntegerColorSampleCounts = other_sample_counts,
+      .framebufferIntegerColorSampleCounts = sample_counts,
 
       /* Vulkan 1.3 properties */
       .minSubgroupSize = 32,

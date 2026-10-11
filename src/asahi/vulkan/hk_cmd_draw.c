@@ -1310,6 +1310,8 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          .pbe_argument_va = pbe_argument_va,
          .imageblock_offset_B = agx_tilebuffer_offset_B(&key->tib, 0),
          .attachment_count = attachment_count,
+         /* Layered MRT uses the shared array builtin, like Gallium. */
+         .mixed_mrt = attachment_count >= 2,
          .imageblock_offset1_B =
             attachment_count > 1 ? agx_tilebuffer_offset_B(&key->tib, 1) : 0,
          .imageblock_offset2_B = attachment_count > 2 ? agx_tilebuffer_offset_B(&key->tib, 2) : 0,

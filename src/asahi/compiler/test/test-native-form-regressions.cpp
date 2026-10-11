@@ -426,3 +426,63 @@ TEST(NativeForms, LateCoverageStaysAfterImageSideEffects)
       ralloc_free(mem);
    }
 }
+
+TEST(NativeForms, VertexOutputsAllowTrailingMemoryFence)
+{
+   for (unsigned count : {5u, 6u, 11u}) {
+      SCOPED_TRACE(count);
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_VERTEX;
+      for (unsigned i = 0; i < count; ++i)
+         agx_st_vary(b, agx_immediate(i), agx_register(2 * i, AGX_SIZE_32));
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE);
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT);
+      agx_stop(b);
+      util_dynarray bytes;
+      util_dynarray_init(&bytes, mem);
+      EXPECT_TRUE(agx3_pack_binary(b->shader, &bytes));
+      EXPECT_GT(bytes.size, 0u);
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, CubeArrayShadowZeroLodUsesNativeDescriptors)
+{
+   for (mesa_shader_stage stage : {MESA_SHADER_VERTEX, MESA_SHADER_TESS_CTRL,
+                                MESA_SHADER_TESS_EVAL, MESA_SHADER_GEOMETRY,
+                                MESA_SHADER_FRAGMENT, MESA_SHADER_COMPUTE}) {
+      for (float lod : {0.0f, 1.0f}) {
+         SCOPED_TRACE(::testing::Message() << "stage=" << stage << " lod=" << lod);
+         nir_builder b = nir_builder_init_simple_shader(
+            stage, &agx_nir_options, "cube array shadow native descriptors");
+         nir_def *texture = nir_bindless_image_agx(&b, nir_imm_int(&b, 0));
+         nir_def *sampler = nir_bindless_sampler_agx(
+            &b, nir_imm_int(&b, 32), nir_imm_intN_t(&b, 5, 16));
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 5);
+         tex->op = nir_texop_txl;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
+         tex->is_array = true;
+         tex->is_shadow = true;
+         tex->is_new_style_shadow = true;
+         tex->coord_components = 4;
+         tex->dest_type = nir_type_float32;
+         tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1,
+                                         nir_imm_vec4(&b, 1, 0, 0, 0));
+         tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
+                                         nir_imm_float(&b, 0.5));
+         tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(&b, lod));
+         tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, texture);
+         tex->src[4] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, sampler);
+         nir_def_init(&tex->instr, &tex->def, 1, 32);
+         nir_builder_instr_insert(&b, &tex->instr);
+         nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), lod == 0.0f);
+         ralloc_free(b.shader);
+      }
+   }
+}
