@@ -2175,10 +2175,10 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
     */
    if (bank_base != 0 &&
        (enc != AGX_ISA_ENCODING_AGX3B || native_staged_coords || array ||
-        three_d || cube || gradient_lod || bias_min || gradient_min ||
+        (three_d && !vertex_stage) || cube || gradient_lod || bias_min || gradient_min ||
         query_lod || (explicit_lod && !immediate_lod) || register_bias ||
         register_offset || (bank_base & 3) ||
-        bank_base > AGX3_STAGING_HALFS - 4))
+        bank_base > AGX3_STAGING_HALFS - (three_d ? 8 : 4)))
       return agx3_tex_decline(I, __LINE__);
    const uint16_t coord = (enc == AGX_ISA_ENCODING_AGX3B ||
                            native_staged_coords || explicit_lod ||
@@ -9601,7 +9601,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * live ranges before publishing into those locations. */
             const bool relocatable_coordinates =
                enc == AGX_ISA_ENCODING_AGX3B && slot != 0 &&
-               !native_staged_coords && I->dim == AGX_DIM_2D &&
+               !native_staged_coords &&
+               (I->dim == AGX_DIM_2D ||
+                (I->dim == AGX_DIM_3D && ctx->stage == MESA_SHADER_VERTEX &&
+                 ctx->key->g17p_uniform_dma &&
+                 I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+                 I->src[1].type == AGX_INDEX_IMMEDIATE)) &&
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
                (I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
                 ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
