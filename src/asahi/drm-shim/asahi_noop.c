@@ -1213,9 +1213,12 @@ asahi_log_submit(const struct drm_asahi_submit *submit)
          offset += sizeof(header) + header.size;
          continue;
       } else if (header.cmd_type == DRM_ASAHI_CMD_RENDER &&
-                 header.size >= sizeof(struct drm_asahi_cmd_render)) {
-         struct drm_asahi_cmd_render render;
-         memcpy(&render, cmdbuf + offset + sizeof(header), sizeof(render));
+                 header.size >= offsetof(struct drm_asahi_cmd_render,
+                                         bg_eot_rsrc_spec_hi)) {
+         /* Only G17P submits the resource-specifier high words. */
+         struct drm_asahi_cmd_render render = {0};
+         memcpy(&render, cmdbuf + offset + sizeof(header),
+                MIN2(sizeof(render), header.size));
          fprintf(log, " vdm_base=0x%llx",
                  (unsigned long long)render.vdm_ctrl_stream_base);
          /* ZLS: the compression bits (2/4/6/8) and the metadata base and
