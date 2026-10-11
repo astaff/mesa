@@ -2174,11 +2174,12 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
     * mode-specific ABI; only the relocatable profile can choose a new base.
     */
    if (bank_base != 0 &&
-       (enc != AGX_ISA_ENCODING_AGX3B || native_staged_coords || array ||
+       (enc != AGX_ISA_ENCODING_AGX3B || native_staged_coords ||
+        (array && !(vertex_stage && explicit_lod && immediate_lod && !shadow && !offset)) ||
         (three_d && !vertex_stage) || cube || gradient_lod || bias_min || gradient_min ||
         query_lod || (explicit_lod && !immediate_lod) || register_bias ||
         register_offset || (bank_base & 3) ||
-        bank_base > AGX3_STAGING_HALFS - (three_d ? 8 : 4)))
+        bank_base > AGX3_STAGING_HALFS - ((array || three_d) ? 8 : 4)))
       return agx3_tex_decline(I, __LINE__);
    const uint16_t coord = (enc == AGX_ISA_ENCODING_AGX3B ||
                            native_staged_coords || explicit_lod ||
@@ -2392,8 +2393,8 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    if (array && !cube && !query_lod && !combined_array_lod &&
        !register_offset &&
        !staged_offset &&
-       (!agx3_tex_stage_array_layer(
-           enc, I->src[0].value + 4, stage_slot, 0, I->src[0].cache,
+       (!agx3_tex_stage_array_layer_at(
+           enc, bank_base, I->src[0].value + 4, stage_slot, 0, I->src[0].cache,
            I->src[0].discard, bytes, &len) ||
         !agx3_append(emission, bytes, len)))
       return agx3_tex_decline(I, __LINE__);
@@ -9521,7 +9522,6 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   if (!agx3_retire_result_wait(emission, enc, I, live))
                      AGX3_REFUSE(I);
                   wait &= (uint16_t)~live;
-                  outstanding &= (uint16_t)~live;
                }
             }
             assert(texture_ops_left > 0);
@@ -9603,7 +9603,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                enc == AGX_ISA_ENCODING_AGX3B && slot != 0 &&
                !native_staged_coords &&
                (I->dim == AGX_DIM_2D ||
-                (I->dim == AGX_DIM_3D && ctx->stage == MESA_SHADER_VERTEX &&
+                ((I->dim == AGX_DIM_3D ||
+                  (I->dim == AGX_DIM_2D_ARRAY && !I->shadow && !I->offset)) &&
+                 ctx->stage == MESA_SHADER_VERTEX &&
                  ctx->key->g17p_uniform_dma &&
                  I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                  I->src[1].type == AGX_INDEX_IMMEDIATE)) &&

@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include "agx3_binder.h"
 #include "agx3_uniform_alu.h"
+#include "agx3_tex_core.h"
 #include "agx_test.h"
 #include "util/u_debug.h"
 
@@ -348,5 +349,95 @@ TEST(AGX3UniformALU, LoweringKeepsF32AndCopiesMixedWidths)
    EXPECT_EQ(same->src[0].type, AGX_INDEX_REGISTER);
    EXPECT_EQ(same->src[1].type, AGX_INDEX_UNIFORM);
    EXPECT_NE(mixed->src[0].type, AGX_INDEX_UNIFORM);
+   ralloc_free(mem);
+}
+
+TEST(AGX3ArrayStaging, NativeVaryingLayerBanks)
+{
+   const struct {
+      uint16_t bank, source;
+      uint8_t slot;
+      bool discard;
+      std::array<uint8_t, 12> expected;
+   } vectors[] = {
+      {16, 50, 2, false, {0x17,0x05,0x54,0x16,0x00,0x64,0x00,0x00,0x70,0xc4,0x04,0x00}},
+      {0, 1, 1, true, {0x17,0x05,0x54,0x06,0x00,0x02,0x00,0x00,0xf0,0xc0,0x04,0x00}},
+      {8, 0, 3, true, {0x17,0x05,0x54,0x0e,0x00,0x00,0x00,0x00,0xf0,0xd0,0x04,0x00}},
+      {24, 54, 5, false, {0x17,0x05,0x54,0x1e,0x00,0x6c,0x00,0x00,0x70,0xe0,0x04,0x00}},
+   };
+   for (const auto &v : vectors) {
+      uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_tex_stage_array_layer_at(
+         AGX_ISA_ENCODING_AGX3B, v.bank, v.source, v.slot, 0,
+         false, v.discard, bytes, &len));
+      ASSERT_EQ(len, v.expected.size());
+      EXPECT_EQ(std::memcmp(bytes, v.expected.data(), len), 0);
+   }
+}
+
+TEST(AGX3ArrayStaging, OperandBounds)
+{
+   uint8_t bytes[AGX3_TEX_MAX_LENGTH], len = 0;
+   for (uint16_t bank : {1, 2, 3, 249, 252, 256, 65535}) {
+      EXPECT_FALSE(agx3_tex_stage_array_layer_at(
+         AGX_ISA_ENCODING_AGX3B, bank, 0, 1, 0, false, false, bytes, &len));
+   }
+   EXPECT_TRUE(agx3_tex_stage_array_layer_at(
+      AGX_ISA_ENCODING_AGX3B, 248, 0, 1, 0, false, false, bytes, &len));
+}
+
+TEST(AGX3ArrayStaging, ReusedCompletionSlotRetainsCoordinateConsumer)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.g17p_uniform_dma = true;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_VERTEX;
+   b->shader->max_reg = 63;
+   for (unsigned i = 0; i < 6; ++i) {
+      agx_index value = agx_register(i * 8, AGX_SIZE_32);
+      value.channels_m1 = 2;
+      agx_device_load_to(b, value, agx_register(96, AGX_SIZE_64),
+                        agx_immediate(i * 16), AGX_FORMAT_I32, 7, 0, false);
+   }
+   for (auto pair : {std::pair<unsigned, unsigned>{0, 48}, {8, 56}, {16, 64}}) {
+      agx_index coords = agx_register(pair.first, AGX_SIZE_32);
+      coords.channels_m1 = 2;
+      agx_index result = agx_register(pair.second, AGX_SIZE_32);
+      result.channels_m1 = 3;
+      agx_texture_sample_to(b, result, coords, agx_immediate(0),
+                           agx_immediate(0), agx_immediate(0),
+                           agx_immediate(0), agx_null(), AGX_DIM_2D_ARRAY,
+                           AGX_LOD_MODE_LOD_MIN, 15, false, false, false,
+                           AGX_GATHER_NONE, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   agx3_tex_sample_desc d = {};
+   d.dest = 64;
+   d.coord = 16;
+   d.width = AGX3_TEX_W32;
+   d.mask = 15;
+   d.array = true;
+   d.vertex_stage = true;
+   d.lod = AGX3_TEX_LOD_LEVEL;
+   d.final = true;
+   const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
+   bool found = false;
+   for (unsigned slot = 1; slot <= 6; ++slot) {
+      d.slot = slot;
+      d.wait_mask = 1u << (slot - 1);
+      uint8_t sample[AGX3_TEX_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &d, sample, &len));
+      for (unsigned i = 0; i + len <= binary.size; ++i)
+         found |= std::memcmp(bytes + i, sample, len) == 0;
+   }
+   EXPECT_TRUE(found);
+   util_dynarray_fini(&binary);
    ralloc_free(mem);
 }

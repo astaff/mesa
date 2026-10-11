@@ -1419,7 +1419,7 @@ agx3_tex_stage_array_layer_at(enum agx_isa_encoding enc, uint16_t bank,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if (enc != AGX_ISA_ENCODING_AGX3B || !sampler_bank_valid(bank) ||
+   if (enc != AGX_ISA_ENCODING_AGX3B || ((bank & 3) || bank > 248) ||
        src >= 256 || slot < 1 || slot > 6 ||
        (wait_mask & ~0x3f) || (src_cache && src_discard))
       return false;
