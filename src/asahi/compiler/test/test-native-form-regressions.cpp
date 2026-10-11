@@ -1,6 +1,7 @@
 #include "agx_test.h"
 #include "agx3_alu_core.h"
 #include "agx3_pack.h"
+#include "agx3_tex_core.h"
 extern "C" {
 #include "agx_nir.h"
 }
@@ -331,4 +332,97 @@ TEST(NativeForms, ImageFenceWaitsRotatingWriteSlots)
    EXPECT_EQ(fences, 3u);
    util_dynarray_fini(&binary);
    ralloc_free(mem);
+}
+
+TEST(NativeForms, ImmediateCubeGathersReserveCemScratch)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 31;
+
+   /* This is the hardware reproducer's allocated shape. The red gather
+    * remains live in r0 while the remaining gathers compute their cube
+    * coordinates. The old immediate-descriptor path used r0 as CEM scratch
+    * and overwrote red with the next face calculation. */
+   agx_index coords = agx_register(16, AGX_SIZE_32);
+   coords.channels_m1 = 3;
+   const unsigned destinations[] = {0, 8, 24, 16};
+   for (unsigned component = 0; component < 4; ++component) {
+      agx_index dst = agx_register(destinations[component], AGX_SIZE_32);
+      dst.channels_m1 = 3;
+      agx_texture_sample_to(b, dst, coords, agx_immediate(0),
+                           agx_immediate(0), agx_immediate(0),
+                           agx_immediate(1), agx_null(), AGX_DIM_CUBE_ARRAY,
+                           AGX_LOD_MODE_AUTO_LOD, 15, false, false, false,
+                           (enum agx_gather)(AGX_GATHER_R + 2 * component), false);
+   }
+   agx_stop(b);
+
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   EXPECT_GE(b->shader->max_reg, 39u);
+
+   /* Check the actual emitted CEM destination, not just the reservation.
+    * All four axis-zero operations must write above the live result bank. */
+   uint8_t cem[AGX3_TEX_MAX_LENGTH], len = 0;
+   ASSERT_TRUE(agx3_tex_cube_cem_calc_to(AGX_ISA_ENCODING_AGX3B, 16, 18, 20,
+                                         32, 0, false, cem, &len));
+   const uint8_t *bytes = (const uint8_t *)binary.data;
+   unsigned count = 0;
+   for (unsigned i = 0; i + len <= binary.size; ++i)
+      count += memcmp(bytes + i, cem, len) == 0;
+   EXPECT_EQ(count, 4u);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
+
+TEST(NativeForms, LateCoverageStaysAfterImageSideEffects)
+{
+   for (bool depth : {false, true}) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_index data = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_device_load_to(b, data, agx_uniform(8, AGX_SIZE_64), agx_immediate(0),
+                         AGX_FORMAT_I32, 15, 0, false);
+      agx_index coord = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_device_load_to(b, coord, agx_uniform(8, AGX_SIZE_64), agx_immediate(4),
+                         AGX_FORMAT_I32, 3, 0, false);
+      agx_instr *store = agx_image_write(
+         b, data, coord, agx_zero(), agx_uniform(12, AGX_SIZE_64),
+         agx_mov_imm(b, 32, 1), AGX_DIM_2D, true);
+      agx_index mask = agx_mov_imm(b, 16, 1);
+      agx_index coverage[8];
+      for (unsigned i = 0; i < 8; ++i)
+         coverage[i] = agx_get_coverage_1x_agx3(b, 16);
+      agx_index word = coverage[0];
+      for (unsigned i = 1; i < 8; ++i)
+         word = agx_iadd(b, word, coverage[i], 0);
+      word = agx_iadd(b, mask, word, 4);
+      agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, wide, word);
+      agx_instr *tests = depth ? agx_zs_emit_agx3(b, wide, 1)
+                              : agx_sample_mask_agx3(b, mask, wide, 2);
+      agx_export(b, data, 8);
+      agx_pressure_schedule(b->shader);
+      bool saw_store = false;
+      agx_foreach_instr_global(b->shader, I) {
+         saw_store |= I == store;
+         if (I == tests) {
+            EXPECT_TRUE(saw_store) << "Native late tests preceded imageStore";
+         }
+      }
+      ralloc_free(mem);
+   }
 }

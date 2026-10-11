@@ -1938,7 +1938,7 @@ agx3_tile_store_bank(agx_context *ctx)
           : raw32_bank || mrt_bank || sample_bank ? 32 : 16;
 }
 
-/* The packer places dynamic cube CEM scratch above every allocated operand.
+/* The packer places cube CEM scratch above every allocated operand.
  * Reserve that storage before spilling/RA, including the extra packed layer
  * word used by bias+minimum. Cube-array face staging and the register LOD
  * operand of a plain cube sample both have seven-bit source fields.
@@ -1962,10 +1962,6 @@ agx3_cube_register_budget(agx_context *ctx)
          ((I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
            I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
           I->src[1].type != AGX_INDEX_IMMEDIATE);
-      if (!register_lod && I->src[3].type == AGX_INDEX_IMMEDIATE &&
-          I->src[4].type == AGX_INDEX_IMMEDIATE)
-         continue;
-
       budget = MIN2(budget,
                     (I->dim == AGX_DIM_CUBE_ARRAY || register_lod) ? 112 :
                     AGX3B_NUM_REGS - 8);
@@ -2260,16 +2256,6 @@ agx_ra(agx_context *ctx)
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           I->op == AGX_OPCODE_LOG2 && I->src[0].type == AGX_INDEX_NORMAL)
          BITSET_SET(log2_gpr, I->src[0].value);
-
-      /* G17P cube CEM rereads its XYZ vector after writing fixed scratch r0
-       * and r7. Constrain the coordinate vector itself above that bank; its
-       * scalar producers remain free to coalesce elsewhere and are copied by
-       * the ordinary collect when necessary. */
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-          I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
-          (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY) &&
-          I->src[0].type == AGX_INDEX_NORMAL)
-         BITSET_SET(high_gpr, I->src[0].value);
 
       /* agx3_tex_stage_cube_array_lod encodes the layer register (coords + 6
        * halves) in seven bits; keep such coordinate vectors below half 128. */

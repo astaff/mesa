@@ -197,3 +197,35 @@ TEST_F(G17PMSAAEpilog, NativeSpillEpilogsCompile)
       }
    }
 }
+
+TEST_F(G17PMSAAEpilog, SingleSampleCollapsePreservesHelperCoverage)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "single-sample helper check");
+   b.shader->info.fs.uses_sample_shading = true;
+   nir_def *helper = nir_load_helper_invocation(&b, 1);
+   nir_intrinsic_instr *exported =
+      nir_intrinsic_instr_create(b.shader, nir_intrinsic_export_agx);
+   exported->num_components = 1;
+   exported->src[0] = nir_src_for_ssa(nir_b2i32(&b, helper));
+   nir_intrinsic_set_base(exported, 8);
+   nir_builder_instr_insert(&b, &exported->instr);
+   ASSERT_TRUE(agx_nir_lower_sample_intrinsics(b.shader, true));
+   ASSERT_TRUE(agx_nir_lower_g17p_1x_sample_shading(b.shader));
+   EXPECT_FALSE(b.shader->info.fs.uses_sample_shading);
+   unsigned active = 0, coverage = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            active += op == nir_intrinsic_load_active_samples_agx;
+            coverage += op == nir_intrinsic_load_sample_mask;
+         }
+      }
+   }
+   EXPECT_EQ(active, 0u);
+   EXPECT_EQ(coverage, 1u);
+   ralloc_free(b.shader);
+}

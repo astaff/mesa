@@ -2144,20 +2144,12 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    const bool cube_register_lod =
       cube && ((explicit_lod && !immediate_lod) || register_bias || bias_min);
 
-   /* The immediate cube corpus uses fixed r0/r7/r2 CEM destinations. Dynamic
-    * descriptor forms, and any cube whose staged LOD must survive CEM, use
-    * the allocator-owned bank supplied below. */
-   const bool fixed_cem = immediate && !cube_register_lod;
-   if (cube && fixed_cem) {
-      const unsigned coord_first = I->src[0].value;
-      const unsigned coord_last = coord_first + (cube_array && !query_lod ? 8 : 6);
-      if (coord_first < 2 || (coord_first < 16 && coord_last > 14))
-         return agx3_tex_decline(I, __LINE__);
-   } else if (cube &&
-              (cem_scratch == NULL || (cem_scratch[0] & 1) ||
-               cem_scratch[2] > 190)) {
+   /* Every cube pipeline needs scratch outside the allocated live values.
+    * Immediate descriptors do not make r0/r7/r2 free: a preceding gather
+    * may still hold its result there when this CEM pipeline executes. */
+   if (cube && (cem_scratch == NULL || (cem_scratch[0] & 1) ||
+                cem_scratch[2] > 190))
       return agx3_tex_decline(I, __LINE__);
-   }
 
    /* Native register-indexed array and cube samples publish their coordinate /
     * face operand bank on slot 6 and wait slot 6 in SMP, independently of the
@@ -2324,38 +2316,25 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       if (wait_mask && (!register_operands || wait_mask != staged_wait))
          return agx3_tex_decline(I, __LINE__);
 
-      const uint16_t fixed_scratch[3] = {0, 14, 4};
-      const uint16_t *scratch = fixed_cem ? fixed_scratch : cem_scratch;
+      const uint16_t *scratch = cem_scratch;
       for (unsigned axis = 0; axis < 3; ++axis) {
-         const bool packed = fixed_cem
-            ? agx3_tex_cube_cem_calc(
-                 enc, I->src[0].value, I->src[0].value + 2,
-                 I->src[0].value + 4, axis,
-                 axis == 2 && I->src[0].discard, bytes, &len)
-            : agx3_tex_cube_cem_calc_to(
-                 enc, I->src[0].value, I->src[0].value + 2,
-                 I->src[0].value + 4, scratch[axis], axis,
-                 axis == 2 && I->src[0].discard, bytes, &len);
-         if (!packed ||
+         if (!agx3_tex_cube_cem_calc_to(
+                enc, I->src[0].value, I->src[0].value + 2,
+                I->src[0].value + 4, scratch[axis], axis,
+                axis == 2 && I->src[0].discard, bytes, &len) ||
              !agx3_append(emission, bytes, len))
             return agx3_tex_decline(I, __LINE__);
 
          if (axis == 0 &&
-             (!(fixed_cem
-                   ? agx3_tex_cube_cem_rcp(enc, bytes, &len)
-                   : agx3_tex_cube_cem_rcp_to(enc, scratch[0], bytes, &len)) ||
+             (!agx3_tex_cube_cem_rcp_to(enc, scratch[0], bytes, &len) ||
               !agx3_append(emission, bytes, len)))
             return agx3_tex_decline(I, __LINE__);
       }
 
       for (unsigned component = 0; component < 2; ++component) {
-         const bool packed = fixed_cem
-            ? agx3_tex_cube_cem_finalize(enc, component, component == 1,
-                                         bytes, &len)
-            : agx3_tex_cube_cem_finalize_to(
-                 enc, component, scratch[0], scratch[component + 1],
-                 stage_slot, bytes, &len);
-         if (!packed ||
+         if (!agx3_tex_cube_cem_finalize_to(
+                enc, component, scratch[0], scratch[component + 1],
+                stage_slot, bytes, &len) ||
              !agx3_append(emission, bytes, len))
             return agx3_tex_decline(I, __LINE__);
       }
@@ -2402,7 +2381,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       return agx3_tex_decline(I, __LINE__);
 
    if (cube) {
-      const uint16_t face = fixed_cem ? 2 : cem_scratch[0] + 2;
+      const uint16_t face = cem_scratch[0] + 2;
       const uint16_t layer = I->src[0].value + 6;
       bool packed;
       if (cube_array && cube_register_lod) {
@@ -8023,7 +8002,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       for (unsigned h = 0; h < ctx->out->rodata.size_16 && base + h < 512; ++h)
          uniform_half_used[base + h] = true;
    }
-   bool has_dynamic_cube_sample = false;
+   bool has_cube_sample = false;
    bool has_packed_array_layer = false;
    unsigned observed_max_reg = ctx->max_reg;
    unsigned count = 0;
@@ -8135,10 +8114,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ((scan_I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                  scan_I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
                 scan_I->src[1].type != AGX_INDEX_IMMEDIATE);
-            if (register_lod ||
-                scan_I->src[3].type != AGX_INDEX_IMMEDIATE ||
-                scan_I->src[4].type != AGX_INDEX_IMMEDIATE)
-               has_dynamic_cube_sample = true;
+            has_cube_sample = true;
             /* So is a cube face packed beside a bias and minimum. */
             if (register_lod &&
                 (scan_I->dim == AGX_DIM_CUBE_ARRAY || bias_min))
@@ -8217,7 +8193,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * (the CEM destination field reaches half 190), so no live register is
     * overwritten. */
    uint16_t cem_scratch[3] = {0};
-   if (has_dynamic_cube_sample) {
+   if (has_cube_sample) {
       const unsigned base = (observed_max_reg + 2) & ~1u;
       if (base + 6 > 190)
          goto fail;
@@ -8684,12 +8660,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ((I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                  I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
                 I->src[1].type != AGX_INDEX_IMMEDIATE);
-            const bool dynamic_cem = register_lod ||
-               I->src[3].type != AGX_INDEX_IMMEDIATE ||
-               I->src[4].type != AGX_INDEX_IMMEDIATE;
-            const uint16_t fixed_scratch[3] = {0, 14, 4};
-            const uint16_t *scratch = dynamic_cem ? cem_scratch
-                                                   : fixed_scratch;
+            const uint16_t *scratch = cem_scratch;
             assert(nd + 5 <= AGX3_SLOT_MAX_REGS);
             e->dst[nd++] = scratch[0];
             e->dst[nd++] = scratch[0] + 2;

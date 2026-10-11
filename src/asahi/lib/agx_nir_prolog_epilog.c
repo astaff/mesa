@@ -1641,6 +1641,17 @@ agx_nir_lower_g17p_tile_samples(nir_shader *s, unsigned nr_samples)
                                      nir_metadata_control_flow, &state);
 }
 
+static bool
+lower_single_active_sample(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_active_samples_agx)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_intN_t(b, 1, intr->def.bit_size));
+   return true;
+}
+
 bool
 agx_nir_lower_g17p_1x_sample_shading(nir_shader *s)
 {
@@ -1650,7 +1661,16 @@ agx_nir_lower_g17p_1x_sample_shading(nir_shader *s)
    nir_lower_single_sampled_options options = {
       .lower_sample_mask_in = true,
    };
-   const bool progress = nir_lower_single_sampled(s, &options);
+   bool progress = nir_lower_single_sampled(s, &options);
+
+   /* Gallium lowers sample-rate helper checks before the raster sample count
+    * is known. Their active-sample mask names the sample-loop iteration, not
+    * hardware coverage. With a single sample the sole iteration is bit0;
+    * leaving it dynamic would import a register from a loop we just removed.
+    * Keep the separate load_sample_mask in those checks so helper lanes and
+    * samples rejected by the hardware still cannot perform side effects. */
+   progress |= nir_shader_intrinsics_pass(s, lower_single_active_sample,
+                                          nir_metadata_control_flow, NULL);
 
    /* With one rasterization sample, per-sample and per-pixel invocation are
     * identical. Leaving this set makes agx_fast_link append its AGX2 sample

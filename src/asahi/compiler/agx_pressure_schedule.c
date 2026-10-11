@@ -197,7 +197,9 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
 
       bool barrier = dep == AGX_SCHEDULE_CLASS_BARRIER;
       bool discards =
-         I->op == AGX_OPCODE_SAMPLE_MASK || I->op == AGX_OPCODE_ZS_EMIT;
+         I->op == AGX_OPCODE_SAMPLE_MASK || I->op == AGX_OPCODE_ZS_EMIT ||
+         I->op == AGX_OPCODE_SAMPLE_MASK_AGX3 ||
+         I->op == AGX_OPCODE_ZS_EMIT_AGX3;
 
       if (dep == AGX_SCHEDULE_CLASS_STORE)
          add_dep(node, memory_load);
