@@ -2075,10 +2075,6 @@ hk_g17p_graphics_uniform_ranges(
           !dev->sampled_images.base_va || !dev->samplers.table.bo ||
           !dev->rodata.indexed_heap_pointers)
          return hk_g17p_graphics_ranges_refused(range_count, count);
-      const uint64_t pointers[2] = {
-         dev->sampled_images.base_va,
-         dev->samplers.table.bo->va->addr,
-      };
       const uint64_t pointers_va = dev->rodata.indexed_heap_pointers;
       sources[count] = HK_G17P_RANGE_SOURCE_CONSTANT;
       ranges[count++] = (struct agx3_ioto_uniform_range){

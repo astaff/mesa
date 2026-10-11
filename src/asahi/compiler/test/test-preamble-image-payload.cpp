@@ -62,9 +62,10 @@ check_payload(unsigned bits, unsigned heap = 24, bool g17p = true)
                 I->intrinsic == nir_intrinsic_bindless_image_agx) {
                EXPECT_EQ(I->src[0].ssa->bit_size, bits);
                EXPECT_EQ(I->def.bit_size, 32u);
-               if (bits == 64)
+               if (bits == 64) {
                   EXPECT_EQ(nir_intrinsic_base(nir_src_as_intrinsic(I->src[0])),
                             28u);
+               }
                EXPECT_EQ(nir_intrinsic_desc_set(I), heap);
                payload_loads++;
             }

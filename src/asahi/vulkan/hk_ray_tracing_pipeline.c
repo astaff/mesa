@@ -1171,9 +1171,6 @@ static struct vk_shader *
 hk_ray_tracing_pipeline_get_shader(struct vk_pipeline *vk_pipeline,
                                    mesa_shader_stage stage)
 {
-   struct hk_ray_tracing_pipeline *pipeline =
-      hk_pipeline_to_ray_tracing(vk_pipeline);
-
    /* The pipeline is one compute shader; there is no per-stage binary to
     * report.  Saying so is better than handing back the megakernel under a
     * stage name it is not. */

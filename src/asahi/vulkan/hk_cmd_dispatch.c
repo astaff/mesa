@@ -1015,7 +1015,6 @@ hk_g17p_append_indirect_launch(
       .helper_program = &helper_program.launch,
       .geometry_va = geometry.gpu,
    };
-   const size_t start = sink->length;
    if (!hk_agx3_g17p_native_indirect_compute_dispatch_append(
           &program->launch, &dispatch, sink)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);

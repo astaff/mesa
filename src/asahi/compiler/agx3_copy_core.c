@@ -83,15 +83,10 @@ agx3_copy_encode_reg_to_uniform(enum agx_isa_encoding encoding,
        src_half + 2 > 256)
       return false;
 
-   const struct agx3_field_kv baseline[] = {
-      KV(9, 3), KV(10, 2), KV(23, 2), KV(24, 2),
-   };
-   const struct agx3_field_kv overrides[] = {
-      KV(3, uniform_half),
-      KV(16, src_half),
-      KV(27, kill ? 1 : 0),
-   };
-
+   /* Both forms below are written byte by byte rather than through the table
+    * composer. In composer terms the instruction is f9=3, f10=2, f23=2,
+    * f24=2 with f3 = uniform half, f16 = source half and f27 = kill.
+    */
    if (uniform_half < 128) {
       /* Grounded COPY ep0 field deposits. This is the same compact form used
        * by the Ioto load packer, except f27 is the caller's kill bit instead

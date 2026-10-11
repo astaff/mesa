@@ -339,10 +339,12 @@ TEST_F(Optimizer, G17PVertexConstantWidth)
       agx_unit_test(b, out);
       agx_opt_compact_constants(b->shader);
       agx_foreach_instr_global(b->shader, I) {
-         if (I->op == AGX_OPCODE_FFMA)
+         if (I->op == AGX_OPCODE_FFMA) {
             EXPECT_EQ(I->src[1].size, AGX_SIZE_16);
-         if (I->op == AGX_OPCODE_MOV_IMM)
+         }
+         if (I->op == AGX_OPCODE_MOV_IMM) {
             EXPECT_EQ(I->imm, 0x1400u);
+         }
       }
    }
 }
