@@ -450,6 +450,7 @@ struct agx_batch {
 
    /* Only a loader-provided resolve may seed the multisample tile reload. */
    bool g17p_resolve_reload;
+   bool g17p_resolve_preserve;
 
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];

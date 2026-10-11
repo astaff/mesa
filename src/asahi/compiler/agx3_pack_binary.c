@@ -7613,8 +7613,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
       for (unsigned rt = 0; rt < array_eot_count; ++rt) {
          const uint8_t selector = ctx->key->g17p_mrt_eot_selectors[rt];
+         const bool store_samples = multisample &&
+            !(ctx->key->g17p_mrt_eot_resolve_mask & BITFIELD_BIT(rt));
          program[agx3_g17p_array_eot[array_eot_count].selector[rt]] =
-            multisample ? (selector & 0xf0) : selector;
+            store_samples ? (selector & 0xf0) : selector;
       }
 
       /* The matched synthetic graph used registers that are absent from the
@@ -7672,7 +7674,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          for (unsigned rt = 0; rt < multi_eot_count; ++rt) {
             const unsigned imgwblk = templates[multi_eot_count].imgwblk[rt];
             uint8_t selector = ctx->key->g17p_mrt_eot_selectors[rt];
-            if (multisample) {
+            const bool store_samples = multisample &&
+               !(ctx->key->g17p_mrt_eot_resolve_mask & BITFIELD_BIT(rt));
+            if (store_samples) {
                program[templates[multi_eot_count].imgwir_wire[rt]] |= 0x02;
                program[imgwblk + 8] &= 0x7f;
                selector = (selector & 0xf0) | 0x02;

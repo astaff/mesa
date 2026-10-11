@@ -550,6 +550,9 @@ struct agx_shader_key {
     * arbitrary target formats, and the IMGWBLK selector of each target in
     * store order. Zero selects the format-specific EOT recognizers. */
    uint8_t g17p_mrt_eot_count;
+   /* Override selected multisample stores with single-sample resolves.
+    * A source-preserving resolve binds separate MS and SS PBE outputs. */
+   uint8_t g17p_mrt_eot_resolve_mask;
    uint8_t g17p_mrt_eot_selectors[AGX_MAX_RTS];
 
    /* Set if this is a secondary shader part (prolog or epilog). This prevents

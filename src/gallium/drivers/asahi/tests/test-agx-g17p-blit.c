@@ -1446,6 +1446,27 @@ main(void)
    };
    pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
    pctx->flush(pctx, NULL, 0);
+   xrgb8_msaa_fb.resolve = NULL;
+   pctx->set_framebuffer_state(pctx, &xrgb8_msaa_fb);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   const struct pipe_blit_info xrgb8_resolve_blit = {
+      .src = {
+         .resource = xrgb8_msaa,
+         .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+         .box = {.width = 8, .height = 8, .depth = 1},
+      },
+      .dst = {
+         .resource = xrgb8_resolve,
+         .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+         .box = {.width = 8, .height = 8, .depth = 1},
+      },
+      .mask = PIPE_MASK_RGBA,
+      .filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   pctx->blit(pctx, &xrgb8_resolve_blit);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->blit(pctx, &xrgb8_resolve_blit);
+   pctx->flush(pctx, NULL, 0);
    pipe_resource_reference(&xrgb8_msaa, NULL);
    pipe_resource_reference(&xrgb8_resolve, NULL);
    printf("G17P XRGB8 2x clear/direct-resolve completed\n");

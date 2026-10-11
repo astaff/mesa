@@ -5189,7 +5189,11 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
       .multisample_store =
          dev->chip == AGX_CHIP_G17P && store &&
          batch->tilebuffer_layout.nr_samples > 1 &&
-         (partial_render || !batch->key.resolve),
+         (partial_render || !batch->key.resolve || batch->g17p_resolve_preserve),
+      .store_and_resolve =
+         dev->chip == AGX_CHIP_G17P && store && !partial_render &&
+         batch->tilebuffer_layout.nr_samples > 1 && batch->key.resolve &&
+         batch->g17p_resolve_preserve,
    };
 
    bool needs_textures_for_spilled_rts =
@@ -5298,9 +5302,10 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
 
       const bool dual_mrt_active = dual_mrt &&
                                    key.op[1] != AGX_BG_EOT_NONE;
-      const unsigned attachment_count = wide_count && op != AGX_BG_EOT_NONE
-                                           ? wide_count : dual_mrt_active ? 2 : 1;
+      const unsigned attachment_count = key.store_and_resolve ? 2 :
+         wide_count && op != AGX_BG_EOT_NONE ? wide_count : dual_mrt_active ? 2 : 1;
       const unsigned attachment_mask =
+         key.store_and_resolve ? BITFIELD_BIT(first_rt) :
          rgba8_mask ? rgba8_mask : BITFIELD_MASK(attachment_count);
       const unsigned slot_count =
          rgba8_mask ? util_last_bit(rgba8_mask) : attachment_count;
@@ -5369,7 +5374,7 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
       size_t capacity;
       if (op == AGX_BG_EOT_NONE)
          capacity = AGX_IOTO_G17P_FRAGMENT_NO_RESOURCE_PROGRAM_SIZE;
-      else if (wide_count)
+      else if (wide_count || key.store_and_resolve)
          /* A wide background is not an RT0 reload: eight clear values need
           * eight load chunks, and the generated program runs past the RT0
           * bound (344 bytes against 246 for eight RGBA8 targets, which is
@@ -5436,6 +5441,18 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
                agx_native_descriptor_rejected(dev, "end-of-tile PBE");
          }
 
+         if (key.store_and_resolve) {
+            if (!agx_g17p_direct_resolve_surface(batch, &resolve_surf))
+               agx_native_descriptor_rejected(dev, "source-preserving resolve");
+            struct pipe_image_view view = image_view_for_surface(&resolve_surf);
+            view.format = agx_g17p_rt0_pbe_format(view.format);
+            struct agx_gallium_pbe_descriptor *argument =
+               agx_pbe_descriptor_at(pbe.cpu, descriptor_size, pbe_index++);
+            if (!agx_batch_upload_pbe(batch, argument, &view, true, true,
+                                      false, false))
+               agx_native_descriptor_rejected(dev, "resolve destination PBE");
+         }
+
          struct agx3_g17p_rt0_eot_program_desc desc = {
             .program_va = program_ptr.gpu,
             .shader_va = shader->ptr + shader->info.main_offset,
@@ -5447,8 +5464,9 @@ agx_build_bg_eot(struct agx_batch *batch, bool store, bool partial_render)
              * whichever API named the layout: the selectors already come
              * from each target's own logical format (agx_bg_eot.c). */
             .mixed_mrt = attachment_count >= 2,
-            .imageblock_offset1_B =
-               dual_mrt_active ? agx_tilebuffer_offset_B(&key.tib, 1) : 0,
+            .imageblock_offset1_B = key.store_and_resolve
+               ? agx_tilebuffer_offset_B(&key.tib, first_rt)
+               : dual_mrt_active ? agx_tilebuffer_offset_B(&key.tib, 1) : 0,
             .shader_binary_size = shader->info.binary_size,
             .scratch_size = shader->info.scratch_size,
             .nr_gprs = shader->info.nr_gprs,

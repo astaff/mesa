@@ -67,6 +67,9 @@ struct agx_bg_eot_key {
     * tib.nr_samples > 1; the caller decides, because storeOp = STORE is the
     * only Vulkan path that wants the unresolved surface. */
    bool multisample_store;
+   /* Store RT0 samples and also resolve that same tile through PBE1.
+    * The two EOT outputs share an imageblock offset, not storage. */
+   bool store_and_resolve;
    /* The framebuffer is an AGX_G17P_MRT_MIXED layout. The tile layout keeps
     * only the targets this program touches, at their framebuffer offsets. */
    bool mixed_mrt;

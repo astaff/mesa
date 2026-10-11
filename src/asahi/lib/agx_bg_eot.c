@@ -429,6 +429,14 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
     * target really is multisample.
     */
    const bool g17p = cache->dev->chip == AGX_CHIP_G17P;
+   if (key->store_and_resolve) {
+      /* This bounded path has two memory outputs from one physical tile. */
+      assert(g17p && key->multisample_store && key->tib.nr_samples > 1 &&
+             !key->tib.layered && !key->tib.spilled[0] &&
+             key->op[0] == AGX_EOT_STORE);
+      for (unsigned rt = 1; rt < ARRAY_SIZE(key->op); ++rt)
+         assert(key->op[rt] == AGX_BG_EOT_NONE);
+   }
    const bool store_multisample =
       key->tib.nr_samples > 1 && (!g17p || key->multisample_store);
 
@@ -505,6 +513,16 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
          .format = physical,
          .image_dim = dim, .image_array = key->tib.layered,
          .explicit_coord = explicit);
+
+      if (key->store_and_resolve) {
+         /* Resolving is non-destructive: first preserve the source samples,
+          * then resolve the same imageblock through a different PBE. The
+          * compiler key supplies each output's native dimension class. */
+         nir_image_store_block_agx(
+            &b, nir_imm_intN_t(&b, 1, 16), nir_imm_int(&b, offset_B), coords,
+            .format = physical, .image_dim = GLSL_SAMPLER_DIM_2D,
+            .image_array = false, .explicit_coord = true);
+      }
    }
 
    struct agx_shader_key compiler_key = {
@@ -528,8 +546,15 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
       for (unsigned rt = 0; rt < ARRAY_SIZE(key->op); ++rt)
          stores += key->op[rt] == AGX_EOT_STORE;
 
-      if (stores > 1 &&
-          stores <= ARRAY_SIZE(compiler_key.g17p_mrt_eot_selectors)) {
+      if (key->store_and_resolve) {
+         assert(stores == 1);
+         compiler_key.g17p_mrt_eot_count = 2;
+         compiler_key.g17p_mrt_eot_resolve_mask = BITFIELD_BIT(1);
+         compiler_key.g17p_mrt_eot_selectors[0] =
+            compiler_key.g17p_mrt_eot_selectors[1] =
+               agx_g17p_mrt_eot_selector(key->tib.logical_format[0]);
+      } else if (stores > 1 &&
+                 stores <= ARRAY_SIZE(compiler_key.g17p_mrt_eot_selectors)) {
          for (unsigned rt = 0; rt < ARRAY_SIZE(key->op); ++rt) {
             if (key->op[rt] == AGX_EOT_STORE) {
                compiler_key.g17p_mrt_eot_selectors
