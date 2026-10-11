@@ -3096,10 +3096,13 @@ agx_update_fs(struct agx_batch *batch)
    struct asahi_fs_shader_key key = {0};
    key.custom_borders = ctx->stage[MESA_SHADER_FRAGMENT].custom_borders;
 
-   /* A fragment shader that runs per sample is unrolled over the sample count
-    * when it is compiled -- G17P has no loop to wrap it in -- so the count
-    * belongs in its variant key, exactly as a tilebuffer fetch's does. */
-   if (ctx->stage[MESA_SHADER_FRAGMENT].shader->info.needs_sample_count ||
+   /* G17P coverage updates use different native words at one and several
+    * samples, including discard-only main shaders. Keep their raster sample
+    * count in the main key, matching Honeykrisp and the linked shader parts.
+    * Other generations need variants for sample-dependent shader operations.
+    */
+   if (dev->chip == AGX_CHIP_G17P ||
+       ctx->stage[MESA_SHADER_FRAGMENT].shader->info.needs_sample_count ||
        ctx->stage[MESA_SHADER_FRAGMENT].shader->info.uses_fbfetch ||
        ctx->stage[MESA_SHADER_FRAGMENT].shader->info.uses_sample_shading) {
       key.nr_samples = nr_samples;

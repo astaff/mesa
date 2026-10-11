@@ -1277,6 +1277,100 @@ check_vertex_output_shapes(struct pipe_context *pctx)
    }
    return ok;
 }
+static bool
+check_discard_main_sample_key(struct pipe_context *pctx)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   nir_builder vs = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "sample key vertex");
+   nir_store_output(&vs, nir_imm_vec4(&vs, 0, 0, 0, 1), nir_imm_int(&vs, 0),
+                    .base = 0, .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_shader_gather_info(vs.shader, nir_shader_get_entrypoint(vs.shader));
+   struct pipe_shader_state vs_state = {.type = PIPE_SHADER_IR_NIR, .ir.nir = vs.shader};
+   void *vs_cso = pctx->create_vs_state(pctx, &vs_state);
+   nir_builder fs = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "discard main raster sample key");
+   fs.shader->info.internal = false;
+   nir_def *x = nir_channel(&fs, nir_load_frag_coord(&fs), 0);
+   nir_demote_if(&fs, nir_flt(&fs, x, nir_imm_float(&fs, 8.0)));
+   nir_store_output(&fs, nir_imm_vec4(&fs, 1, 0, 0, 0.5), nir_imm_int(&fs, 0),
+                    .base = 0, .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_DATA0);
+   nir_shader_gather_info(fs.shader, nir_shader_get_entrypoint(fs.shader));
+   struct pipe_shader_state fs_state = {.type = PIPE_SHADER_IR_NIR, .ir.nir = fs.shader};
+   struct agx_uncompiled_shader *fs_cso = pctx->create_fs_state(pctx, &fs_state);
+   struct pipe_rasterizer_state rast = {
+      .depth_clip_near = true, .depth_clip_far = true, .multisample = true,
+      .point_size = 1, .line_width = 1,
+   };
+   struct pipe_depth_stencil_alpha_state depth = {0};
+   void *rast_cso = pctx->create_rasterizer_state(pctx, &rast);
+   void *depth_cso = pctx->create_depth_stencil_alpha_state(pctx, &depth);
+   void *ve_cso = pctx->create_vertex_elements_state(pctx, 0, NULL);
+   if (!vs_cso || !fs_cso || !rast_cso || !depth_cso || !ve_cso)
+      return false;
+   if (fs_cso->info.needs_sample_count || fs_cso->info.uses_fbfetch ||
+       fs_cso->info.uses_sample_shading)
+      return false;
+   pctx->bind_vs_state(pctx, vs_cso);
+   pctx->bind_fs_state(pctx, fs_cso);
+   pctx->bind_rasterizer_state(pctx, rast_cso);
+   pctx->bind_depth_stencil_alpha_state(pctx, depth_cso);
+   pctx->bind_vertex_elements_state(pctx, ve_cso);
+   struct pipe_viewport_state viewport = {.scale = {8, 8, 0.5}, .translate = {8, 8, 0.5}};
+   pctx->set_viewport_states(pctx, 0, 1, &viewport);
+   pctx->set_sample_mask(pctx, ~0u);
+   const unsigned sequence[] = {1, 4, 2, 1};
+   struct agx_compiled_shader *variants[5] = {0};
+   bool ok = true;
+   for (unsigned alpha = 0; alpha < 2; ++alpha) {
+      struct pipe_blend_state blend = {.rt[0].colormask = 0xf, .alpha_to_coverage = alpha};
+      void *blend_cso = pctx->create_blend_state(pctx, &blend);
+      pctx->bind_blend_state(pctx, blend_cso);
+      for (unsigned step = 0; step < ARRAY_SIZE(sequence); ++step) {
+         const unsigned samples = sequence[step];
+         struct pipe_resource templ = {
+            .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .width0 = 16, .height0 = 16, .depth0 = 1, .array_size = 1,
+            .nr_samples = samples, .nr_storage_samples = samples,
+            .bind = PIPE_BIND_RENDER_TARGET, .usage = PIPE_USAGE_DEFAULT,
+         };
+         struct pipe_resource *color = pctx->screen->resource_create(pctx->screen, &templ);
+         if (!color) return false;
+         struct pipe_framebuffer_state fb = {
+            .width = 16, .height = 16, .layers = 1, .samples = samples, .nr_cbufs = 1,
+            .cbufs[0] = {.texture = color, .format = templ.format},
+         };
+         pctx->set_framebuffer_state(pctx, &fb);
+         const struct pipe_draw_info info = {.mode = MESA_PRIM_TRIANGLES, .instance_count = 1};
+         const struct pipe_draw_start_count_bias draw = {.count = 3};
+         pctx->draw_vbo(pctx, &info, 0, NULL, &draw, 1);
+         unsigned found = 0, keyed_samples = ~0u;
+         hash_table_foreach(fs_cso->variants, ent) {
+            if (ent->data == ctx->fs) {
+               keyed_samples = ((const struct asahi_fs_shader_key *)ent->key)->nr_samples;
+               found++;
+            }
+         }
+         bool phase_ok = found == 1 && keyed_samples == samples && ctx->fs &&
+                         !ctx->fs->failed && ctx->fs->b.info.main_size &&
+                         ctx->skipped_no_program == 0 && ctx->batch && ctx->batch->draws;
+         if (variants[samples]) phase_ok &= variants[samples] == ctx->fs;
+         variants[samples] = ctx->fs;
+         printf("sample-key alpha=%u samples=%u actual=%u main_size=%u result=%s\n",
+                alpha, samples, keyed_samples, ctx->fs ? ctx->fs->b.info.main_size : 0,
+                phase_ok ? "PASS" : "FAIL");
+         ok &= phase_ok;
+         pipe_resource_reference(&color, NULL);
+      }
+      pctx->bind_blend_state(pctx, NULL);
+      pctx->delete_blend_state(pctx, blend_cso);
+   }
+   ok &= variants[1] != variants[2] && variants[1] != variants[4] && variants[2] != variants[4];
+   return ok;
+}
+
 int
 main(void)
 {
@@ -1310,6 +1404,16 @@ main(void)
    if (!pctx) {
       fprintf(stderr, "context_create failed\n");
       return 1;
+   }
+
+   if (getenv("AGX_TEST_MAIN_SAMPLE_KEY")) {
+      glsl_type_singleton_init_or_ref();
+      const bool ok = check_discard_main_sample_key(pctx);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      glsl_type_singleton_decref();
+      close(fd);
+      return ok ? 0 : 1;
    }
 
    if (getenv("AGX_TEST_VERTEX_OUTPUT_SHAPES")) {
