@@ -7,6 +7,7 @@
 #include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/bitset.h"
+#include "agx_native_descriptor.h"
 #include "agx_state.h"
 #include "nir.h"
 #include "nir_builder_opcodes.h"
@@ -132,6 +133,13 @@ lower_sampler(nir_builder *b, nir_tex_instr *tex, bool wide_native_handle,
    if (!nir_tex_instr_need_sampler(tex))
       return false;
 
+   /* Custom-border variants revisit binding lowering after the query's
+    * indirect handle has already been built (and possibly optimized).
+    * Preserve that handle, including a dynamic API sampler index. */
+   if (wide_native_handle && tex->op == nir_texop_lod &&
+       nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle) >= 0)
+      return false;
+
    nir_def *index = sampler_index(b, tex);
 
    if (clamp_to_zero)
@@ -139,6 +147,11 @@ lower_sampler(nir_builder *b, nir_tex_instr *tex, bool wide_native_handle,
 
    nir_def *handle = clamp_to_zero ? load_custom_border_sampler(b, index)
                                    : nir_load_sampler_handle_agx(b, index);
+   if (wide_native_handle && tex->op == nir_texop_lod) {
+      /* The ordinary table maps API i to native i+1. The query bank is
+       * disjoint from both this bank and the custom-border companions. */
+      handle = nir_iadd_imm(b, handle, AGX_GALLIUM_G17P_QUERY_LOD_BASE - 1);
+   }
    if (wide_native_handle)
       handle = nir_u2u64(b, handle);
 
@@ -288,7 +301,9 @@ lower(nir_builder *b, nir_instr *instr, void *data)
           BITSET_LAST_BIT(b->shader->info.samplers_used) >
              bindful_sampler_count);
 
-      if ((sampler_outside_bindful || clamp_to_zero) &&
+      const bool query_lod = options->g17p_native_sampler_handles &&
+                             tex->op == nir_texop_lod;
+      if ((sampler_outside_bindful || clamp_to_zero || query_lod) &&
           lower_sampler(b, tex, options->g17p_native_sampler_handles,
                         clamp_to_zero)) {
          progress = true;
@@ -398,6 +413,13 @@ agx_nir_lower_custom_border_g17p(nir_shader *shader)
       };
       progress |= nir_shader_instructions_pass(
          shader, lower, nir_metadata_control_flow, &options);
+
+      /* Binding lowering above can introduce descriptor-crawl handles again
+       * for array samples. Texture coordinates are already lowered here, so
+       * the sample itself must use the native G17P table index just as it does
+       * after the initial texture-lowering pass.
+       */
+      progress |= agx_nir_rebind_g17p_texture_crawls(shader);
 
       /* Gallium variants apply this pass after the common AGX preprocess so
        * ordinary shaders do not pay for border emulation. Lower the small

@@ -320,6 +320,136 @@ check_sampler_boundary_compile(struct pipe_context *pctx)
 }
 
 static bool
+check_query_lod_custom_border_bindings(void)
+{
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      nir_shader *nir = build_sampler_boundary_fs(0);
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir)));
+      nir_def *frag = nir_load_frag_coord(&b);
+      nir_def *dynamic = nir_iand_imm(
+         &b, nir_f2u32(&b, nir_channel(&b, frag, 0)), 31);
+      nir_tex_instr *query = nir_tex_instr_create(nir, mode == 2 ? 2 : 1);
+      query->op = nir_texop_lod;
+      query->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      query->dest_type = nir_type_float32;
+      query->coord_components = 2;
+      query->sampler_index = mode == 1 ? 31 : 0;
+      query->src[0] = nir_tex_src_for_ssa(
+         nir_tex_src_coord, nir_channels(&b, frag, 3));
+      if (mode == 2)
+         query->src[1] = nir_tex_src_for_ssa(nir_tex_src_sampler_offset, dynamic);
+      nir_builder_instr_insert(&b, &query->instr);
+      nir_def_init(&query->instr, &query->def, 2, 32);
+      nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *sum = nir_fadd(&b, intr->src[0].ssa,
+                                    nir_channel(&b, &query->def, 0));
+            nir_src_rewrite(&intr->src[0], sum);
+         }
+      }
+      BITSET_SET(nir->info.samplers_used, mode == 0 ? 0 : 31);
+      bool bindless = false;
+      struct agx_lower_bindings_options options = {
+         .uses_bindless_samplers = &bindless,
+         .g17p_native_sampler_handles = true,
+         .bindful_sampler_count = AGX_GALLIUM_G17P_IMMEDIATE_API_SAMPLERS,
+      };
+      agx_nir_lower_bindings(nir, &options);
+      const int handle_idx =
+         nir_tex_instr_src_index(query, nir_tex_src_sampler_handle);
+      assert(handle_idx >= 0);
+      nir_def *handle = query->src[handle_idx].src.ssa;
+      const bool lowered = agx_nir_lower_custom_border_g17p(nir);
+      unsigned count = 0;
+      for (unsigned i = 0; i < query->num_srcs; ++i) {
+         if (query->src[i].src_type == nir_tex_src_sampler_handle) {
+            ++count;
+            if (query->src[i].src.ssa != handle)
+               count += 100;
+         }
+      }
+      const bool ok = lowered && bindless && count == 1;
+      if (!ok)
+         fprintf(stderr, "G17P query/custom-border mode %u changed query handle "
+                         "or duplicated source (%u)\n", mode, count);
+      if (ok)
+         nir_validate_shader(nir, "query LOD with custom border");
+      ralloc_free(nir);
+      if (!ok)
+         return false;
+   }
+   return true;
+}
+
+static bool
+check_query_lod_compile(struct pipe_context *pctx)
+{
+   static const enum glsl_sampler_dim dimensions[] = {
+      GLSL_SAMPLER_DIM_1D, GLSL_SAMPLER_DIM_2D,
+      GLSL_SAMPLER_DIM_3D,
+   };
+
+   for (unsigned d = 0; d < ARRAY_SIZE(dimensions); ++d) {
+      for (unsigned mode = 0; mode < 3; ++mode) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options,
+            "G17P biased query LOD sampler bank");
+         const unsigned components = d == 0 ? 1 : d == 1 ? 2 : 3;
+         nir_def *frag = nir_load_frag_coord(&b);
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, mode == 2 ? 2 : 1);
+         tex->op = nir_texop_lod;
+         tex->sampler_dim = dimensions[d];
+         tex->dest_type = nir_type_float32;
+         tex->coord_components = components;
+         tex->sampler_index = mode == 1 ? 31 : 0;
+         tex->src[0] = nir_tex_src_for_ssa(
+            nir_tex_src_coord, nir_trim_vector(&b, frag, components));
+         if (mode == 2) {
+            tex->src[1] = nir_tex_src_for_ssa(
+               nir_tex_src_sampler_offset,
+               nir_iand_imm(&b, nir_f2u32(&b, nir_channel(&b, frag, 0)), 31));
+         }
+         nir_builder_instr_insert(&b, &tex->instr);
+         nir_def_init(&tex->instr, &tex->def, 2, 32);
+         nir_def *result = nir_vec4(&b, nir_channel(&b, &tex->def, 0),
+                                   nir_channel(&b, &tex->def, 1),
+                                   nir_imm_float(&b, 0), nir_imm_float(&b, 1));
+         nir_store_output(&b, result, nir_imm_int(&b, 0), .base = 0,
+                          .write_mask = 0xf,
+                          .io_semantics.location = FRAG_RESULT_DATA0);
+         b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+         BITSET_SET(b.shader->info.textures_used, 0);
+         BITSET_SET(b.shader->info.samplers_used, mode == 0 ? 0 : 31);
+         struct pipe_shader_state cso = {
+            .type = PIPE_SHADER_IR_NIR,
+            .report_compile_error = true,
+            .ir.nir = b.shader,
+         };
+         struct agx_uncompiled_shader *shader = pctx->create_fs_state(pctx, &cso);
+         const bool ok = shader && !cso.error_message &&
+                         shader->info.uses_query_lod &&
+                         shader->uses_bindless_samplers;
+         if (!ok)
+            fprintf(stderr, "G17P query LOD dimension %u mode %u: %s\n",
+                    dimensions[d], mode,
+                    cso.error_message ? cso.error_message : "missing query bank");
+         if (shader)
+            pctx->delete_fs_state(pctx, shader);
+         free(cso.error_message);
+         if (!ok)
+            return false;
+      }
+   }
+   return true;
+}
+
+static bool
 check_es3_compile_contract(struct pipe_context *pctx)
 {
    struct pipe_shader_state accepted = {
@@ -1232,7 +1362,9 @@ main(void)
           AGX_GALLIUM_G17P_API_SAMPLERS ||
        screen->shader_caps[MESA_SHADER_COMPUTE].max_texture_samplers !=
           AGX_GALLIUM_G17P_API_SAMPLERS ||
-       !check_sampler_boundary_compile(pctx))
+       !check_sampler_boundary_compile(pctx) ||
+       !check_query_lod_compile(pctx) ||
+       !check_query_lod_custom_border_bindings())
       return 1;
    printf("G17P native sampler slots 0..31 compile through the local table\n");
 

@@ -1489,6 +1489,27 @@ lower_g17p_projected_3d_runtime_offset(nir_builder *b, nir_instr *instr,
    return true;
 }
 
+/* nir_lower_tex intentionally leaves rectangle samples implicit because
+ * they have no mip chain. G17P still requires an explicit level outside a
+ * derivative-capable stage. The sampler retains unnormalized coordinates;
+ * this changes only the LOD operand, just like ordinary non-fragment tex.
+ * Run after sampler-bias lowering, whose bias is ignored in these stages.
+ */
+static bool
+lower_g17p_rectangle_lod(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+{
+   if (nir_shader_supports_implicit_lod(b->shader) ||
+       tex->sampler_dim != GLSL_SAMPLER_DIM_RECT ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb))
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_steal_tex_src(tex, nir_tex_src_bias);
+   tex->op = nir_texop_txl;
+   nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0));
+   return true;
+}
+
 bool
 agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias)
 {
@@ -1512,6 +1533,8 @@ agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias)
     * zero, and folding a bias into that level would leave the shape
     * unencodable. agx_upload_samplers() packs the field to match. */
    progress |= lower_texture_early(s, support_lod_bias, false, true);
+   NIR_PASS(progress, s, nir_shader_tex_pass, lower_g17p_rectangle_lod,
+            nir_metadata_control_flow, NULL);
 
    /* No qualified runtime-offset ABI can place 3D Z beside the gradient
     * banks, and the inferred bank-8 continuation fails filtered samples on

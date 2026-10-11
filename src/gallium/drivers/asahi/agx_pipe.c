@@ -2060,10 +2060,11 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
       /* G17P's Ioto path publishes a native 32-byte per-stage sampler table.
        * Slots 15+ are selected indirectly after accounting for the reserved
        * texel-fetch entry, so native graphics and compute can expose
-       * Gallium's complete API table without the legacy heap. */
+       * Gallium's complete API table without the legacy heap. Geometry
+       * shaders use the same table through their lowered compute programs. */
       if (agx_device(pscreen)->chip == AGX_CHIP_G17P &&
           (i == MESA_SHADER_VERTEX || i == MESA_SHADER_FRAGMENT ||
-           i == MESA_SHADER_COMPUTE))
+           i == MESA_SHADER_GEOMETRY || i == MESA_SHADER_COMPUTE))
          caps->max_texture_samplers = PIPE_MAX_SAMPLERS;
       /* TODO: Enable when fully baked */
       else if (strcmp(util_get_process_name(), "blender") == 0)

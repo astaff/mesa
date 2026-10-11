@@ -114,8 +114,9 @@ TEST_F(G17PMSAAEpilog, PerSampleMainExportsCompile)
             ASSERT_TRUE(fits);
             EXPECT_TRUE(link.sample_shading);
             EXPECT_FALSE(b.shader->info.fs.uses_sample_shading);
-            if (samples == 4 && targets == 8)
+            if (samples == 4 && targets == 8) {
                EXPECT_TRUE(link.packed_colour);
+            }
             agx_preprocess_nir(b.shader);
             agx_shader_key key = {};
             key.dev.encoding = AGX_ISA_ENCODING_AGX3B;

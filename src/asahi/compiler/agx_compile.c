@@ -7985,10 +7985,17 @@ agx3_sink_vertex_outputs(agx_context *ctx)
          stores[I->src[0].value] = I;
          break;
       }
+      case AGX_OPCODE_ATOMIC:
+         /* UVS is invocation-private output storage, disjoint from device
+          * memory. Delay only its stores, retaining the relative order of
+          * every atomic and memory access. SSA output values remain live
+          * until the terminal bundle because this runs before RA. Barriers,
+          * other side effects and control flow still refuse below. */
+         break;
       default:
          /* Pure SSA producers may move relative to vertex writeout. Their
           * actual encodings remain validated by the normal compiler path;
-          * side effects and control flow require a separate ordering proof. */
+          * other side effects and control flow require an ordering proof. */
          if (!agx_opcodes_info[I->op].can_eliminate)
             return false;
          break;

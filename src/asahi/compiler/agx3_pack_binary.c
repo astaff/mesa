@@ -1646,7 +1646,8 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
                               enum agx_isa_encoding enc, const agx_instr *I,
                               uint16_t wait_mask,
                               struct agx3_staging_banks *banks,
-                              uint16_t bank_floor, uint16_t *outstanding)
+                              uint16_t bank_floor, uint16_t *outstanding,
+                              uint8_t *write_slot)
 {
    const bool normalized = I->format == AGX_FORMAT_U8NORM ||
                            I->format == AGX_FORMAT_RGB10A2;
@@ -1839,6 +1840,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
          fprintf(stderr, "G17P imgwci instruction compose refusal\n");
       goto fail;
    }
+   *write_slot = slot;
    util_dynarray_fini(&staged);
    return true;
 
@@ -7988,6 +7990,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
    struct util_dynarray fixups;
    uint16_t outstanding = 0;
+   uint16_t image_write_slots = 0;
    uint8_t next_uvs_slot = 1;
    unsigned texture_ops_left = 0;
    unsigned tile_loads_left = 0;
@@ -8941,6 +8944,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          /* A wait retires its slots before this instruction issues its own. */
          outstanding &= (uint16_t)~wait;
          const uint16_t outstanding_here = outstanding;
+         image_write_slots &= outstanding_here;
+         /* A new scheduled producer starts a different slot generation. */
+         if (slot)
+            image_write_slots &= (uint16_t)~(1u << (slot - 1));
          if (slot)
             outstanding |= (uint16_t)(1u << (slot - 1));
 
@@ -9492,11 +9499,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (I->op == AGX_OPCODE_IMAGE_WRITE) {
+            uint8_t write_slot;
             if (!agx3_emit_storage_image_write(emission, enc, I, wait,
                                                &staging_banks,
                                                image_write_bank_floor,
-                                               &outstanding))
+                                               &outstanding, &write_slot))
                AGX3_REFUSE(I);
+            image_write_slots &= outstanding;
+            image_write_slots |= 1u << (write_slot - 1);
             ctx->agx3_staging_halfs =
                MAX2(ctx->agx3_staging_halfs, MAX2(staging_banks.end, 16));
             continue;
@@ -10691,11 +10701,24 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * issued writes, which the scheduler's drain cannot see. */
             const bool device = I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
                                 I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE;
-            const uint16_t retire = wait | (device ? outstanding_here : 0);
+            /* The native PBE-to-texture fence includes a wait on slot1.
+             * Heap image writes rotate through the six completion slots,
+             * however, so retire their other live generations before the
+             * fence invalidates the texture cache. Waiting after the fence
+             * is too late: a following read can still observe the old texel.
+             * Unrelated memory/texture producers do not join this wait. */
+            const bool texture_wait =
+               I->imm == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT;
+            const uint16_t image_wait = texture_wait
+               ? image_write_slots & outstanding_here & ~1u : 0;
+            const uint16_t retire =
+               wait | image_wait | (device ? outstanding_here : 0);
             if (!agx3_emit_scoped_barrier(emission, enc, I, retire))
                AGX3_REFUSE(I);
-            outstanding &= (uint16_t)~retire;
-            agx3_staging_forget(&staging_banks, retire);
+            const uint16_t completed = retire | (texture_wait ? 1u : 0);
+            outstanding &= (uint16_t)~completed;
+            image_write_slots &= (uint16_t)~completed;
+            agx3_staging_forget(&staging_banks, completed);
             continue;
          }
 

@@ -151,6 +151,64 @@ check(const struct shape *shape)
    return ok;
 }
 
+/* Custom border lowering runs on the preprocessed shader variant. It invokes
+ * binding lowering again, which must not leave an AGX2 descriptor address on
+ * either sample used to interpolate the custom border.
+ */
+static bool
+check_custom_border(void)
+{
+   const struct shape shape = {
+      "custom border array", GLSL_SAMPLER_DIM_2D, true, 3,
+   };
+   nir_shader *shader = build(&shape);
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            tex->op = nir_texop_tex;
+            nir_steal_tex_src(tex, nir_tex_src_lod);
+         }
+      }
+   }
+
+   bool uses_bindless_samplers = false;
+   struct agx_lower_bindings_options options = {
+      .uses_bindless_samplers = &uses_bindless_samplers,
+      .g17p_plain_txf_crawl = true,
+      .g17p_native_sampler_handles = true,
+      .bindful_sampler_count = AGX_GALLIUM_G17P_API_SAMPLERS,
+   };
+   NIR_PASS(_, shader, agx_nir_lower_bindings, &options);
+   NIR_PASS(_, shader, agx_nir_lower_texture_for_generation,
+            AGX_DESCRIPTOR_GENERATION_9);
+   NIR_PASS(_, shader, agx_nir_rebind_g17p_texture_crawls);
+   agx_preprocess_nir(shader);
+   NIR_PASS(_, shader, agx_nir_lower_custom_border_g17p);
+   nir_validate_shader(shader, "after custom border variant lowering");
+
+   unsigned samples = 0;
+   bool ok = true;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            samples++;
+            ok &= nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) < 0;
+         }
+      }
+   }
+   ok &= samples == 2;
+   printf("custom border array %s (%u samples)\n",
+          ok ? "native table" : "BAD HANDLE", samples);
+   ralloc_free(shader);
+   return ok;
+}
+
 int
 main(void)
 {
@@ -159,6 +217,8 @@ main(void)
 
    for (unsigned i = 0; i < ARRAY_SIZE(shapes); ++i)
       ok &= check(&shapes[i]);
+
+   ok &= check_custom_border();
 
    glsl_type_singleton_decref();
    return ok ? 0 : 1;

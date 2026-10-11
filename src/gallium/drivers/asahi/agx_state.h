@@ -321,6 +321,7 @@ struct agx_uncompiled_shader {
       bool uses_sample_shading;
       bool needs_sample_count;
       bool uses_buffer_textures;
+      bool uses_query_lod;
       bool writes_memory;
 
       /* Number of bindful textures, images used */
@@ -854,7 +855,7 @@ struct agx_compiled_shader *agx_build_meta_shader(struct agx_context *ctx,
 void agx_launch(struct agx_batch *batch, struct agx_grid grid,
                 struct agx_workgroup wg, struct agx_compiled_shader *cs,
                 struct agx_linked_shader *linked, mesa_shader_stage stage,
-                unsigned variable_shared_mem);
+                unsigned variable_shared_mem, uint64_t indirect_num_workgroups);
 
 void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                         enum agx_barrier barrier, enum libagx_program program,

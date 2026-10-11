@@ -736,13 +736,12 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                                    : info->dst.resource;
          stencil.dst.format = PIPE_FORMAT_R8_UINT;
          stencil.mask = PIPE_MASK_R;
-         /* There is no meaningful average of stencil values, so resolving a
-          * multisample stencil buffer takes sample zero. Saying so also keeps
-          * u_blitter off its per-sample shading path, whose sample loop the
-          * G17P fast linker cannot encode: without this the blit's fragment
-          * program fails to link and the stencil aspect is silently dropped.
+         /* Resolve stencil by selecting sample zero, but preserve every
+          * sample when copying between multisample images. G17P sample
+          * shading handles the latter through the shared static lowering.
           */
-         stencil.sample0_only = info->src.resource->nr_samples > 1;
+         stencil.sample0_only = info->src.resource->nr_samples > 1 &&
+                                info->dst.resource->nr_samples <= 1;
          agx_blit(pipe, &stencil);
          return;
       }

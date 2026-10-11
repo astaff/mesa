@@ -29,6 +29,11 @@
 #define AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE \
    (1u + AGX_GALLIUM_G17P_API_SAMPLERS)
 
+/* LOD queries cannot carry the software bias used by ordinary samples.
+ * Their private sampler bank keeps the API bias in the native descriptor. */
+#define AGX_GALLIUM_G17P_QUERY_LOD_BASE \
+   (AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE + AGX_GALLIUM_G17P_API_SAMPLERS)
+
 /* HAL200's immediate sampler operand names native slots 0..15. Gallium keeps
  * slot zero for texel fetch, leaving API samplers 0..14 directly encodable.
  * Later API samplers use an indirect native-table index instead. */

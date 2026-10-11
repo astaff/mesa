@@ -1,7 +1,9 @@
 #include "agx_test.h"
 #include "agx3_alu_core.h"
 #include "agx3_pack.h"
+extern "C" {
 #include "agx_nir.h"
+}
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -207,4 +209,126 @@ TEST(NativeForms, MinmaxReusesUniformCopiedForComparison)
       EXPECT_TRUE(agx_is_equiv(I->src[0], I->src[2]));
       ralloc_free(mem);
    }
+}
+
+TEST(NativeForms, AtomicVertexOutputsReachTerminalBundle)
+{
+   for (bool position : {false, true}) {
+      SCOPED_TRACE(position);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "atomic vertex outputs");
+      nir_def *address = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *value = nir_global_atomic_agx(
+         &b, 32, address, nir_imm_int(&b, 0), nir_imm_int(&b, 1));
+      nir_intrinsic_set_atomic_op(nir_def_as_intrinsic(value), nir_atomic_op_iadd);
+      nir_store_uvs_agx(&b, value, nir_imm_intN_t(&b, 4, 16));
+      nir_def *second = nir_global_atomic_agx(
+         &b, 32, address, nir_imm_int(&b, 4), nir_imm_int(&b, -1));
+      nir_intrinsic_set_atomic_op(nir_def_as_intrinsic(second), nir_atomic_op_iadd);
+      nir_store_uvs_agx(&b, nir_iadd(&b, value, second),
+                       nir_imm_intN_t(&b, 5, 16));
+      if (position) {
+         for (unsigned c = 0; c < 4; ++c)
+            nir_store_uvs_agx(&b, nir_imm_float(&b, c == 3 ? 1.0 : 0.0),
+                             nir_imm_intN_t(&b, c, 16));
+      }
+      b.shader->info.outputs_written = BITFIELD64_BIT(VARYING_SLOT_VAR0) |
+                                     (position ? VARYING_BIT_POS : 0);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 4;
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, RectangleImplicitLodOutsideFragment)
+{
+   for (mesa_shader_stage stage : {MESA_SHADER_VERTEX, MESA_SHADER_COMPUTE,
+                                   MESA_SHADER_FRAGMENT}) {
+      for (bool sampler_bias : {false, true}) {
+         SCOPED_TRACE(stage);
+         SCOPED_TRACE(sampler_bias);
+         nir_builder b = nir_builder_init_simple_shader(
+            stage, &agx_nir_options, "rectangle implicit lod");
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+         tex->op = nir_texop_tex;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_RECT;
+         tex->dest_type = nir_type_float32;
+         tex->coord_components = 2;
+         tex->src[0] = nir_tex_src_for_ssa(
+            nir_tex_src_coord, nir_imm_vec2(&b, 3.0, 5.0));
+         nir_def_init(&tex->instr, &tex->def, 4, 32);
+         nir_builder_instr_insert(&b, &tex->instr);
+         agx_nir_lower_g17p_texture_early(b.shader, sampler_bias);
+         EXPECT_EQ(tex->sampler_dim, GLSL_SAMPLER_DIM_RECT);
+         EXPECT_GE(nir_tex_instr_src_index(tex, nir_tex_src_coord), 0);
+         if (stage == MESA_SHADER_FRAGMENT) {
+            EXPECT_EQ(tex->op, sampler_bias ? nir_texop_txb : nir_texop_tex);
+         } else {
+            EXPECT_EQ(tex->op, nir_texop_txl);
+            EXPECT_LT(nir_tex_instr_src_index(tex, nir_tex_src_bias), 0);
+            int lod = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+            ASSERT_GE(lod, 0);
+            EXPECT_EQ(nir_src_as_float(tex->src[lod].src), 0.0);
+         }
+         nir_validate_shader(b.shader, "rectangle level zero");
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(NativeForms, ImageFenceWaitsRotatingWriteSlots)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_index data = agx_register(16, AGX_SIZE_32);
+   data.channels_m1 = 3;
+   agx_index coord = agx_register(24, AGX_SIZE_32);
+   coord.channels_m1 = 1;
+   for (unsigned i = 0; i < 3; ++i) {
+      agx_image_write(b, data, coord, agx_zero(), agx_uniform(8, AGX_SIZE_64),
+                      agx_register(28, AGX_SIZE_32), AGX_DIM_2D, true);
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+
+   agx3_encoded_scoped_barrier fence;
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3B,
+                                       AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT,
+                                       &fence));
+   const uint8_t *bytes = (const uint8_t *)binary.data;
+   unsigned fences = 0;
+   for (unsigned i = 0; i + fence.length <= binary.size; ++i) {
+      if (memcmp(bytes + i, fence.bytes, fence.length))
+         continue;
+      /* The first write uses the fence's embedded slot1 wait. Later writes
+       * rotate to slots2/3 and must finish before the cache fence, not after. */
+      if (fences > 0) {
+         uint8_t carrier[AGX3_ALU_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_alu_band_identity_wait(
+            AGX_ISA_ENCODING_AGX3B, 0, 1u << fences, carrier, &len));
+         ASSERT_GE(i, len);
+         EXPECT_EQ(memcmp(bytes + i - len, carrier, len), 0) << fences;
+      }
+      ++fences;
+      i += fence.length - 1;
+   }
+   EXPECT_EQ(fences, 3u);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
 }

@@ -1754,7 +1754,10 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
    };
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, nir, agx_nir_lower_interpolation, false);
+      /* G17P fragment Layer is a flat coefficient, as in Honeykrisp. The
+       * compute grid-Z register is not a fragment Layer system value. */
+      NIR_PASS(_, nir, agx_nir_lower_interpolation,
+               dev->chip == AGX_CHIP_G17P);
    }
 
    /* We always use dynamic sample shading in the GL driver. Indicate that. */
@@ -1929,7 +1932,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL,
                   NULL);
          NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
-         NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs, false);
+         NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs,
+                  dev->chip == AGX_CHIP_G17P);
       } else {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
 
@@ -2117,7 +2121,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       NIR_PASS(_, gs_copy, agx_nir_lower_cull_distance_vs);
 
       struct agx_unlinked_uvs_layout uvs = {0};
-      NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs, false);
+      NIR_PASS(_, gs_copy, agx_nir_lower_uvs, &uvs,
+               dev->chip == AGX_CHIP_G17P);
 
       compiled->gs_copy =
          agx_compile_nir(dev, gs_copy, &pctx->debug, MESA_SHADER_GEOMETRY,
@@ -2309,9 +2314,22 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       nir_foreach_function_impl(impl, nir) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
-               if (instr->type == nir_instr_type_tex)
-                  so->info.uses_buffer_textures |=
-                     nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_BUF;
+               if (instr->type != nir_instr_type_tex)
+                  continue;
+
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               so->info.uses_buffer_textures |=
+                  tex->sampler_dim == GLSL_SAMPLER_DIM_BUF;
+               if (tex->op == nir_texop_lod) {
+                  /* G17P's native LOD query takes implicit derivatives and
+                   * the sampler's descriptor bias, not a shader bias operand.
+                   * The early pass above added only the API sampler bias;
+                   * remove it here and bind a biased companion below. Keep
+                   * ordinary sampling's software bias to avoid accumulating
+                   * descriptor and sample-level quantization errors. */
+                  nir_steal_tex_src(tex, nir_tex_src_bias);
+                  so->info.uses_query_lod = true;
+               }
             }
          }
       }
@@ -3249,6 +3267,12 @@ agx_bind_shader_state(struct pipe_context *pctx, void *cso,
    else
       ctx->stage[stage].dirty = ~0;
 
+   struct agx_uncompiled_shader *old = ctx->stage[stage].shader;
+   struct agx_uncompiled_shader *next = cso;
+   if ((old && old->info.uses_query_lod) !=
+       (next && next->info.uses_query_lod))
+      ctx->stage[stage].dirty |= AGX_STAGE_DIRTY_SAMPLER;
+
    ctx->stage[stage].shader = cso;
 }
 
@@ -3899,10 +3923,14 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
       /* Keep ordinary sampler handles stable at i+1.  If any sampler needs a
        * custom border, reserve a disjoint clamp-to-zero bank at slot 33, as
        * Honeykrisp does with its second sampler plane. */
-      const unsigned count = custom_borders
-                                ? AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE +
-                                     ctx->stage[stage].sampler_count
-                                : nr_samplers;
+      const bool query_lod = cs->so && cs->so->info.uses_query_lod;
+      unsigned count = nr_samplers;
+      if (custom_borders)
+         count = AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE +
+                 ctx->stage[stage].sampler_count;
+      if (query_lod)
+         count = AGX_GALLIUM_G17P_QUERY_LOD_BASE +
+                 ctx->stage[stage].sampler_count;
       struct agx_ptr T = agx_pool_alloc_aligned(
          &batch->pool, sampler_length * count, 64);
       memset(T.cpu, 0, sampler_length * count);
@@ -3993,6 +4021,21 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
                cfg.compare_func = AGX_COMPARE_FUNC_LEQUAL;
                cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
             }
+         }
+      }
+
+      if (query_lod) {
+         for (unsigned i = 0; i < ctx->stage[stage].sampler_count; ++i) {
+            const struct agx_sampler_state *sampler =
+               ctx->stage[stage].samplers[i];
+            const uint8_t *ordinary =
+               (const uint8_t *)T.cpu + sampler_length * (i + 1);
+            uint8_t *query = (uint8_t *)T.cpu + sampler_length *
+               (AGX_GALLIUM_G17P_QUERY_LOD_BASE + i);
+            agx_unpack(NULL, ordinary, SAMPLER_HAL200, cfg);
+            cfg.lod_bias = sampler ? CLAMP(sampler->base.lod_bias, -16.0, 16.0)
+                                   : 0.0;
+            AGX_SAMPLER_HAL200_pack((uint32_t *)query, &cfg);
          }
       }
 
@@ -6170,6 +6213,16 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
 
    struct agx_fragment_face_2_packed face_2;
    agx_pack_fragment_face_2(&face_2, object_type, &ctx->fs->b.info);
+   /* G17P's native depth contract must preserve late shader side effects.
+    * An unchanged depth output alone does not permit early rejection when
+    * image or SSBO stores precede the fragment tests. Match Honeykrisp's
+    * native face packing rather than inheriting the AGX2 depth-only word. */
+   if (!agx_ppp_hal200_fragment_face_depth_pack(
+          dev->chip, agx_translate_depth_layout(ctx->fs->b.info.depth_layout),
+          ctx->fs->b.info.early_fragment_tests,
+          ctx->fs->so && ctx->fs->so->info.writes_memory,
+          face_2.opaque[0], &face_2.opaque[0]))
+      return NULL;
 
    /* The output select carries the vertex program's clip-distance planes,
     * point size and viewport/layer selectors alongside the fragment bits;
@@ -7148,7 +7201,7 @@ agx_launch_gs_prerast(struct agx_batch *batch,
    }
 
    /* Launch the vertex shader first */
-   agx_launch(batch, grid_vs, wg, ctx->vs, ctx->linked.vs, ctx->vs->stage, 0);
+   agx_launch(batch, grid_vs, wg, ctx->vs, ctx->linked.vs, ctx->vs->stage, 0, 0);
 
    /* Transform feedback and various queries require extra dispatching,
     * determine if we need that here.
@@ -7174,7 +7227,7 @@ agx_launch_gs_prerast(struct agx_batch *batch,
    if (gs->gs_count && xfb_or_queries) {
       perf_debug(dev, "Geometry shader count");
       agx_launch(batch, grid_gs, wg, gs->gs_count, NULL, MESA_SHADER_GEOMETRY,
-                 0);
+                 0, 0);
    }
 
    if (gs->gs.prefix_sum) {
@@ -7186,11 +7239,11 @@ agx_launch_gs_prerast(struct agx_batch *batch,
    if (xfb_or_queries) {
       perf_debug(dev, "Geometry shader transform feedback / query program");
       agx_launch(batch, agx_1d(1), agx_workgroup(1, 1, 1), gs->pre_gs, NULL,
-                 MESA_SHADER_COMPUTE, 0);
+                 MESA_SHADER_COMPUTE, 0, 0);
    }
 
    /* Pre-rast geometry shader */
-   agx_launch(batch, grid_gs, wg, gs, NULL, MESA_SHADER_GEOMETRY, 0);
+   agx_launch(batch, grid_gs, wg, gs, NULL, MESA_SHADER_GEOMETRY, 0, 0);
 }
 
 static void
@@ -7731,10 +7784,10 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    }
 
    agx_launch(batch, vs_grid, agx_workgroup(64, 1, 1), ctx->vs, ctx->linked.vs,
-              MESA_SHADER_VERTEX, 0);
+              MESA_SHADER_VERTEX, 0, 0);
 
    agx_launch(batch, tcs_grid, agx_workgroup(tcs->tess.output_patch_size, 1, 1),
-              ctx->tcs, NULL, MESA_SHADER_TESS_CTRL, 0);
+              ctx->tcs, NULL, MESA_SHADER_TESS_CTRL, 0, 0);
 
    uint64_t c_prims = agx_get_query_address(
       batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_C_PRIMITIVES]);
@@ -8439,7 +8492,7 @@ void
 agx_launch(struct agx_batch *batch, struct agx_grid grid,
            struct agx_workgroup wg, struct agx_compiled_shader *cs,
            struct agx_linked_shader *linked, mesa_shader_stage stage,
-           unsigned variable_shared_mem)
+           unsigned variable_shared_mem, uint64_t indirect_num_workgroups)
 {
    struct agx_context *ctx = batch->ctx;
 
@@ -8454,7 +8507,12 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
     * available in GPU memory. This is either the indirect buffer, or just a
     * buffer we upload ourselves if not indirect.
     */
-   if (grid.mode == AGX_CDM_MODE_DIRECT) {
+   if (indirect_num_workgroups) {
+      /* G17P expands indirect workgroup counts into a separate hardware
+       * record of global thread counts. Keep the API counts for the shader.
+       */
+      batch->uniforms.tables[AGX_SYSVAL_TABLE_GRID] = indirect_num_workgroups;
+   } else if (grid.mode == AGX_CDM_MODE_DIRECT) {
       uint32_t groups[3] = {
          grid.count[0] / wg.x,
          grid.count[1] / wg.y,
@@ -8671,7 +8729,7 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    }
 
    agx_launch(batch, grid, wg, cs, NULL, MESA_SHADER_COMPUTE,
-              info->variable_shared_mem);
+              info->variable_shared_mem, indirect);
 
    /* TODO: Dirty tracking? */
    agx_dirty_all(ctx);
