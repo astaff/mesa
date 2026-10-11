@@ -351,8 +351,14 @@ agx_g17p_vertex_program_info(
        compiler_info->uvs_size < compiler_info->clip_off ||
        compiler_info->uvs_size - compiler_info->clip_off > 8 ||
        (position_only && compiler_info->uvs_written != 0) ||
-       compiler_info->user_size > 124u ||
-       compiler_info->uvs_size > 128u ||
+       compiler_info->user_size > 125u ||
+       /* Besides the 128 API components, unlinked G17P shaders reserve a
+        * default Layer varying and PointSize, eight fixed clip distances,
+        * and one packed layer/viewport word. UVSW and the native state counts
+        * both have eight-bit indices; the fragment coefficient bound is
+        * checked separately when linking.
+        */
+       compiler_info->uvs_size > 139u ||
        __builtin_popcountll(compiler_info->uvs_written) > compiler_info->user_size)
       return false;
 

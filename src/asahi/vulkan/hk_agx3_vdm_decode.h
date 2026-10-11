@@ -25,11 +25,13 @@ extern "C" {
  * layouts are rejected before any fields are consumed. */
 #define HK_AGX3_SHADER_BINARY_VERSION 32u
 
-/* A G17P vertex program writes at most 128 UVS words: Apple's compiler emits
- * position plus thirty-one float4 user locations. Its fragment linker refuses
- * a 128th coefficient. */
-#define HK_AGX3_G17P_MAX_UVS_WORDS 128u
-#define HK_AGX3_G17P_MAX_USER_WORDS (HK_AGX3_G17P_MAX_UVS_WORDS - 4u)
+/* API outputs include position. Unlinked shaders additionally reserve a
+ * default Layer varying and PointSize, up to eight fixed clip-distance copies,
+ * and one packed layer/viewport word. The 125 ordinary words plus RHW and
+ * FragCoordZ still fit the separate 127-coefficient bound.
+ */
+#define HK_AGX3_G17P_MAX_UVS_WORDS 139u
+#define HK_AGX3_G17P_MAX_USER_WORDS 125u
 #define HK_AGX3_G17P_MAX_COEFFICIENTS 127u
 
 bool hk_agx3_shader_binary_version_supported(uint32_t version);

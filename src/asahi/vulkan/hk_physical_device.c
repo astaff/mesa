@@ -800,9 +800,10 @@ hk_get_device_features(
        * graphics/compute counter now has a strict native helper or fragment-
        * prolog compiler oracle and shares the guarded compact-report ABI. */
       features->pipelineStatisticsQuery = true;
-      /* The graphics-stage descriptor, storage-write and atomic paths record
-       * through HAL200 but are not yet qualified on hardware. */
-      features->vertexPipelineStoresAndAtomics = false;
+      /* Vertex, tessellation and geometry storage operations share the
+       * native compiler and compute-backed geometry/tessellation paths.
+       */
+      features->vertexPipelineStoresAndAtomics = true;
       /* Qualified on hardware: g17p-vulkan-fragment-side-effects renders
        * 1024/1024 exact pixels, 0 cleared, 0 wrong, with 0/256 mixed 2x2
        * quads and 0/32 mixed 8x4 SIMD groups, and its fragment stores,
@@ -932,11 +933,13 @@ hk_get_device_properties(const struct agx_device *dev,
     * giving a theoretical limit of 119. We round down to 116 to give a sensible
     * limit in vec4s.
     */
-   /* G17P has the same 128-word UVS budget: Apple's compiler writes position
-    * plus thirty-one float4 user locations, and its fragment linker admits 127
-    * coefficients. The same reserve for clip/cull and layer/viewport words
-    * applies. */
-   unsigned max_vgt_output_components = 116;
+   /* G17P's 8-bit UVS indices and native vertex-state counts also cover the
+    * fixed-function copies above and the unlinked shader's default Layer and
+    * PointSize. The API's 128 components include position; these defaults and
+    * fixed copies are internal reservations. Fragment coefficients retain
+    * their independent bound. The 136-word clip boundary is hardware-tested.
+    */
+   unsigned max_vgt_output_components = dev->chip == AGX_CHIP_G17P ? 128 : 116;
 
    *properties = (struct vk_properties){
       .apiVersion = hk_get_vk_version(),
@@ -948,7 +951,10 @@ hk_get_device_properties(const struct agx_device *dev,
       /* Vulkan 1.0 limits */
       .maxImageDimension1D = 16384,
       .maxImageDimension2D = 16384,
-      .maxImageDimension3D = 16384,
+      /* G17P supports 3D base dimensions up to 2048, although the shared
+       * texture descriptor fields can encode larger arrays.
+       */
+      .maxImageDimension3D = dev->chip == AGX_CHIP_G17P ? 2048 : 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
       /* The G17P texture/PBE includes the software alignment tail in its

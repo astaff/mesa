@@ -8142,6 +8142,11 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
 
    if (draw.restart) {
       uint32_t index_size_B = agx_index_size_to_B(draw.index_size);
+      /* The range helper removes firstIndex for direct draws. Adjust its
+       * matching base too; indirect draws retain their original base/range
+       * and read firstIndex from the application draw descriptor.
+       */
+      uint64_t index_buffer = agx_draw_index_buffer(draw);
 
       if (dev->dev.chip == AGX_CHIP_G17P) {
          /* Disabled statistics are represented by the writable scratch page,
@@ -8150,13 +8155,13 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
          libagx_increment_ia_restart_nonnull(
             cmd, agx_1d(1024), AGX_BARRIER_ALL | AGX_PREGFX, ia_vertices,
             ia_prims, vs_invocations, c_prims, c_inv, draw_ptr,
-            draw.index_buffer, agx_draw_index_range_el(draw),
+            index_buffer, agx_draw_index_range_el(draw),
             dyn->ia.primitive_restart_index, index_size_B, prim, patch_size);
       } else {
          libagx_increment_ia_restart(
             cmd, agx_1d(1024), AGX_BARRIER_ALL | AGX_PREGFX, ia_vertices,
             ia_prims, vs_invocations, c_prims, c_inv, draw_ptr,
-            draw.index_buffer, agx_draw_index_range_el(draw),
+            index_buffer, agx_draw_index_range_el(draw),
             dyn->ia.primitive_restart_index, index_size_B, prim, patch_size);
       }
    } else {

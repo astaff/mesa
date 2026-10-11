@@ -118,6 +118,24 @@ write_desc(struct hk_descriptor_set *set, uint32_t binding, uint32_t elem,
    hk_descriptor_set_publish(set, dst, desc_size);
 }
 
+/* Select the existing heap entry for zero bias, avoiding an extra allocation. */
+static uint16_t
+unbiased_sampler_index(const struct hk_sampler *sampler, unsigned plane)
+{
+   const struct hk_rc_sampler *hw = sampler->planes[plane].unbiased;
+   return hw ? hw->index : sampler->planes[plane].hw->index;
+}
+
+static void
+write_g17p_sampler_bias(struct hk_sampled_image_descriptor_sw *sw,
+                       const struct hk_sampler *sampler, unsigned plane)
+{
+   sw->g17p.lod_bias = sampler->mip_lod_bias;
+   sw->g17p.unbiased_sampler_index = unbiased_sampler_index(sampler, plane);
+   sw->g17p.unbiased_clamp_0_sampler_index =
+      sampler->has_border ? unbiased_sampler_index(sampler, 1) : 0;
+}
+
 /* The G17P descriptor of a single-plane view, optionally with a single-plane
  * sampler without a custom border: exactly the bytes the general path below
  * writes for that case, built directly instead of through its three-plane
@@ -157,6 +175,7 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
                .lod_bias_fp16 = sampler->lod_bias_fp16,
             },
       };
+      write_g17p_sampler_bias(&desc.sw, sampler, 0);
       if (!hk_set_null_native_texture(9, &desc.tex))
          return false;
       write_desc(set, binding, elem, &desc, sizeof(desc));
@@ -201,7 +220,7 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
          },
    };
    if (sampler)
-      desc.sw.sampler = sampler->planes[0].hw->key;
+      write_g17p_sampler_bias(&desc.sw, sampler, 0);
 
    write_desc(set, binding, elem, &desc, sizeof(desc));
    return true;
@@ -322,7 +341,10 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
           * image plane. G17P consumes the native heap index directly. */
          desc[plane].sw.sampler_index = hk_sampler_descriptor_index(
             set->layout, sampler->planes[sampler_plane].hw->index);
-         desc[plane].sw.sampler = sampler->planes[sampler_plane].hw->key;
+         if (set->layout->descriptor_generation == 9)
+            write_g17p_sampler_bias(&desc[plane].sw, sampler, sampler_plane);
+         else
+            desc[plane].sw.sampler = sampler->planes[sampler_plane].hw->key;
          desc[plane].sw.lod_bias_fp16 = sampler->lod_bias_fp16;
          desc[plane].sw.clamp_0_sampler_index_or_negative = -1;
       }

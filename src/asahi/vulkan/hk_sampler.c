@@ -313,8 +313,8 @@ hk_CreateSampler(VkDevice device,
    }
 
    /* Gen4 has no bias field, so shaders fetch it from the descriptor set.
-    * HAL200/Gen5 carry it in the hardware sampler and must see a zero software
-    * bias or the API bias would be applied twice. */
+    * G17P explicit-bias samples use the separate full-precision software
+    * field, to avoid losing precision when the two biases cancel. */
    sampler->lod_bias_fp16 =
       agx_chip_sampler_generation(pdev->dev.chip) ==
             AGX_SAMPLER_GENERATION_GEN4
@@ -416,6 +416,34 @@ hk_CreateSampler(VkDevice device,
       sampler->border_is_int = vk_border_color_is_int(info->borderColor);
    }
 
+   if (pdev->dev.chip == AGX_CHIP_G17P && info->mipLodBias != 0.0f) {
+      VkSamplerCreateInfo unbiased_info = *info;
+      unbiased_info.mipLodBias = 0.0f;
+
+      for (unsigned plane = 0; plane < sampler->plane_count; ++plane) {
+         if (plane && sampler->vk.ycbcr_conversion) {
+            unbiased_info.minFilter = unbiased_info.magFilter =
+               sampler->vk.ycbcr_conversion->state.chroma_filter;
+         }
+
+         if (!pack_sampler(pdev, &unbiased_info, plane == 0,
+                           workaround_rgba4, int_border_custom,
+                           sampler->vk.reduction_mode, &samp)) {
+            hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
+            return hk_sampler_pack_error(dev, &unbiased_info,
+                                         sampler->vk.reduction_mode,
+                                         "unbiased plane");
+         }
+
+         result = hk_sampler_heap_add(dev, &samp,
+                                      &sampler->planes[plane].unbiased);
+         if (result != VK_SUCCESS) {
+            hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
+            return result;
+         }
+      }
+   }
+
    *pSampler = hk_sampler_to_handle(sampler);
 
    return VK_SUCCESS;
@@ -433,6 +461,8 @@ hk_DestroySampler(VkDevice device, VkSampler _sampler,
 
    for (uint8_t plane = 0; plane < sampler->plane_count; plane++) {
       hk_sampler_heap_remove(dev, sampler->planes[plane].hw);
+      if (sampler->planes[plane].unbiased)
+         hk_sampler_heap_remove(dev, sampler->planes[plane].unbiased);
    }
 
    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);

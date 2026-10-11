@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "hk_nir_sampler_bias.h"
 #include "util/u_debug.h"
 
 #include "hk_nir_ray_tracing.h"
@@ -42,6 +43,7 @@
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
 #include "hk_shader.h"
+#include "hk_nir_sampler_bias.h"
 
 #include "nir_builder_opcodes.h"
 #include "nir_builtin_builder.h"
@@ -1958,11 +1960,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * Only the Gen4 sampler word has no LOD-bias field. On every later
     * generation hk_CreateSampler writes the API bias into the hardware
     * sampler (SAMPLER_HAL200.lod_bias, SAMPLER_GEN5.lod_bias) and
-    * deliberately publishes a *zero* software bias, so lowering the software
-    * bias into the shader adds a descriptor crawl that provably computes
+    * keeps ordinary sampling in hardware. Lowering a zero software bias
+    * into every shader would add a descriptor crawl that computes
     * nothing: it turns every tex into txb(load 0), and every txd into
     * gradients scaled by exp2(load 0). Skipping it is a no-op for the value
     * and keeps a genuine API bias or gradient as the shader's own operand.
+    * G17P txb is handled separately below: its two biases must be added
+    * before the sampler/instruction's fixed-point quantization.
     */
    const bool support_lod_bias =
       agx_chip_sampler_generation(dev->dev.chip) == AGX_SAMPLER_GENERATION_GEN4;
@@ -1979,6 +1983,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, agx_nir_lower_g17p_texture_early, support_lod_bias);
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_early, support_lod_bias);
+
+   if (dev->dev.chip == AGX_CHIP_G17P)
+      NIR_PASS(_, nir, nir_shader_tex_pass, hk_lower_g17p_sampler_bias,
+               nir_metadata_control_flow, NULL);
 
    struct hk_instance *instance = hk_physical_device_instance(
       (struct hk_physical_device *)dev->vk.physical);

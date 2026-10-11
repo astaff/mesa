@@ -21,7 +21,15 @@ struct hk_descriptor_set_layout;
 
 /* Software tail following a generation-sized native texture descriptor. */
 struct hk_sampled_image_descriptor_sw {
-   struct agx_sampler_packed sampler;
+   union {
+      struct agx_sampler_packed sampler;
+      /* G17P uses heap samplers, leaving the embedded AGX2 word available. */
+      struct {
+         uint16_t unbiased_sampler_index;
+         uint16_t unbiased_clamp_0_sampler_index;
+         float lod_bias;
+      } g17p;
+   };
    /* Raw native heap index on G17P; AGX2-biased index on other chips. */
    uint16_t sampler_index;
 

@@ -191,6 +191,19 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'hk_sampler_bias',
+    executable(
+      'hk_sampler_bias_test',
+      files('tests/test-hk-sampler-bias.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src, inc_asahi],
+      dependencies : [idep_nir, idep_mesautil],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
 endif
 
 hk_entrypoints = custom_target(

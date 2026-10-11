@@ -34,6 +34,8 @@ struct hk_sampler {
 
    struct {
       struct hk_rc_sampler *hw;
+      /* G17P explicit-bias samples combine both biases before quantization. */
+      struct hk_rc_sampler *unbiased;
    } planes[2];
 };
 

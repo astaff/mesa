@@ -14,6 +14,7 @@
 #include "hk_descriptor_set_layout.h"
 #include "hk_native_descriptor.h"
 #include "hk_shader.h"
+#include "hk_nir_sampler_bias.h"
 #include "layout/layout.h"
 
 #include "nir.h"
@@ -714,14 +715,20 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
    if (tex->op == nir_texop_lod_bias) {
       /* G17P carries API LOD bias in its native sampler word. Avoid a
        * redundant software load, including for dynamically indexed sets. */
-      if (ctx->descriptor_generation == 9) {
+      if (ctx->descriptor_generation == 9 &&
+          !(tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS)) {
          nir_def_replace(&tex->def, nir_imm_float16(b, 0.0));
          return true;
       }
-      unsigned offs = native.lod_bias;
+      const bool combined = ctx->descriptor_generation == 9;
+      unsigned offs = combined
+         ? native.sampler + offsetof(struct hk_sampled_image_descriptor_sw,
+                                     g17p.lod_bias)
+         : native.lod_bias;
 
       nir_def *bias = load_resource_deref_desc(
-         b, 1, 16, nir_src_as_deref(nir_src_for_ssa(sampler)),
+         b, 1, combined ? 32 : 16,
+         nir_src_as_deref(nir_src_for_ssa(sampler)),
          plane_offset_B + offs, ctx);
 
       nir_def_replace(&tex->def, bias);
@@ -834,6 +841,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
          offs = native.clamp_0_sampler_index;
       }
 
+      if (ctx->descriptor_generation == 9 &&
+          (tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS)) {
+         offs = native.sampler +
+                (clamp_to_0
+                    ? offsetof(struct hk_sampled_image_descriptor_sw,
+                               g17p.unbiased_clamp_0_sampler_index)
+                    : offsetof(struct hk_sampled_image_descriptor_sw,
+                               g17p.unbiased_sampler_index));
+      }
+
       nir_def *index = load_resource_deref_desc(
          b, 1, 16, nir_src_as_deref(nir_src_for_ssa(sampler)),
          plane_offset_B + offs, ctx);
@@ -866,6 +883,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, index);
    }
 
+   /* The HK descriptor selection is complete; do not leak a private flag
+    * into shared native texture-shape validation. */
+   tex->backend_flags &= ~HK_TEXTURE_FLAG_COMBINED_BIAS;
    return true;
 }
 

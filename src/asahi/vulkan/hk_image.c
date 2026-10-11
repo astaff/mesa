@@ -716,7 +716,9 @@ hk_GetPhysicalDeviceImageFormatProperties2(
                                  pImageFormatInfo->usage, pImageFormatInfo->pNext))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-   const uint32_t max_dim = 16384;
+   const uint32_t max_dim = pImageFormatInfo->type == VK_IMAGE_TYPE_3D
+                               ? pdev->vk.properties.maxImageDimension3D
+                               : 16384;
    VkExtent3D maxExtent;
    uint32_t maxArraySize;
    switch (pImageFormatInfo->type) {
