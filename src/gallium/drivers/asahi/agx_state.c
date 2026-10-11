@@ -2273,6 +2273,23 @@ should_lower_robustness(const nir_intrinsic_instr *intr, const void *data)
    }
 }
 
+static nir_def *
+agx_buffer_texture_metadata(nir_builder *b, nir_tex_instr *tex)
+{
+   const int src = nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+   assert(src >= 0);
+   nir_intrinsic_instr *handle = nir_src_as_intrinsic(tex->src[src].src);
+   assert(handle && handle->intrinsic == nir_intrinsic_load_texture_handle_agx);
+   mesa_shader_stage stage = b->shader->info.stage;
+   if (stage == MESA_SHADER_VERTEX && b->shader->info.vs.tes_poly)
+      stage = MESA_SHADER_TESS_EVAL;
+   nir_def *base = nir_load_sysval_agx(
+      b, 1, 64, .desc_set = AGX_SYSVAL_STAGE(stage),
+      .binding = offsetof(struct agx_stage_uniforms, buffer_texture_base));
+   return nir_iadd(b, base, nir_u2u64(b, nir_imul_imm(
+      b, nir_u2u32(b, handle->src[0].ssa), AGX_G17P_EMRT_DESCRIPTOR_SIZE)));
+}
+
 static void
 agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
                       nir_shader *nir, bool support_lod_bias, bool robust)
@@ -2297,6 +2314,18 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    /* We need to lower binding tables before calling agx_preprocess_nir, since
     * that does texture lowering that needs to know the binding model.
     */
+   if (dev->chip == AGX_CHIP_G17P) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_tex)
+                  so->info.uses_buffer_textures |=
+                     nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_BUF;
+            }
+         }
+      }
+   }
+
    struct agx_lower_bindings_options binding_options = {
       .uses_bindless_samplers = &so->uses_bindless_samplers,
       .g17p_plain_txf_crawl = dev->chip == AGX_CHIP_G17P,
@@ -2376,8 +2405,12 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
 
    const enum agx_descriptor_generation descriptor_generation =
       agx_gallium_descriptor_generation(dev->chip);
-   NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
-            descriptor_generation);
+   if (dev->chip == AGX_CHIP_G17P)
+      NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata_cb,
+               descriptor_generation, agx_buffer_texture_metadata);
+   else
+      NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
+               descriptor_generation);
    if (dev->chip == AGX_CHIP_G17P)
       NIR_PASS(_, nir, agx_nir_rebind_g17p_texture_crawls);
    NIR_PASS(_, nir, nir_lower_ssbo, NULL);
@@ -3701,6 +3734,14 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
    struct agx_ptr T_tex = agx_pool_alloc_aligned(
       &batch->pool, descriptor_size * nr_tex_descriptors, 64);
 
+   struct agx_ptr buffer_metadata = {0};
+   if (cs->so->info.uses_buffer_textures) {
+      buffer_metadata = agx_pool_alloc_aligned(
+         &batch->pool, nr_textures * AGX_G17P_EMRT_DESCRIPTOR_SIZE, 32);
+      memset(buffer_metadata.cpu, 0, nr_textures * AGX_G17P_EMRT_DESCRIPTOR_SIZE);
+   }
+   batch->stage_uniforms[stage].buffer_texture_base = buffer_metadata.gpu;
+
    for (unsigned i = 0; i < MIN2(nr_textures, nr_active_textures); ++i) {
       struct agx_sampler_view *tex = ctx->stage[stage].textures[i];
       struct agx_gallium_texture_descriptor *texture =
@@ -3724,6 +3765,20 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
          agx_native_descriptor_rejected(dev, "sampled texture");
 
       memcpy(texture, &tex->desc, descriptor_size);
+      if (buffer_metadata.cpu && tex->base.target == PIPE_BUFFER) {
+         uint8_t *entry = (uint8_t *)buffer_metadata.cpu +
+                          i * AGX_G17P_EMRT_DESCRIPTOR_SIZE;
+         const uint32_t elements =
+            agx_texture_buffer_size_el(tex->format, tex->base.u.buf.size);
+         const uint64_t address = agx_map_gpu(rsrc) + tex->base.u.buf.offset;
+         const uint32_t rgb32 = tex->format == PIPE_FORMAT_R32G32B32_FLOAT ||
+                                tex->format == PIPE_FORMAT_R32G32B32_UINT ||
+                                tex->format == PIPE_FORMAT_R32G32B32_SINT;
+         memcpy(entry, &tex->desc, descriptor_size);
+         memcpy(entry + AGX_G17P_BUFFER_TEXTURE_SIZE_OFFSET, &elements, 4);
+         memcpy(entry + AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET, &address, 8);
+         memcpy(entry + AGX_G17P_BUFFER_TEXTURE_RGB32_OFFSET, &rgb32, 4);
+      }
    }
 
    for (unsigned i = nr_active_textures; i < nr_textures; ++i) {

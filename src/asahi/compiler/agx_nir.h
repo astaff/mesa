@@ -55,6 +55,14 @@ bool agx_nir_lower_texture_with_buffer_metadata(struct nir_shader *s,
                                                bool robust_formatless_images,
                                                uint64_t sparse_ro_offset,
                                                bool sparse_buffer_residency);
+struct nir_builder;
+struct nir_def;
+struct nir_tex_instr;
+typedef struct nir_def *(*agx_buffer_texture_metadata_cb)(
+   struct nir_builder *b, struct nir_tex_instr *tex);
+bool agx_nir_lower_texture_with_buffer_metadata_cb(
+   struct nir_shader *s, unsigned generation,
+   agx_buffer_texture_metadata_cb buffer_metadata);
 bool agx_nir_lower_multisampled_image_store(struct nir_shader *s);
 bool agx_nir_lower_multisampled_image_store_for_generation(struct nir_shader *s,
                                                          unsigned generation);

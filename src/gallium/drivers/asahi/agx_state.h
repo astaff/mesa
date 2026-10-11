@@ -177,6 +177,7 @@ struct PACKED agx_stage_uniforms {
     * tables to bindless access.
     */
    uint64_t texture_base;
+   uint64_t buffer_texture_base;
 
    /* Uniform buffer objects */
    uint64_t ubo_base[PIPE_MAX_CONSTANT_BUFFERS];
@@ -319,6 +320,7 @@ struct agx_uncompiled_shader {
       bool uses_fbfetch;
       bool uses_sample_shading;
       bool needs_sample_count;
+      bool uses_buffer_textures;
       bool writes_memory;
 
       /* Number of bindful textures, images used */
