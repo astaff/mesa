@@ -336,7 +336,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
          cfg.width = DIV_ROUND_UP(u_minify(layout->width_px, level), denom.x);
          cfg.height = DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
          cfg.first_level = 0;
-         cfg.last_level = 1;
+         cfg.last_level = dev->dev.chip == AGX_CHIP_G17P ? 0 : 1;
       } else {
          cfg.address = base_addr + ail_get_layer_offset_B(layout, layer);
          cfg.width = layout->width_px;
