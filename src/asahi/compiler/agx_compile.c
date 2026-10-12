@@ -7410,8 +7410,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * fp32 RTE boundary after those rewrites, then lower the integer math. */
    if (agx3_fma &&
        nir_is_rounding_mode_rtne(nir->info.float_controls_execution_mode, 32)) {
-      NIR_PASS(_, nir, nir_shader_lower_instructions, agx_rte_fma_filter,
-               agx_rte_fma_boundary, NULL);
+      NIR_PASS(_, nir, agx_nir_lower_rte_fma);
       NIR_PASS(_, nir, nir_lower_int64);
       NIR_PASS(_, nir, agx_nir_lower_imul64);
       NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
@@ -11283,8 +11282,27 @@ agx_rte_fma_filter(const nir_instr *instr, const void *data)
    if (instr->type != nir_instr_type_alu)
       return false;
    const nir_alu_instr *alu = nir_instr_as_alu(instr);
-   return alu->op == nir_op_ffma && alu->def.bit_size == 32 &&
-          alu->def.num_components == 1;
+   if (alu->op != nir_op_ffma || alu->def.bit_size != 32 ||
+       alu->def.num_components != 1)
+      return false;
+
+   for (unsigned s = 0; s < 3; ++s) {
+      const nir_scalar src =
+         nir_get_scalar(alu->src[s].src.ssa, alu->src[s].swizzle[0]);
+      if (!nir_scalar_is_const(src))
+         continue;
+      const uint32_t bits = nir_scalar_as_uint(src);
+      const unsigned exponent = (bits >> 23) & 0xff;
+      if (exponent == 255)
+         return false;
+      if (s == 2) {
+         if (exponent >= 26)
+            return false;
+      } else if (exponent == 0 || (exponent >= 127 && !(bits & 0x7fffff))) {
+         return false;
+      }
+   }
+   return true;
 }
 
 static nir_def *
@@ -11347,6 +11365,16 @@ agx_rte_fma_boundary(nir_builder *b, nir_instr *instr, void *data)
    nir_def *unchanged = &alu->def;
    nir_pop_if(b, NULL);
    return nir_if_phi(b, fixed, unchanged);
+}
+
+bool
+agx_nir_lower_rte_fma(nir_shader *nir)
+{
+   if (!nir_is_rounding_mode_rtne(nir->info.float_controls_execution_mode, 32))
+      return false;
+
+   return nir_shader_lower_instructions(nir, agx_rte_fma_filter,
+                                        agx_rte_fma_boundary, NULL);
 }
 
 /* Separate pure kills from testing updates before lowering their different
