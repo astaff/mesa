@@ -12,6 +12,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_range_analysis.h"
 #include "util/bitset.h"
 #include "util/glheader.h"
 #include "util/half_float.h"
@@ -11277,11 +11278,8 @@ agx_max_vertex_attribs(const struct agx_device_key *dev)
  * the minimum normal. Only repair zero results under explicit fp32 RTE;
  * integer mantissas classify that boundary without another rounding step. */
 static bool
-agx_rte_fma_filter(const nir_instr *instr, const void *data)
+agx_rte_fma_needs_repair(const nir_alu_instr *alu, nir_fp_analysis_state *fp)
 {
-   if (instr->type != nir_instr_type_alu)
-      return false;
-   const nir_alu_instr *alu = nir_instr_as_alu(instr);
    if (alu->op != nir_op_ffma || alu->def.bit_size != 32 ||
        alu->def.num_components != 1)
       return false;
@@ -11302,7 +11300,30 @@ agx_rte_fma_filter(const nir_instr *instr, const void *data)
          return false;
       }
    }
+   const fp_class_mask fractional = FP_CLASS_NON_INTEGRAL |
+                                    FP_CLASS_LT_ZERO_GT_NEG_ONE |
+                                    FP_CLASS_GT_ZERO_LT_POS_ONE;
+   for (unsigned s = 0; s < 2; ++s) {
+      if (!(nir_analyze_fp_class(fp, alu->src[s].src.ssa) & fractional))
+         return false;
+   }
    return true;
+}
+
+struct agx_rte_fma_decisions {
+   BITSET_WORD *repair;
+   unsigned count;
+};
+
+static bool
+agx_rte_fma_filter(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   const struct agx_rte_fma_decisions *decisions = data;
+   return alu->op == nir_op_ffma && alu->def.index < decisions->count &&
+          BITSET_TEST(decisions->repair, alu->def.index);
 }
 
 static nir_def *
@@ -11320,8 +11341,9 @@ agx_rte_fma_boundary(nir_builder *b, nir_instr *instr, void *data)
    nir_def *ex = nir_ushr_imm(b, ax, 23);
    nir_def *ey = nir_ushr_imm(b, ay, 23);
    nir_def *ez = nir_ushr_imm(b, az, 23);
-   nir_def *finite = nir_iand(b, nir_ine_imm(b, ex, 255),
-      nir_iand(b, nir_ine_imm(b, ey, 255), nir_ine_imm(b, ez, 255)));
+   nir_def *finite =
+      nir_iand(b, nir_ine_imm(b, ex, 255),
+               nir_iand(b, nir_ine_imm(b, ey, 255), nir_ine_imm(b, ez, 255)));
    nir_def *mx = nir_bcsel(b, nir_ieq_imm(b, ex, 0), nir_imm_int(b, 0),
       nir_ior_imm(b, nir_iand_imm(b, ax, 0x7fffff), 0x800000));
    nir_def *my = nir_bcsel(b, nir_ieq_imm(b, ey, 0), nir_imm_int(b, 0),
@@ -11373,8 +11395,28 @@ agx_nir_lower_rte_fma(nir_shader *nir)
    if (!nir_is_rounding_mode_rtne(nir->info.float_controls_execution_mode, 32))
       return false;
 
-   return nir_shader_lower_instructions(nir, agx_rte_fma_filter,
-                                        agx_rte_fma_boundary, NULL);
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_fp_analysis_state fp = nir_create_fp_analysis_state(impl);
+      struct agx_rte_fma_decisions decisions = {
+         .repair = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD)),
+         .count = impl->ssa_alloc,
+      };
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               const nir_alu_instr *alu = nir_instr_as_alu(instr);
+               if (agx_rte_fma_needs_repair(alu, &fp))
+                  BITSET_SET(decisions.repair, alu->def.index);
+            }
+         }
+      }
+      nir_free_fp_analysis_state(&fp);
+      progress |= nir_function_impl_lower_instructions(
+         impl, agx_rte_fma_filter, agx_rte_fma_boundary, &decisions);
+      free(decisions.repair);
+   }
+   return progress;
 }
 
 /* Separate pure kills from testing updates before lowering their different
