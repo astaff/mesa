@@ -117,24 +117,46 @@ instr_can_cse(const agx_instr *I)
           agx_opcodes_info[I->op].can_reorder;
 }
 
-void
-agx_opt_cse(agx_context *ctx)
+static void
+agx_opt_cse_impl(agx_context *ctx, bool require_overlap)
 {
    struct set *instr_set = _mesa_set_create(NULL, hash_instr, instrs_equal);
    agx_index *replacement = malloc(sizeof(agx_index) * ctx->alloc);
+   unsigned *last = NULL;
+   if (require_overlap) {
+      last = calloc(ctx->alloc, sizeof(*last));
+      agx_compute_liveness(ctx);
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_src(I, s)
+            I->src[s].kill = false;
+      }
+   }
 
    agx_foreach_block(ctx, block) {
       memset(replacement, 0, sizeof(agx_index) * ctx->alloc);
       _mesa_set_clear(instr_set, NULL);
+      if (require_overlap) {
+         memset(last, 0, ctx->alloc * sizeof(*last));
+         unsigned position = 0;
+         agx_foreach_instr_in_block(block, I) {
+            ++position;
+            if (I->op != AGX_OPCODE_PHI) {
+               agx_foreach_ssa_src(I, s)
+                  last[I->src[s].value] = position;
+            }
+         }
+         U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v)
+            last[v] = position;
+      }
 
+      unsigned position = 0;
       agx_foreach_instr_in_block(block, instr) {
-         /* Rewrite as we go so we converge locally in 1 iteration */
+         ++position;
          agx_foreach_ssa_src(instr, s) {
             agx_index repl = replacement[instr->src[s].value];
             if (!agx_is_null(repl))
                agx_replace_src(instr, s, repl);
          }
-
          if (!instr_can_cse(instr))
             continue;
 
@@ -143,14 +165,43 @@ agx_opt_cse(agx_context *ctx)
             _mesa_set_search_or_add(instr_set, instr, &found);
          if (found) {
             const agx_instr *match = entry->key;
-
-            agx_foreach_dest(instr, d) {
-               replacement[instr->dest[d].value] = match->dest[d];
+            if (require_overlap) {
+               bool safe = true;
+               agx_foreach_ssa_dest(instr, d) {
+                  const unsigned a = match->dest[d].value;
+                  const unsigned b = instr->dest[d].value;
+                  safe &= !u_sparse_bitset_test(&block->live_out, b) &&
+                          (last[b] < position || last[a] >= position);
+               }
+               if (!safe) {
+                  entry->key = instr;
+                  continue;
+               }
+               agx_foreach_ssa_dest(instr, d) {
+                  const unsigned a = match->dest[d].value;
+                  const unsigned b = instr->dest[d].value;
+                  last[a] = MAX2(last[a], last[b]);
+               }
             }
+            agx_foreach_dest(instr, d)
+               replacement[instr->dest[d].value] = match->dest[d];
          }
       }
    }
 
+   free(last);
    free(replacement);
    _mesa_set_destroy(instr_set, NULL);
+}
+
+void
+agx_opt_cse(agx_context *ctx)
+{
+   agx_opt_cse_impl(ctx, false);
+}
+
+void
+agx_opt_cse_pressure(agx_context *ctx)
+{
+   agx_opt_cse_impl(ctx, true);
 }

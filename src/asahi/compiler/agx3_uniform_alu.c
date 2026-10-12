@@ -24,16 +24,23 @@ uniform_float_encode(enum agx_isa_encoding encoding,
 
    const unsigned count = op == AGX3_UNIFORM_FMA ? 3 : 2;
    bool uniform = false, reg = false;
+   unsigned half_uniforms = 0;
    for (unsigned i = 0; i < count; ++i) {
+      const bool source_half = half || src[i].half;
+      if (src[i].half && !half && src[i].kind != AGX3_FLOAT_UNIFORM)
+         return false;
+      if (src[i].half && !half && (++half_uniforms > 1 || saturate))
+         return false;
       if (uniform_dest && (src[i].kind == AGX3_FLOAT_UNIFORM ||
                            src[i].abs || src[i].neg))
          return false;
       switch (src[i].kind) {
       case AGX3_FLOAT_UNIFORM:
          uniform = true;
-         if (src[i].value >= 512 || (!half && (src[i].value & 1)) ||
+         if (src[i].value >= 512 || (!source_half && (src[i].value & 1)) ||
              src[i].abs ||
-             (src[i].neg && (half || op != AGX3_UNIFORM_FMA || i != 2)) ||
+             (src[i].neg &&
+              (source_half || op != AGX3_UNIFORM_FMA || i != 2)) ||
              src[i].cache || src[i].discard)
             return false;
          break;
@@ -89,7 +96,8 @@ uniform_float_encode(enum agx_isa_encoding encoding,
          }
          fields[n++] = (struct agx3_field_kv){base + s->kind - 1, value};
          fields[n++] = (struct agx3_field_kv){base + 8, s->kind};
-         fields[n++] = (struct agx3_field_kv){base + 9, half ? 1 : 2};
+         fields[n++] =
+            (struct agx3_field_kv){base + 9, half || s->half ? 1 : 2};
          fields[n++] = (struct agx3_field_kv){base + 10, s->cache};
          fields[n++] = (struct agx3_field_kv){base + 12, s->discard};
          fields[n++] = (struct agx3_field_kv){

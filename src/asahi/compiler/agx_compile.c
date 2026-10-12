@@ -3791,11 +3791,24 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
       }
 
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+      bool has_full_gpr = false;
+      unsigned half_uniforms = 0;
+      agx_foreach_src(I, s) {
+         has_full_gpr |= (I->src[s].type == AGX_INDEX_NORMAL ||
+                          I->src[s].type == AGX_INDEX_REGISTER) &&
+                         I->src[s].size == AGX_SIZE_32;
+         half_uniforms += I->src[s].type == AGX_INDEX_UNIFORM &&
+                          I->src[s].size == AGX_SIZE_16;
+      }
       agx_foreach_src(I, s) {
          if (I->src[s].size != AGX_SIZE_16 ||
              I->src[s].type == AGX_INDEX_IMMEDIATE ||
              I->src[s].type == AGX_INDEX_NULL || I->src[s].abs ||
              I->src[s].neg)
+            continue;
+         if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+             agx_channels(I->dest[0]) == 1 && has_full_gpr &&
+             half_uniforms == 1 && I->src[s].type == AGX_INDEX_UNIFORM)
             continue;
 
          agx_index widened = agx_temp(ctx, AGX_SIZE_32);
@@ -9201,16 +9214,16 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
 
    AGX_PASS(ctx, agx_lower_uniform_sources);
 
-   /* Legalization can introduce repeated half-to-float conversions and
-    * uniform-source copies after the main CSE pass. Merge them before vertex
-    * register allocation, retaining the legalized operand types. The existing
-    * DMA path also needs this for descriptor words used by several operations.
-    * Do not run copy propagation here: it could undo source legalization. */
    if (((key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-         ctx->stage == MESA_SHADER_VERTEX) ||
+         (ctx->stage == MESA_SHADER_VERTEX || !ctx->is_preamble)) ||
         (key->g17p_uniform_dma && out->agx3_uniform_dma_count)) &&
-       !(agx_compiler_debug & AGX_DBG_NOOPT))
-      AGX_PASS(ctx, agx_opt_cse);
+       !(agx_compiler_debug & AGX_DBG_NOOPT)) {
+      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
+          ctx->stage != MESA_SHADER_VERTEX)
+         AGX_PASS(ctx, agx_opt_cse_pressure);
+      else
+         AGX_PASS(ctx, agx_opt_cse);
+   }
 
    if (native_cprog && ctx->is_preamble &&
        key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {

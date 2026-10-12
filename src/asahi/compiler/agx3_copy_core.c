@@ -53,7 +53,39 @@ agx3_copy_encode_reg16(enum agx_isa_encoding encoding, uint16_t dest_half,
       KV(9, 2), KV(10, 1), KV(23, 2), KV(24, 1),
    };
    struct agx3_field_kv overrides[11] = {
-      KV(2, dest_half), KV(16, src_half), KV(11, dest_cache),
+      KV(2, dest_half),  KV(16, src_half),    KV(11, dest_cache),
+      KV(25, src_cache), KV(27, src_discard),
+   };
+   unsigned n = 5;
+   for (unsigned i = 0; i < 6; ++i) {
+      if (wait_mask & (1u << i))
+         overrides[n++] = (struct agx3_field_kv)KV(30 + i, 1);
+   }
+   return agx3_bind_compose(encoding, "copy", 0, baseline,
+                            AGX3_COPY_ARRAY_SIZE(baseline), overrides, n, out,
+                            len);
+}
+
+bool
+agx3_copy_encode_reg32(enum agx_isa_encoding encoding, uint16_t dest_half,
+                       uint16_t src_half, bool dest_cache, bool src_cache,
+                       bool src_discard, uint16_t wait_mask,
+                       uint8_t out[AGX3_COPY_MAX_LENGTH], uint8_t *len)
+{
+   if (out == NULL || len == NULL || encoding != AGX_ISA_ENCODING_AGX3B ||
+       dest_half >= 128 || src_half >= 256 || ((dest_half | src_half) & 1) ||
+       wait_mask >= (1u << 6) || (wait_mask & (wait_mask - 1)) ||
+       (src_cache && src_discard))
+      return false;
+
+   const struct agx3_field_kv baseline[] = {
+      KV(9, 2),
+      KV(10, 2),
+      KV(23, 2),
+      KV(24, 2),
+   };
+   struct agx3_field_kv overrides[11] = {
+      KV(2, dest_half),  KV(16, src_half),    KV(11, dest_cache),
       KV(25, src_cache), KV(27, src_discard),
    };
    unsigned n = 5;

@@ -48,8 +48,9 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
       /* Apple G17P/G16G arithmetic reads aligned f32 uniforms directly.
        * The instruction-level check below retains copies for mixed widths. */
       if (encoding == AGX_ISA_ENCODING_AGX3B)
-         return size == AGX_SIZE_32 && value < 512 && !(value & 1) &&
-                src_index < (op == AGX_OPCODE_FFMA ? 3 : 2);
+         return (size == AGX_SIZE_16 ||
+                 (size == AGX_SIZE_32 && !(value & 1))) &&
+                value < 512 && src_index < (op == AGX_OPCODE_FFMA ? 3 : 2);
       return encoding == AGX_ISA_ENCODING_AGX2 && !is_64;
    case AGX_OPCODE_FLTNORM_AGX3:
       /* G17P colour packing has native uniform operands in both lanes.
@@ -286,9 +287,16 @@ agx_lower_uniform_sources(agx_context *ctx)
          copy_float_uniforms = I->nr_dests != 1 ||
                                I->dest[0].size != size || (half_float && I->saturate);
          bool has_gpr = false;
+         unsigned half_uniforms = 0;
          agx_foreach_src(I, s) {
+            const bool native_half_uniform =
+               full_float && I->src[s].type == AGX_INDEX_UNIFORM &&
+               I->src[s].size == AGX_SIZE_16 && !I->src[s].abs &&
+               !I->src[s].neg;
+            half_uniforms += native_half_uniform;
             if (I->src[s].type != AGX_INDEX_IMMEDIATE)
-               copy_float_uniforms |= I->src[s].size != size;
+               copy_float_uniforms |=
+                  I->src[s].size != size && !native_half_uniform;
             if (half_float)
                copy_float_uniforms |= I->src[s].abs || I->src[s].neg;
             has_gpr |= I->src[s].type != AGX_INDEX_UNIFORM &&
@@ -298,6 +306,10 @@ agx_lower_uniform_sources(agx_context *ctx)
          }
          if (has_gpr)
             first_uniform = UINT_MAX;
+         else if (half_uniforms)
+            copy_float_uniforms = true;
+         copy_float_uniforms |=
+            half_uniforms > 1 || (half_uniforms && I->saturate);
       }
 
       /* G17P ISEL reads an aligned 32-bit uniform directly as one comparand

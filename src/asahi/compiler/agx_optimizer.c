@@ -178,6 +178,32 @@ agx_g17p_tie_zero_minmax(agx_context *ctx, agx_instr *I)
    I->fcond = max ? AGX_FCOND_GTN : AGX_FCOND_LTN;
 }
 
+static bool
+agx_can_fold_half_uniform(const agx_instr *I, agx_instr **defs)
+{
+   if (I->nr_dests != 1 || I->dest[0].size != AGX_SIZE_32 ||
+       agx_channels(I->dest[0]) != 1 || I->saturate)
+      return false;
+
+   unsigned half_uniforms = 0;
+   bool full_gpr = false;
+   agx_foreach_src(I, s) {
+      agx_index src = I->src[s];
+      agx_instr *def = src.type == AGX_INDEX_NORMAL ? defs[src.value] : NULL;
+      if (def && agx_is_fmov(def) && !def->saturate && !src.abs && !src.neg &&
+          !def->src[0].abs && !def->src[0].neg) {
+         if (def->src[0].type == AGX_INDEX_UNIFORM ||
+             def->src[0].type == AGX_INDEX_IMMEDIATE)
+            src = def->src[0];
+      }
+      half_uniforms += src.type == AGX_INDEX_UNIFORM && src.size == AGX_SIZE_16;
+      full_gpr |=
+         (src.type == AGX_INDEX_NORMAL || src.type == AGX_INDEX_REGISTER) &&
+         src.size == AGX_SIZE_32 && !src.memory && agx_channels(src) == 1;
+   }
+   return half_uniforms == 1 && full_gpr;
+}
+
 static void
 agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
 {
@@ -216,8 +242,10 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
       if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           (ins->op == AGX_OPCODE_FADD || ins->op == AGX_OPCODE_FMUL ||
            ins->op == AGX_OPCODE_FFMA) &&
-          src.size == AGX_SIZE_32 &&
-          def->src[0].size == AGX_SIZE_16)
+          src.size == AGX_SIZE_32 && def->src[0].size == AGX_SIZE_16 &&
+          !(def->src[0].type == AGX_INDEX_UNIFORM && !def->src[0].memory &&
+            !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg &&
+            agx_can_fold_half_uniform(ins, defs)))
          continue;
 
       /* FLTNORM and RGB10A2 packing have only captured f32 sources. Keep

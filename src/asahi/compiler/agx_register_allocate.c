@@ -229,7 +229,8 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
    enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
 
    agx_foreach_instr_global(ctx, I) {
-      if (I->op == AGX_OPCODE_MOV_IMM && remat)
+      if (remat && (I->op == AGX_OPCODE_MOV_IMM ||
+                    agx_can_rematerialize_uniform(ctx, I)))
          continue;
 
       agx_foreach_ssa_dest(I, d) {
@@ -273,7 +274,8 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
          if (I->op == AGX_OPCODE_PHI)
             continue;
 
-         if (I->op == AGX_OPCODE_MOV_IMM && remat)
+         if (remat && (I->op == AGX_OPCODE_MOV_IMM ||
+                       agx_can_rematerialize_uniform(ctx, I)))
             continue;
 
          if (debug) {
@@ -1972,6 +1974,7 @@ agx3_cube_register_budget(agx_context *ctx)
 void
 agx_ra(agx_context *ctx)
 {
+   ctx->uniforms_written = agx_has_uniform_store(ctx);
    agx_lower_agx3b_atomic_returns(ctx);
 
    bool force_spilling =

@@ -284,6 +284,17 @@ instr_cost(nir_instr *instr, const void *data)
    }
 }
 
+static float
+instr_cost_g17p(nir_instr *instr, const void *data)
+{
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->op == nir_op_fabs && alu->def.bit_size <= 32)
+         return 1.0f;
+   }
+   return instr_cost(instr, data);
+}
+
 /* G17P's vertex output store reads its 16-bit index from the uniform file
  * (agx_instr_accepts_uniform), so an index computed in the preamble -- an
  * unlinked vertex shader's per-draw slot plus the component -- costs the
@@ -617,6 +628,7 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p)
    nir_opt_preamble_options options = preamble_options;
    if (g17p) {
       options.def_size = def_size_g17p;
+      options.instr_cost_cb = instr_cost_g17p;
       options.rewrite_cost_cb = rewrite_cost_g17p;
    }
    NIR_PASS(progress, nir, nir_opt_preamble, &options, sizes);

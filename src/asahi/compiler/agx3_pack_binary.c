@@ -613,15 +613,20 @@ agx3_try_uniform_float(struct util_dynarray *emission,
    for (unsigned s = 0; s < count; ++s) {
       const agx_index v = I->src[s];
       if (v.memory || v.kill || agx_channels(v) != 1 ||
-          (v.type != AGX_INDEX_IMMEDIATE && v.size != size))
+          (v.type != AGX_INDEX_IMMEDIATE && v.size != size &&
+           !(!half && v.type == AGX_INDEX_UNIFORM && v.size == AGX_SIZE_16)))
          return -1;
       src[s] = (struct agx3_uniform_float_src){
-         .kind = v.type == AGX_INDEX_UNIFORM ? AGX3_FLOAT_UNIFORM :
-                 v.type == AGX_INDEX_IMMEDIATE ? AGX3_FLOAT_IMMEDIATE :
-                 agx3_src_is_register(v) ? AGX3_FLOAT_REGISTER : 0,
+         .kind = v.type == AGX_INDEX_UNIFORM     ? AGX3_FLOAT_UNIFORM
+                 : v.type == AGX_INDEX_IMMEDIATE ? AGX3_FLOAT_IMMEDIATE
+                 : agx3_src_is_register(v)       ? AGX3_FLOAT_REGISTER
+                                                 : 0,
          .value = v.value,
-         .abs = v.abs, .neg = v.neg,
-         .cache = v.cache, .discard = v.discard,
+         .abs = v.abs,
+         .neg = v.neg,
+         .cache = v.cache,
+         .discard = v.discard,
+         .half = v.size == AGX_SIZE_16 && v.type == AGX_INDEX_UNIFORM,
       };
    }
    const enum agx3_uniform_float_op op = fma ? AGX3_UNIFORM_FMA :
@@ -12818,6 +12823,25 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 !agx3_append(emission, bytes, len))
                AGX3_REFUSE(I);
             continue;
+         }
+
+         if (I->op == AGX_OPCODE_BITOP &&
+             (I->truth_table & 0xfu) == AGX3_SEL_TT_MOV && I->nr_dests == 1 &&
+             I->nr_srcs == 2 && agx3_src_is_register(I->src[0]) &&
+             !I->src[0].memory && !I->src[0].abs && !I->src[0].neg &&
+             I->src[0].size == AGX_SIZE_32 && agx_channels(I->src[0]) == 1 &&
+             I->src[1].type == AGX_INDEX_IMMEDIATE && I->src[1].value == 0 &&
+             agx3_src_is_register(I->dest[0]) && !I->dest[0].memory &&
+             I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1) {
+            uint8_t bytes[AGX3_COPY_MAX_LENGTH];
+            uint8_t len = 0;
+            if (agx3_copy_encode_reg32(enc, I->dest[0].value, I->src[0].value,
+                                       I->dest[0].cache, I->src[0].cache,
+                                       I->src[0].discard, wait, bytes, &len)) {
+               if (!agx3_append(emission, bytes, len))
+                  AGX3_REFUSE(I);
+               continue;
+            }
          }
 
          /*

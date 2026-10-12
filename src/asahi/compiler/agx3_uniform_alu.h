@@ -26,6 +26,7 @@ struct agx3_uniform_float_src {
    uint16_t value;
    bool abs, neg;
    bool cache, discard;
+   bool half;
 };
 
 /* Native constant-program f32 ALU -> uniform-file destination. The initial

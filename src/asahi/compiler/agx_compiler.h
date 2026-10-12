@@ -564,6 +564,7 @@ typedef struct {
    nir_shader *nir;
    mesa_shader_stage stage;
    bool is_preamble;
+   bool uniforms_written;
    unsigned scratch_size_B;
    /* The input mask/compact ranks are frozen before native import selection.
     * Later DCE may remove a read without changing this external interface. */
@@ -1167,6 +1168,9 @@ bool agx3_lower_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_texture_publications(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
+void agx_opt_cse_pressure(agx_context *ctx);
+bool agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I);
+bool agx_has_uniform_store(const agx_context *ctx);
 void agx_opt_compact_constants(agx_context *ctx);
 void agx_opt_promote_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
