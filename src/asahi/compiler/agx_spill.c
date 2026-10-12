@@ -331,6 +331,16 @@ remat_to(agx_builder *b, agx_index dst, struct spill_ctx *ctx, unsigned node)
 }
 
 static void
+record_spill(struct spill_ctx *ctx)
+{
+   if (ctx->remat_only) {
+      assert(ctx->shader->key->has_scratch && "remat fallback needs scratch");
+      ctx->shader->remat_fallback_spilled = true;
+   }
+   ctx->shader->has_spill_pcopy_reserved = true;
+}
+
+static void
 insert_spill(agx_builder *b, struct spill_ctx *ctx, unsigned node)
 {
    if (!ctx->remat[node]) {
@@ -339,18 +349,10 @@ insert_spill(agx_builder *b, struct spill_ctx *ctx, unsigned node)
        * let register allocation finish with real spilling under the full
        * budget instead of failing the compile
        * (ssbo.phys.layout.random.8bit.nested_structs_arrays.20). */
-      if (ctx->remat_only) {
-         assert(b->shader->key->has_scratch && "remat fallback needs scratch");
-         b->shader->remat_fallback_spilled = true;
-      }
+      record_spill(ctx);
 
       agx_index idx = reconstruct_index(ctx, node);
       agx_mov_to(b, agx_index_as_mem(idx, ctx->spill_base), idx);
-
-      /* We only need the extra registers reserved if we actually spilled
-       * instead of just remat.
-       */
-      b->shader->has_spill_pcopy_reserved = true;
    }
 }
 
@@ -528,6 +530,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
             agx_mov_to(&b, gpr, I->src[s]);
 
          agx_mov_to(&b, mem, gpr);
+         record_spill(ctx);
          I->src[s] = mem;
          continue;
       }
@@ -555,6 +558,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
 
          remat_to(&b, tmp, ctx, node);
          agx_mov_to(&b, agx_index_as_mem(idx, ctx->spill_base), tmp);
+         record_spill(ctx);
       }
 
       /* Use the spilled version */
@@ -1282,6 +1286,7 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
          .W = W,
          .S = S,
          .spill_base = n,
+         .remat_only = remat_only,
       };
 
       agx_foreach_predecessor(block, pred) {

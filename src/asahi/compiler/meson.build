@@ -157,6 +157,7 @@ if with_tests
          'test/test-minifloat.cpp',
          'test/test-optimizer.cpp',
          'test/test-pressure-cse.cpp',
+         'test/test-spill-fallback.cpp',
          'test/test-uniform-remat.cpp',
          'test/test-lower-pseudo.cpp',
          'test/test-lower-parallel-copy.cpp',
