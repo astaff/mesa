@@ -1426,7 +1426,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          }
          image->planes[plane].offset_B = plane_offset_B;
 
-         for (uint8_t prior = 0; prior < plane; prior++) {
+         /* The offset is relative to the image's memory binding, or for a
+          * disjoint image to the plane's own binding, where planes cannot
+          * overlap one another.
+          */
+         for (uint8_t prior = 0; !image->disjoint && prior < plane; prior++) {
             if (hk_image_plane_ranges_overlap(
                    plane_offset_B, image->planes[plane].layout.size_B,
                    image->planes[prior].offset_B,
