@@ -1325,3 +1325,39 @@ TEST_F(Optimizer, G17PRangeSelectSemantics)
       }
    }
 }
+
+TEST_F(Optimizer, G17PFusesConstantValuedSelectPredicates)
+{
+   for (unsigned yes : {0u, 1u, 255u, 65535u}) {
+      for (unsigned no : {0u, 1u, 255u, 65535u}) {
+         agx_builder *actual = agx_test_builder(mem_ctx);
+         agx_builder *expected = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         for (agx_builder *b : {actual, expected}) {
+            b->shader->key = &key;
+            agx_index variable = agx_preload(b, wx);
+            agx_index predicate = agx_temp(b->shader, AGX_SIZE_16);
+            agx_icmpsel_to(b, predicate, variable, agx_immediate(7),
+                           agx_immediate(yes), agx_immediate(no),
+                           AGX_ICOND_ULT);
+            agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+            if (b == expected && (yes == 0) == (no == 0)) {
+               agx_unit_test(b, yes == 0 ? wy : wz);
+               continue;
+            }
+            if (b == expected)
+               agx_icmpsel_to(b, out, variable, agx_immediate(7),
+                              yes == 0 ? wy : wz, no == 0 ? wy : wz,
+                              AGX_ICOND_ULT);
+            else
+               agx_icmpsel_to(b, out, predicate, agx_zero(), wy, wz,
+                              AGX_ICOND_UEQ);
+            agx_unit_test(b, out);
+         }
+         agx_optimize_and_dce(actual->shader);
+         agx_dce(expected->shader, true);
+         ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+      }
+   }
+}

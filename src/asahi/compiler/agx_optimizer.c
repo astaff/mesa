@@ -1066,7 +1066,7 @@ agx_optimizer_select_guard(agx_context *ctx, agx_instr **defs, agx_instr *I)
  * Care must be taken to invert the condition by swapping cmpsel arguments.
  */
 static void
-agx_optimizer_cmpsel(agx_instr **defs, agx_instr *I)
+agx_optimizer_cmpsel(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
    /* Check for unfused select */
    if (!agx_is_equiv(I->src[1], agx_zero()) || I->icond != AGX_ICOND_UEQ ||
@@ -1075,6 +1075,25 @@ agx_optimizer_cmpsel(agx_instr **defs, agx_instr *I)
 
    /* Check for condition */
    agx_instr *def = defs[I->src[0].value];
+   if (!def)
+      return;
+   if (def->op == AGX_OPCODE_ICMPSEL && !def->saturate && !def->invert_cond &&
+       agx_select_plain(I->src[0]) && I->src[0].size == def->dest[0].size &&
+       agx_select_plain(def->src[2]) && agx_select_plain(def->src[3])) {
+      bool yes, no;
+      if (!agx_eval_immediate_icond(ctx, I->icond, def->src[2], I->src[1],
+                                    &yes) ||
+          !agx_eval_immediate_icond(ctx, I->icond, def->src[3], I->src[1], &no))
+         return;
+      const agx_index a = I->src[yes ? 2 : 3];
+      const agx_index b = I->src[no ? 2 : 3];
+      I->src[0] = yes == no ? agx_zero() : def->src[0];
+      I->src[1] = yes == no ? agx_zero() : def->src[1];
+      I->src[2] = a;
+      I->src[3] = b;
+      I->icond = yes == no ? AGX_ICOND_UEQ : def->icond;
+      return;
+   }
    if (def->op != AGX_OPCODE_ICMP && def->op != AGX_OPCODE_FCMP)
       return;
 
@@ -1336,7 +1355,7 @@ agx_optimizer_forward(agx_context *ctx)
       } else if (I->op == AGX_OPCODE_ICMPSEL) {
          /* Fusing a compare of two inlined immediates yields a select the
           * fold below can resolve. */
-         agx_optimizer_cmpsel(defs, I);
+         agx_optimizer_cmpsel(ctx, defs, I);
          agx_g17p_tie_zero_minmax(ctx, I);
          agx_optimizer_select_guard(ctx, defs, I);
          agx_instr *folded = agx_optimizer_fold_icmpsel(ctx, I);
