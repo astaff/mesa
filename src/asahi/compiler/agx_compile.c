@@ -9284,6 +9284,8 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
       AGX_PASS(ctx, agx_dce, true);
    }
 
+   AGX_PASS(ctx, agx3_fuse_fma_texture_publications);
+
    if (!agx3_tile_store_payloads_fit(ctx)) {
       agx_set_refusal(ctx, "tile-store payload bank overflow", __LINE__);
       ralloc_free(ctx);

@@ -305,3 +305,115 @@ agx3_lower_scalar_texture_publications(agx_context *ctx)
    ralloc_free(defs);
    return progress;
 }
+
+static bool
+fma_staging_producer(const agx_instr *I, bool immutable_uniforms)
+{
+   if (!I || I->op != AGX_OPCODE_FFMA || I->nr_srcs != 3 || I->nr_dests != 1 ||
+       I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].size != AGX_SIZE_32 ||
+       agx_channels(I->dest[0]) != 1 || I->saturate || I->agx3_tex_coord_stage)
+      return false;
+   unsigned special = 0;
+   for (unsigned i = 0; i < 3; ++i) {
+      const agx_index src = I->src[i];
+      const bool immediate = src.type == AGX_INDEX_IMMEDIATE;
+      if (src.size != (immediate ? AGX_SIZE_16 : AGX_SIZE_32) ||
+          agx_channels(src) != 1 || src.memory || src.abs || src.neg)
+         return false;
+      if (immediate) {
+         if (i == 2 || src.value >= 256)
+            return false;
+         special++;
+      } else if (src.type == AGX_INDEX_UNIFORM) {
+         if (!immutable_uniforms || i == 2 || src.value >= 256 ||
+             (src.value & 1))
+            return false;
+         special++;
+      } else if (src.type != AGX_INDEX_NORMAL)
+         return false;
+   }
+   return special <= 1;
+}
+
+bool
+agx3_fuse_fma_texture_publications(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
+       ctx->key->fs.ignore_tib_dependencies || list_length(&ctx->blocks) != 1)
+      return false;
+   agx_instr **defs = rzalloc_array(ctx, agx_instr *, ctx->alloc);
+   unsigned *uses = rzalloc_array(ctx, unsigned, ctx->alloc);
+   if (!defs || !uses)
+      return false;
+   bool immutable = true;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->agx3_tex_coord_stage)
+         return false;
+      immutable &= I->op != AGX_OPCODE_UNIFORM_STORE &&
+                   I->op != AGX_OPCODE_UNIFORM_FADD_AGX3 &&
+                   I->op != AGX_OPCODE_UNIFORM_FMUL_AGX3 &&
+                   I->op != AGX_OPCODE_UNIFORM_FFMA_AGX3;
+      agx_foreach_ssa_src(I, i)
+         uses[I->src[i].value]++;
+      agx_foreach_ssa_dest(I, i)
+         defs[I->dest[i].value] = I;
+   }
+   bool measured = false;
+   unsigned demand = 0;
+   agx_foreach_instr_global(ctx, publication) {
+      if (publication->op != AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 ||
+          publication->nr_srcs != 3 || !agx_is_null(publication->src[2]))
+         continue;
+      agx_instr *producer[2];
+      bool valid = true;
+      for (unsigned c = 0; c < 2; ++c) {
+         const agx_index src = publication->src[c];
+         if (src.type != AGX_INDEX_NORMAL || src.size != AGX_SIZE_32 ||
+             agx_channels(src) != 1 || src.abs || src.neg || src.memory ||
+             uses[src.value] != 1 ||
+             !fma_staging_producer(defs[src.value], immutable)) {
+            valid = false;
+            break;
+         }
+         producer[c] = defs[src.value];
+      }
+      if (!valid || producer[0] == producer[1])
+         continue;
+      if (!measured) {
+         agx_compute_liveness(ctx);
+         demand = agx_calc_register_demand(ctx, false);
+         measured = true;
+      }
+      struct list_head *next[2] = {producer[0]->link.next,
+                                   producer[1]->link.next};
+      unsigned earlier = 0;
+      agx_foreach_instr_global(ctx, I) {
+         if (I == producer[0] || I == producer[1]) {
+            earlier = I == producer[1];
+            break;
+         }
+      }
+      for (unsigned c = 0; c < 2; ++c) {
+         list_del(&producer[c]->link);
+         list_addtail(&producer[c]->link, &publication->link);
+      }
+      agx_compute_liveness(ctx);
+      if (agx_calc_register_demand(ctx, false) > demand) {
+         list_del(&producer[0]->link);
+         list_del(&producer[1]->link);
+         list_addtail(&producer[earlier ^ 1]->link, next[earlier ^ 1]);
+         list_addtail(&producer[earlier]->link, next[earlier]);
+         agx_compute_liveness(ctx);
+         continue;
+      }
+      for (unsigned c = 0; c < 2; ++c) {
+         producer[c]->agx3_tex_coord_stage = true;
+         producer[c]->agx3_tex_coord_component = c;
+      }
+      producer[0]->agx3_tex_coord_start = true;
+      publication->agx3_tex_coords_staged = true;
+      return true;
+   }
+   return false;
+}

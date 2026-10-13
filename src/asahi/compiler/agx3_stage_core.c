@@ -12,21 +12,24 @@
 
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
 
-bool
-agx3_stage_vertex_alu(enum agx_isa_encoding enc, bool fma,
-                      uint16_t dest, uint8_t slot, const uint16_t src[3],
-                      bool uniform0, const bool live[3], const bool discard[3],
-                      uint16_t wait_mask, uint8_t out[16], uint8_t *len)
+static bool
+stage_alu(enum agx_isa_encoding enc, bool fma, uint16_t dest, uint8_t slot,
+          const uint16_t src[3], enum agx3_stage_fma_source source0,
+          const bool live[3], const bool discard[3], uint16_t wait_mask,
+          uint8_t out[16], uint8_t *len)
 {
-   if (enc != AGX_ISA_ENCODING_AGX3B || !src || !live || !discard ||
-       !out || !len || dest >= 256 || (dest & 1) || slot < 1 || slot > 6 ||
-       wait_mask > 0x3f || (uniform0 && !fma))
+   if (enc != AGX_ISA_ENCODING_AGX3B || !src || !live || !discard || !out ||
+       !len || dest >= 256 || (dest & 1) || slot < 1 || slot > 6 ||
+       wait_mask > 0x3f || (unsigned)source0 > AGX3_STAGE_FMA_IMMEDIATE ||
+       (source0 != AGX3_STAGE_FMA_REGISTER && !fma))
       return false;
    for (unsigned s = 0; s < (fma ? 3 : 2); ++s) {
-      if (src[s] >= 256 || (src[s] & 1) || (live[s] && discard[s]))
+      const bool immediate = s == 0 && source0 == AGX3_STAGE_FMA_IMMEDIATE;
+      if (src[s] >= 256 || (!immediate && (src[s] & 1)) ||
+          (live[s] && discard[s]))
          return false;
    }
-   if (uniform0 && (live[0] || discard[0]))
+   if (source0 != AGX3_STAGE_FMA_REGISTER && (live[0] || discard[0]))
       return false;
 
    /* Exact native witnesses are recorded with their full field vectors in
@@ -37,12 +40,21 @@ agx3_stage_vertex_alu(enum agx_isa_encoding enc, bool fma,
       KV(60, 2),
    };
    struct agx3_field_kv fields[24] = {
-      KV(5, dest), KV(12, slot), KV(18, src[1]),
-      KV(42, uniform0 ? 3 : 2), KV(uniform0 ? 36 : 35, src[0]),
-      KV(27, live[1]), KV(29, discard[1]),
+      KV(5, dest),
+      KV(12, slot),
+      KV(18, src[1]),
+      KV(42, source0 == AGX3_STAGE_FMA_UNIFORM     ? 3
+             : source0 == AGX3_STAGE_FMA_IMMEDIATE ? 1
+                                                   : 2),
+      KV(source0 == AGX3_STAGE_FMA_UNIFORM     ? 36
+         : source0 == AGX3_STAGE_FMA_IMMEDIATE ? 34
+                                               : 35,
+         src[0]),
+      KV(27, live[1]),
+      KV(29, discard[1]),
    };
    unsigned n = 7;
-   if (!uniform0) {
+   if (source0 == AGX3_STAGE_FMA_REGISTER) {
       fields[n++] = (struct agx3_field_kv)KV(44, live[0]);
       fields[n++] = (struct agx3_field_kv)KV(46, discard[0]);
    }
@@ -65,6 +77,27 @@ agx3_stage_vertex_alu(enum agx_isa_encoding enc, bool fma,
          return true;
    }
    return false;
+}
+
+bool
+agx3_stage_vertex_alu(enum agx_isa_encoding enc, bool fma, uint16_t dest,
+                      uint8_t slot, const uint16_t src[3], bool uniform0,
+                      const bool live[3], const bool discard[3],
+                      uint16_t wait_mask, uint8_t out[16], uint8_t *len)
+{
+   return stage_alu(enc, fma, dest, slot, src,
+                    uniform0 ? AGX3_STAGE_FMA_UNIFORM : AGX3_STAGE_FMA_REGISTER,
+                    live, discard, wait_mask, out, len);
+}
+
+bool
+agx3_stage_fma(enum agx_isa_encoding enc, uint16_t dest, uint8_t slot,
+               const uint16_t src[3], enum agx3_stage_fma_source source0,
+               const bool live[3], const bool discard[3], uint16_t wait_mask,
+               uint8_t out[16], uint8_t *len)
+{
+   return stage_alu(enc, true, dest, slot, src, source0, live, discard,
+                    wait_mask, out, len);
 }
 
 static bool

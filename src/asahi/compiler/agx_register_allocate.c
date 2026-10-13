@@ -215,7 +215,7 @@ agx_split_width(const agx_instr *I)
  * classes. Becuase we allocate in SSA, this calculation is exact in
  * linear-time. Depends on liveness information.
  */
-static unsigned
+unsigned
 agx_calc_register_demand(agx_context *ctx, bool remat)
 {
    /* Print detailed demand calculation, helpful to debug spilling */

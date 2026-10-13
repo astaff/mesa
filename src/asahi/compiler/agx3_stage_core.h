@@ -60,6 +60,17 @@ bool agx3_stage_vertex_alu(enum agx_isa_encoding enc, bool fma,
                            const bool live[3], const bool discard[3],
                            uint16_t wait_mask, uint8_t out[16], uint8_t *len);
 
+enum agx3_stage_fma_source {
+   AGX3_STAGE_FMA_REGISTER,
+   AGX3_STAGE_FMA_UNIFORM,
+   AGX3_STAGE_FMA_IMMEDIATE,
+};
+
+bool agx3_stage_fma(enum agx_isa_encoding enc, uint16_t dest, uint8_t slot,
+                    const uint16_t src[3], enum agx3_stage_fma_source source0,
+                    const bool live[3], const bool discard[3],
+                    uint16_t wait_mask, uint8_t out[16], uint8_t *len);
+
 /* General-register source liveness is independent of staging liveness.
  * Vertex outputs may export the same GPR more than once; do not kill that
  * source merely because each staging value has a single UVSW consumer. */

@@ -8508,6 +8508,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
           * outstanding results are synchronized at the shader-part tail. */
          if (I->op == AGX_OPCODE_EXPORT)
             continue;
+         if (agx_is_texture_publication(I) && I->agx3_tex_coords_staged) {
+            if (I->op != AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 ||
+                I->nr_srcs != 3 || !agx_is_null(I->src[2]) ||
+                active_coord_resource == UINT32_MAX || !I->imm ||
+                I->imm > resource_capacity || publication_values[I->imm])
+               goto fail;
+            publication_values[I->imm] = active_coord_resource + 1;
+            active_coord_resource = UINT32_MAX;
+            continue;
+         }
          e->is_async = agx3_is_async(I) || I->agx3_tex_coord_start;
          e->latches_srcs = agx_is_texture_publication(I);
          /* Release ordering includes reads whose results are used after the
@@ -9050,6 +9060,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (agx_is_texture_publication(I)) {
+            if (I->agx3_tex_coords_staged) {
+               if (enc != AGX_ISA_ENCODING_AGX3B || !native_coord_slot ||
+                   !I->imm || I->imm > resource_capacity ||
+                   !publication_values[I->imm])
+                  AGX3_REFUSE(I);
+               const unsigned value = publication_values[I->imm] - 1;
+               agx3_staging_release(&staging_banks, outstanding_here);
+               if (resource_bases[value] != 0 || resources[value].halves != 4 ||
+                   !agx3_staging_hold(&staging_banks, 0, 4, native_coord_slot))
+                  AGX3_REFUSE(I);
+               ctx->agx3_staging_halfs = MAX2(ctx->agx3_staging_halfs, 4);
+               continue;
+            }
             const bool scalar = I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3;
             if (enc != AGX_ISA_ENCODING_AGX3B || !slot ||
                 I->nr_srcs != (scalar ? 3 : 2) ||
@@ -9171,6 +9194,44 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                if (!agx3_alu_fadd_stage(enc, staging_dest,
                                         native_coord_slot, src, hints, wait,
                                         bytes, &len))
+                  AGX3_REFUSE(I);
+            } else if (I->op == AGX_OPCODE_FFMA) {
+               if (I->nr_srcs != 3 || I->saturate)
+                  AGX3_REFUSE(I);
+               const unsigned first =
+                  I->src[1].type == AGX_INDEX_UNIFORM ||
+                        I->src[1].type == AGX_INDEX_IMMEDIATE
+                     ? 1
+                     : 0;
+               const unsigned order[3] = {first, first ^ 1, 2};
+               const enum agx3_stage_fma_source source0 =
+                  I->src[first].type == AGX_INDEX_UNIFORM
+                     ? AGX3_STAGE_FMA_UNIFORM
+                  : I->src[first].type == AGX_INDEX_IMMEDIATE
+                     ? AGX3_STAGE_FMA_IMMEDIATE
+                     : AGX3_STAGE_FMA_REGISTER;
+               uint16_t src[3];
+               bool live[3], discard[3];
+               for (unsigned i = 0; i < 3; ++i) {
+                  const agx_index value = I->src[order[i]];
+                  const bool immediate =
+                     i == 0 && source0 == AGX3_STAGE_FMA_IMMEDIATE;
+                  const bool special =
+                     i == 0 && source0 != AGX3_STAGE_FMA_REGISTER;
+                  if (value.size != (immediate ? AGX_SIZE_16 : AGX_SIZE_32) ||
+                      agx_channels(value) != 1 || value.memory || value.abs ||
+                      value.neg || value.kill || value.value >= 256 ||
+                      (!immediate && (value.value & 1)) ||
+                      (value.cache && value.discard) ||
+                      (special ? value.cache || value.discard
+                               : value.type != AGX_INDEX_REGISTER))
+                     AGX3_REFUSE(I);
+                  src[i] = value.value;
+                  live[i] = value.cache;
+                  discard[i] = value.discard;
+               }
+               if (!agx3_stage_fma(enc, staging_dest, native_coord_slot, src,
+                                   source0, live, discard, wait, bytes, &len))
                   AGX3_REFUSE(I);
             } else {
                AGX3_REFUSE(I);
