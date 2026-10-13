@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include <cmath>
+#include "util/half_float.h"
 #include <gtest/gtest.h>
 #include "agx_test.h"
 extern "C" {
@@ -330,4 +331,178 @@ TEST(RTEFMA, BoundedAddendExpressionsCannotReachReferenceBoundary)
          }
       }
    }
+}
+
+static unsigned
+lower_grid_expression(unsigned mode, uint32_t factor_bits,
+                      unsigned component = 0)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "fixed-grid FMA expression");
+   b.shader->info.float_controls_execution_mode =
+      FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32;
+   b.fp_math_ctrl = nir_fp_preserve_sz_inf_nan;
+   nir_def *raw = nir_load_frag_coord(&b);
+   nir_def *a = agx_test_load_preamble(&b, 1, 16, 0);
+   nir_def *c = agx_test_load_preamble(&b, 1, 16, 1);
+   nir_def *half_a = nir_f2f32(&b, a);
+   nir_def *half_c = nir_f2f32(&b, c);
+   nir_def *x = half_a;
+   nir_def *y = mode == 0 ? half_c : nir_imm_int(&b, factor_bits);
+   if (mode == 1)
+      y = nir_channel(&b, raw, 1);
+   if (mode == 3)
+      x = nir_fadd(&b, half_a, half_c);
+   if (mode == 4)
+      x = nir_fmul_imm(&b, half_a, 1.0f / 3.0f);
+   if (mode == 5) {
+      nir_def *condition = nir_flt_imm(&b, nir_channel(&b, raw, 0), 0.0);
+      x = nir_bcsel(&b, condition, half_a, nir_channel(&b, raw, 1));
+   }
+   if (mode == 6) {
+      nir_def *condition = nir_flt_imm(&b, nir_channel(&b, raw, 0), 0.0);
+      x = nir_bcsel(&b, condition, nir_fneg(&b, half_a), nir_fabs(&b, half_c));
+   }
+   if (mode == 7)
+      x = nir_channel(&b, nir_vec2(&b, half_a, nir_channel(&b, raw, 1)),
+                      component);
+   if (mode == 8 || mode == 9) {
+      nir_def *condition = nir_flt_imm(&b, nir_channel(&b, raw, 0), 0.0);
+      nir_push_if(&b, condition);
+      nir_def *one = half_a;
+      nir_push_else(&b, NULL);
+      nir_def *two = mode == 8 ? half_c : nir_channel(&b, raw, 1);
+      nir_pop_if(&b, NULL);
+      x = nir_if_phi(&b, one, two);
+   }
+   if (mode == 10)
+      x = nir_fmul_imm(&b, nir_channel(&b, raw, 0), 2.0f);
+   if (mode == 11) {
+      x = nir_fmul(&b, nir_u2f32(&b, nir_channel(&b, raw, 0)),
+                   nir_imm_int(&b, 0x0d800000));
+   }
+   if (mode == 12) {
+      for (unsigned i = 0; i < component; ++i)
+         x = nir_fneg(&b, x);
+   }
+   nir_def *value = nir_ffma(&b, x, y, nir_channel(&b, raw, 2));
+   agx_test_store_local_pixel_agx(&b, nir_vec4(&b, value, value, value, value),
+                                  nir_imm_intN_t(&b, 0xff, 16),
+                                  nir_undef(&b, 2, 16), 0, 0xf,
+                                  (enum pipe_format)AIL_ISA_FORMAT_I32);
+   agx_nir_lower_rte_fma(b.shader);
+   nir_validate_shader(b.shader, "grid expression FMA repair");
+   nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+   nir_index_blocks(impl);
+   unsigned blocks = impl->num_blocks;
+   ralloc_free(b.shader);
+   return blocks;
+}
+
+TEST(RTEFMA, HalfPrecisionProductsLieOnSafeGrids)
+{
+   EXPECT_EQ(lower_grid_expression(0, 0), 1u);
+   EXPECT_EQ(lower_grid_expression(2, 0x3f000000), 1u);
+   EXPECT_EQ(lower_grid_expression(2, 0x01000000), 1u);
+   EXPECT_EQ(lower_grid_expression(3, 0x01000000), 1u);
+   EXPECT_EQ(lower_grid_expression(4, 0x0d800000), 1u);
+   EXPECT_EQ(lower_grid_expression(6, 0x3f000000), 1u);
+}
+
+TEST(RTEFMA, GridProofRetainsUnknownAndFineProducts)
+{
+   EXPECT_GT(lower_grid_expression(1, 0), 1u);
+   EXPECT_GT(lower_grid_expression(2, 0x00800000), 1u);
+   EXPECT_GT(lower_grid_expression(3, 0x00800000), 1u);
+   EXPECT_GT(lower_grid_expression(4, 0x0d000000), 1u);
+   EXPECT_GT(lower_grid_expression(5, 0x3f000000), 1u);
+}
+
+TEST(RTEFMA, GridCacheKeepsComponentsSeparate)
+{
+   EXPECT_EQ(lower_grid_expression(7, 0x3f000000, 0), 1u);
+   EXPECT_GT(lower_grid_expression(7, 0x3f000000, 1), 1u);
+}
+
+TEST(RTEFMA, GridPhiRequiresEveryIncomingPath)
+{
+   EXPECT_EQ(lower_grid_expression(8, 0x3f000000), 4u);
+   EXPECT_GT(lower_grid_expression(9, 0x3f000000), 4u);
+}
+
+TEST(RTEFMA, HalfGridNumericalBoundaryAndCounterexample)
+{
+   const float min_normal = uif(0x00800000);
+   EXPECT_TRUE(needs_boundary_repair(_mesa_half_to_float(0x8001), min_normal,
+                                     min_normal));
+   EXPECT_FALSE(needs_boundary_repair(_mesa_half_to_float(0x8001),
+                                      uif(0x01000000), min_normal));
+   uint32_t state = 121;
+   auto random = [&state]() {
+      state = state * 1664525u + 1013904223u;
+      return state;
+   };
+   for (unsigned bits = 0; bits <= 0xffff; ++bits) {
+      float x = _mesa_half_to_float(bits);
+      float y = _mesa_half_to_float(random() & 0xffff);
+      if (!std::isfinite(x) || !std::isfinite(y))
+         continue;
+      float cancel = float(-double(x) * double(y));
+      for (float z : {0.0f, min_normal, -min_normal, cancel,
+                      std::nextafter(cancel, INFINITY),
+                      std::nextafter(cancel, -INFINITY)})
+         ASSERT_FALSE(needs_boundary_repair(x, y, z)) << bits;
+      for (float z :
+           {min_normal, -min_normal, uif(0x00800001), -uif(0x00800001)})
+         ASSERT_FALSE(needs_boundary_repair(x, uif(0x01000000), z)) << bits;
+   }
+}
+
+TEST(RTEFMA, FloatScalingAndIntegerExpressionsKeepProductGrids)
+{
+   EXPECT_EQ(lower_grid_expression(10, 0x3f000000), 1u);
+   EXPECT_GT(lower_grid_expression(10, 0x3e800000), 1u);
+   EXPECT_EQ(lower_grid_expression(11, 0x27000000), 1u);
+   EXPECT_GT(lower_grid_expression(11, 0x26800000), 1u);
+}
+
+TEST(RTEFMA, GridDepthLimitRetainsConservativeRepair)
+{
+   EXPECT_EQ(lower_grid_expression(12, 0x3f000000, 32), 1u);
+   EXPECT_GT(lower_grid_expression(12, 0x3f000000, 128), 1u);
+}
+
+TEST(RTEFMA, CyclicPhiKeepsConservativeGrid)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "cyclic fixed-grid FMA");
+   b.shader->info.float_controls_execution_mode =
+      FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32;
+   b.fp_math_ctrl = nir_fp_preserve_sz_inf_nan;
+   nir_def *raw = nir_load_frag_coord(&b);
+   nir_def *initial = nir_f2f32(&b, agx_test_load_preamble(&b, 1, 16, 0));
+   nir_variable *state =
+      nir_local_variable_create(b.impl, glsl_float_type(), "state");
+   nir_store_var(&b, state, initial, 1);
+   nir_push_loop(&b);
+   nir_def *current = nir_load_var(&b, state);
+   nir_def *value =
+      nir_ffma(&b, current, nir_imm_float(&b, 0.5), nir_channel(&b, raw, 2));
+   agx_test_store_local_pixel_agx(&b, nir_vec4(&b, value, value, value, value),
+                                  nir_imm_intN_t(&b, 0xff, 16),
+                                  nir_undef(&b, 2, 16), 0, 0xf,
+                                  (enum pipe_format)AIL_ISA_FORMAT_I32);
+   nir_push_if(&b, nir_flt_imm(&b, current, 0));
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, NULL);
+   nir_store_var(&b, state, nir_fadd_imm(&b, current, 0.25), 1);
+   nir_pop_loop(&b, NULL);
+   nir_lower_vars_to_ssa(b.shader);
+   nir_index_blocks(b.impl);
+   unsigned before = b.impl->num_blocks;
+   EXPECT_TRUE(agx_nir_lower_rte_fma(b.shader));
+   nir_validate_shader(b.shader, "cyclic grid repair");
+   nir_index_blocks(b.impl);
+   EXPECT_GT(b.impl->num_blocks, before);
+   ralloc_free(b.shader);
 }

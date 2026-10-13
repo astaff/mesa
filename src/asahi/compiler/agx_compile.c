@@ -11357,8 +11357,113 @@ agx_rte_fma_large_addend(nir_scalar value, nir_fp_analysis_state *fp,
    return false;
 }
 
+struct agx_fma_grid_analysis {
+   int16_t *cache;
+   size_t *offsets;
+   unsigned count;
+};
+
+static int
+agx_fma_grid_quantum(nir_scalar value, struct agx_fma_grid_analysis *grid,
+                     unsigned depth)
+{
+   value = nir_scalar_chase_movs(value);
+   if (value.def->bit_size == 16)
+      return -24;
+   if (value.def->bit_size != 32 || !depth || !grid->cache ||
+       value.def->index >= grid->count || !grid->offsets ||
+       value.comp >=
+          grid->offsets[value.def->index + 1] - grid->offsets[value.def->index])
+      return -149;
+   size_t index = grid->offsets[value.def->index] + value.comp;
+   if (grid->cache[index] > 0)
+      return grid->cache[index] - 150;
+   if (grid->cache[index] < 0)
+      return -149;
+   grid->cache[index] = -1;
+   int quantum = -149;
+   if (nir_scalar_is_const(value)) {
+      uint32_t bits = nir_scalar_as_uint(value) & 0x7fffffff;
+      unsigned exponent = bits >> 23;
+      uint32_t mantissa = bits & 0x7fffff;
+      if (!bits || exponent == 255) {
+         quantum = 128;
+      } else {
+         if (exponent)
+            mantissa |= 0x800000;
+         quantum =
+            (exponent ? (int)exponent - 150 : -149) + __builtin_ctz(mantissa);
+      }
+   } else if (nir_def_instr(value.def)->type == nir_instr_type_phi) {
+      nir_phi_instr *phi = nir_instr_as_phi(nir_def_instr(value.def));
+      quantum = 128;
+      nir_foreach_phi_src(src, phi)
+         quantum = MIN2(quantum, agx_fma_grid_quantum(
+                                    nir_get_scalar(src->src.ssa, value.comp),
+                                    grid, depth - 1));
+   } else if (nir_scalar_is_alu(value)) {
+      nir_op op = nir_scalar_alu_op(value);
+      switch (op) {
+      case nir_op_fneg:
+      case nir_op_fabs:
+      case nir_op_f2f32:
+         quantum = agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 0),
+                                        grid, depth - 1);
+         break;
+      case nir_op_ftrunc:
+      case nir_op_ffloor:
+      case nir_op_fceil:
+      case nir_op_fround_even:
+      case nir_op_i2f32:
+      case nir_op_u2f32:
+      case nir_op_b2f32:
+         quantum = 0;
+         break;
+      case nir_op_fsat:
+         quantum =
+            MIN2(0, agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 0),
+                                         grid, depth - 1));
+         break;
+      case nir_op_bcsel:
+         quantum = MIN2(agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 1),
+                                             grid, depth - 1),
+                        agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 2),
+                                             grid, depth - 1));
+         break;
+      case nir_op_fadd:
+      case nir_op_fmin:
+      case nir_op_fmax:
+      case nir_op_fmin_agx:
+      case nir_op_fmax_agx:
+         quantum = MIN2(agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 0),
+                                             grid, depth - 1),
+                        agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 1),
+                                             grid, depth - 1));
+         break;
+      case nir_op_fmul:
+      case nir_op_ffma:
+         quantum = agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 0),
+                                        grid, depth - 1) +
+                   agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 1),
+                                        grid, depth - 1);
+         if (op == nir_op_ffma)
+            quantum = MIN2(
+               quantum, agx_fma_grid_quantum(nir_scalar_chase_alu_src(value, 2),
+                                             grid, depth - 1));
+         quantum = CLAMP(quantum, -149, 128);
+         break;
+      default:
+         break;
+      }
+   }
+   quantum = CLAMP(quantum, -149, 104);
+   grid->cache[index] = quantum + 150;
+   return quantum;
+}
+
 static bool
-agx_rte_fma_needs_repair(const nir_alu_instr *alu, nir_fp_analysis_state *fp)
+agx_rte_fma_needs_repair(const nir_alu_instr *alu, nir_fp_analysis_state *fp,
+                         struct agx_fma_grid_analysis *grid)
 {
    if (alu->op != nir_op_ffma || alu->def.bit_size != 32 ||
        alu->def.num_components != 1)
@@ -11387,6 +11492,13 @@ agx_rte_fma_needs_repair(const nir_alu_instr *alu, nir_fp_analysis_state *fp)
       if (!(nir_analyze_fp_class(fp, alu->src[s].src.ssa) & fractional))
          return false;
    }
+   int product_quantum = 0;
+   for (unsigned source = 0; source < 2; ++source)
+      product_quantum += agx_fma_grid_quantum(
+         nir_get_scalar(alu->src[source].src.ssa, alu->src[source].swizzle[0]),
+         grid, 64);
+   if (product_quantum >= -149)
+      return false;
    if (agx_rte_fma_large_addend(
           nir_get_scalar(alu->src[2].src.ssa, alu->src[2].swizzle[0]), fp, 8))
       return false;
@@ -11481,6 +11593,22 @@ agx_nir_lower_rte_fma(nir_shader *nir)
    bool progress = false;
    nir_foreach_function_impl(impl, nir) {
       nir_fp_analysis_state fp = nir_create_fp_analysis_state(impl);
+      struct agx_fma_grid_analysis grid = {
+         .offsets = calloc((size_t)impl->ssa_alloc + 1, sizeof(size_t)),
+         .count = impl->ssa_alloc,
+      };
+      if (grid.offsets) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               nir_def *def = nir_instr_def(instr);
+               if (def && def->index < grid.count)
+                  grid.offsets[def->index + 1] = def->num_components;
+            }
+         }
+         for (unsigned i = 0; i < grid.count; ++i)
+            grid.offsets[i + 1] += grid.offsets[i];
+         grid.cache = calloc(grid.offsets[grid.count], sizeof(int16_t));
+      }
       struct agx_rte_fma_decisions decisions = {
          .repair = calloc(BITSET_WORDS(impl->ssa_alloc), sizeof(BITSET_WORD)),
          .count = impl->ssa_alloc,
@@ -11489,12 +11617,14 @@ agx_nir_lower_rte_fma(nir_shader *nir)
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_alu) {
                const nir_alu_instr *alu = nir_instr_as_alu(instr);
-               if (agx_rte_fma_needs_repair(alu, &fp))
+               if (agx_rte_fma_needs_repair(alu, &fp, &grid))
                   BITSET_SET(decisions.repair, alu->def.index);
             }
          }
       }
       nir_free_fp_analysis_state(&fp);
+      free(grid.cache);
+      free(grid.offsets);
       progress |= nir_function_impl_lower_instructions(
          impl, agx_rte_fma_filter, agx_rte_fma_boundary, &decisions);
       free(decisions.repair);
