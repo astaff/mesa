@@ -10,6 +10,52 @@ extern "C" {
 #include <gtest/gtest.h>
 #include <vector>
 
+TEST(NativeForms, BankedScalarCollectAffinity)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.secondary = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_index occupied = agx_preload(b, agx_register(1, AGX_SIZE_16));
+   agx_index inputs[4];
+   for (unsigned i = 0; i < 4; ++i)
+      inputs[i] = agx_preload(b, agx_register(8 + 2 * i, AGX_SIZE_32));
+   agx_instr *packs[2];
+   for (unsigned i = 0; i < 2; ++i) {
+      agx_index dest = agx_temp(b->shader, AGX_SIZE_16);
+      packs[i] = agx_fltnorm_agx3_to(
+         b, dest, inputs[2 * i], inputs[2 * i + 1], AGX_FORMAT_U8NORM);
+   }
+   agx_index vector = agx_vec_temp(b->shader, AGX_SIZE_16, 2);
+   agx_instr *collect = agx_collect_to(b, vector, 2);
+   collect->src[0] = packs[0]->dest[0];
+   collect->src[1] = packs[1]->dest[0];
+   agx_unit_test(b, vector);
+   for (unsigned i = 0; i < 2; ++i) {
+      agx_instr *store = agx_alloc_instr(b, AGX_OPCODE_ST_TILE, 0, 3);
+      store->src[0] = packs[i]->dest[0];
+      store->src[1] = agx_immediate(1);
+      store->src[2] = agx_null();
+      store->format = AGX_FORMAT_I16;
+      store->mask = 1;
+      store->pixel_offset = i;
+      agx_builder_insert(&b->cursor, store);
+   }
+   agx_unit_test(b, occupied);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_EQ(packs[0]->dest[0].value & 1, 0u);
+   EXPECT_EQ(packs[1]->dest[0].value, packs[0]->dest[0].value + 1);
+   EXPECT_LT(packs[1]->dest[0].value, agx3_tile_store_bank(b->shader));
+   ralloc_free(mem);
+}
+
 TEST(NativeForms, BoundedUnaryRegistersUnderPressure)
 {
    for (agx_opcode op : {AGX_OPCODE_TRUNC, AGX_OPCODE_DFDX, AGX_OPCODE_DFDY}) {

@@ -1169,6 +1169,62 @@ try_coalesce_with(struct ra_ctx *rctx, agx_index ssa, unsigned count,
    return true;
 }
 
+static bool
+pick_collect_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
+                      unsigned count, unsigned align, unsigned *out)
+{
+   agx_index idx = I->dest[d];
+   agx_instr *collect = rctx->src_to_collect_phi[idx.value];
+   if (!collect || collect->op != AGX_OPCODE_COLLECT)
+      return false;
+   const enum ra_class cls = ra_class_for_index(idx);
+   const unsigned minimum = dest_minimum(rctx, I, d);
+   const unsigned limit = dest_limit(rctx, I, d);
+   unsigned our_source = ~0u;
+   agx_foreach_ssa_src(collect, s) {
+      if (agx_is_equiv(collect->src[s], idx)) {
+         our_source = s;
+         break;
+      }
+   }
+   assert(our_source < collect->nr_srcs);
+   agx_foreach_ssa_src(collect, s) {
+      if (!BITSET_TEST(rctx->visited, collect->src[s].value))
+         continue;
+      unsigned base = affinity_base_of_collect(rctx, collect, s);
+      if (base >= rctx->bound[cls])
+         continue;
+      unsigned reg = base + our_source * align;
+      if (reg < minimum || reg + count > limit || reg % align)
+         continue;
+      if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count)) {
+         *out = reg;
+         return true;
+      }
+   }
+   unsigned collect_align = rctx->ncomps[collect->dest[0].value];
+   unsigned offset = our_source * align;
+   for (unsigned base = 0; base + collect->nr_srcs * align <= limit;
+        base += collect_align) {
+      if (base + offset >= minimum &&
+          !BITSET_TEST_COUNT(rctx->used_regs[cls], base, collect->nr_srcs * align)) {
+         *out = base + offset;
+         return true;
+      }
+   }
+   if (collect_align > align) {
+      for (unsigned reg = offset; reg + collect_align <= limit;
+           reg += collect_align) {
+         if (reg >= minimum &&
+             !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count)) {
+            *out = reg;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
 /*
  * A destination with a G17P bank constraint (e.g. a colour tile-store payload,
  * limited to the tile-store bank by agx3_tile_store_bank()) used to skip every
@@ -1226,7 +1282,7 @@ pick_bank_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
       }
    }
 
-   return false;
+   return pick_collect_affinity(rctx, I, d, count, align, out);
 }
 
 static unsigned
@@ -1340,72 +1396,9 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
       }
    }
 
-   /* Try to allocate sources of collects contiguously */
-   if (collect_phi && collect_phi->op == AGX_OPCODE_COLLECT) {
-      agx_instr *collect = collect_phi;
-
-      assert(count == align && "collect sources are scalar");
-
-      /* Find our offset in the collect. If our source is repeated in the
-       * collect, this may not be unique. We arbitrarily choose the first.
-       */
-      unsigned our_source = ~0;
-      agx_foreach_ssa_src(collect, s) {
-         if (agx_is_equiv(collect->src[s], idx)) {
-            our_source = s;
-            break;
-         }
-      }
-
-      assert(our_source < collect->nr_srcs && "source must be in the collect");
-
-      /* See if we can allocate compatibly with any source of the collect */
-      agx_foreach_ssa_src(collect, s) {
-         if (!BITSET_TEST(rctx->visited, collect->src[s].value))
-            continue;
-
-         /* Determine where the collect should start relative to the source */
-         unsigned base = affinity_base_of_collect(rctx, collect, s);
-         if (base >= rctx->bound[cls])
-            continue;
-
-         unsigned our_reg = base + (our_source * align);
-
-         /* Don't allocate past the end of the register file */
-         if ((our_reg + align) > rctx->bound[cls])
-            continue;
-
-         /* If those registers are free, then choose them */
-         if (!BITSET_TEST_COUNT(rctx->used_regs[cls], our_reg, align))
-            return our_reg;
-      }
-
-      unsigned collect_align = rctx->ncomps[collect->dest[0].value];
-      unsigned offset = our_source * align;
-
-      /* Prefer ranges of the register file that leave room for all sources of
-       * the collect contiguously.
-       */
-      for (unsigned base = 0;
-           base + (collect->nr_srcs * align) <= rctx->bound[cls];
-           base += collect_align) {
-         if (!BITSET_TEST_COUNT(rctx->used_regs[cls], base,
-                                collect->nr_srcs * align))
-            return base + offset;
-      }
-
-      /* Try to respect the alignment requirement of the collect destination,
-       * which may be greater than the sources (e.g. pack_64_2x32_split). Look
-       * for a register for the source such that the collect base is aligned.
-       */
-      if (collect_align > align) {
-         for (unsigned reg = offset; reg + collect_align <= rctx->bound[cls];
-              reg += collect_align) {
-            if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count))
-               return reg;
-         }
-      }
-   }
+   unsigned collect_reg;
+   if (pick_collect_affinity(rctx, I, d, count, align, &collect_reg))
+      return collect_reg;
 
    /* Try to allocate phi sources compatibly with their phis */
    if (collect_phi && collect_phi->op == AGX_OPCODE_PHI) {
