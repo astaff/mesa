@@ -11278,6 +11278,61 @@ agx_max_vertex_attribs(const struct agx_device_key *dev)
  * the minimum normal. Only repair zero results under explicit fp32 RTE;
  * integer mantissas classify that boundary without another rounding step. */
 static bool
+agx_rte_fma_large_addend(nir_scalar value, nir_fp_analysis_state *fp,
+                         unsigned depth)
+{
+   const fp_class_mask small = FP_CLASS_ANY_ZERO | FP_CLASS_LT_ZERO_GT_NEG_ONE |
+                               FP_CLASS_GT_ZERO_LT_POS_ONE;
+   if (!(nir_analyze_fp_class(fp, value.def) & small))
+      return true;
+   value = nir_scalar_chase_movs(value);
+   if (nir_scalar_is_const(value) && value.def->bit_size == 32) {
+      const unsigned exponent = (nir_scalar_as_uint(value) >> 23) & 255;
+      return exponent >= 26;
+   }
+   if (!depth || !nir_scalar_is_alu(value))
+      return false;
+   const nir_op op = nir_scalar_alu_op(value);
+   if (op == nir_op_bcsel) {
+      return agx_rte_fma_large_addend(nir_scalar_chase_alu_src(value, 1), fp,
+                                      depth - 1) &&
+             agx_rte_fma_large_addend(nir_scalar_chase_alu_src(value, 2), fp,
+                                      depth - 1);
+   }
+   if (op == nir_op_fabs || op == nir_op_fneg)
+      return agx_rte_fma_large_addend(nir_scalar_chase_alu_src(value, 0), fp,
+                                      depth - 1);
+   const bool max = op == nir_op_fmax || op == nir_op_fmax_agx;
+   const bool min = op == nir_op_fmin || op == nir_op_fmin_agx;
+   if (op != nir_op_fadd && !max && !min)
+      return false;
+   for (unsigned s = 0; s < 2; ++s) {
+      const nir_scalar constant = nir_scalar_chase_alu_src(value, s);
+      if (!nir_scalar_is_const(constant) || constant.def->bit_size != 32)
+         continue;
+      const uint32_t bits = nir_scalar_as_uint(constant);
+      if (op == nir_op_fadd && !(bits & 0x7fffffff) &&
+          agx_rte_fma_large_addend(nir_scalar_chase_alu_src(value, s ^ 1), fp,
+                                   depth - 1))
+         return true;
+      const unsigned exponent = (bits >> 23) & 255;
+      if (exponent < 26 || exponent == 255)
+         continue;
+      const bool negative = bits >> 31;
+      if ((max && !negative) || (min && negative))
+         return true;
+      if (op == nir_op_fadd) {
+         const nir_scalar other = nir_scalar_chase_alu_src(value, s ^ 1);
+         const fp_class_mask opposite =
+            negative ? FP_CLASS_ANY_POS_FINITE : FP_CLASS_ANY_NEG_FINITE;
+         if (!(nir_analyze_fp_class(fp, other.def) & opposite))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
 agx_rte_fma_needs_repair(const nir_alu_instr *alu, nir_fp_analysis_state *fp)
 {
    if (alu->op != nir_op_ffma || alu->def.bit_size != 32 ||
@@ -11307,6 +11362,9 @@ agx_rte_fma_needs_repair(const nir_alu_instr *alu, nir_fp_analysis_state *fp)
       if (!(nir_analyze_fp_class(fp, alu->src[s].src.ssa) & fractional))
          return false;
    }
+   if (agx_rte_fma_large_addend(
+          nir_get_scalar(alu->src[2].src.ssa, alu->src[2].swizzle[0]), fp, 8))
+      return false;
    return true;
 }
 

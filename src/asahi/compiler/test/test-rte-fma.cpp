@@ -215,3 +215,119 @@ TEST(RTEFMA, IntegralMultipliersCannotReachReferenceBoundary)
          ASSERT_FALSE(needs_boundary_repair(x, y, z));
    }
 }
+
+static unsigned
+lower_large_addend_expression(unsigned form)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "bounded FMA addend");
+   b.shader->info.float_controls_execution_mode =
+      FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32;
+   b.fp_math_ctrl = nir_fp_preserve_sz_inf_nan;
+   nir_def *coord = nir_load_frag_coord(&b);
+   nir_def *q = nir_channel(&b, coord, 2);
+   nir_def *z;
+   switch (form) {
+   case 0:
+      z = nir_fadd_imm(&b, nir_fabs(&b, q), 1.0f);
+      break;
+   case 1:
+      z = nir_fmax(&b, q, nir_imm_float(&b, 1.0f));
+      break;
+   case 2:
+      z = nir_fmin(&b, q, nir_imm_float(&b, -1.0f));
+      break;
+   case 3:
+      z = nir_bcsel(&b, nir_flt_imm(&b, q, 0), nir_imm_float(&b, -1.0f),
+                    nir_fadd_imm(&b, nir_fabs(&b, q), 2.0f));
+      break;
+   case 4:
+   case 5:
+      z = nir_bcsel(&b, nir_flt_imm(&b, q, 0), nir_imm_float(&b, 2.0f),
+                    nir_imm_float(&b, form == 4 ? 0.0f : 0.5f));
+      break;
+   case 6:
+      z = nir_fmin(&b, nir_fabs(&b, q), nir_imm_float(&b, 1.0f));
+      break;
+   case 7:
+      z = nir_fadd_imm(&b, nir_fabs(&b, q), 0.5f);
+      break;
+   case 8:
+      z = nir_fadd_imm(&b, nir_fabs(&b, q), uif(0x0d000000));
+      break;
+   case 9:
+      z = nir_fadd_imm(&b, nir_fneg(&b, nir_fabs(&b, q)), -uif(0x0d000000));
+      break;
+   case 10:
+      z = nir_fadd_imm(&b, nir_fabs(&b, q), uif(0x0c800000));
+      break;
+   case 11:
+      z = nir_fmax(&b, q, nir_imm_float(&b, uif(0x0d000000)));
+      break;
+   case 12:
+      z = nir_fmin(&b, q, nir_imm_float(&b, -uif(0x0d000000)));
+      break;
+   case 13:
+      z = nir_fadd_imm(&b, q, 1.0f);
+      break;
+   default:
+      z = nir_fadd_imm(&b, nir_fabs(&b, q), uif(1));
+      break;
+   }
+   nir_def *value =
+      nir_ffma(&b, nir_channel(&b, coord, 0), nir_channel(&b, coord, 1), z);
+   agx_test_store_local_pixel_agx(&b, nir_vec4(&b, value, value, value, value),
+                                  nir_imm_intN_t(&b, 0xff, 16),
+                                  nir_undef(&b, 2, 16), 0, 0xf,
+                                  (enum pipe_format)AIL_ISA_FORMAT_I32);
+   nir_lower_alu(b.shader);
+   agx_nir_lower_fminmax(b.shader);
+   agx_nir_lower_rte_fma(b.shader);
+   nir_validate_shader(b.shader, "bounded addend FMA repair");
+   nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+   nir_index_blocks(impl);
+   unsigned blocks = impl->num_blocks;
+   ralloc_free(b.shader);
+   return blocks;
+}
+
+TEST(RTEFMA, DynamicLargeAddendsNeedNoRepair)
+{
+   for (unsigned form : {0u, 1u, 2u, 3u, 5u, 7u, 8u, 9u, 11u, 12u}) {
+      SCOPED_TRACE(form);
+      EXPECT_EQ(lower_large_addend_expression(form), 1u);
+   }
+   for (unsigned form : {4u, 6u, 10u, 13u, 14u}) {
+      SCOPED_TRACE(form);
+      EXPECT_GT(lower_large_addend_expression(form), 1u);
+   }
+}
+
+TEST(RTEFMA, BoundedAddendExpressionsCannotReachReferenceBoundary)
+{
+   uint32_t state = 987;
+   auto random = [&state]() {
+      state = state * 1664525u + 1013904223u;
+      return state;
+   };
+   for (float bias : {1.0f, 0.5f, uif(0x0d000000)}) {
+      for (unsigned i = 0; i < 32768; ++i) {
+         float q = i < 256 ? 0.0f : uif(random());
+         if (!std::isfinite(q))
+            continue;
+         for (float z : {std::fabs(q) + bias, -(std::fabs(q) + bias),
+                         std::fmax(q, bias), std::fmin(q, -bias)}) {
+            if (!std::isfinite(z))
+               continue;
+            float x =
+               uif(((1 + random() % 254) << 23) | (random() & 0x807fffffu));
+            float center = float(-double(z) / double(x));
+            if (!std::isfinite(center))
+               continue;
+            for (float y : {center, std::nextafter(center, -INFINITY),
+                            std::nextafter(center, INFINITY)})
+               ASSERT_FALSE(needs_boundary_repair(x, y, z));
+         }
+      }
+   }
+}
