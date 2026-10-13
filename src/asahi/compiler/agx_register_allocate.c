@@ -1286,6 +1286,55 @@ pick_bank_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
    return pick_collect_affinity(rctx, I, d, count, align, out);
 }
 
+static bool
+pick_phi_edge_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
+                       unsigned count, unsigned align, unsigned *out)
+{
+   if (I->op != AGX_OPCODE_PHI ||
+       rctx->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+      return false;
+   enum ra_class cls = ra_class_for_index(I->dest[d]);
+   unsigned first = ~0u;
+   agx_foreach_ssa_src(I, s) {
+      if (!I->src[s].has_reg || ra_class_for_index(I->src[s]) != cls)
+         continue;
+      unsigned reg = I->src[s].reg;
+      if (reg % align || reg < dest_minimum(rctx, I, d) ||
+          reg + count > dest_limit(rctx, I, d) ||
+          BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count))
+         continue;
+      bool private = true;
+      agx_foreach_phi_in_block(rctx->block, other) {
+         if (other == I)
+            continue;
+         agx_foreach_ssa_src(other, edge) {
+            agx_index src = other->src[edge];
+            if (ra_class_for_index(src) != cls)
+               continue;
+            agx_index own = I->src[edge];
+            bool identity = own.type == AGX_INDEX_NORMAL && own.has_reg &&
+                            ra_class_for_index(own) == cls && own.reg == reg;
+            if (identity)
+               continue;
+            if (!src.has_reg ||
+                (src.reg < reg + count &&
+                 reg < src.reg + rctx->ncomps[other->dest[0].value])) {
+               private = false;
+               break;
+            }
+         }
+         if (!private)
+            break;
+      }
+      if (private)
+         first = MIN2(first, reg);
+   }
+   if (first == ~0u)
+      return false;
+   *out = first;
+   return true;
+}
+
 static unsigned
 pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
 {
@@ -1317,7 +1366,8 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
    if (dest_minimum(rctx, I, d) > 0 ||
        dest_limit(rctx, I, d) < rctx->bound[cls]) {
       unsigned out;
-      if (pick_bank_affinity(rctx, I, d, count, align, &out))
+      if (pick_bank_affinity(rctx, I, d, count, align, &out) ||
+          pick_phi_edge_affinity(rctx, I, d, count, align, &out))
          return out;
       return find_regs(rctx, I, d, count, align);
    }
@@ -1343,6 +1393,9 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
 
    /* Try to allocate phis compatibly with their sources */
    if (I->op == AGX_OPCODE_PHI) {
+      unsigned edge_reg;
+      if (pick_phi_edge_affinity(rctx, I, d, count, align, &edge_reg))
+         return edge_reg;
       agx_foreach_ssa_src(I, s) {
          /* Loop headers have phis with a source preceding the definition */
          bool may_be_unvisited = rctx->block->loop_header;

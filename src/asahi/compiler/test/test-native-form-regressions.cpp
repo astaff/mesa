@@ -369,6 +369,255 @@ TEST(NativeForms, BankedScalarCollectAffinity)
    ralloc_free(mem);
 }
 
+TEST(NativeForms, PhiWebAtRegisterBoundaryAvoidsEdgeCopies)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.is_helper = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *join = agx_test_block(b->shader);
+   agx_block_add_successor(entry, join);
+   agx_index input = agx_preload(b, agx_register(30, AGX_SIZE_32));
+   b->cursor = agx_after_block(join);
+   agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *phi = agx_phi_to(b, value, 1);
+   phi->src[0] = input;
+   agx_instr *use = agx_unit_test(b, value);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_EQ(use->src[0].value, 30u);
+   unsigned copies = 0;
+   agx_foreach_instr_global(b->shader, I)
+      copies += I->op == AGX_OPCODE_MOV;
+   EXPECT_EQ(copies, 0u);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, SpillPhiUsesActualOtherEdgeWithoutCopyingLiveSlot)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.is_helper = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+   b->shader->has_spill_pcopy_reserved = true;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *left = agx_test_block(b->shader);
+   agx_block *right = agx_test_block(b->shader);
+   agx_block *join = agx_test_block(b->shader);
+   agx_block_add_successor(entry, left);
+   agx_block_add_successor(entry, right);
+   agx_block_add_successor(left, join);
+   agx_block_add_successor(right, join);
+   agx_index input = agx_preload(b, agx_register(20, AGX_SIZE_32));
+   agx_index second = agx_preload(b, agx_register(22, AGX_SIZE_32));
+   agx_index padding[4];
+   for (agx_index &slot : padding) {
+      slot = agx_temp(b->shader, AGX_SIZE_32);
+      slot.memory = true;
+      agx_mov_to(b, slot, input);
+   }
+   agx_index held = agx_temp(b->shader, AGX_SIZE_32);
+   held.memory = true;
+   agx_mov_to(b, held, input);
+   agx_index other = agx_temp(b->shader, AGX_SIZE_32);
+   other.memory = true;
+   for (agx_block *block : {left, right}) {
+      b->cursor = agx_after_block(block);
+      if (block == right)
+         agx_mov_to(b, other, second);
+      for (agx_index slot : padding)
+         agx_unit_test(b, agx_mov(b, slot));
+   }
+   b->cursor = agx_after_block(join);
+   agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+   value.memory = true;
+   agx_instr *phi = agx_phi_to(b, value, 2);
+   phi->src[0] = held;
+   phi->src[1] = other;
+   agx_instr *reload = agx_mov_to(b, agx_temp(b->shader, AGX_SIZE_32), value);
+   agx_unit_test(b, reload->dest[0]);
+   agx_instr *held_reload =
+      agx_mov_to(b, agx_temp(b->shader, AGX_SIZE_32), held);
+   agx_unit_test(b, held_reload->dest[0]);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_TRUE(reload->src[0].memory);
+   EXPECT_EQ(reload->src[0].value, 10u);
+   EXPECT_EQ(held_reload->src[0].value, 8u);
+   unsigned stores = 0;
+   agx_foreach_instr_global(b->shader, I)
+      stores += I->op == AGX_OPCODE_MOV && I->dest[0].memory;
+   EXPECT_EQ(stores, 7u);
+   EXPECT_EQ(b->shader->scratch_size_B, 24u);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, PhiAffinityKeepsCrossedEdgeInputsOutOfSwapCycles)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.is_helper = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *left = agx_test_block(b->shader);
+   agx_block *right = agx_test_block(b->shader);
+   agx_block *join = agx_test_block(b->shader);
+   agx_block_add_successor(entry, left);
+   agx_block_add_successor(entry, right);
+   agx_block_add_successor(left, join);
+   agx_block_add_successor(right, join);
+   agx_index x = agx_preload(b, agx_register(10, AGX_SIZE_16));
+   agx_index y = agx_preload(b, agx_register(12, AGX_SIZE_16));
+   b->cursor = agx_after_block(join);
+   agx_index first = agx_temp(b->shader, AGX_SIZE_16);
+   agx_index second = agx_temp(b->shader, AGX_SIZE_16);
+   agx_instr *a = agx_phi_to(b, first, 2);
+   a->src[0] = x;
+   a->src[1] = y;
+   agx_instr *c = agx_phi_to(b, second, 2);
+   c->src[0] = y;
+   c->src[1] = x;
+   agx_instr *use_first = agx_unit_test(b, first);
+   agx_instr *use_second = agx_unit_test(b, second);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_EQ(use_first->src[0].value, 10u);
+   EXPECT_EQ(use_second->src[0].value, 1u);
+   unsigned copies = 0, swaps = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      copies += I->op == AGX_OPCODE_MOV;
+      swaps += I->op == AGX_OPCODE_SWAP;
+   }
+   EXPECT_EQ(copies, 3u);
+   EXPECT_EQ(swaps, 0u);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, PhiEdgeAffinityRespectsTileBankAndLiveValues)
+{
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      SCOPED_TRACE(mode);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.is_helper = true;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->any_cf = true;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *left = agx_test_block(b->shader);
+      agx_block *right = agx_test_block(b->shader);
+      agx_block *join = agx_test_block(b->shader);
+      agx_block_add_successor(entry, left);
+      agx_block_add_successor(entry, right);
+      agx_block_add_successor(left, join);
+      agx_block_add_successor(right, join);
+      agx_index held =
+         mode == 2 ? agx_preload(b, agx_register(10, AGX_SIZE_16)) : agx_null();
+      agx_index incoming[2];
+      unsigned side = 0;
+      for (agx_block *block : {left, right}) {
+         b->cursor = agx_after_block(block);
+         unsigned reg = side == 0 ? 20 : (mode == 0 ? 10 : 22);
+         incoming[side++] =
+            mode == 2 ? held : agx_preload(b, agx_register(reg, AGX_SIZE_16));
+      }
+      b->cursor = agx_after_block(join);
+      agx_index value = agx_temp(b->shader, AGX_SIZE_16);
+      agx_instr *phi = agx_phi_to(b, value, 2);
+      phi->src[0] = incoming[0];
+      phi->src[1] = incoming[1];
+      agx_instr *use = agx_unit_test(b, value);
+      agx_instr *store = agx_alloc_instr(b, AGX_OPCODE_ST_TILE, 0, 3);
+      store->src[0] = value;
+      store->src[1] = agx_immediate(1);
+      store->src[2] = agx_null();
+      store->format = AGX_FORMAT_I16;
+      store->mask = 1;
+      agx_builder_insert(&b->cursor, store);
+      agx_instr *held_use = mode == 2 ? agx_unit_test(b, held) : nullptr;
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      EXPECT_LT(use->src[0].value, agx3_tile_store_bank(b->shader));
+      EXPECT_EQ(use->src[0].value, mode == 0 ? 10u : 1u);
+      if (held_use)
+         EXPECT_EQ(held_use->src[0].value, 10u);
+      unsigned copies = 0;
+      agx_foreach_instr_global(b->shader, I)
+         copies += I->op == AGX_OPCODE_MOV;
+      EXPECT_EQ(copies, mode == 0 ? 1u : 2u);
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, PhiUsesOtherEdgeWhenPreferredRegisterIsLive)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.is_helper = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *left = agx_test_block(b->shader);
+   agx_block *right = agx_test_block(b->shader);
+   agx_block *join = agx_test_block(b->shader);
+   agx_block_add_successor(entry, left);
+   agx_block_add_successor(entry, right);
+   agx_block_add_successor(left, join);
+   agx_block_add_successor(right, join);
+   agx_index held = agx_preload(b, agx_register(10, AGX_SIZE_16));
+   b->cursor = agx_after_block(right);
+   agx_index other = agx_preload(b, agx_register(12, AGX_SIZE_16));
+   b->cursor = agx_after_block(join);
+   agx_index value = agx_temp(b->shader, AGX_SIZE_16);
+   agx_instr *phi = agx_phi_to(b, value, 2);
+   phi->src[0] = held;
+   phi->src[1] = other;
+   agx_instr *use = agx_unit_test(b, value);
+   agx_instr *held_use = agx_unit_test(b, held);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_EQ(use->src[0].value, 12u);
+   EXPECT_EQ(held_use->src[0].value, 10u);
+   unsigned copies = 0;
+   agx_foreach_instr_global(b->shader, I)
+      copies += I->op == AGX_OPCODE_MOV;
+   EXPECT_EQ(copies, 1u);
+   ralloc_free(mem);
+}
+
 TEST(NativeForms, BoundedUnaryRegistersUnderPressure)
 {
    for (agx_opcode op : {AGX_OPCODE_TRUNC, AGX_OPCODE_DFDX, AGX_OPCODE_DFDY}) {
