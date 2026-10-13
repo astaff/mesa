@@ -147,6 +147,107 @@ TEST(NativeForms, CollectSplitEarlyInteriorExportAffinity)
    }
 }
 
+TEST(NativeForms, EarlyPairExportLeavesLaterWideGroupAvailable)
+{
+   for (unsigned mode = 0; mode < 6; ++mode) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+      agx_index input = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_instr *pair[2];
+      for (unsigned i = 0; i < 2; ++i) {
+         unsigned component = mode == 2 ? i : 1 - i;
+         pair[component] =
+            agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32), input, input);
+      }
+      agx_index pair_vector = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_instr *collect = agx_collect_to(b, pair_vector, 2);
+      for (unsigned i = 0; i < 2; ++i)
+         collect->src[i] = pair[i]->dest[0];
+      agx_instr *pair_split = agx_split(b, 2, pair_vector);
+      for (unsigned i = 0; i < 2; ++i)
+         pair_split->dest[i] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *wide[4];
+      for (unsigned i = 0; i < 4; ++i)
+         wide[i] =
+            agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32), input, input);
+      agx_index vector = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *wide_collect = agx_collect_to(b, vector, 4);
+      for (unsigned i = 0; i < 4; ++i)
+         wide_collect->src[i] = wide[i]->dest[0];
+      agx_instr *split = agx_split(b, 4, vector);
+      for (unsigned i = 0; i < 4; ++i) {
+         split->dest[i] = agx_temp(b->shader, AGX_SIZE_32);
+         agx_unit_test(b, split->dest[i]);
+      }
+      if (mode != 1) {
+         if (mode >= 3) {
+            agx_publish_texture_scalar_agx3(b, pair_split->dest[0], input,
+                                            agx_null(), 1);
+            if (mode >= 4) {
+               agx_index resource = agx_get_vec_index(1, AGX_SIZE_32, 2);
+               resource.type = AGX_INDEX_RESOURCE;
+               agx_index result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+               agx_texture_sample_to(
+                  b, result, resource, agx_zero(), agx_zero(),
+                  agx_uniform(24, AGX_SIZE_64), agx_uniform(28, AGX_SIZE_64),
+                  agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15, false,
+                  false, false, AGX_GATHER_NONE, false);
+               if (mode == 5) {
+                  agx_index later = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+                  agx_texture_sample_to(
+                     b, later, resource, agx_zero(), agx_zero(),
+                     agx_uniform(32, AGX_SIZE_64), agx_uniform(36, AGX_SIZE_64),
+                     agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15, false,
+                     false, false, AGX_GATHER_NONE, false);
+                  agx_instr *later_split = agx_split(b, 4, later);
+                  later_split->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+                  for (unsigned i = 1; i < 4; ++i)
+                     later_split->dest[i] = agx_null();
+                  agx_unit_test(b, later_split->dest[0]);
+               }
+               agx_instr *result_split = agx_split(b, 4, result);
+               result_split->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+               for (unsigned i = 1; i < 4; ++i)
+                  result_split->dest[i] = agx_null();
+               agx_unit_test(b, agx_fmul(b, result_split->dest[0], input));
+            }
+         } else
+            agx_unit_test(b, agx_fmul(b, pair_split->dest[0], input));
+      }
+      if (mode == 1)
+         agx_export(b, pair_split->dest[0], 12);
+      agx_export(b, pair_split->dest[1], 14);
+      ASSERT_TRUE(agx_opt_collect_split(b->shader));
+      agx_dce(b->shader, true);
+      agx_validate(b->shader, "early pair export allocation");
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      EXPECT_EQ(pair[1]->dest[0].value == 14u, mode != 0 && mode != 4);
+      if (mode == 0 || mode == 4) {
+         EXPECT_LT(pair[1]->dest[0].value, 8u);
+         for (unsigned i = 0; i < 4; ++i)
+            EXPECT_EQ(wide[i]->dest[0].value, 8 + 2 * i);
+      }
+      bool exported = false;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_EXPORT && I->imm == 14) {
+            exported = true;
+            EXPECT_EQ(I->src[0].type, AGX_INDEX_REGISTER);
+            EXPECT_EQ(I->src[0].value, 14u);
+         }
+      }
+      EXPECT_TRUE(exported);
+      ralloc_free(mem);
+   }
+}
+
 TEST(NativeForms, CollectSplitKeepsVectorConsumersAndModifiers)
 {
    void *mem = ralloc_context(NULL);

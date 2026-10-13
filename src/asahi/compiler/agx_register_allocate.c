@@ -104,7 +104,7 @@ struct ra_ctx {
 
    /* For affinities */
    agx_instr **src_to_collect_phi;
-   BITSET_WORD *early_interior_export;
+   BITSET_WORD *early_scalar_export;
    struct phi_web_node *phi_web;
 
    /* If bit i of used_regs is set, and register i is the first consecutive
@@ -1381,7 +1381,7 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
       if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align) &&
           (reg % align) == 0) {
          unsigned lower;
-         if (BITSET_TEST(rctx->early_interior_export, idx.value) &&
+         if (BITSET_TEST(rctx->early_scalar_export, idx.value) &&
              reg + count > *rctx->count[cls] &&
              find_regs_simple(rctx, cls, count, align, dest_minimum(rctx, I, d),
                               reg, &lower))
@@ -2016,6 +2016,64 @@ agx3_cube_register_budget(agx_context *ctx)
    return ROUND_DOWN_TO(budget, alignment);
 }
 
+static bool
+pair_peer_publication_consumed_early(agx_context *ctx, unsigned value)
+{
+   if (list_length(&ctx->blocks) != 1)
+      return false;
+   bool found = false;
+   agx_block *block = list_first_entry(&ctx->blocks, agx_block, link);
+   agx_foreach_instr_in_block(block, P) {
+      bool reads = false;
+      agx_foreach_ssa_src(P, q)
+         reads |= P->src[q].value == value;
+      const struct agx_opcode_info *info = &agx_opcodes_info[P->op];
+      if (!reads || (info->can_reorder && info->can_eliminate &&
+                     info->schedule_class == AGX_SCHEDULE_CLASS_NONE))
+         continue;
+      if (!agx_is_texture_publication(P))
+         return false;
+      bool consumed = false;
+      for (struct list_head *node = P->link.next; node != &block->instructions;
+           node = node->next) {
+         agx_instr *sample = list_entry(node, agx_instr, link);
+         if (agx_texture_resource(sample) != P->imm || sample->nr_dests != 1 ||
+             sample->dest[0].type != AGX_INDEX_NORMAL)
+            continue;
+         BITSET_WORD *result = BITSET_CALLOC(ctx->alloc);
+         if (!result)
+            return false;
+         BITSET_SET(result, sample->dest[0].value);
+         for (struct list_head *next_node = sample->link.next;
+              next_node != &block->instructions; next_node = next_node->next) {
+            agx_instr *I = list_entry(next_node, agx_instr, link);
+            if (I->op == AGX_OPCODE_TEXTURE_SAMPLE)
+               break;
+            bool uses = false;
+            agx_foreach_ssa_src(I, q)
+               uses |= BITSET_TEST(result, I->src[q].value);
+            if (!uses)
+               continue;
+            if (I->op == AGX_OPCODE_SPLIT || I->op == AGX_OPCODE_COLLECT) {
+               agx_foreach_ssa_dest(I, d)
+                  BITSET_SET(result, I->dest[d].value);
+               continue;
+            }
+            const struct agx_opcode_info *use_info = &agx_opcodes_info[I->op];
+            consumed = use_info->can_reorder && use_info->can_eliminate &&
+                       use_info->schedule_class == AGX_SCHEDULE_CLASS_NONE;
+            break;
+         }
+         free(result);
+         break;
+      }
+      if (!consumed)
+         return false;
+      found = true;
+   }
+   return found;
+}
+
 void
 agx_ra(agx_context *ctx)
 {
@@ -2239,13 +2297,20 @@ agx_ra(agx_context *ctx)
    BITSET_WORD *tex_low128 = BITSET_CALLOC(ctx->alloc);
    unsigned max_ncomps = 1;
    unsigned *definition_order = calloc(ctx->alloc, sizeof(unsigned));
-   BITSET_WORD *early_interior_export = BITSET_CALLOC(ctx->alloc);
+   BITSET_WORD *early_scalar_export = BITSET_CALLOC(ctx->alloc);
+   BITSET_WORD *effectful_use = BITSET_CALLOC(ctx->alloc);
    unsigned instruction_order = 0;
 
    const unsigned tile_gpr_limit = agx3_tile_store_bank(ctx);
 
    agx_foreach_instr_global(ctx, I) {
       instruction_order++;
+      const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
+      if (!info->can_reorder || !info->can_eliminate ||
+          info->schedule_class != AGX_SCHEDULE_CLASS_NONE) {
+         agx_foreach_ssa_src(I, q)
+            BITSET_SET(effectful_use, I->src[q].value);
+      }
       /* The G17P funop encoder and fused quadrant selects use the bounded
        * seven-bit operand forms. Constrain only their SSA webs; unrelated
        * values retain the complete register file. */
@@ -2408,8 +2473,12 @@ agx_ra(agx_context *ctx)
             agx_instr *affinity = src_to_collect_phi[value];
             if (affinity && affinity->op == AGX_OPCODE_EXPORT) {
                if (s > 0 && definition_order[value] < last_unexported &&
-                   s < last_unexported_source)
-                  BITSET_SET(early_interior_export, value);
+                   (s < last_unexported_source ||
+                    (collect->nr_srcs == 2 &&
+                     (!BITSET_TEST(effectful_use, collect->src[0].value) ||
+                      pair_peer_publication_consumed_early(
+                         ctx, collect->src[0].value)))))
+                  BITSET_SET(early_scalar_export, value);
             } else if (!affinity || affinity->op == AGX_OPCODE_COLLECT) {
                src_to_collect_phi[value] = collect;
             }
@@ -2483,7 +2552,7 @@ agx_ra(agx_context *ctx)
          .shader = ctx,
          .block = block,
          .src_to_collect_phi = src_to_collect_phi,
-         .early_interior_export = early_interior_export,
+         .early_scalar_export = early_scalar_export,
          .phi_web = phi_web,
          .ncomps = ncomps,
          .ncomps_unrounded = ncomps_unrounded,
@@ -2662,7 +2731,8 @@ agx_ra(agx_context *ctx)
    free(tex_low128);
    free(src_to_collect_phi);
    free(definition_order);
-   free(early_interior_export);
+   free(early_scalar_export);
+   free(effectful_use);
    free(ncomps);
    free(ncomps_unrounded);
    free(sizes);
