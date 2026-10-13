@@ -7253,6 +7253,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * conversions remain.
     */
    progress = false;
+   if (byte_indices)
+      NIR_PASS(progress, nir, agx_nir_scalarize_int64);
    NIR_PASS(progress, nir, nir_lower_int64);
 
    /* If we lowered actual int64 arithmetic (not folded into the address
@@ -7354,6 +7356,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * We need to lower int64 again to deal with the resulting 64-bit csels.
     */
    NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
+   if (byte_indices)
+      NIR_PASS(_, nir, agx_nir_scalarize_int64);
    NIR_PASS(_, nir, nir_lower_int64);
 
    /* We need to lower fmin/fmax again after nir_opt_algebraic_late due to f2fmp
@@ -7412,6 +7416,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (agx3_fma &&
        nir_is_rounding_mode_rtne(nir->info.float_controls_execution_mode, 32)) {
       NIR_PASS(_, nir, agx_nir_lower_rte_fma);
+      if (byte_indices)
+         NIR_PASS(_, nir, agx_nir_scalarize_int64);
       NIR_PASS(_, nir, nir_lower_int64);
       NIR_PASS(_, nir, agx_nir_lower_imul64);
       NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
