@@ -954,10 +954,10 @@ TEST(NativeForms, TextureFmaStagingPreservesDemand)
    for (unsigned i = 0; i < 6; ++i)
       operands[i] = agx_iadd(b, input, agx_immediate(i + 1), 0);
    agx_index x = agx_ffma(b, operands[0], operands[1], operands[2]);
-   agx_index y = agx_ffma(b, operands[3], operands[4], operands[5]);
    agx_index live[10];
    for (unsigned i = 0; i < 10; ++i)
       live[i] = agx_iadd(b, input, agx_immediate(i + 10), 0);
+   agx_index y = agx_ffma(b, operands[3], operands[4], operands[5]);
    agx_index coord = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
    agx_instr *collect = agx_collect_to(b, coord, 2);
    collect->src[0] = x;
@@ -1059,6 +1059,49 @@ TEST(NativeForms, MultipleTextureFmaPublications)
    EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
    EXPECT_GT(binary.size, 0u);
    util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, TextureFmaPublicationPrecedesEarlierSamples)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   agx_index input = agx_preload(b, agx_register(0, AGX_SIZE_32));
+   agx_index x = agx_ffma(b, input, agx_uniform(0, AGX_SIZE_32), input);
+   agx_index y = agx_ffma(b, input, agx_uniform(2, AGX_SIZE_32), input);
+   agx_instr *samples[2];
+   for (unsigned i = 0; i < 2; ++i) {
+      agx_index coordinates = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_instr *collect = agx_collect_to(b, coordinates, 2);
+      collect->src[0] = i ? x : input;
+      collect->src[1] = i ? y : input;
+      agx_index result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      samples[i] = agx_texture_sample_to(
+         b, result, coordinates, agx_zero(), agx_zero(),
+         agx_uniform(24, AGX_SIZE_64), agx_uniform(28, AGX_SIZE_64), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15, false, false, false,
+         AGX_GATHER_NONE, false);
+      agx_unit_test(b, result);
+   }
+   ASSERT_TRUE(agx3_lower_scalar_texture_publications(b->shader));
+   agx_dce(b->shader, true);
+   ASSERT_TRUE(agx3_fuse_fma_texture_publications(b->shader));
+   bool published = false;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 &&
+          I->imm == agx_texture_resource(samples[1])) {
+         EXPECT_TRUE(I->agx3_tex_coords_staged);
+         published = true;
+      }
+      if (I == samples[0])
+         EXPECT_TRUE(published);
+   }
+   EXPECT_TRUE(published);
    ralloc_free(mem);
 }
 

@@ -360,7 +360,7 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
    bool measured = false;
    bool progress = false;
    unsigned demand = 0;
-   agx_foreach_instr_global(ctx, publication) {
+   agx_foreach_instr_global_safe(ctx, publication) {
       if (publication->op != AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 ||
           publication->agx3_tex_coords_staged ||
           publication->nr_srcs != 3 || !agx_is_null(publication->src[2]))
@@ -409,10 +409,16 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       }
       struct list_head *next[2] = {producer[0]->link.next,
                                    producer[1]->link.next};
+      struct list_head *publication_next = publication->link.next;
+      struct list_head *anchor = next[earlier ^ 1];
+      if (anchor == &publication->link)
+         anchor = publication_next;
+      list_del(&publication->link);
       for (unsigned c = 0; c < 2; ++c) {
          list_del(&producer[c]->link);
-         list_addtail(&producer[c]->link, &publication->link);
+         list_addtail(&producer[c]->link, anchor);
       }
+      list_addtail(&publication->link, anchor);
       agx_index dest[2] = {producer[0]->dest[0], producer[1]->dest[0]};
       agx_index src[2] = {publication->src[0], publication->src[1]};
       for (unsigned c = 0; c < 2; ++c) {
@@ -426,6 +432,8 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
             producer[c]->dest[0] = dest[c];
             publication->src[c] = src[c];
          }
+         list_del(&publication->link);
+         list_addtail(&publication->link, publication_next);
          list_del(&producer[0]->link);
          list_del(&producer[1]->link);
          list_addtail(&producer[earlier ^ 1]->link, next[earlier ^ 1]);
