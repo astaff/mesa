@@ -541,3 +541,58 @@ TEST(NativeForms, EndOfTilePreservesSamplesAndResolvesSameTile)
       ralloc_free(b.shader);
    }
 }
+
+static agx_shader_info
+compile_partial_varying(unsigned components, unsigned bits,
+                        glsl_interp_mode mode)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "partial varying cache");
+   nir_def *bary = nir_load_barycentric_pixel(&b, 32);
+   nir_intrinsic_set_interp_mode(nir_def_as_intrinsic(bary), mode);
+   nir_def *input = nir_load_interpolated_input(&b, components, bits, bary,
+                                                nir_imm_int(&b, 0));
+   nir_intrinsic_instr *load = nir_def_as_intrinsic(input);
+   nir_intrinsic_set_component(load, components == 1 ? 3 : 0);
+   nir_intrinsic_set_dest_type(
+      load, bits == 16 ? nir_type_float16 : nir_type_float32);
+   nir_intrinsic_set_io_semantics(
+      load, nir_io_semantics{.location = VARYING_SLOT_VAR0});
+   nir_def *value = nir_channel(&b, input, components - 1);
+   if (bits == 16)
+      value = nir_f2f32(&b, value);
+   agx_test_store_local_pixel_agx(&b, nir_vec4(&b, value, value, value, value),
+                                  nir_imm_intN_t(&b, 0xff, 16),
+                                  nir_undef(&b, 2, 16), 0, 0xf,
+                                  PIPE_FORMAT_R32_UINT);
+   b.shader->info.inputs_read = BITFIELD64_BIT(VARYING_SLOT_VAR0);
+   b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.no_preamble = true;
+   key.fs.nr_samples = 1;
+   agx_preprocess_nir(b.shader);
+   agx_shader_part part = {};
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+   agx_shader_info info = part.info;
+   free(part.binary);
+   ralloc_free(b.shader);
+   return info;
+}
+
+TEST(NativeForms, PartialVaryingOmitsUnusedChannels)
+{
+   for (unsigned bits : {16u, 32u}) {
+      for (glsl_interp_mode mode :
+           {INTERP_MODE_SMOOTH, INTERP_MODE_NOPERSPECTIVE}) {
+         SCOPED_TRACE(bits);
+         SCOPED_TRACE(mode);
+         agx_shader_info scalar = compile_partial_varying(1, bits, mode);
+         agx_shader_info vector = compile_partial_varying(4, bits, mode);
+         ASSERT_GT(scalar.main_size, 0u);
+         EXPECT_LE(vector.main_size, scalar.main_size + 8);
+         EXPECT_LE(vector.nr_gprs, 2 * scalar.nr_gprs);
+      }
+   }
+}

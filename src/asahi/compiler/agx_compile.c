@@ -688,7 +688,7 @@ static bool
 agx_emit_load_vary_agx3(agx_builder *b, agx_index dest, agx_index cf,
                         agx_index sample_index, unsigned components,
                         enum agx_interpolation interp, bool perspective,
-                        nir_alu_type dest_type)
+                        nir_alu_type dest_type, unsigned read_mask)
 {
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
        (dest.size != AGX_SIZE_16 && dest.size != AGX_SIZE_32) ||
@@ -755,6 +755,10 @@ agx_emit_load_vary_agx3(agx_builder *b, agx_index dest, agx_index cf,
 
    agx_index channels[4];
    for (unsigned c = 0; c < components; ++c) {
+      if (!(read_mask & BITFIELD_BIT(c))) {
+         channels[c] = agx_undef(dest.size);
+         continue;
+      }
       agx_index channel_cf = cf;
       channel_cf.value += c;
 
@@ -809,7 +813,8 @@ agx_emit_load_vary(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
    agx_index I = cf_for_intrinsic(b, instr);
 
    if (agx_emit_load_vary_agx3(b, dest, I, sample_index, components, interp,
-                               perspective, nir_intrinsic_dest_type(instr))) {
+                               perspective, nir_intrinsic_dest_type(instr),
+                               nir_def_components_read(&instr->def))) {
       agx_emit_cached_split(b, dest, components);
       return;
    }
