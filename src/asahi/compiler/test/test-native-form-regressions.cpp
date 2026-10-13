@@ -86,6 +86,67 @@ TEST(NativeForms, CollectSplitPaddingRetainsScalarAffinity)
    }
 }
 
+TEST(NativeForms, CollectSplitEarlyInteriorExportAffinity)
+{
+   for (unsigned mode = 0; mode < 5; ++mode) {
+      bool all_exported = mode == 1;
+      unsigned exported_component = mode == 2 ? 3 : (mode == 4 ? 0 : 1);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+      agx_index input = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_index high =
+         mode == 3 ? agx_preload(b, agx_register(31, AGX_SIZE_16)) : agx_null();
+      agx_instr *producers[4];
+      unsigned order[4] = {0, 1, 2, 3};
+      if (mode == 2) {
+         order[0] = 3;
+         order[3] = 0;
+      }
+      for (unsigned component : order)
+         producers[component] =
+            agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32), input, input);
+      agx_index vector = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *collect = agx_collect_to(b, vector, 4);
+      for (unsigned i = 0; i < 4; ++i)
+         collect->src[i] = producers[i]->dest[0];
+      agx_instr *split = agx_split(b, 4, vector);
+      for (unsigned i = 0; i < 4; ++i) {
+         split->dest[i] = agx_temp(b->shader, AGX_SIZE_32);
+         if (i == exported_component)
+            agx_export(b, split->dest[i], 14);
+         else if (all_exported)
+            agx_export(b, split->dest[i], 12 + 2 * i);
+         else
+            agx_unit_test(b, split->dest[i]);
+      }
+      if (!agx_is_null(high))
+         agx_unit_test(b, high);
+      ASSERT_TRUE(agx_opt_collect_split(b->shader));
+      agx_dce(b->shader, true);
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      EXPECT_EQ(producers[exported_component]->dest[0].value == 14u,
+                all_exported || mode == 2 || mode == 3 || mode == 4);
+      bool exported = false;
+      agx_foreach_instr_global(b->shader, I) {
+         if (I->op == AGX_OPCODE_EXPORT && I->imm == 14) {
+            exported = true;
+            EXPECT_EQ(I->src[0].type, AGX_INDEX_REGISTER);
+            EXPECT_EQ(I->src[0].value, 14u);
+         }
+      }
+      EXPECT_TRUE(exported);
+      ralloc_free(mem);
+   }
+}
+
 TEST(NativeForms, CollectSplitKeepsVectorConsumersAndModifiers)
 {
    void *mem = ralloc_context(NULL);

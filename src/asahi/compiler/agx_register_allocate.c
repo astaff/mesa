@@ -104,6 +104,7 @@ struct ra_ctx {
 
    /* For affinities */
    agx_instr **src_to_collect_phi;
+   BITSET_WORD *early_interior_export;
    struct phi_web_node *phi_web;
 
    /* If bit i of used_regs is set, and register i is the first consecutive
@@ -1378,8 +1379,15 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
       unsigned reg = collect_phi->imm;
 
       if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align) &&
-          (reg % align) == 0)
+          (reg % align) == 0) {
+         unsigned lower;
+         if (BITSET_TEST(rctx->early_interior_export, idx.value) &&
+             reg + count > *rctx->count[cls] &&
+             find_regs_simple(rctx, cls, count, align, dest_minimum(rctx, I, d),
+                              reg, &lower))
+            return lower;
          return reg;
+      }
    }
 
    /* Try to coalesce vector exports */
@@ -2168,10 +2176,14 @@ agx_ra(agx_context *ctx)
    BITSET_WORD *high_gpr = BITSET_CALLOC(ctx->alloc);
    BITSET_WORD *tex_low128 = BITSET_CALLOC(ctx->alloc);
    unsigned max_ncomps = 1;
+   unsigned *definition_order = calloc(ctx->alloc, sizeof(unsigned));
+   BITSET_WORD *early_interior_export = BITSET_CALLOC(ctx->alloc);
+   unsigned instruction_order = 0;
 
    const unsigned tile_gpr_limit = agx3_tile_store_bank(ctx);
 
    agx_foreach_instr_global(ctx, I) {
+      instruction_order++;
       /* The G17P funop encoder and fused quadrant selects use the bounded
        * seven-bit operand forms. Constrain only their SSA webs; unrelated
        * values retain the complete register file. */
@@ -2279,6 +2291,7 @@ agx_ra(agx_context *ctx)
          ncomps_unrounded[v] = agx_index_size_16(I->dest[d]);
          ncomps[v] = util_next_power_of_two(ncomps_unrounded[v]);
          sizes[v] = I->dest[d].size;
+         definition_order[v] = instruction_order;
          classes[v] = ra_class_for_index(I->dest[d]);
 
          max_ncomps = MAX2(max_ncomps, ncomps[v]);
@@ -2308,12 +2321,26 @@ agx_ra(agx_context *ctx)
          }
          if (!valid)
             continue;
-         ncomps[dest] = util_next_power_of_two(span);
+         unsigned last_unexported = 0, last_unexported_source = 0;
          agx_foreach_ssa_src(collect, s) {
             unsigned value = collect->src[s].value;
             if (!src_to_collect_phi[value] ||
-                src_to_collect_phi[value]->op == AGX_OPCODE_COLLECT)
+                src_to_collect_phi[value]->op != AGX_OPCODE_EXPORT) {
+               last_unexported = MAX2(last_unexported, definition_order[value]);
+               last_unexported_source = s;
+            }
+         }
+         ncomps[dest] = util_next_power_of_two(span);
+         agx_foreach_ssa_src(collect, s) {
+            unsigned value = collect->src[s].value;
+            agx_instr *affinity = src_to_collect_phi[value];
+            if (affinity && affinity->op == AGX_OPCODE_EXPORT) {
+               if (s > 0 && definition_order[value] < last_unexported &&
+                   s < last_unexported_source)
+                  BITSET_SET(early_interior_export, value);
+            } else if (!affinity || affinity->op == AGX_OPCODE_COLLECT) {
                src_to_collect_phi[value] = collect;
+            }
          }
       }
    }
@@ -2384,6 +2411,7 @@ agx_ra(agx_context *ctx)
          .shader = ctx,
          .block = block,
          .src_to_collect_phi = src_to_collect_phi,
+         .early_interior_export = early_interior_export,
          .phi_web = phi_web,
          .ncomps = ncomps,
          .ncomps_unrounded = ncomps_unrounded,
@@ -2561,6 +2589,8 @@ agx_ra(agx_context *ctx)
    free(high_gpr);
    free(tex_low128);
    free(src_to_collect_phi);
+   free(definition_order);
+   free(early_interior_export);
    free(ncomps);
    free(ncomps_unrounded);
    free(sizes);
