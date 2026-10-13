@@ -1056,6 +1056,82 @@ TEST(NativeForms, ScalarCubeSpillRebuildsCurrentAffinity)
    ralloc_free(mem);
 }
 
+TEST(NativeForms, CubeScratchUsesDeadRegionsWithoutAsyncDestinations)
+{
+   for (unsigned mode = 0; mode < 5; ++mode) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+      b->shader->max_reg = 103;
+      if (mode == 3)
+         b->shader->any_cf = true;
+      if (mode == 1) {
+         agx_index input = agx_register(8, AGX_SIZE_32);
+         input.channels_m1 = 1;
+         agx_index pending = agx_register(36, AGX_SIZE_32);
+         pending.channels_m1 = 3;
+         agx_texture_sample_to(b, pending, input, agx_zero(), agx_zero(),
+                               agx_uniform(24, AGX_SIZE_64),
+                               agx_uniform(28, AGX_SIZE_64), agx_null(),
+                               AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15, false,
+                               false, false, AGX_GATHER_NONE, false);
+      }
+      agx_index coords = agx_register(4, AGX_SIZE_32);
+      coords.channels_m1 = 2;
+      agx_index result = agx_register(24, AGX_SIZE_32);
+      result.channels_m1 = 3;
+      agx_texture_sample_to(b, result, coords, agx_zero(), agx_zero(),
+                            agx_uniform(24, AGX_SIZE_64),
+                            agx_uniform(28, AGX_SIZE_64), agx_null(),
+                            AGX_DIM_CUBE, AGX_LOD_MODE_AUTO_LOD, 15, false,
+                            false, false, AGX_GATHER_NONE, false);
+      if (mode == 4)
+         agx_fmul_to(b, agx_register(36, AGX_SIZE_32),
+                     agx_register(12, AGX_SIZE_32),
+                     agx_uniform(8, AGX_SIZE_32));
+      for (unsigned reg = 16; reg < 104; reg += 2) {
+         bool hole =
+            reg == 36 || (reg >= 64 && reg < 68) || (reg >= 70 && reg < 74);
+         if (mode == 2 && (reg == 64 || reg == 70))
+            hole = false;
+         if (!hole)
+            agx_fmul_to(b, agx_register(0, AGX_SIZE_32),
+                        agx_register(reg, AGX_SIZE_32),
+                        agx_uniform(8, AGX_SIZE_32));
+      }
+      agx_stop(b);
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary)) << mode;
+      bool reused = mode == 0 || mode == 1 || mode == 4;
+      EXPECT_EQ(b->shader->max_reg, reused ? 103u : 111u);
+      const unsigned expected[] = {
+         reused ? 64u : 104u,
+         reused ? ((mode == 1 || mode == 4) ? 70u : 36u) : 108u,
+         reused ? ((mode == 1 || mode == 4) ? 72u : 70u) : 110u,
+      };
+      const uint8_t *bytes = (const uint8_t *)binary.data;
+      for (unsigned axis = 0; axis < 3; ++axis) {
+         uint8_t cem[AGX3_TEX_MAX_LENGTH], length = 0;
+         ASSERT_TRUE(agx3_tex_cube_cem_calc_to(AGX_ISA_ENCODING_AGX3B, 4, 6, 8,
+                                               expected[axis], axis, false, cem,
+                                               &length));
+         unsigned matches = 0;
+         for (unsigned i = 0; i + length <= binary.size; ++i)
+            matches += memcmp(bytes + i, cem, length) == 0;
+         EXPECT_EQ(matches, 1u) << mode << ":" << axis;
+      }
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
+   }
+}
+
 TEST(NativeForms, ImmediateCubeGathersReserveCemScratch)
 {
    void *mem = ralloc_context(NULL);

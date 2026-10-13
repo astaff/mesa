@@ -7608,6 +7608,123 @@ agx3_apply_early_compares(agx_context *ctx, struct util_dynarray *emission,
    return moved;
 }
 
+static bool
+agx3_reusable_cube_scratch(agx_context *ctx, unsigned maximum,
+                           uint16_t scratch[3])
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble || !ctx->nir ||
+       ctx->nir->info.stage != MESA_SHADER_FRAGMENT ||
+       list_length(&ctx->blocks) != 1 || ctx->any_cf)
+      return false;
+   agx_foreach_instr_global(ctx, I) {
+      switch (I->op) {
+      case AGX_OPCODE_FFMA:
+      case AGX_OPCODE_FMUL:
+      case AGX_OPCODE_FADD:
+      case AGX_OPCODE_FCMPSEL:
+      case AGX_OPCODE_RSQRT:
+      case AGX_OPCODE_SRSQRT:
+      case AGX_OPCODE_RCP:
+      case AGX_OPCODE_LOG2:
+      case AGX_OPCODE_EXP2:
+      case AGX_OPCODE_GET_SR:
+      case AGX_OPCODE_CONVERT:
+      case AGX_OPCODE_MOV:
+      case AGX_OPCODE_BITOP:
+      case AGX_OPCODE_INTERP_AGX3:
+      case AGX_OPCODE_PERSP_MUL_AGX3:
+      case AGX_OPCODE_RHW_INTERP_AGX3:
+      case AGX_OPCODE_PERSP_RCP_AGX3:
+      case AGX_OPCODE_EXPORT:
+      case AGX_OPCODE_WAIT_PIX:
+      case AGX_OPCODE_SIGNAL_PIX:
+      case AGX_OPCODE_STOP:
+      case AGX_OPCODE_PUBLISH_TEXTURE_AGX3:
+      case AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3:
+         break;
+      case AGX_OPCODE_TEXTURE_SAMPLE:
+         if ((I->dim != AGX_DIM_2D && I->dim != AGX_DIM_CUBE) || I->shadow ||
+             I->offset || I->query_lod || I->sparse ||
+             I->gather != AGX_GATHER_NONE ||
+             I->lod_mode != AGX_LOD_MODE_AUTO_LOD || I->nr_srcs < 6)
+            return false;
+         for (unsigned q = 3; q <= 4; ++q) {
+            if (I->src[q].type != AGX_INDEX_UNIFORM &&
+                I->src[q].type != AGX_INDEX_IMMEDIATE)
+               return false;
+         }
+         break;
+      default:
+         return false;
+      }
+   }
+
+   BITSET_DECLARE(live, AGX_NUM_REGS) = {0};
+   BITSET_DECLARE(forbidden, AGX_NUM_REGS) = {0};
+   BITSET_DECLARE(asynchronous_writes, AGX_NUM_REGS) = {0};
+   agx_foreach_instr_global_rev(ctx, I) {
+      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->dim == AGX_DIM_CUBE) {
+         BITSET_OR(forbidden, forbidden, live);
+         agx_foreach_reg_dest(I, d)
+            BITSET_SET_COUNT(forbidden, I->dest[d].value,
+                             agx_index_size_16(I->dest[d]));
+         agx_foreach_reg_src(I, q)
+            BITSET_SET_COUNT(forbidden, I->src[q].value,
+                             agx_index_size_16(I->src[q]));
+      }
+      agx_foreach_reg_dest(I, d)
+         BITSET_CLEAR_COUNT(live, I->dest[d].value,
+                            agx_index_size_16(I->dest[d]));
+      agx_foreach_reg_src(I, q)
+         BITSET_SET_COUNT(live, I->src[q].value, agx_index_size_16(I->src[q]));
+   }
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->dim == AGX_DIM_CUBE) {
+         BITSET_OR(forbidden, forbidden, asynchronous_writes);
+         BITSET_DECLARE(result, AGX_NUM_REGS) = {0};
+         agx_foreach_reg_dest(I, d)
+            BITSET_SET_COUNT(result, I->dest[d].value,
+                             agx_index_size_16(I->dest[d]));
+         agx_block *block = list_first_entry(&ctx->blocks, agx_block, link);
+         for (struct list_head *node = I->link.next;
+              node != &block->instructions; node = node->next) {
+            agx_instr *next = list_entry(node, agx_instr, link);
+            bool consumes_result = false;
+            agx_foreach_reg_src(next, q)
+               consumes_result |= BITSET_TEST_COUNT(
+                  result, next->src[q].value, agx_index_size_16(next->src[q]));
+            if (consumes_result)
+               break;
+            agx_foreach_reg_dest(next, d)
+               BITSET_SET_COUNT(forbidden, next->dest[d].value,
+                                agx_index_size_16(next->dest[d]));
+         }
+      }
+      if (agx3_is_async(I)) {
+         agx_foreach_reg_dest(I, d)
+            BITSET_SET_COUNT(asynchronous_writes, I->dest[d].value,
+                             agx_index_size_16(I->dest[d]));
+      }
+   }
+   const unsigned width[3] = {4, 2, 2};
+   for (unsigned c = 0; c < 3; ++c) {
+      bool found = false;
+      unsigned limit = MIN2(maximum + 1, c == 0 ? 128 : 192);
+      for (unsigned reg = 16; reg + width[c] <= limit; reg += 2) {
+         if (BITSET_TEST_COUNT(forbidden, reg, width[c]))
+            continue;
+         scratch[c] = reg;
+         BITSET_SET_COUNT(forbidden, reg, width[c]);
+         found = true;
+         break;
+      }
+      if (!found)
+         return false;
+   }
+   return true;
+}
+
 bool
 agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 {
@@ -8224,10 +8341,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
    /* CEM axis 0 writes a magnitude/face pair, axes 1 and 2 one 32-bit
     * coordinate each; the implicit face word is reserved too, or axis 1
-    * overwrites it. One reusable bank immediately above RA's allocation
-    * holds these, published through every CEM/reciprocal/finalizer field
-    * (the CEM destination field reaches half 190), so no live register is
-    * overwritten. */
+    * overwrites it. */
    uint16_t cem_scratch[3] = {0};
    if (has_cube_sample) {
       const unsigned base = (observed_max_reg + 2) & ~1u;
@@ -8236,7 +8350,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       cem_scratch[0] = base;
       cem_scratch[1] = base + 4;
       cem_scratch[2] = base + 6;
-      ctx->max_reg = base + 7;
+      uint16_t reusable[3];
+      if (agx3_reusable_cube_scratch(ctx, observed_max_reg, reusable)) {
+         memcpy(cem_scratch, reusable, sizeof(reusable));
+         ctx->max_reg =
+            MAX2(ctx->max_reg,
+                 MAX3(reusable[0] + 3, reusable[1] + 1, reusable[2] + 1));
+      } else {
+         ctx->max_reg = base + 7;
+      }
    }
 
    /* MS-array reads and runtime-offset array gathers merge a normalized
