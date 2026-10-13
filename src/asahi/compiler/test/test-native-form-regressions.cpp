@@ -1105,6 +1105,74 @@ TEST(NativeForms, TextureFmaPublicationPrecedesEarlierSamples)
    ralloc_free(mem);
 }
 
+TEST(NativeForms, TextureFmaPublicationPressure)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_index input = agx_preload(b, agx_register(0, AGX_SIZE_32));
+   agx_index coordinates[65][2];
+   for (unsigned i = 0; i < 65; ++i) {
+      coordinates[i][0] = agx_ffma(b, input, agx_uniform(2 * i, AGX_SIZE_32), input);
+      coordinates[i][1] = agx_ffma(b, input, agx_uniform(2 * i + 2, AGX_SIZE_32), input);
+   }
+   agx_instr *first_sample = nullptr;
+   agx_index sum = agx_null();
+   for (unsigned i = 0; i < 65; ++i) {
+      agx_index coord = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_instr *collect = agx_collect_to(b, coord, 2);
+      collect->src[0] = coordinates[i][0];
+      collect->src[1] = coordinates[i][1];
+      agx_index sampled = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *sample = agx_texture_sample_to(
+         b, sampled, coord, agx_zero(), agx_zero(),
+         agx_uniform(200, AGX_SIZE_64), agx_uniform(204, AGX_SIZE_64), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15, false, false, false,
+         AGX_GATHER_NONE, false);
+      if (!i)
+         first_sample = sample;
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *split = agx_split(b, 4, sampled);
+      split->dest[0] = x;
+      for (unsigned c = 1; c < 4; ++c)
+         split->dest[c] = agx_null();
+      sum = i ? agx_fadd(b, sum, x) : x;
+   }
+   agx_export(b, sum, 8);
+   agx_stop(b);
+   ASSERT_TRUE(agx3_lower_scalar_texture_publications(b->shader));
+   agx_dce(b->shader, true);
+   ASSERT_TRUE(agx3_fuse_fma_texture_publications(b->shader));
+   unsigned early = 0, fused = 0;
+   bool before_sample = true;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I == first_sample)
+         before_sample = false;
+      if (agx_is_texture_publication(I) && I->agx3_tex_coords_staged) {
+         fused++;
+         early += before_sample;
+      }
+   }
+   EXPECT_EQ(fused, 65u);
+   EXPECT_EQ(early, 64u);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   agx_lower_pseudo(b->shader);
+   agx_opt_register_cache(b->shader);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+   EXPECT_GT(binary.size, 0u);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
 TEST(NativeForms, TextureFmaStagingRespectsCoverageOrdering)
 {
    for (unsigned position = 0; position < 3; ++position) {

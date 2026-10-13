@@ -3,6 +3,7 @@
  */
 #include "agx_builder.h"
 #include "agx_compiler.h"
+#include "agx3_resource_ir.h"
 #include "agx3_staging.h"
 #include <string.h>
 
@@ -307,6 +308,86 @@ agx3_lower_scalar_texture_publications(agx_context *ctx)
 }
 
 static bool
+texture_publications_fit(agx_context *ctx)
+{
+   unsigned count = 0, capacity = 0, use_capacity = 0, max_id = 0;
+   agx_foreach_instr_global(ctx, I) {
+      count++;
+      capacity += I->agx3_tex_coord_start || agx_is_texture_publication(I);
+      use_capacity += I->agx3_tex_coords_staged || agx_texture_resource(I);
+      max_id = MAX3(max_id, agx_publication_resource(I), agx_texture_resource(I));
+   }
+   void *mem = ralloc_context(NULL);
+   struct agx3_resource_value *values =
+      rzalloc_array(mem, struct agx3_resource_value, capacity);
+   struct agx3_resource_use *uses =
+      rzalloc_array(mem, struct agx3_resource_use, use_capacity);
+   struct agx3_slot_instr *base =
+      rzalloc_array(mem, struct agx3_slot_instr, count);
+   uint32_t *ids = rzalloc_array(mem, uint32_t, max_id + 1);
+   uint16_t *placements = rzalloc_array(mem, uint16_t, capacity);
+   bool ok = false;
+   if (!mem || !values || !uses || !base || !ids || !placements)
+      goto done;
+   unsigned value_count = 0, use_count = 0, k = 0, active = UINT32_MAX;
+   agx_foreach_instr_global(ctx, I) {
+      base[k].is_async = I->agx3_tex_coord_start ||
+         agx_is_texture_publication(I) || I->op == AGX_OPCODE_TEXTURE_SAMPLE;
+      if (I->agx3_tex_coord_start) {
+         if (active != UINT32_MAX)
+            goto done;
+         active = value_count++;
+         values[active] = (struct agx3_resource_value){
+            .producer = k, .halves = 4, .alignment = 4,
+            .fixed_base = I->op == AGX_OPCODE_FFMA ? UINT16_MAX : 0,
+         };
+      }
+      if (agx_is_texture_publication(I)) {
+         const bool scalar = I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3;
+         if (!I->imm || ids[I->imm])
+            goto done;
+         if (I->agx3_tex_coords_staged) {
+            if (active == UINT32_MAX)
+               goto done;
+            ids[I->imm] = active + 1;
+            active = UINT32_MAX;
+         } else {
+            ids[I->imm] = ++value_count;
+            values[value_count - 1] = (struct agx3_resource_value){
+               .producer = k,
+               .halves = agx_is_null(I->src[scalar ? 2 : 1]) ? 4 : 6,
+               .alignment = 4, .fixed_base = UINT16_MAX,
+            };
+         }
+      } else if (I->agx3_tex_coords_staged) {
+         if (active == UINT32_MAX)
+            goto done;
+         uses[use_count++] = (struct agx3_resource_use){
+            .instruction = k, .value = active, .count = 4,
+            .through_completion = true,
+         };
+         active = UINT32_MAX;
+      }
+      unsigned id = agx_texture_resource(I);
+      if (id) {
+         if (!ids[id])
+            goto done;
+         uses[use_count++] = (struct agx3_resource_use){
+            .instruction = k, .value = ids[id] - 1,
+            .count = agx_index_size_16(I->src[0]), .through_completion = true,
+         };
+      }
+      k++;
+   }
+   ok = active == UINT32_MAX &&
+      agx3_resource_lower(values, value_count, uses, use_count, base, count,
+                           AGX3_STAGING_HALFS, placements, base);
+done:
+   ralloc_free(mem);
+   return ok;
+}
+
+static bool
 fma_staging_producer(const agx_instr *I, bool immutable_uniforms)
 {
    if (!I || I->op != AGX_OPCODE_FFMA || I->nr_srcs != 3 || I->nr_dests != 1 ||
@@ -410,27 +491,38 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       struct list_head *next[2] = {producer[0]->link.next,
                                    producer[1]->link.next};
       struct list_head *publication_next = publication->link.next;
-      struct list_head *anchor = next[earlier ^ 1];
-      if (anchor == &publication->link)
-         anchor = publication_next;
-      list_del(&publication->link);
-      for (unsigned c = 0; c < 2; ++c) {
-         list_del(&producer[c]->link);
-         list_addtail(&producer[c]->link, anchor);
-      }
-      list_addtail(&publication->link, anchor);
       agx_index dest[2] = {producer[0]->dest[0], producer[1]->dest[0]};
       agx_index src[2] = {publication->src[0], publication->src[1]};
-      for (unsigned c = 0; c < 2; ++c) {
-         producer[c]->dest[0] = agx_null();
-         producer[c]->dest[0].size = AGX_SIZE_32;
-         publication->src[c] = agx_null();
-      }
-      agx_compute_liveness(ctx);
-      if (agx_calc_register_demand(ctx, false) > demand) {
+      for (unsigned late = 0; late < 2; ++late) {
+         struct list_head *anchor = late ? publication_next : next[earlier ^ 1];
+         if (anchor == &publication->link)
+            anchor = publication_next;
+         list_del(&publication->link);
+         for (unsigned c = 0; c < 2; ++c) {
+            list_del(&producer[c]->link);
+            list_addtail(&producer[c]->link, anchor);
+            producer[c]->dest[0] = agx_null();
+            producer[c]->dest[0].size = AGX_SIZE_32;
+            publication->src[c] = agx_null();
+            producer[c]->agx3_tex_coord_stage = true;
+            producer[c]->agx3_tex_coord_component = c;
+         }
+         list_addtail(&publication->link, anchor);
+         producer[0]->agx3_tex_coord_start = true;
+         publication->agx3_tex_coords_staged = true;
+         agx_compute_liveness(ctx);
+         if (agx_calc_register_demand(ctx, false) <= demand &&
+             texture_publications_fit(ctx)) {
+            progress = true;
+            break;
+         }
+         publication->agx3_tex_coords_staged = false;
          for (unsigned c = 0; c < 2; ++c) {
             producer[c]->dest[0] = dest[c];
             publication->src[c] = src[c];
+            producer[c]->agx3_tex_coord_stage = false;
+            producer[c]->agx3_tex_coord_start = false;
+            producer[c]->agx3_tex_coord_component = 0;
          }
          list_del(&publication->link);
          list_addtail(&publication->link, publication_next);
@@ -439,15 +531,7 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
          list_addtail(&producer[earlier ^ 1]->link, next[earlier ^ 1]);
          list_addtail(&producer[earlier]->link, next[earlier]);
          agx_compute_liveness(ctx);
-         continue;
       }
-      for (unsigned c = 0; c < 2; ++c) {
-         producer[c]->agx3_tex_coord_stage = true;
-         producer[c]->agx3_tex_coord_component = c;
-      }
-      producer[0]->agx3_tex_coord_start = true;
-      publication->agx3_tex_coords_staged = true;
-      progress = true;
    }
    return progress;
 }
