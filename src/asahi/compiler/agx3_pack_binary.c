@@ -8454,6 +8454,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    agx_instr **ordered = rzalloc_array(ctx, agx_instr *, count ? count : 1);
    uint8_t *native_coord_slots =
       rzalloc_array(ctx, uint8_t, count ? count : 1);
+   uint32_t *native_coord_values =
+      rzalloc_array(ctx, uint32_t, count ? count : 1);
    unsigned resource_capacity = 0, resource_use_capacity = 0;
    agx_foreach_instr_global(ctx, resource_scan) {
       resource_capacity += resource_scan->agx3_tex_coord_start ||
@@ -8474,7 +8476,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    uint32_t *resource_last_use = rzalloc_array(ctx, uint32_t,
                                                resource_capacity + 1);
    if (sl == NULL || res == NULL || ordered == NULL ||
-       native_coord_slots == NULL || !resources || !resource_uses ||
+       native_coord_slots == NULL || !native_coord_values ||
+       !resources || !resource_uses ||
        !resource_bases || !publication_values || !resource_last_use)
       goto fail;
 
@@ -8612,12 +8615,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             active_coord_resource = resource_count++;
             /* Both scalar publications join one native completion event.
              * Represent their coordinate pair as a real resource value,
-             * independent of the discarded GPR destinations. The existing
-             * arithmetic publication ABI fixes this pair at halves 0..3.
+             * independent of the discarded GPR destinations.
              */
             resources[active_coord_resource] = (struct agx3_resource_value){
-               .producer = k - 1, .halves = 4, .alignment = 4, .fixed_base = 0,
+               .producer = k - 1, .halves = 4, .alignment = 4,
+               .fixed_base = I->op == AGX_OPCODE_FFMA ? UINT16_MAX : 0,
             };
+         }
+         if (I->agx3_tex_coord_stage) {
+            if (active_coord_resource == UINT32_MAX)
+               goto fail;
+            native_coord_values[k - 1] = active_coord_resource + 1;
          }
          if (I->agx3_tex_coords_staged) {
             if (active_coord_resource == UINT32_MAX)
@@ -9066,11 +9074,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                    !publication_values[I->imm])
                   AGX3_REFUSE(I);
                const unsigned value = publication_values[I->imm] - 1;
+               const uint16_t base = resource_bases[value];
                agx3_staging_release(&staging_banks, outstanding_here);
-               if (resource_bases[value] != 0 || resources[value].halves != 4 ||
-                   !agx3_staging_hold(&staging_banks, 0, 4, native_coord_slot))
+               if (resources[value].halves != 4 ||
+                   !agx3_staging_hold(&staging_banks, base, 4, native_coord_slot))
                   AGX3_REFUSE(I);
-               ctx->agx3_staging_halfs = MAX2(ctx->agx3_staging_halfs, 4);
+               ctx->agx3_staging_halfs = MAX2(ctx->agx3_staging_halfs, base + 4);
                continue;
             }
             const bool scalar = I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3;
@@ -9145,7 +9154,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 agx_channels(I->dest[0]) != 1)
                AGX3_REFUSE(I);
 
+            if (!native_coord_values[instr_index])
+               AGX3_REFUSE(I);
             const uint16_t staging_dest =
+               resource_bases[native_coord_values[instr_index] - 1] +
                2 * (uint16_t)I->agx3_tex_coord_component;
             uint8_t bytes[AGX3_ALU_MAX_LENGTH];
             uint8_t len = 0;

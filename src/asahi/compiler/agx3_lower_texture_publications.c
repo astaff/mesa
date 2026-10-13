@@ -348,8 +348,6 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       return false;
    bool immutable = true;
    agx_foreach_instr_global(ctx, I) {
-      if (I->agx3_tex_coord_stage)
-         return false;
       immutable &= I->op != AGX_OPCODE_UNIFORM_STORE &&
                    I->op != AGX_OPCODE_UNIFORM_FADD_AGX3 &&
                    I->op != AGX_OPCODE_UNIFORM_FMUL_AGX3 &&
@@ -360,9 +358,11 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
          defs[I->dest[i].value] = I;
    }
    bool measured = false;
+   bool progress = false;
    unsigned demand = 0;
    agx_foreach_instr_global(ctx, publication) {
       if (publication->op != AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 ||
+          publication->agx3_tex_coords_staged ||
           publication->nr_srcs != 3 || !agx_is_null(publication->src[2]))
          continue;
       agx_instr *producer[2];
@@ -380,6 +380,28 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       }
       if (!valid || producer[0] == producer[1])
          continue;
+      unsigned earlier = 0, found = 0;
+      agx_foreach_instr_global(ctx, I) {
+         if (I == publication)
+            break;
+         if (I == producer[0] || I == producer[1]) {
+            unsigned c = I == producer[1];
+            if (!found)
+               earlier = c;
+            found |= 1u << c;
+         } else if (found &&
+                    (I->op == AGX_OPCODE_BEGIN_CF ||
+                     agx_opcodes_info[I->op].schedule_class ==
+                        AGX_SCHEDULE_CLASS_INVALID ||
+                     (agx_opcodes_info[I->op].schedule_class ==
+                         AGX_SCHEDULE_CLASS_COVERAGE &&
+                      (!I->nr_dests || !agx_opcodes_info[I->op].can_reorder)))) {
+            valid = false;
+            break;
+         }
+      }
+      if (!valid || found != 3)
+         continue;
       if (!measured) {
          agx_compute_liveness(ctx);
          demand = agx_calc_register_demand(ctx, false);
@@ -387,19 +409,23 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       }
       struct list_head *next[2] = {producer[0]->link.next,
                                    producer[1]->link.next};
-      unsigned earlier = 0;
-      agx_foreach_instr_global(ctx, I) {
-         if (I == producer[0] || I == producer[1]) {
-            earlier = I == producer[1];
-            break;
-         }
-      }
       for (unsigned c = 0; c < 2; ++c) {
          list_del(&producer[c]->link);
          list_addtail(&producer[c]->link, &publication->link);
       }
+      agx_index dest[2] = {producer[0]->dest[0], producer[1]->dest[0]};
+      agx_index src[2] = {publication->src[0], publication->src[1]};
+      for (unsigned c = 0; c < 2; ++c) {
+         producer[c]->dest[0] = agx_null();
+         producer[c]->dest[0].size = AGX_SIZE_32;
+         publication->src[c] = agx_null();
+      }
       agx_compute_liveness(ctx);
       if (agx_calc_register_demand(ctx, false) > demand) {
+         for (unsigned c = 0; c < 2; ++c) {
+            producer[c]->dest[0] = dest[c];
+            publication->src[c] = src[c];
+         }
          list_del(&producer[0]->link);
          list_del(&producer[1]->link);
          list_addtail(&producer[earlier ^ 1]->link, next[earlier ^ 1]);
@@ -413,7 +439,7 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       }
       producer[0]->agx3_tex_coord_start = true;
       publication->agx3_tex_coords_staged = true;
-      return true;
+      progress = true;
    }
-   return false;
+   return progress;
 }

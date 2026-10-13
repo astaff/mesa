@@ -1627,7 +1627,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          I->src[0].type == AGX_INDEX_NORMAL &&
          I->src[1].type == AGX_INDEX_NORMAL;
 
-      if (I->nr_dests == 1 && !g17p_ft1 && !g17p_srl_boundary &&
+      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) &&
+          !g17p_ft1 && !g17p_srl_boundary &&
           !g17p_reg_isub && !g17p_reg_and) {
          unsigned first_src = 0;
          unsigned end = 0;

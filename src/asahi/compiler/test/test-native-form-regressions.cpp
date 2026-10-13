@@ -983,10 +983,217 @@ TEST(NativeForms, TextureFmaStagingPreservesDemand)
    unsigned index = 0;
    agx_foreach_instr_global(b->shader, I) {
       EXPECT_FALSE(I->agx3_tex_coords_staged);
+      if (I->op == AGX_OPCODE_FFMA)
+         EXPECT_EQ(I->dest[0].type, AGX_INDEX_NORMAL);
+      if (agx_is_texture_publication(I)) {
+         EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
+         EXPECT_EQ(I->src[1].type, AGX_INDEX_NORMAL);
+      }
       ASSERT_LT(index, order.size());
       EXPECT_EQ(I, order[index++]);
    }
    EXPECT_EQ(index, order.size());
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, MultipleTextureFmaPublications)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_index input = agx_preload(b, agx_register(0, AGX_SIZE_32));
+   agx_index output[3];
+   for (unsigned i = 0; i < 3; ++i) {
+      agx_index coord = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_index x = agx_ffma(b, input, agx_uniform(2 * i, AGX_SIZE_32), input);
+      agx_index y = agx_ffma(b, agx_uniform(6 + 2 * i, AGX_SIZE_32), input, input);
+      agx_instr *collect = agx_collect_to(b, coord, 2);
+      collect->src[0] = x;
+      collect->src[1] = y;
+      output[i] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index sampled = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_texture_sample_to(
+         b, sampled, coord, agx_zero(), agx_zero(),
+         agx_uniform(24, AGX_SIZE_64), agx_uniform(28, AGX_SIZE_64), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15, false, false, false,
+         AGX_GATHER_NONE, false);
+      agx_instr *split = agx_split(b, 4, sampled);
+      split->dest[0] = output[i];
+      for (unsigned c = 1; c < 4; ++c)
+         split->dest[c] = agx_null();
+   }
+   for (unsigned i = 0; i < 3; ++i)
+      agx_export(b, output[i], 8 + 2 * i);
+   agx_stop(b);
+   ASSERT_TRUE(agx3_lower_scalar_texture_publications(b->shader));
+   agx_dce(b->shader, true);
+   ASSERT_TRUE(agx3_fuse_fma_texture_publications(b->shader));
+   agx_dce(b->shader, true);
+   unsigned stages = 0, publications = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      stages += I->agx3_tex_coord_stage;
+      if (I->agx3_tex_coord_stage)
+         EXPECT_TRUE(agx_is_null(I->dest[0]));
+      if (agx_is_texture_publication(I)) {
+         publications++;
+         EXPECT_TRUE(I->agx3_tex_coords_staged);
+         EXPECT_TRUE(agx_is_null(I->src[0]));
+         EXPECT_TRUE(agx_is_null(I->src[1]));
+      }
+   }
+   EXPECT_EQ(stages, 6u);
+   EXPECT_EQ(publications, 3u);
+   EXPECT_FALSE(agx3_fuse_fma_texture_publications(b->shader));
+   agx_ra(b->shader);
+   EXPECT_FALSE(b->shader->ra_failed);
+   agx_lower_pseudo(b->shader);
+   agx_opt_register_cache(b->shader);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+   EXPECT_GT(binary.size, 0u);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, TextureFmaStagingRespectsCoverageOrdering)
+{
+   for (unsigned position = 0; position < 3; ++position) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_index input = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_index outputs[2];
+      for (unsigned i = 0; i < 3; ++i) {
+         if (i == position) {
+            agx_instr *coverage =
+               agx_alloc_instr(b, AGX_OPCODE_SAMPLE_MASK_AGX3, 0, 2);
+            coverage->src[0] = input;
+            coverage->src[1] = agx_zero();
+            agx_builder_insert(&b->cursor, coverage);
+         }
+         if (i < 2)
+            outputs[i] = agx_ffma(b, input, agx_uniform(2 * i, AGX_SIZE_32), input);
+      }
+      agx_instr *publication = agx_publish_texture_scalar_agx3(
+         b, outputs[0], outputs[1], agx_null(), 1);
+      std::vector<const agx_instr *> order;
+      agx_foreach_instr_global(b->shader, I)
+         order.push_back(I);
+      EXPECT_EQ(agx3_fuse_fma_texture_publications(b->shader), position == 0);
+      EXPECT_EQ(publication->agx3_tex_coords_staged, position == 0);
+      if (position != 0) {
+         unsigned index = 0;
+         agx_foreach_instr_global(b->shader, I) {
+            ASSERT_LT(index, order.size());
+            EXPECT_EQ(I, order[index++]);
+         }
+         EXPECT_EQ(index, order.size());
+      }
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, TextureFmaPublicationsPreserveReusedCoordinates)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->max_reg = 63;
+   for (unsigned pair = 0; pair < 2; ++pair) {
+      agx_index outputs[2];
+      for (unsigned c = 0; c < 2; ++c) {
+         outputs[c] = agx_register(16 + 4 * pair + 2 * c, AGX_SIZE_32);
+         agx_instr *fma = agx_ffma_to(
+            b, outputs[c], agx_uniform(12 + 4 * pair + 2 * c, AGX_SIZE_32),
+            agx_register(2, AGX_SIZE_32), agx_register(4, AGX_SIZE_32));
+         fma->agx3_tex_coord_stage = true;
+         fma->agx3_tex_coord_start = c == 0;
+         fma->agx3_tex_coord_component = c;
+      }
+      agx_instr *publication = agx_publish_texture_scalar_agx3(
+         b, outputs[0], outputs[1], agx_null(), pair + 1);
+      publication->agx3_tex_coords_staged = true;
+   }
+   const unsigned values[3] = {1, 2, 1};
+   for (unsigned i = 0; i < 3; ++i) {
+      agx_index resource = agx_get_vec_index(values[i], AGX_SIZE_32, 2);
+      resource.type = AGX_INDEX_RESOURCE;
+      agx_index result = agx_register(40 + 8 * i, AGX_SIZE_32);
+      result.channels_m1 = 3;
+      agx_texture_sample_to(
+         b, result, resource, agx_zero(), agx_zero(),
+         agx_uniform(24, AGX_SIZE_64), agx_uniform(28, AGX_SIZE_64), agx_null(),
+         AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15, false, false, false,
+         AGX_GATHER_NONE, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   EXPECT_EQ(b->shader->agx3_staging_halfs, 8u);
+   const uint8_t *bytes = (const uint8_t *)binary.data;
+   const bool hints[3] = {};
+   for (unsigned pair = 0; pair < 2; ++pair) {
+      for (unsigned c = 0; c < 2; ++c) {
+         const uint16_t src[3] = {uint16_t(12 + 4 * pair + 2 * c), 2, 4};
+         unsigned found = 0;
+         for (unsigned slot = 1; slot <= 6; ++slot) {
+            for (unsigned wait = 0; wait < 64; ++wait) {
+               uint8_t expected[16], length = 0;
+               ASSERT_TRUE(agx3_stage_fma(
+                  AGX_ISA_ENCODING_AGX3B, 4 * pair + 2 * c, slot, src,
+                  AGX3_STAGE_FMA_UNIFORM, hints, hints, wait, expected, &length));
+               for (unsigned offset = 0; offset + length <= binary.size; ++offset)
+                  found += memcmp(bytes + offset, expected, length) == 0;
+            }
+         }
+         EXPECT_EQ(found, 1u) << pair << ":" << c;
+      }
+   }
+   for (unsigned i = 0; i < 3; ++i) {
+      agx3_tex_sample_desc desc = {};
+      desc.dest = 40 + 8 * i;
+      desc.coord = 4 * (values[i] - 1);
+      desc.width = AGX3_TEX_W32;
+      desc.mask = 15;
+      desc.lod = AGX3_TEX_LOD_AUTO;
+      desc.texture_kind = desc.sampler_kind = AGX3_TEX_OPERAND_UNIFORM;
+      desc.texture_value = 24;
+      desc.sampler_value = 28;
+      desc.sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER;
+      desc.coord_kill = i != 0;
+      desc.final = desc.sample_group_end = i == 2;
+      desc.sample_group_nonterminal = i != 2;
+      unsigned found = 0;
+      for (unsigned slot = 1; slot <= 6; ++slot) {
+         for (unsigned wait = 0; wait <= 6; ++wait) {
+            desc.slot = slot;
+            desc.wait_mask = wait ? 1u << (wait - 1) : 0;
+            uint8_t expected[AGX3_TEX_MAX_LENGTH], length = 0;
+            ASSERT_TRUE(agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3B, &desc,
+                                              expected, &length));
+            for (unsigned offset = 0; offset + length <= binary.size; ++offset)
+               found += memcmp(bytes + offset, expected, length) == 0;
+         }
+      }
+      EXPECT_EQ(found, 1u) << i;
+   }
+   util_dynarray_fini(&binary);
    ralloc_free(mem);
 }
 
