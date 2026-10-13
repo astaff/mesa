@@ -332,6 +332,13 @@ tc_get_renderpass_info(struct threaded_context *tc)
    return tc->renderpass_info_recording;
 }
 
+static void
+tc_mark_renderpass_resource_change(struct threaded_context *tc)
+{
+   if (tc->options.parse_renderpass_info && tc->in_renderpass)
+      tc->renderpass_info_recording->has_resource_changes = true;
+}
+
 static bool
 tc_check_fb_access(struct threaded_context *tc, struct pipe_resource *src, struct pipe_resource *dst)
 {
@@ -783,12 +790,16 @@ _tc_sync(struct threaded_context *tc, UNUSED const char *info, UNUSED const char
       bool fb_has_work = TC_RENDERPASS_INFO_HAS_WORK(tc->renderpass_info_recording->data32[0]);
       if (renderpass_info_idx > 0) {
          uint32_t fb_info = tc->renderpass_info_recording->data32[0];
+         bool fb_ended = tc->renderpass_info_recording->ended;
          next->renderpass_info_idx = -1;
          tc_batch_increment_renderpass_info(tc, tc->next, false);
-         if (fb_has_work && tc->seen_fb_state && !tc->renderpass_info_recording->ended)
+         if (fb_has_work && tc->seen_fb_state && !fb_ended)
             tc->renderpass_info_recording->data32[0] = fb_info;
-      } else if (!fb_has_work) {
+      } else if (!fb_has_work || tc->renderpass_info_recording->ended) {
          tc->renderpass_info_recording->data32[0] = 0;
+         tc->renderpass_info_recording->has_resource_changes = false;
+         for (unsigned i = 0; i < ARRAY_SIZE(tc->renderpass_info_recording->resolve); i++)
+            pipe_resource_reference(&tc->renderpass_info_recording->resolve[i], NULL);
       }
       tc->renderpass_info_recording->ended = false;
       /* the batch has executed, so a reused info must not match calls recorded after this */
@@ -1190,8 +1201,8 @@ TC_FUNC1(set_sample_mask, , unsigned, , )
 TC_FUNC1(set_min_samples, , unsigned, , )
 TC_FUNC1(set_polygon_stipple, const, struct pipe_poly_stipple, *, &)
 
-TC_FUNC1(texture_barrier, , unsigned, , )
-TC_FUNC1(memory_barrier, , unsigned, , )
+TC_FUNC1(texture_barrier, , unsigned, , , tc_mark_renderpass_resource_change(tc))
+TC_FUNC1(memory_barrier, , unsigned, , , tc_mark_renderpass_resource_change(tc))
 TC_FUNC1(delete_texture_handle, , uint64_t, , )
 TC_FUNC1(delete_image_handle, , uint64_t, , )
 TC_FUNC1(set_frontend_noop, , bool, , )
@@ -1727,6 +1738,7 @@ tc_set_constant_buffer(struct pipe_context *_pipe,
                        const struct pipe_constant_buffer *cb)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
 
    if (unlikely(!cb || (!cb->buffer && !cb->user_buffer))) {
       struct tc_constant_buffer_base *p =
@@ -1940,6 +1952,7 @@ tc_set_sampler_views(struct pipe_context *_pipe,
       return;
 
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct tc_sampler_views *p =
       tc_add_slot_based_call(tc, TC_CALL_set_sampler_views, tc_sampler_views,
                              views ? count : 0);
@@ -2072,6 +2085,7 @@ tc_set_shader_images(struct pipe_context *_pipe,
       return;
 
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct tc_shader_images *p =
       tc_add_slot_based_call(tc, TC_CALL_set_shader_images, tc_shader_images,
                              images ? count : 0);
@@ -2163,6 +2177,7 @@ tc_set_shader_buffers(struct pipe_context *_pipe,
       return;
 
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct tc_shader_buffers *p =
       tc_add_slot_based_call(tc, TC_CALL_set_shader_buffers, tc_shader_buffers,
                              buffers ? count : 0);
@@ -2224,6 +2239,7 @@ tc_set_vertex_buffers(struct pipe_context *_pipe, unsigned count,
                       const struct pipe_vertex_buffer *buffers)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
 
    assert(!count || buffers);
 
@@ -2773,6 +2789,7 @@ tc_buffer_map(struct pipe_context *_pipe,
               struct pipe_transfer **transfer)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct threaded_resource *tres = threaded_resource(resource);
    struct pipe_context *pipe = tc->pipe;
 
@@ -2902,6 +2919,7 @@ tc_texture_map(struct pipe_context *_pipe,
                struct pipe_transfer **transfer)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct threaded_resource *tres = threaded_resource(resource);
    struct pipe_context *pipe = tc->pipe;
    bool is_internal_unsynchronized = usage & PIPE_MAP_UNSYNCHRONIZED &&
@@ -2997,6 +3015,7 @@ tc_transfer_flush_region(struct pipe_context *_pipe,
                          const struct pipe_box *rel_box)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct threaded_transfer *ttrans = threaded_transfer(transfer);
    struct threaded_resource *tres = threaded_resource(transfer->resource);
    unsigned required_usage = PIPE_MAP_WRITE |
@@ -3207,6 +3226,7 @@ tc_buffer_subdata(struct pipe_context *_pipe,
                   unsigned size, const void *data)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct threaded_resource *tres = threaded_resource(resource);
 
    if (!size)
@@ -3336,8 +3356,10 @@ tc_texture_subdata(struct pipe_context *_pipe,
       return;
 
    bool ended = false;
-   if (tc->options.parse_renderpass_info && tc->in_renderpass)
+   if (tc->options.parse_renderpass_info && tc->in_renderpass) {
+      tc_mark_renderpass_resource_change(tc);
       ended = tc_check_fb_access(tc, NULL, resource);
+   }
 
    /* Small uploads can be enqueued, big uploads must sync. */
    if (size <= TC_MAX_SUBDATA_BYTES) {
@@ -4491,6 +4513,7 @@ tc_launch_grid(struct pipe_context *_pipe,
                const struct pipe_grid_info *info)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct tc_launch_grid_call *p = tc_add_call(tc, TC_CALL_launch_grid,
                                                tc_launch_grid_call);
 
@@ -4538,6 +4561,7 @@ tc_image_copy_buffer(struct pipe_context *_pipe,
                      const struct pipe_box *box)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct threaded_resource *tbuf = dst->target == PIPE_BUFFER ? threaded_resource(dst) : threaded_resource(src);
    struct threaded_resource *timg = dst->target == PIPE_BUFFER ? threaded_resource(src) : threaded_resource(dst);
    struct tc_image_copy_buffer *p =
@@ -4591,6 +4615,7 @@ tc_resource_copy_region(struct pipe_context *_pipe,
                         const struct pipe_box *src_box)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   tc_mark_renderpass_resource_change(tc);
    struct threaded_resource *tdst = threaded_resource(dst);
    struct tc_resource_copy_region *p =
       tc_add_call(tc, TC_CALL_resource_copy_region,
@@ -4696,6 +4721,7 @@ tc_blit(struct pipe_context *_pipe, const struct pipe_blit_info *info)
        (info->dst.resource->array_size && info->dst.resource->array_size != tc->fb_layers) ||
        (!tc->renderpass_info_recording->has_draw && !tc->renderpass_info_recording->cbuf_clear && !tc->renderpass_info_recording->zsbuf_clear)) {
       bool ended = false;
+      tc_mark_renderpass_resource_change(tc);
       if (tc->options.parse_renderpass_info && tc->in_renderpass)
          ended = tc_check_fb_access(tc, info->src.resource, info->dst.resource);
       struct tc_blit_call *blit = tc_blit_enqueue(tc, info);

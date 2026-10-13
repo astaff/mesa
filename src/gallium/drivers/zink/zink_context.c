@@ -3209,7 +3209,8 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
             ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 
          if (use_tc_info && ((very_legal_and_conformant_msaa_opt && !ctx->fb_state.nr_cbufs) ||
-                            ctx->dynamic_fb.tc_info.zsbuf_invalidate))
+                            (ctx->dynamic_fb.tc_info.zsbuf_invalidate &&
+                             !ctx->dynamic_fb.tc_info.has_resource_changes)))
             ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
          else
             ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_STORE;

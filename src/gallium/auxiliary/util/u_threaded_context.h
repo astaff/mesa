@@ -467,7 +467,8 @@ struct tc_renderpass_info {
          /* whether the zsbuf is used for fbfetch */
          bool zsbuf_fbfetch : 1;
          uint8_t pad2 : 4;
-         uint16_t pad3;
+         uint16_t has_resource_changes : 1;
+         uint16_t pad3 : 15;
       };
       uint64_t data;
       /* fb info is in data32[0] */
