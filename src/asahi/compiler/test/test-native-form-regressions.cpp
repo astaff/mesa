@@ -10,6 +10,157 @@ extern "C" {
 #include <gtest/gtest.h>
 #include <vector>
 
+TEST(NativeForms, CollectSplitSameWidthAndChains)
+{
+   for (agx_size size : {AGX_SIZE_16, AGX_SIZE_32, AGX_SIZE_64}) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_index input[3];
+      for (unsigned i = 0; i < 3; ++i)
+         input[i] = agx_preload(b, agx_register(4 * i, size));
+      agx_index previous = input[0];
+      for (unsigned i = 0; i < 8; ++i) {
+         agx_index vector = agx_vec_temp(b->shader, size, 2);
+         agx_instr *collect = agx_collect_to(b, vector, 2);
+         collect->src[0] = previous;
+         collect->src[1] = input[1 + (i & 1)];
+         agx_instr *split = agx_split(b, 2, vector);
+         split->dest[0] = agx_temp(b->shader, size);
+         split->dest[1] = agx_null();
+         previous = split->dest[0];
+      }
+      agx_instr *use = agx_unit_test(b, previous);
+      ASSERT_TRUE(agx_opt_collect_split(b->shader));
+      EXPECT_TRUE(agx_is_equiv(use->src[0], input[0]));
+      EXPECT_EQ(use->src[0].size, size);
+      agx_dce(b->shader, true);
+      agx_foreach_instr_global(b->shader, I) {
+         EXPECT_NE(I->op, AGX_OPCODE_COLLECT);
+         EXPECT_NE(I->op, AGX_OPCODE_SPLIT);
+      }
+      EXPECT_FALSE(agx_opt_collect_split(b->shader));
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, CollectSplitPaddingRetainsScalarAffinity)
+{
+   for (bool dead_normal : {false, true}) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+      agx_index occupied = agx_preload(b, agx_register(1, AGX_SIZE_16));
+      agx_index input = agx_preload(b, agx_register(16, AGX_SIZE_32));
+      agx_instr *producers[3];
+      for (unsigned i = 0; i < 3; ++i)
+         producers[i] = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                    input, input);
+      agx_index padding = dead_normal ? agx_mov_imm(b, 32, 7)
+                                     : agx_undef(AGX_SIZE_32);
+      agx_index vector = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *collect = agx_collect_to(b, vector, 4);
+      for (unsigned i = 0; i < 3; ++i)
+         collect->src[i] = producers[i]->dest[0];
+      collect->src[3] = padding;
+      agx_instr *split = agx_split(b, 4, vector);
+      for (unsigned i = 0; i < 3; ++i) {
+         split->dest[i] = agx_temp(b->shader, AGX_SIZE_32);
+         agx_unit_test(b, split->dest[i]);
+      }
+      split->dest[3] = agx_null();
+      agx_unit_test(b, occupied);
+      ASSERT_TRUE(agx_opt_collect_split(b->shader));
+      agx_dce(b->shader, true);
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      EXPECT_EQ(producers[0]->dest[0].value % 8, 0u);
+      EXPECT_EQ(producers[1]->dest[0].value, producers[0]->dest[0].value + 2);
+      EXPECT_EQ(producers[2]->dest[0].value, producers[0]->dest[0].value + 4);
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, CollectSplitKeepsVectorConsumersAndModifiers)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+   agx_index y = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   agx_index vector = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_instr *collect = agx_collect_to(b, vector, 2);
+   collect->src[0] = x;
+   collect->src[1] = y;
+   agx_instr *split = agx_split(b, 2, vector);
+   split->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+   split->dest[1] = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *vector_use = agx_unit_test(b, vector);
+   agx_index result = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *add = agx_fadd_to(
+      b, result, agx_neg(agx_abs(split->dest[0])), split->dest[1]);
+   agx_unit_test(b, result);
+   ASSERT_TRUE(agx_opt_collect_split(b->shader));
+   EXPECT_TRUE(agx_is_equiv(add->src[0], agx_neg(agx_abs(x))));
+   EXPECT_TRUE(add->src[0].abs);
+   EXPECT_TRUE(add->src[0].neg);
+   EXPECT_TRUE(agx_is_equiv(add->src[1], y));
+   EXPECT_TRUE(agx_is_equiv(vector_use->src[0], vector));
+   agx_dce(b->shader, true);
+   bool kept_vector = false;
+   agx_foreach_instr_global(b->shader, I) {
+      kept_vector |= I == collect;
+      EXPECT_NE(I->op, AGX_OPCODE_SPLIT);
+   }
+   EXPECT_TRUE(kept_vector);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, CollectSplitDoesNotChangeWidthsOrOperandClasses)
+{
+   for (agx_size size : {AGX_SIZE_32, AGX_SIZE_64}) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_index x = agx_preload(b, agx_register(0, size));
+      agx_index vector = agx_vec_temp(b->shader, size, 2);
+      agx_instr *collect = agx_collect_to(b, vector, 2);
+      collect->src[0] = collect->src[1] = x;
+      agx_instr *split = agx_split(b, 4, vector);
+      for (unsigned i = 0; i < 4; ++i) {
+         split->dest[i] = agx_temp(b->shader, agx_size(size - 1));
+         agx_unit_test(b, split->dest[i]);
+      }
+      EXPECT_FALSE(agx_opt_collect_split(b->shader));
+      ralloc_free(mem);
+   }
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_index x = agx_preload(b, agx_register(0, AGX_SIZE_32));
+   agx_index vector = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_instr *collect = agx_collect_to(b, vector, 2);
+   collect->src[0] = x;
+   collect->src[1] = agx_uniform(20, AGX_SIZE_32);
+   agx_instr *split = agx_split(b, 2, vector);
+   split->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+   split->dest[1] = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *first = agx_unit_test(b, split->dest[0]);
+   agx_instr *second = agx_unit_test(b, split->dest[1]);
+   agx_index original_second = second->src[0];
+   ASSERT_TRUE(agx_opt_collect_split(b->shader));
+   EXPECT_TRUE(agx_is_equiv(first->src[0], x));
+   EXPECT_TRUE(agx_is_equiv(second->src[0], original_second));
+   agx_dce(b->shader, true);
+   bool kept_split = false;
+   agx_foreach_instr_global(b->shader, I)
+      kept_split |= I == split;
+   EXPECT_TRUE(kept_split);
+   ralloc_free(mem);
+}
+
 TEST(NativeForms, BankedScalarCollectAffinity)
 {
    void *mem = ralloc_context(NULL);

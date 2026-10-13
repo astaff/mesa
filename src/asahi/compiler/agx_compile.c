@@ -9225,6 +9225,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
 
    AGX_PASS(ctx, agx_lower_uniform_sources);
 
+
    if (((key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
          (ctx->stage == MESA_SHADER_VERTEX || !ctx->is_preamble)) ||
         (key->g17p_uniform_dma && out->agx3_uniform_dma_count)) &&
@@ -9281,6 +9282,13 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
     */
    if (agx3_lower_scalar_texture_publications(ctx)) {
       agx_validate(ctx, "scalar texture publications");
+      AGX_PASS(ctx, agx_dce, true);
+   }
+
+
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       agx_opt_collect_split(ctx)) {
+      agx_validate(ctx, "collect/split folding");
       AGX_PASS(ctx, agx_dce, true);
    }
 

@@ -573,6 +573,99 @@ agx_supports_zext(agx_instr *I, unsigned s)
    }
 }
 
+bool
+agx_opt_collect_split(agx_context *ctx)
+{
+   agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
+   agx_index *aliases = calloc(ctx->alloc, sizeof(*aliases));
+   bool progress = false;
+   if (!defs || !aliases)
+      goto done;
+   for (unsigned i = 0; i < ctx->alloc; ++i)
+      aliases[i] = agx_null();
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         defs[I->dest[d].value] = I;
+   }
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op != AGX_OPCODE_SPLIT || I->nr_srcs != 1 || I->saturate ||
+          I->src[0].type != AGX_INDEX_NORMAL || I->src[0].memory ||
+          I->src[0].abs || I->src[0].neg)
+         continue;
+      agx_instr *collect = defs[I->src[0].value];
+      if (!collect || collect->op != AGX_OPCODE_COLLECT ||
+          collect->nr_dests != 1 || collect->saturate ||
+          collect->dest[0].memory ||
+          collect->dest[0].size != I->src[0].size ||
+          collect->nr_srcs != I->nr_dests ||
+          agx_channels(collect->dest[0]) != collect->nr_srcs ||
+          agx_channels(I->src[0]) != I->nr_dests)
+         continue;
+      bool hinted = false;
+      agx_foreach_ssa_dest(I, d) {
+         const agx_index dest = I->dest[d], src = collect->src[d];
+         if (dest.size != I->src[0].size || dest.memory ||
+             agx_channels(dest) != 1 || src.type != AGX_INDEX_NORMAL ||
+             src.size != dest.size || src.memory || src.abs || src.neg ||
+             agx_channels(src) != 1)
+            continue;
+         aliases[dest.value] = src;
+         if (!hinted) {
+            if (!ctx->collect_split_hints.data)
+               util_dynarray_init(&ctx->collect_split_hints, ctx);
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(collect));
+            agx_instr *hint = agx_alloc_instr(
+               &b, AGX_OPCODE_COLLECT, 1, collect->nr_srcs);
+            hint->dest[0] = collect->dest[0];
+            agx_foreach_src(collect, s)
+               hint->src[s] = collect->src[s];
+            util_dynarray_append(&ctx->collect_split_hints, hint);
+            hinted = true;
+         }
+      }
+   }
+   for (unsigned i = 0; i < ctx->alloc; ++i) {
+      if (agx_is_null(aliases[i]))
+         continue;
+      agx_index root = aliases[i];
+      unsigned steps = 0;
+      while (!agx_is_null(aliases[root.value])) {
+         if (++steps >= ctx->alloc)
+            goto done;
+         root = aliases[root.value];
+      }
+      unsigned value = i;
+      while (!agx_is_null(aliases[value])) {
+         unsigned next = aliases[value].value;
+         aliases[value] = root;
+         value = next;
+      }
+   }
+   util_dynarray_foreach(&ctx->collect_split_hints, agx_instr *, hint) {
+      agx_instr *I = *hint;
+      agx_foreach_ssa_src(I, s) {
+         agx_index src = I->src[s], alias = aliases[src.value];
+         if (!agx_is_null(alias) && src.size == alias.size && !src.memory &&
+             agx_channels(src) == 1)
+            agx_replace_src(I, s, alias);
+      }
+   }
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_src(I, s) {
+         const agx_index src = I->src[s], alias = aliases[src.value];
+         if (agx_is_null(alias) || src.size != alias.size || src.memory ||
+             agx_channels(src) != 1)
+            continue;
+         agx_replace_src(I, s, alias);
+         progress = true;
+      }
+   }
+done:
+   free(aliases);
+   free(defs);
+   return progress;
+}
+
 static void
 agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {

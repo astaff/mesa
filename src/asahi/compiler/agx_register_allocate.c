@@ -2285,6 +2285,39 @@ agx_ra(agx_context *ctx)
       }
    }
 
+   if (!ctx->scratch_size_B) {
+      util_dynarray_foreach(&ctx->collect_split_hints, agx_instr *, hint) {
+         agx_instr *collect = *hint;
+         unsigned dest = collect->dest[0].value;
+         unsigned width = agx_size_align_16(collect->dest[0].size);
+         unsigned span = collect->nr_srcs * width;
+         if (ncomps[dest] || !span || span > 16)
+            continue;
+         bool valid = true;
+         agx_foreach_src(collect, s) {
+            agx_index src = collect->src[s];
+            if (src.type == AGX_INDEX_UNDEF || agx_is_null(src))
+               continue;
+            if (src.type == AGX_INDEX_NORMAL && !ncomps[src.value]) {
+               collect->src[s] = agx_undef(src.size);
+               continue;
+            }
+            valid &= src.type == AGX_INDEX_NORMAL && !src.memory &&
+               src.size == collect->dest[0].size && agx_channels(src) == 1 &&
+               !src.abs && !src.neg && ncomps[src.value] == width;
+         }
+         if (!valid)
+            continue;
+         ncomps[dest] = util_next_power_of_two(span);
+         agx_foreach_ssa_src(collect, s) {
+            unsigned value = collect->src[s].value;
+            if (!src_to_collect_phi[value] ||
+                src_to_collect_phi[value]->op == AGX_OPCODE_COLLECT)
+               src_to_collect_phi[value] = collect;
+         }
+      }
+   }
+
    /* The ordered eight-target RGBA8 reload keeps sixteen packed halves live
     * until its terminal tile stores. Its shared texture coordinates are also
     * bank-constrained, so the shuffler cannot evict them from that low bank.
