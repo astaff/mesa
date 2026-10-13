@@ -470,6 +470,7 @@ typedef struct {
    bool agx3_tex_coord_component : 1;
    bool agx3_tex_coord_start : 1;
    bool agx3_tex_coords_staged : 1;
+   bool agx3_cube_scalar_coords  : 1;
 
 } agx_instr;
 
@@ -1168,6 +1169,7 @@ void agx3_split_vector_stack_access(agx_context *ctx);
 bool agx3_lower_texture_publications(agx_context *ctx);
 bool agx3_fuse_fma_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_texture_publications(agx_context *ctx);
+bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);

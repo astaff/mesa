@@ -1559,6 +1559,49 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          continue;
       }
 
+      if (I->agx3_cube_scalar_coords && I->nr_dests == 1 &&
+          I->dest[0].type == AGX_INDEX_NORMAL) {
+         unsigned released[3], nr_released = 0;
+         for (unsigned c = 0; c < 3; ++c) {
+            unsigned src = c ? c + 5 : 0;
+            if (I->src[src].type != AGX_INDEX_NORMAL || !I->src[src].kill)
+               continue;
+            bool duplicate = false;
+            for (unsigned n = 0; n < nr_released; ++n)
+               duplicate |= agx_is_equiv(I->src[src], I->src[released[n]]);
+            if (duplicate)
+               continue;
+            kill_source(rctx, I, src);
+            released[nr_released++] = src;
+         }
+         unsigned count = rctx->ncomps[I->dest[0].value], reg;
+         bool found =
+            nr_released && find_regs_simple(rctx, RA_GPR, count, count,
+                                            dest_minimum(rctx, I, 0),
+                                            dest_limit(rctx, I, 0), &reg);
+         if (found) {
+            reg = pick_regs(rctx, I, 0);
+            assign_regs(rctx, I->dest[0], reg);
+            agx_foreach_ssa_src(I, src) {
+               if (!I->src[src].kill)
+                  continue;
+               bool already = false;
+               for (unsigned n = 0; n < nr_released; ++n)
+                  already |= agx_is_equiv(I->src[src], I->src[released[n]]);
+               if (!already)
+                  kill_source(rctx, I, src);
+            }
+            agx_set_sources(rctx, I);
+            agx_set_dests(rctx, I);
+            continue;
+         }
+         for (unsigned n = 0; n < nr_released; ++n) {
+            unsigned src = released[n];
+            BITSET_SET_COUNT(used_regs_gpr, ssa_to_reg[I->src[src].value],
+                             rctx->ncomps[I->src[src].value]);
+         }
+      }
+
       /* AGX3b device atomics return the old value in-place over their value
        * operand.  When that operand dies here, assign the destination to its
        * exact base before the generic allocator can choose a different free
@@ -1957,7 +2000,7 @@ agx3_cube_register_budget(agx_context *ctx)
       agx_foreach_ssa_dest(I, d)
          alignment = MAX2(alignment,
                          util_next_power_of_two(agx_index_size_16(I->dest[d])));
-      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs < 6 ||
           (I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY))
          continue;
 
@@ -2121,6 +2164,7 @@ agx_ra(agx_context *ctx)
       }
    }
 
+   const bool ssa_renumbered = spilling || remat;
    if (spilling || remat) {
       assert((remat || ctx->key->has_scratch) &&
              "internal shaders are unspillable");
@@ -2144,6 +2188,24 @@ agx_ra(agx_context *ctx)
 
       /* The resulting program can now be assigned registers */
       assert(effective_demand <= max_possible_regs && "spiller post-condition");
+   }
+
+   unsigned original_hints =
+      util_dynarray_num_elements(&ctx->collect_split_hints, agx_instr *);
+   if (ssa_renumbered || ctx->scratch_size_B) {
+      agx_foreach_instr_global(ctx, I) {
+         if (!I->agx3_cube_scalar_coords || I->nr_srcs != 8)
+            continue;
+         if (!ctx->collect_split_hints.data)
+            util_dynarray_init(&ctx->collect_split_hints, ctx);
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         agx_instr *hint = agx_alloc_instr(&b, AGX_OPCODE_COLLECT, 1, 3);
+         hint->dest[0] = agx_vec_temp(ctx, AGX_SIZE_32, 3);
+         hint->src[0] = I->src[0];
+         hint->src[1] = I->src[6];
+         hint->src[2] = I->src[7];
+         util_dynarray_append(&ctx->collect_split_hints, hint);
+      }
    }
 
    /* Record all phi webs. First initialize the union-find data structure with
@@ -2235,6 +2297,12 @@ agx_ra(agx_context *ctx)
            I->op == AGX_OPCODE_IMAGE_LOAD)) {
          if (I->src[0].type == AGX_INDEX_NORMAL)
             BITSET_SET(texture_gpr, I->src[0].value);
+         if (I->agx3_cube_scalar_coords) {
+            for (unsigned s = 6; s < 8; ++s) {
+               if (I->src[s].type == AGX_INDEX_NORMAL)
+                  BITSET_SET(texture_gpr, I->src[s].value);
+            }
+         }
 
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
              I->lod_mode == AGX_LOD_MODE_LOD_GRAD &&
@@ -2298,8 +2366,12 @@ agx_ra(agx_context *ctx)
       }
    }
 
-   if (!ctx->scratch_size_B) {
+   {
+      unsigned hint_index = 0;
       util_dynarray_foreach(&ctx->collect_split_hints, agx_instr *, hint) {
+         if (hint_index++ < original_hints &&
+             (ssa_renumbered || ctx->scratch_size_B))
+            continue;
          agx_instr *collect = *hint;
          unsigned dest = collect->dest[0].value;
          unsigned width = agx_size_align_16(collect->dest[0].size);

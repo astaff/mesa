@@ -185,6 +185,91 @@ scalar_publication_source(agx_index src)
 }
 
 static bool
+scalar_cube_sample(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+       I->nr_dests != 1 || I->dim != AGX_DIM_CUBE || I->shadow || I->offset ||
+       I->query_lod || I->sparse || I->gather != AGX_GATHER_NONE ||
+       I->lod_mode != AGX_LOD_MODE_AUTO_LOD || I->agx3_tex_coords_staged ||
+       I->src[0].type != AGX_INDEX_NORMAL || I->src[0].memory ||
+       I->src[0].size != AGX_SIZE_32 || agx_channels(I->src[0]) != 3 ||
+       I->src[0].abs || I->src[0].neg ||
+       I->src[1].type != AGX_INDEX_IMMEDIATE || I->src[1].value != 0 ||
+       !agx_is_null(I->src[5]))
+      return false;
+   for (unsigned q = 3; q <= 4; ++q) {
+      if (I->src[q].type != AGX_INDEX_UNIFORM &&
+          I->src[q].type != AGX_INDEX_IMMEDIATE)
+         return false;
+   }
+   return true;
+}
+
+bool
+agx3_lower_scalar_cube_coordinates(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+      return false;
+
+   agx_instr **defs = rzalloc_array(ctx, agx_instr *, ctx->alloc);
+   BITSET_WORD *vector_uses =
+      rzalloc_array(ctx, BITSET_WORD, BITSET_WORDS(ctx->alloc));
+   if (!defs || !vector_uses)
+      return false;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         defs[I->dest[d].value] = I;
+      bool scalar_sample = scalar_cube_sample(I);
+      agx_foreach_ssa_src(I, q) {
+         if (q != 0 || !scalar_sample)
+            BITSET_SET(vector_uses, I->src[q].value);
+      }
+   }
+
+   bool progress = false;
+   agx_foreach_instr_global_safe(ctx, I) {
+      if (!scalar_cube_sample(I))
+         continue;
+      if (BITSET_TEST(vector_uses, I->src[0].value))
+         continue;
+      agx_instr *collect = defs[I->src[0].value];
+      if (!collect || collect->op != AGX_OPCODE_COLLECT ||
+          collect->nr_srcs != 3)
+         continue;
+      bool eligible = true;
+      for (unsigned c = 0; c < 3; ++c) {
+         agx_index src = collect->src[c];
+         eligible &= scalar_publication_source(src) &&
+                     (src.type != AGX_INDEX_REGISTER || src.value <= 126);
+      }
+      if (!eligible)
+         continue;
+      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+      agx_instr *sample = agx_alloc_instr(&b, I->op, 1, 8);
+      memcpy(&sample->op, &I->op, sizeof(*I) - offsetof(agx_instr, op));
+      sample->nr_srcs = 8;
+      sample->dest[0] = I->dest[0];
+      memcpy(sample->src, I->src, 6 * sizeof(agx_index));
+      sample->src[0] = collect->src[0];
+      sample->src[6] = collect->src[1];
+      sample->src[7] = collect->src[2];
+      sample->agx3_cube_scalar_coords = true;
+      if (!ctx->collect_split_hints.data)
+         util_dynarray_init(&ctx->collect_split_hints, ctx);
+      agx_instr *hint = agx_alloc_instr(&b, AGX_OPCODE_COLLECT, 1, 3);
+      hint->dest[0] = collect->dest[0];
+      for (unsigned c = 0; c < 3; ++c)
+         hint->src[c] = collect->src[c];
+      util_dynarray_append(&ctx->collect_split_hints, hint);
+      agx_builder_insert(&b.cursor, sample);
+      agx_remove_instruction(I);
+      progress = true;
+   }
+   return progress;
+}
+
+static bool
 ssa_preserves_publications(const agx_instr *I)
 {
    if (agx_texture_resource(I))

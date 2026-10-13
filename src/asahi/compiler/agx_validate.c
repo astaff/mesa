@@ -292,6 +292,13 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
 {
    unsigned size = agx_size_align_16(I->src[s].size);
 
+   if (I->agx3_cube_scalar_coords && (s == 0 || s == 6 || s == 7)) {
+      assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+             I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->nr_srcs == 8 &&
+             I->dim == AGX_DIM_CUBE && I->lod_mode == AGX_LOD_MODE_AUTO_LOD);
+      return 2;
+   }
+
    /* This is a sampler-private value, not a dimensional GPR coordinate. */
    if (agx_texture_resource(I) && s == 0)
       return agx_index_size_16(I->src[s]);

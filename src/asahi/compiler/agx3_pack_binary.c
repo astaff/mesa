@@ -1881,6 +1881,8 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
                          uint16_t bank_base, bool publication_last)
 {
    const bool published = agx_texture_resource(I) != 0;
+   const bool scalar_cube = I->agx3_cube_scalar_coords;
+   const unsigned source_count = scalar_cube ? 8 : 6;
    const bool explicit_lod = I->lod_mode == AGX_LOD_MODE_LOD_MIN;
    const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
    const bool gradient_min = I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN;
@@ -1985,9 +1987,9 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
          : (implicit_lod &&
             (zero_bias || agx3_tex_imm(I->src[1], 0)));
    const bool texture_immediate =
-      I->nr_srcs == 6 && I->src[3].type == AGX_INDEX_IMMEDIATE;
+      I->nr_srcs == source_count && I->src[3].type == AGX_INDEX_IMMEDIATE;
    const bool sampler_immediate =
-      I->nr_srcs == 6 && I->src[4].type == AGX_INDEX_IMMEDIATE;
+      I->nr_srcs == source_count && I->src[4].type == AGX_INDEX_IMMEDIATE;
    const bool immediate = texture_immediate && sampler_immediate;
    /* agx_emit_tex() publishes the packed offset on the instruction rather
     * than through src[5], because a comparison sample needs that operand for
@@ -2040,7 +2042,26 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       (implicit_lod || immediate_lod) &&
       (agx_is_null(I->src[5]) || (!shadow && immediate_offset)) &&
       (!offset || immediate_offset);
-   if (I->nr_dests != 1 || I->nr_srcs != 6 ||
+   if (scalar_cube) {
+      if (enc != AGX_ISA_ENCODING_AGX3B || I->nr_srcs != 8 ||
+          I->dim != AGX_DIM_CUBE || shadow || offset || query_lod || gather ||
+          I->sparse || I->lod_mode != AGX_LOD_MODE_AUTO_LOD ||
+          native_coord_slot || published)
+         return agx3_tex_decline(I, __LINE__);
+      for (unsigned s = 0; s < 3; ++s) {
+         agx_index src = I->src[s ? s + 5 : 0];
+         if (!agx3_tex_plain_reg(src) || src.size != AGX_SIZE_32 ||
+             agx_channels(src) != 1 || (src.value & 1) || src.value > 126)
+            return agx3_tex_decline(I, __LINE__);
+      }
+   }
+   const bool coordinates_valid = published ? published_shape : scalar_cube ||
+      (agx3_tex_plain_reg(I->src[0]) && I->src[0].size == AGX_SIZE_32 &&
+       agx_channels(I->src[0]) == (query_lod ? (three_d || cube ? 3 : 2) :
+                                  cube_array ? 4 :
+                                  (array || three_d || cube) ? 3 : 2) &&
+       !(I->src[0].value & 3) && I->src[0].value <= max_coord);
+   if (I->nr_dests != 1 || I->nr_srcs != source_count ||
        !agx3_tex_plain_reg(I->dest[0]) ||
        (I->dest[0].size != AGX_SIZE_16 &&
         I->dest[0].size != AGX_SIZE_32) ||
@@ -2049,13 +2070,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
        agx_channels(I->dest[0]) != (I->sparse ? 8u : 4u) ||
        I->dest[0].value >= 128 ||
        (I->dest[0].size == AGX_SIZE_32 && (I->dest[0].value & 1)) ||
-       (published ? !published_shape :
-        (!agx3_tex_plain_reg(I->src[0]) ||
-         I->src[0].size != AGX_SIZE_32 ||
-         agx_channels(I->src[0]) != (query_lod ? (three_d || cube ? 3 : 2) :
-                                    cube_array ? 4 :
-                                    (array || three_d || cube) ? 3 : 2) ||
-         (I->src[0].value & 3) || I->src[0].value > max_coord)) ||
+       !coordinates_valid ||
        !valid_lod || !agx3_tex_imm(I->src[2], 0) ||
        (texture_immediate
            ? I->src[3].value > 15
@@ -2323,10 +2338,16 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
 
       const uint16_t *scratch = cem_scratch;
       for (unsigned axis = 0; axis < 3; ++axis) {
-         if (!agx3_tex_cube_cem_calc_to(
-                enc, I->src[0].value, I->src[0].value + 2,
-                I->src[0].value + 4, scratch[axis], axis,
-                axis == 2 && I->src[0].discard, bytes, &len) ||
+         const bool discard[3] = {
+            axis == 2 && I->src[0].discard,
+            axis == 2 && (scalar_cube ? I->src[6].discard : I->src[0].discard),
+            axis == 2 && (scalar_cube ? I->src[7].discard : I->src[0].discard),
+         };
+         if (!agx3_tex_cube_cem_calc_hints_to(
+                enc, I->src[0].value,
+                scalar_cube ? I->src[6].value : I->src[0].value + 2,
+                scalar_cube ? I->src[7].value : I->src[0].value + 4,
+                scratch[axis], axis, discard, bytes, &len) ||
              !agx3_append(emission, bytes, len))
             return agx3_tex_decline(I, __LINE__);
 

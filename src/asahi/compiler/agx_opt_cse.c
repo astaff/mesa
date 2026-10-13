@@ -78,6 +78,8 @@ instrs_equal(const void *_i1, const void *_i2)
       return false;
    if (i1->dim != i2->dim)
       return false;
+   if (i1->agx3_cube_scalar_coords != i2->agx3_cube_scalar_coords)
+      return false;
    if (i1->offset != i2->offset)
       return false;
    /* Two samples that differ only in their coordinate offset are different
