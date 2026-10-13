@@ -8,8 +8,9 @@
 #include "agx_compiler.h"
 #include "agx_test.h"
 
-#include <gtest/gtest.h>
+#include <vector>
 #include "util/u_debug.h"
+#include <gtest/gtest.h>
 
 static void
 agx_optimize_and_dce(agx_context *ctx)
@@ -1083,6 +1084,244 @@ TEST_F(Optimizer, TileSampleImmediateControls)
          agx_optimize_and_dce(b->shader);
          EXPECT_EQ(store->src[1].type, AGX_INDEX_IMMEDIATE);
          EXPECT_EQ(store->src[1].value, mask);
+      }
+   }
+}
+
+TEST_F(Optimizer, G17PAbsorbsExclusiveSelectGuards)
+{
+   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+      for (unsigned target = 0; target < 8; ++target) {
+         for (unsigned guard = 0; guard < 8; ++guard) {
+            for (bool reverse : {false, true}) {
+               agx_builder *actual = agx_test_builder(mem_ctx);
+               agx_builder *expected = agx_test_builder(mem_ctx);
+               struct agx_shader_key key = {};
+               key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+               for (agx_builder *b : {actual, expected}) {
+                  b->shader->key = &key;
+                  agx_index variable = agx_preload(b, agx_register(0, size));
+                  agx_index predicate = agx_icmp(
+                     b, variable, agx_immediate(guard), AGX_ICOND_UEQ, false);
+                  agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_icmpsel_to(b, inner, variable, agx_immediate(target), wy,
+                                 wz, AGX_ICOND_UEQ);
+                  agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+                  if (b == expected && guard == target) {
+                     agx_unit_test(b, wz);
+                     continue;
+                  }
+                  if (b == expected)
+                     agx_icmpsel_to(b, out, variable, agx_immediate(target), wy,
+                                    wz, AGX_ICOND_UEQ);
+                  else if (b == expected && !reverse)
+                     agx_icmpsel_to(b, out, variable, agx_immediate(guard), wz,
+                                    inner, AGX_ICOND_UEQ);
+                  else
+                     agx_icmpsel_to(b, out, predicate, agx_zero(),
+                                    reverse ? wz : inner, reverse ? inner : wz,
+                                    reverse ? AGX_ICOND_UGT : AGX_ICOND_UEQ);
+                  agx_unit_test(b, out);
+               }
+               agx_optimize_and_dce(actual->shader);
+               agx_dce(expected->shader, true);
+               ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+            }
+         }
+      }
+   }
+}
+
+TEST_F(Optimizer, G17PAbsorbsCompoundSelectGuards)
+{
+   for (unsigned first = 0; first < 8; ++first) {
+      for (unsigned second = 0; second < 8; ++second) {
+         agx_builder *actual = agx_test_builder(mem_ctx);
+         agx_builder *expected = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         for (agx_builder *b : {actual, expected}) {
+            b->shader->key = &key;
+            agx_index variable = agx_preload(b, wx);
+            agx_index predicate = agx_temp(b->shader, AGX_SIZE_16);
+            agx_icmp_to(b, predicate, variable, agx_immediate(first),
+                        AGX_ICOND_UEQ, false);
+            agx_index compound = agx_temp(b->shader, AGX_SIZE_16);
+            agx_icmpsel_to(b, compound, variable, agx_immediate(second),
+                           agx_immediate(1), predicate, AGX_ICOND_UEQ);
+            agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+            agx_icmpsel_to(b, inner, variable, agx_immediate(7), wy, wz,
+                           AGX_ICOND_UEQ);
+            agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+            if (b == expected && (first == 7 || second == 7)) {
+               agx_unit_test(b, wz);
+               continue;
+            }
+            if (b == expected)
+               agx_icmpsel_to(b, out, variable, agx_immediate(7), wy, wz,
+                              AGX_ICOND_UEQ);
+            else
+               agx_icmpsel_to(b, out, compound, agx_zero(), inner, wz,
+                              AGX_ICOND_UEQ);
+            agx_unit_test(b, out);
+         }
+         agx_optimize_and_dce(actual->shader);
+         agx_dce(expected->shader, true);
+         ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+      }
+   }
+}
+
+TEST_F(Optimizer, G17PAbsorbsRangeSelectGuards)
+{
+   for (enum agx_icond cond :
+        {AGX_ICOND_ULT, AGX_ICOND_UGT, AGX_ICOND_SLT, AGX_ICOND_SGT}) {
+      for (unsigned target = 0; target < 8; ++target) {
+         for (unsigned threshold = 0; threshold < 8; ++threshold) {
+            const bool guarded =
+               (cond == AGX_ICOND_ULT || cond == AGX_ICOND_SLT)
+                  ? target < threshold
+                  : target > threshold;
+            agx_builder *actual = agx_test_builder(mem_ctx);
+            agx_builder *expected = agx_test_builder(mem_ctx);
+            struct agx_shader_key key = {};
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+            for (agx_builder *b : {actual, expected}) {
+               b->shader->key = &key;
+               agx_index variable = agx_preload(b, wx);
+               agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+               agx_icmpsel_to(b, inner, agx_immediate(target), variable, wy, wz,
+                              AGX_ICOND_UEQ);
+               agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+               if (b == expected && guarded) {
+                  agx_unit_test(b, wz);
+                  continue;
+               }
+               if (b == expected)
+                  agx_icmpsel_to(b, out, variable, agx_immediate(target), wy,
+                                 wz, AGX_ICOND_UEQ);
+               else
+                  agx_icmpsel_to(b, out, variable, agx_immediate(threshold), wz,
+                                 inner, cond);
+               agx_unit_test(b, out);
+            }
+            agx_optimize_and_dce(actual->shader);
+            agx_dce(expected->shader, true);
+            ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+         }
+      }
+   }
+}
+
+static uint32_t
+select_test_run(agx_context *ctx, uint32_t input)
+{
+   std::vector<uint32_t> values(ctx->alloc);
+   auto read = [&](agx_index index) {
+      if (index.type == AGX_INDEX_IMMEDIATE)
+         return index.value;
+      if (index.type == AGX_INDEX_REGISTER)
+         return index.value == 2 ? 0x12345678u : 0xabcdef01u;
+      return values[index.value];
+   };
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_PRELOAD) {
+         values[I->dest[0].value] = input;
+      } else if (I->op == AGX_OPCODE_ICMPSEL || I->op == AGX_OPCODE_ICMP) {
+         uint32_t x = read(I->src[0]), y = read(I->src[1]);
+         const bool half =
+            I->src[0].size == AGX_SIZE_16 && I->src[1].size == AGX_SIZE_16;
+         int64_t sx = half ? (int16_t)x : (int32_t)x;
+         int64_t sy = half ? (int16_t)y : (int32_t)y;
+         bool result = false;
+         switch (I->icond) {
+         case AGX_ICOND_UEQ:
+         case AGX_ICOND_SEQ:
+            result = x == y;
+            break;
+         case AGX_ICOND_ULT:
+            result = x < y;
+            break;
+         case AGX_ICOND_UGT:
+            result = x > y;
+            break;
+         case AGX_ICOND_SLT:
+            result = sx < sy;
+            break;
+         case AGX_ICOND_SGT:
+            result = sx > sy;
+            break;
+         default:
+            ADD_FAILURE();
+            break;
+         }
+         values[I->dest[0].value] = I->op == AGX_OPCODE_ICMP
+                                       ? result != I->invert_cond
+                                       : read(I->src[result ? 2 : 3]);
+      } else if (I->op == AGX_OPCODE_UNIT_TEST) {
+         return read(I->src[0]);
+      } else {
+         ADD_FAILURE() << I->op;
+         return 0;
+      }
+   }
+   ADD_FAILURE();
+   return 0;
+}
+
+TEST_F(Optimizer, G17PRangeSelectSemantics)
+{
+   const enum agx_icond conditions[] = {
+      AGX_ICOND_UEQ, AGX_ICOND_ULT, AGX_ICOND_UGT,
+      AGX_ICOND_SEQ, AGX_ICOND_SLT, AGX_ICOND_SGT,
+   };
+   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+      for (enum agx_icond guard : conditions) {
+         for (enum agx_icond inner_cond : conditions) {
+            for (unsigned threshold : {6u, 0x7fffu, 0x8000u, 0xffffu}) {
+               agx_builder *before = agx_test_builder(mem_ctx);
+               agx_builder *after = agx_test_builder(mem_ctx);
+               struct agx_shader_key key = {};
+               key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+               for (agx_builder *b : {before, after}) {
+                  b->shader->key = &key;
+                  agx_index variable = agx_preload(b, agx_register(0, size));
+                  agx_index predicate = agx_temp(b->shader, AGX_SIZE_16);
+                  agx_icmp_to(b, predicate, variable, agx_immediate(threshold),
+                              guard, false);
+                  agx_index compound = agx_temp(b->shader, AGX_SIZE_16);
+                  agx_icmpsel_to(b, compound, variable,
+                                 agx_immediate(threshold - 2), agx_immediate(1),
+                                 predicate, guard);
+                  agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_icmpsel_to(b, inner, variable, agx_immediate(7), wy, wz,
+                                 inner_cond);
+                  agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_icmpsel_to(b, out, compound, agx_zero(), inner, wz,
+                                 AGX_ICOND_UEQ);
+                  agx_unit_test(b, out);
+               }
+               agx_optimize_and_dce(after->shader);
+               if (threshold == 6 && guard == AGX_ICOND_ULT &&
+                   inner_cond == AGX_ICOND_ULT) {
+                  unsigned selects = 0;
+                  agx_foreach_instr_global(after->shader, I)
+                     selects += I->op == AGX_OPCODE_ICMPSEL;
+                  ASSERT_EQ(selects, 1u);
+               }
+               for (uint32_t input = 0; input < 0x10000; ++input)
+                  ASSERT_EQ(select_test_run(before->shader, input),
+                            select_test_run(after->shader, input))
+                     << input;
+               if (size == AGX_SIZE_32) {
+                  for (uint32_t input : {0x10000u, 0x7fffffffu, 0x80000000u,
+                                         0xfffffffeu, 0xffffffffu})
+                     ASSERT_EQ(select_test_run(before->shader, input),
+                               select_test_run(after->shader, input))
+                        << input;
+               }
+            }
+         }
       }
    }
 }

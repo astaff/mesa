@@ -817,6 +817,247 @@ agx_optimizer_fold_icmpsel(agx_context *ctx, agx_instr *I)
    return folded;
 }
 
+static bool
+agx_same_select_value(agx_index a, agx_index b)
+{
+   return agx_is_equiv(a, b) && a.size == b.size && a.abs == b.abs &&
+          a.neg == b.neg && a.memory == b.memory &&
+          a.channels_m1 == b.channels_m1;
+}
+
+struct agx_select_domain {
+   agx_instr **defs;
+   agx_index variable;
+   uint64_t cuts[32];
+   unsigned count;
+};
+
+static bool agx_select_collect_value(struct agx_select_domain *d,
+                                     agx_index value, unsigned depth);
+
+static bool
+agx_select_plain(agx_index value)
+{
+   return !value.abs && !value.neg && !value.memory &&
+          agx_channels(value) == 1 && value.size <= AGX_SIZE_32;
+}
+
+static bool
+agx_select_collect_condition(struct agx_select_domain *d, const agx_instr *I,
+                             unsigned depth)
+{
+   if (!depth || !agx_select_plain(I->src[0]) || !agx_select_plain(I->src[1]) ||
+       I->icond == 3 || I->icond == 7)
+      return false;
+   for (unsigned side = 0; side < 2; ++side) {
+      if (!agx_same_select_value(I->src[side], d->variable))
+         continue;
+      const agx_index other = I->src[side ^ 1];
+      if (other.type != AGX_INDEX_IMMEDIATE || d->count > 30)
+         return false;
+      d->cuts[d->count++] = other.value;
+      d->cuts[d->count++] = (uint64_t)other.value + 1;
+      return true;
+   }
+   return agx_select_collect_value(d, I->src[0], depth - 1) &&
+          agx_select_collect_value(d, I->src[1], depth - 1);
+}
+
+static bool
+agx_select_collect_value(struct agx_select_domain *d, agx_index value,
+                         unsigned depth)
+{
+   if (!agx_select_plain(value))
+      return false;
+   if (value.type == AGX_INDEX_IMMEDIATE)
+      return true;
+   if (!depth || value.type != AGX_INDEX_NORMAL ||
+       agx_same_select_value(value, d->variable))
+      return false;
+   const agx_instr *I = d->defs[value.value];
+   if (!I || (I->op != AGX_OPCODE_ICMPSEL && I->op != AGX_OPCODE_ICMP) ||
+       I->saturate || (I->op == AGX_OPCODE_ICMPSEL && I->invert_cond) ||
+       value.size != I->dest[0].size || !agx_select_plain(I->dest[0]) ||
+       !agx_select_collect_condition(d, I, depth - 1))
+      return false;
+   return I->op == AGX_OPCODE_ICMP ||
+          (agx_select_collect_value(d, I->src[2], depth - 1) &&
+           agx_select_collect_value(d, I->src[3], depth - 1));
+}
+
+static uint32_t agx_select_evaluate_value(const struct agx_select_domain *d,
+                                          agx_index value, uint32_t input);
+
+static bool
+agx_select_evaluate_condition(const struct agx_select_domain *d,
+                              const agx_instr *I, uint32_t input)
+{
+   uint32_t x = agx_select_evaluate_value(d, I->src[0], input);
+   uint32_t y = agx_select_evaluate_value(d, I->src[1], input);
+   const bool half =
+      I->src[0].size == AGX_SIZE_16 && I->src[1].size == AGX_SIZE_16;
+   if (half) {
+      x &= 0xffff;
+      y &= 0xffff;
+   }
+   const int32_t sx = half ? (int16_t)x : (int32_t)x;
+   const int32_t sy = half ? (int16_t)y : (int32_t)y;
+   switch (I->icond) {
+   case AGX_ICOND_UEQ:
+   case AGX_ICOND_SEQ:
+      return x == y;
+   case AGX_ICOND_ULT:
+      return x < y;
+   case AGX_ICOND_UGT:
+      return x > y;
+   case AGX_ICOND_SLT:
+      return sx < sy;
+   case AGX_ICOND_SGT:
+      return sx > sy;
+   default:
+      UNREACHABLE("invalid select condition");
+   }
+}
+
+static uint32_t
+agx_select_evaluate_value(const struct agx_select_domain *d, agx_index value,
+                          uint32_t input)
+{
+   if (value.type == AGX_INDEX_IMMEDIATE)
+      return value.value;
+   if (agx_same_select_value(value, d->variable))
+      return input;
+   const agx_instr *I = d->defs[value.value];
+   const bool condition = agx_select_evaluate_condition(d, I, input);
+   if (I->op == AGX_OPCODE_ICMP)
+      return condition != I->invert_cond;
+   return agx_select_evaluate_value(d, I->src[condition ? 2 : 3], input);
+}
+
+static int
+agx_select_compare_cut(const void *a, const void *b)
+{
+   const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+   return (x > y) - (x < y);
+}
+
+static void
+agx_optimizer_select_guard(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_ICMPSEL || I->saturate || I->invert_cond ||
+       agx_channels(I->dest[0]) != 1)
+      return;
+   for (unsigned branch = 2; branch < 4; ++branch) {
+      const agx_index value = I->src[branch];
+      if (value.type != AGX_INDEX_NORMAL || !agx_select_plain(value) ||
+          value.size != I->dest[0].size)
+         continue;
+      const agx_instr *inner = defs[value.value];
+      if (!inner ||
+          (inner->op != AGX_OPCODE_ICMPSEL && inner->op != AGX_OPCODE_ICMP) ||
+          inner->saturate ||
+          (inner->op == AGX_OPCODE_ICMPSEL && inner->invert_cond))
+         continue;
+      agx_instr boolean_select;
+      agx_index boolean_sources[4];
+      if (inner->op == AGX_OPCODE_ICMP) {
+         boolean_select = *inner;
+         boolean_sources[0] = inner->src[0];
+         boolean_sources[1] = inner->src[1];
+         boolean_sources[2] = agx_immediate(!inner->invert_cond);
+         boolean_sources[3] = agx_immediate(inner->invert_cond);
+         boolean_select.src = boolean_sources;
+         boolean_select.nr_srcs = 4;
+         boolean_select.op = AGX_OPCODE_ICMPSEL;
+         boolean_select.invert_cond = false;
+         inner = &boolean_select;
+      }
+      for (unsigned base = 2; base < 4; ++base) {
+         if (!agx_same_select_value(inner->src[base], I->src[branch ^ 1]))
+            continue;
+         for (unsigned side = 0; side < 2; ++side) {
+            const agx_index variable = inner->src[side];
+            if (variable.type != AGX_INDEX_NORMAL ||
+                !agx_select_plain(variable))
+               continue;
+            const uint64_t limit = UINT64_C(1)
+                                   << (variable.size == AGX_SIZE_16 ? 16 : 32);
+            struct agx_select_domain d = {
+               .defs = defs,
+               .variable = variable,
+               .cuts = {0, limit / 2, limit},
+               .count = 3,
+            };
+            if (!agx_select_collect_condition(&d, I, 8) ||
+                !agx_select_collect_condition(&d, inner, 8))
+               continue;
+            qsort(d.cuts, d.count, sizeof(d.cuts[0]), agx_select_compare_cut);
+            bool active[32] = {false};
+            for (unsigned c = 0; c + 1 < d.count; ++c) {
+               active[c] = agx_select_evaluate_condition(&d, I, d.cuts[c]) ==
+                              (branch == 2) &&
+                           agx_select_evaluate_condition(
+                              &d, inner, d.cuts[c]) == (base == 3);
+            }
+            bool any = false, all = true;
+            for (unsigned c = 0; c + 1 < d.count; ++c) {
+               if (d.cuts[c] == d.cuts[c + 1])
+                  continue;
+               any |= active[c];
+               all &= active[c];
+            }
+            if (!any || all) {
+               I->src[0] = I->src[1] = agx_zero();
+               I->src[2] = I->src[3] = inner->src[all ? (base ^ 1) : base];
+               I->icond = AGX_ICOND_UEQ;
+               return;
+            }
+            const enum agx_icond conditions[] = {
+               AGX_ICOND_UEQ, AGX_ICOND_ULT, AGX_ICOND_UGT,
+               AGX_ICOND_SLT, AGX_ICOND_SGT,
+            };
+            for (unsigned op = 0; op < ARRAY_SIZE(conditions); ++op) {
+               for (unsigned c = 0; c < d.count; ++c) {
+                  for (unsigned delta = 0; delta < 2; ++delta) {
+                     const uint64_t constant = d.cuts[c] - delta;
+                     if (constant >= 0x10000)
+                        continue;
+                     agx_index sources[2] = {variable, agx_immediate(constant)};
+                     agx_instr comparison = {
+                        .src = sources,
+                        .icond = conditions[op],
+                     };
+                     bool match = true, inverse = true;
+                     for (unsigned cell = 0; cell + 1 < d.count; ++cell) {
+                        if (d.cuts[cell] == d.cuts[cell + 1])
+                           continue;
+                        const bool first = agx_select_evaluate_condition(
+                           &d, &comparison, d.cuts[cell]);
+                        const bool last = agx_select_evaluate_condition(
+                           &d, &comparison, d.cuts[cell + 1] - 1);
+                        match &= first == active[cell] && last == active[cell];
+                        inverse &=
+                           first != active[cell] && last != active[cell];
+                        if (!match && !inverse)
+                           break;
+                     }
+                     if (!match && !inverse)
+                        continue;
+                     I->src[0] = sources[0];
+                     I->src[1] = sources[1];
+                     I->src[2] = inner->src[inverse ? base : (base ^ 1)];
+                     I->src[3] = inner->src[inverse ? (base ^ 1) : base];
+                     I->icond = comparison.icond;
+                     return;
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
 /*
  * Fuse conditions into select. Specifically, acts on icmpsel and fuses:
  *
@@ -1097,6 +1338,7 @@ agx_optimizer_forward(agx_context *ctx)
           * fold below can resolve. */
          agx_optimizer_cmpsel(defs, I);
          agx_g17p_tie_zero_minmax(ctx, I);
+         agx_optimizer_select_guard(ctx, defs, I);
          agx_instr *folded = agx_optimizer_fold_icmpsel(ctx, I);
          if (folded)
             defs[folded->dest[0].value] = folded;
