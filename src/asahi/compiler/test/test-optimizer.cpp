@@ -1361,3 +1361,86 @@ TEST_F(Optimizer, G17PFusesConstantValuedSelectPredicates)
       }
    }
 }
+
+TEST_F(Optimizer, G17POuterInputProvesCompoundSelectGuard)
+{
+   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      for (agx_builder *b : {actual, expected}) {
+         b->shader->key = &key;
+         agx_index variable = agx_preload(b, agx_register(0, size));
+         agx_index upper = agx_temp(b->shader, AGX_SIZE_16);
+         agx_icmp_to(b, upper, variable, agx_immediate(6), AGX_ICOND_SLT,
+                     false);
+         agx_index interval = agx_temp(b->shader, AGX_SIZE_16);
+         agx_icmpsel_to(b, interval, variable, agx_immediate(4), agx_zero(),
+                        upper, AGX_ICOND_SLT);
+         agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+         agx_icmpsel_to(b, inner, interval, agx_zero(), wz, wy, AGX_ICOND_UEQ);
+         agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+         if (b == expected)
+            agx_icmpsel_to(b, out, variable, agx_immediate(5), wy, wz,
+                           AGX_ICOND_UEQ);
+         else
+            agx_icmpsel_to(b, out, variable, agx_immediate(5), wz, inner,
+                           AGX_ICOND_SLT);
+         agx_unit_test(b, out);
+      }
+      agx_optimize_and_dce(actual->shader);
+      agx_dce(expected->shader, true);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}
+
+TEST_F(Optimizer, G17PCompoundInnerGuardSemantics)
+{
+   const enum agx_icond conditions[] = {
+      AGX_ICOND_UEQ, AGX_ICOND_ULT, AGX_ICOND_UGT,
+      AGX_ICOND_SEQ, AGX_ICOND_SLT, AGX_ICOND_SGT,
+   };
+   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+      for (enum agx_icond guard : conditions) {
+         for (enum agx_icond inner_cond : conditions) {
+            for (unsigned threshold : {6u, 0x7fffu, 0x8000u, 0xffffu}) {
+               agx_builder *before = agx_test_builder(mem_ctx);
+               agx_builder *after = agx_test_builder(mem_ctx);
+               struct agx_shader_key key = {};
+               key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+               for (agx_builder *b : {before, after}) {
+                  b->shader->key = &key;
+                  agx_index variable = agx_preload(b, agx_register(0, size));
+                  agx_index predicate = agx_temp(b->shader, AGX_SIZE_16);
+                  agx_icmp_to(b, predicate, variable, agx_immediate(threshold),
+                              inner_cond, false);
+                  agx_index compound = agx_temp(b->shader, AGX_SIZE_16);
+                  agx_icmpsel_to(b, compound, variable,
+                                 agx_immediate(threshold - 2), agx_zero(),
+                                 predicate, inner_cond);
+                  agx_index inner = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_icmpsel_to(b, inner, compound, agx_zero(), wz, wy,
+                                 AGX_ICOND_UEQ);
+                  agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_icmpsel_to(b, out, variable, agx_immediate(7), wz, inner,
+                                 guard);
+                  agx_unit_test(b, out);
+               }
+               agx_optimize_and_dce(after->shader);
+               for (uint32_t input = 0; input < 0x10000; ++input)
+                  ASSERT_EQ(select_test_run(before->shader, input),
+                            select_test_run(after->shader, input))
+                     << input;
+               if (size == AGX_SIZE_32) {
+                  for (uint32_t input : {0x10000u, 0x7fffffffu, 0x80000000u,
+                                         0xfffffffeu, 0xffffffffu})
+                     ASSERT_EQ(select_test_run(before->shader, input),
+                               select_test_run(after->shader, input))
+                        << input;
+               }
+            }
+         }
+      }
+   }
+}

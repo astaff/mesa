@@ -976,8 +976,9 @@ agx_optimizer_select_guard(agx_context *ctx, agx_instr **defs, agx_instr *I)
       for (unsigned base = 2; base < 4; ++base) {
          if (!agx_same_select_value(inner->src[base], I->src[branch ^ 1]))
             continue;
-         for (unsigned side = 0; side < 2; ++side) {
-            const agx_index variable = inner->src[side];
+         for (unsigned side = 0; side < 4; ++side) {
+            const agx_index variable =
+               side < 2 ? inner->src[side] : I->src[side - 2];
             if (variable.type != AGX_INDEX_NORMAL ||
                 !agx_select_plain(variable))
                continue;
