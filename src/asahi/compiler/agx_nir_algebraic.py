@@ -365,6 +365,18 @@ for bits in range(1, 16):
          ('ubitfield_extract', a, 16, bits)),
     ])
 
+fold_aligned_bounds = []
+for shift in (1, 2):
+    size = 1 << shift
+    for component in range(4):
+        delta = component * size
+        folded_offset = a if delta == 0 else ('iadd', a, delta)
+        fold_aligned_bounds.append(
+            (('ult(agx_has_reusable_bound_store_index)',
+               ('iadd', ('iand', 'a@32', -size),
+                              delta + size - 1), 'b@32'),
+             ('ult', ('ushr', folded_offset, shift), ('ushr', b, shift))))
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--import-path', required=True)
@@ -376,6 +388,7 @@ def run():
     import nir_algebraic  # pylint: disable=import-error
 
     print('#include "agx_nir.h"')
+    print('#include "agx_nir_aligned_bounds.h"')
 
     print(nir_algebraic.AlgebraicPass("agx_nir_cleanup_amul", cleanup_amul).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_lea", fuse_lea).render())
@@ -392,7 +405,8 @@ def run():
                                       fold_extract16_bfe).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
-                                      fuse_imad + ixor_bcsel).render())
+                                      fuse_imad + ixor_bcsel +
+                                      fold_aligned_bounds).render())
 
 
 if __name__ == '__main__':
