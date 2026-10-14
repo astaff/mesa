@@ -159,6 +159,7 @@ if with_tests
          'test/test-optimizer.cpp',
          'test/test-pressure-cse.cpp',
          'test/test-rte-fma.cpp',
+         'test/test-border-index.cpp',
          'test/test-scalarize-int64.cpp',
          'test/test-spill-fallback.cpp',
          'test/test-uniform-remat.cpp',
