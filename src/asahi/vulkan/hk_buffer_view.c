@@ -164,6 +164,12 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       texture.stride =
          (texture.width * util_format_get_blocksize(format)) - 16;
    }
+   if (g17p && rgb32) {
+      texture.channels = AGX_CHANNELS_R32;
+      texture.swizzle_g = AGX_CHANNEL_0;
+      texture.swizzle_b = AGX_CHANNEL_0;
+      texture.stride = texture.width * sizeof(uint32_t) - 16;
+   }
    if (g17p) {
       /* A sparse-resident buffer carries a per-page residency bitmap, and the
        * buffer texture descriptor has no hardware sparse mode to report
