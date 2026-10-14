@@ -1477,8 +1477,12 @@ hk_drop_border_emulation(struct util_dynarray *ifs)
  * uses integer texels; the shader performs the Vulkan numerical conversion.
  * The descriptor's existing type/channel fields avoid a new software ABI. */
 static bool
-lower_scaled_storage(nir_builder *b, nir_intrinsic_instr *intr, void *unused)
+lower_scaled_storage(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   const struct hk_physical_device *pdev = data;
+   if (!b->shader->info.internal && pdev && !pdev->scaled_storage)
+      return false;
+
    const bool load = intr->intrinsic == nir_intrinsic_bindless_image_load;
    const bool store = intr->intrinsic == nir_intrinsic_bindless_image_store;
    if ((!load && !store) || nir_intrinsic_format(intr) != PIPE_FORMAT_NONE ||
@@ -2124,7 +2128,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
    if (agx_chip_descriptor_generation(dev->dev.chip) == 9) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_scaled_storage,
-               nir_metadata_none, NULL);
+               nir_metadata_none, hk_device_physical(dev));
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_scaled_sample,
                hk_scaled_sample_guard(nir) ? nir_metadata_none
                                            : nir_metadata_control_flow,

@@ -60,6 +60,7 @@ struct hk_physical_device {
     * features. Only then can a valid application descriptor carry a nonzero
     * hk_sampled_image_descriptor_sw::scaled_conversion kind. */
    bool scaled_sampling;
+   bool scaled_storage;
 
    /* Set once a device of this GPU creates a sampler whose border colour G17P
     * shaders must emulate (hk_CreateSampler). Shaders compiled before then
