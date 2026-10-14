@@ -164,6 +164,7 @@ if with_tests
          'test/test-byte-swap.cpp',
          'test/test-minmax-canonical.cpp',
          'test/test-selected-f2i.cpp',
+         'test/test-buffer-format-groups.cpp',
          'test/test-scalarize-int64.cpp',
          'test/test-spill-fallback.cpp',
          'test/test-uniform-remat.cpp',
