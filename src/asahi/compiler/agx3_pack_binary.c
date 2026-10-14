@@ -787,7 +787,7 @@ agx3_emit_funop(struct util_dynarray *emission, enum agx_isa_encoding enc,
 }
 
 /* An async producer whose result later consumers must wait on. */
-static bool
+bool
 agx3_is_async(const agx_instr *I)
 {
    if ((I->op == AGX_OPCODE_ATOMIC || I->op == AGX_OPCODE_LOCAL_ATOMIC) &&

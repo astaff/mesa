@@ -618,6 +618,131 @@ TEST(NativeForms, PhiUsesOtherEdgeWhenPreferredRegisterIsLive)
    ralloc_free(mem);
 }
 
+TEST(NativeForms, TransientTextureVectorBecomesScalarBeforeAnyEviction)
+{
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      SCOPED_TRACE(mode);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+      agx_index held[3];
+      held[0] = agx_preload(b, agx_register(0, AGX_SIZE_16));
+      held[1] = agx_preload(b, agx_register(8, AGX_SIZE_16));
+      held[2] = agx_preload(b, agx_register(18, AGX_SIZE_16));
+      agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_index coords_reg = agx_register(4, AGX_SIZE_32);
+      coords_reg.channels_m1 = 1;
+      agx_preload_to(b, coords, coords_reg);
+      agx_index result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *sample = agx_texture_sample_to(
+         b, result, coords, agx_zero(), agx_zero(),
+         agx_uniform(24, AGX_SIZE_64), agx_uniform(28, AGX_SIZE_64),
+         agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD,
+         mode == 3 ? 1 : 15, false, false, false, AGX_GATHER_NONE, false);
+      agx_index extra = agx_null();
+      if (mode == 2)
+         extra = agx_fadd(b, agx_uniform(0, AGX_SIZE_32),
+                          agx_uniform(2, AGX_SIZE_32));
+      agx_instr *split = agx_split(b, 4, result);
+      for (unsigned i = 0; i < 4; ++i)
+         split->dest[i] = mode == 3 && i
+                            ? agx_null() : agx_temp(b->shader, AGX_SIZE_32);
+      if (mode == 3) {
+         extra = agx_fadd(b, agx_uniform(0, AGX_SIZE_32),
+                          agx_uniform(2, AGX_SIZE_32));
+         agx_export(b, extra, 12);
+      }
+      agx_index second = mode == 3 ? agx_uniform(4, AGX_SIZE_32)
+                                   : split->dest[3];
+      agx_unit_test(b, agx_fadd(b, split->dest[0], second));
+      if (mode != 3) {
+         agx_unit_test(b, split->dest[1]);
+         agx_unit_test(b, split->dest[2]);
+      }
+      if (mode == 1)
+         agx_unit_test(b, result);
+      if (mode == 2)
+         agx_unit_test(b, extra);
+      for (agx_index value : held)
+         agx_unit_test(b, value);
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      EXPECT_EQ(sample->dest[0].value, mode == 0 ? 10u : 24u);
+      EXPECT_EQ(agx_channels(sample->dest[0]), 4u);
+      if (mode == 0) {
+         EXPECT_EQ(b->shader->max_reg, 18u);
+         for (unsigned i = 0; i < 4; ++i)
+            EXPECT_EQ(split->dest[i].value, 10u + 2 * i);
+      }
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, TransientTextureResultPreservesEarlierAsyncWriteSpan)
+{
+   for (bool complete : {false, true}) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+      agx_index low = agx_preload(b, agx_register(0, AGX_SIZE_16));
+      agx_index high = agx_preload(b, agx_register(18, AGX_SIZE_16));
+      agx_index x = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index y = agx_preload(b, agx_register(6, AGX_SIZE_32));
+      agx_publish_texture_scalar_agx3(b, x, y, agx_null(), 1);
+      agx_index resource = agx_get_vec_index(1, AGX_SIZE_32, 2);
+      resource.type = AGX_INDEX_RESOURCE;
+      agx_index previous = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *first = agx_texture_sample_to(
+         b, previous, resource, agx_zero(), agx_zero(),
+         agx_uniform(24, AGX_SIZE_64), agx_uniform(28, AGX_SIZE_64),
+         agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 8,
+         false, false, false, AGX_GATHER_NONE, false);
+      agx_unit_test(b, low);
+      agx_instr *parts = agx_split(b, 4, previous);
+      for (unsigned i = 0; i < 3; ++i)
+         parts->dest[i] = agx_null();
+      parts->dest[3] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index retained = parts->dest[3];
+      if (complete)
+         retained = agx_fadd(b, retained, agx_uniform(0, AGX_SIZE_32));
+      agx_index result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *sample = agx_texture_sample_to(
+         b, result, resource, agx_zero(), agx_zero(),
+         agx_uniform(24, AGX_SIZE_64), agx_uniform(28, AGX_SIZE_64),
+         agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 15,
+         false, false, false, AGX_GATHER_NONE, false);
+      agx_instr *split = agx_split(b, 4, result);
+      for (unsigned i = 0; i < 4; ++i)
+         split->dest[i] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_unit_test(b, agx_fadd(b, split->dest[0], split->dest[3]));
+      agx_unit_test(b, split->dest[1]);
+      agx_unit_test(b, split->dest[2]);
+      agx_unit_test(b, retained);
+      if (complete)
+         agx_unit_test(b, parts->dest[3]);
+      agx_unit_test(b, low);
+      agx_unit_test(b, high);
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      EXPECT_EQ(first->dest[0].value, 8u);
+      EXPECT_EQ(sample->dest[0].value, complete ? 4u : 24u);
+      EXPECT_EQ(agx_channels(sample->dest[0]), 4u);
+      ralloc_free(mem);
+   }
+}
+
 TEST(NativeForms, BoundedUnaryRegistersUnderPressure)
 {
    for (agx_opcode op : {AGX_OPCODE_TRUNC, AGX_OPCODE_DFDX, AGX_OPCODE_DFDY}) {
