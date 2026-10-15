@@ -349,6 +349,38 @@ match_value(const nir_algebraic_table *table,
    }
 }
 
+static inline bool
+match_expression_sources(const nir_algebraic_table *table,
+                         const nir_search_expression *expr, nir_alu_instr *instr,
+                         unsigned num_components, const uint8_t *swizzle,
+                         struct match_state *state)
+{
+   /* If this is a commutative expression and it's one of the first few, look
+    * up its direction for the current search operation.  We'll use that value
+    * to possibly flip the sources for the match.
+    */
+   unsigned comm_op_flip =
+      !!(state->comm_op_direction & expr->comm_expr_mask);
+
+   bool matched = true;
+   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
+      /* If src1 of the search expression is a constant, check that first since it's faster. */
+      unsigned src_idx = i < 2 ? i ^ expr->src1_is_const : i;
+
+      /* 2src_commutative instructions that have 3 sources are only commutative
+       * in the first two sources.  Source 2 is always source 2.
+       */
+      if (!match_value(table, &state->table->values[expr->srcs[src_idx]].value, instr,
+                       i < 2 ? src_idx ^ comm_op_flip : src_idx,
+                       num_components, swizzle, state)) {
+         matched = false;
+         break;
+      }
+   }
+
+   return matched;
+}
+
 static bool
 match_expression(const nir_algebraic_table *table, const nir_search_expression *expr, nir_alu_instr *instr,
                  unsigned num_components, const uint8_t *swizzle,
@@ -390,30 +422,8 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
       }
    }
 
-   /* If this is a commutative expression and it's one of the first few, look
-    * up its direction for the current search operation.  We'll use that value
-    * to possibly flip the sources for the match.
-    */
-   unsigned comm_op_flip =
-      !!(state->comm_op_direction & expr->comm_expr_mask);
-
-   bool matched = true;
-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
-      /* If src1 of the search expression is a constant, check that first since it's faster. */
-      unsigned src_idx = i < 2 ? i ^ expr->src1_is_const : i;
-
-      /* 2src_commutative instructions that have 3 sources are only commutative
-       * in the first two sources.  Source 2 is always source 2.
-       */
-      if (!match_value(table, &state->table->values[expr->srcs[src_idx]].value, instr,
-                       i < 2 ? src_idx ^ comm_op_flip : src_idx,
-                       num_components, swizzle, state)) {
-         matched = false;
-         break;
-      }
-   }
-
-   return matched;
+   return match_expression_sources(table, expr, instr, num_components,
+                                   swizzle, state);
 }
 
 static unsigned
@@ -690,18 +700,37 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
    unsigned comm_expr_combinations =
       1 << MIN2(search->comm_exprs, NIR_SEARCH_MAX_COMM_OPS);
 
+   const bool direct_root = search->cond_index == -1;
+   if (direct_root) {
+      if (!nir_op_matches_search_op(instr->op, search->opcode) ||
+          (search->value.bit_size > 0 &&
+           instr->def.bit_size != search->value.bit_size) ||
+          (search->fp_math_ctrl_exclude & instr->fp_math_ctrl) ||
+          (search->swizzle >= 0 &&
+           (instr->def.num_components != 1 || search->swizzle != 0)))
+         return false;
+      assert(nir_op_infos[instr->op].num_inputs > 0);
+   }
+   const unsigned root_fp_math_ctrl = nir_fp_fast_math |
+      (direct_root ? instr->fp_math_ctrl : 0);
+
    bool found = false;
    for (unsigned comb = 0; comb < comm_expr_combinations; comb++) {
       /* The bitfield of directions is just the current iteration.  Hooray for
        * binary.
        */
       state.comm_op_direction = comb;
-      state.fp_math_ctrl = nir_fp_fast_math;
+      state.fp_math_ctrl = root_fp_math_ctrl;
       state.variables_seen = 0;
 
-      if (match_expression(table, search, instr,
-                           instr->def.num_components,
-                           identity_swizzle, &state)) {
+      const bool matched = direct_root
+         ? match_expression_sources(table, search, instr,
+                                    instr->def.num_components,
+                                    identity_swizzle, &state)
+         : match_expression(table, search, instr,
+                            instr->def.num_components,
+                            identity_swizzle, &state);
+      if (matched) {
          found = true;
          break;
       }

@@ -28,6 +28,7 @@ extern "C" {
 #include "nir_search.h"
 }
 #include <vector>
+#include <utility>
 
 namespace {
 
@@ -545,6 +546,251 @@ TEST_F(nir_opt_algebraic_test, skipped_opcodes_have_flags_cleared)
    EXPECT_GT(visited.size(), 1u);
    for (nir_instr *instr : visited)
       EXPECT_EQ(instr->pass_flags, 0u);
+}
+
+
+static std::vector<std::pair<unsigned, unsigned>> root_source_visits;
+static unsigned root_condition_calls;
+
+static bool
+record_root_source(const nir_search_state *, const nir_alu_instr *,
+                   unsigned src, unsigned components, const uint8_t *)
+{
+   root_source_visits.emplace_back(src, components);
+   return true;
+}
+
+static bool
+root_condition_second_try(const nir_alu_instr *)
+{
+   return ++root_condition_calls == 2;
+}
+
+static nir_def *
+root_header_input(nir_builder *build, unsigned components, const char *name)
+{
+   nir_variable *variable = nir_local_variable_create(
+      build->impl, glsl_vector_type(GLSL_TYPE_FLOAT, components), name);
+   return nir_load_var(build, variable);
+}
+
+TEST_F(nir_opt_algebraic_test, root_header_guards_preserve_source_visits)
+{
+   for (unsigned components : {1u, 2u, 4u, 8u, 16u}) {
+      for (unsigned mode = 0; mode < 6; ++mode) {
+         SCOPED_TRACE(components);
+         SCOPED_TRACE(mode);
+         nir_shader_compiler_options options = {};
+         nir_builder current = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &options, "root header guards");
+         ralloc_steal(b->shader, current.shader);
+         nir_def *lhs = root_header_input(&current, components, "lhs");
+         nir_def *rhs = root_header_input(&current, components, "rhs");
+         nir_def *root = nir_fadd(&current, lhs, rhs);
+         nir_def_as_alu(root)->fp_math_ctrl = nir_fp_exact;
+         nir_intrinsic_instr *store = filter_store(&current, root);
+         nir_search_value_union values[3] = {};
+         filter_variable(values[0]);
+         filter_variable(values[1]);
+         values[1].variable.variable = 1;
+         values[0].variable.cond_index = 0;
+         values[1].variable.cond_index = 0;
+         filter_expression(values[2], mode == 2 ? nir_op_fsub : nir_op_fadd,
+                           0, mode == 1 ? 64 : 32);
+         values[2].expression.srcs[1] = 1;
+         values[2].expression.comm_exprs = 1;
+         values[2].expression.comm_expr_mask = 1;
+         if (mode == 3)
+            values[2].expression.fp_math_ctrl_exclude = nir_fp_exact;
+         if (mode >= 4)
+            values[2].expression.swizzle = mode == 4 ? 1 : 0;
+         const uint16_t transition[] = {2};
+         std::vector<per_op_table> operations(nir_num_search_ops);
+         operations[nir_op_fadd] = {nullptr, 1, transition};
+         const struct transform transforms[] = {
+            {0, 0, ~0u}, {2, 0, 0}, {0, 0, ~0u},
+         };
+         const uint16_t offsets[] = {0, 0, 1};
+         const nir_search_variable_cond conditions[] = {record_root_source};
+         nir_algebraic_table table = {};
+         table.transforms = transforms;
+         table.transform_offsets = offsets;
+         table.pass_op_table = operations.data();
+         table.values = values;
+         table.variable_cond = conditions;
+         const bool enabled[] = {true};
+         const bool expected = mode == 0 || (mode == 5 && components == 1);
+         root_source_visits.clear();
+         EXPECT_EQ(nir_algebraic_impl(current.impl, enabled, &table), expected);
+         EXPECT_EQ(store->src[0].ssa, expected ? lhs : root);
+         if (expected)
+            EXPECT_EQ(root_source_visits,
+                      (std::vector<std::pair<unsigned, unsigned>>{{0, components}, {1, components}}));
+         else
+            EXPECT_TRUE(root_source_visits.empty());
+         nir_validate_shader(current.shader, "root header guards");
+      }
+   }
+}
+
+TEST_F(nir_opt_algebraic_test, root_expression_conditions_keep_direction_order)
+{
+   for (unsigned components : {1u, 4u}) {
+      for (bool reject_header : {false, true}) {
+         SCOPED_TRACE(components);
+         SCOPED_TRACE(reject_header);
+         nir_shader_compiler_options options = {};
+         nir_builder current = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &options, "root condition order");
+         ralloc_steal(b->shader, current.shader);
+         nir_def *lhs = root_header_input(&current, components, "lhs");
+         nir_def *rhs = root_header_input(&current, components, "rhs");
+         nir_def *root = nir_fadd(&current, lhs, rhs);
+         nir_intrinsic_instr *store = filter_store(&current, root);
+         nir_search_value_union values[3] = {};
+         filter_variable(values[0]);
+         filter_variable(values[1]);
+         values[1].variable.variable = 1;
+         values[0].variable.cond_index = 0;
+         values[1].variable.cond_index = 0;
+         filter_expression(values[2], nir_op_fadd, 0,
+                           reject_header ? 64 : 32, 0);
+         values[2].expression.srcs[1] = 1;
+         values[2].expression.comm_exprs = 1;
+         values[2].expression.comm_expr_mask = 1;
+         const uint16_t transition[] = {2};
+         std::vector<per_op_table> operations(nir_num_search_ops);
+         operations[nir_op_fadd] = {nullptr, 1, transition};
+         const struct transform transforms[] = {
+            {0, 0, ~0u}, {2, 0, 0}, {0, 0, ~0u},
+         };
+         const uint16_t offsets[] = {0, 0, 1};
+         const nir_search_expression_cond expression_conditions[] = {root_condition_second_try};
+         const nir_search_variable_cond variable_conditions[] = {record_root_source};
+         nir_algebraic_table table = {};
+         table.transforms = transforms;
+         table.transform_offsets = offsets;
+         table.pass_op_table = operations.data();
+         table.values = values;
+         table.expression_cond = expression_conditions;
+         table.variable_cond = variable_conditions;
+         const bool enabled[] = {true};
+         root_condition_calls = 0;
+         root_source_visits.clear();
+         EXPECT_EQ(nir_algebraic_impl(current.impl, enabled, &table), !reject_header);
+         EXPECT_EQ(root_condition_calls, 2u);
+         EXPECT_EQ(store->src[0].ssa, reject_header ? root : rhs);
+         if (reject_header)
+            EXPECT_TRUE(root_source_visits.empty());
+         else
+            EXPECT_EQ(root_source_visits,
+                      (std::vector<std::pair<unsigned, unsigned>>{{1, components}, {0, components}}));
+         nir_validate_shader(current.shader, "root condition order");
+      }
+   }
+}
+
+TEST_F(nir_opt_algebraic_test, root_fp_controls_reach_replacement)
+{
+   for (unsigned components : {1u, 4u}) {
+      for (unsigned control = 0; control <= nir_fp_no_fast_math; ++control) {
+         if ((control & (nir_fp_no_contract | nir_fp_no_reassoc)) &&
+             !(control & nir_fp_no_transform))
+            continue;
+         SCOPED_TRACE(components);
+         SCOPED_TRACE(control);
+         nir_shader_compiler_options options = {};
+         nir_builder current = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &options, "root FP controls");
+         ralloc_steal(b->shader, current.shader);
+         nir_def *lhs = root_header_input(&current, components, "lhs");
+         nir_def *rhs = root_header_input(&current, components, "rhs");
+         nir_def *root = nir_fadd(&current, lhs, rhs);
+         nir_def_as_alu(root)->fp_math_ctrl = control;
+         nir_intrinsic_instr *store = filter_store(&current, root);
+         nir_search_value_union values[4] = {};
+         filter_variable(values[0]);
+         filter_variable(values[1]);
+         values[1].variable.variable = 1;
+         filter_expression(values[2], nir_op_fadd, 0, 32);
+         values[2].expression.srcs[1] = 1;
+         values[2].expression.comm_exprs = 1;
+         values[2].expression.comm_expr_mask = 1;
+         filter_expression(values[3], nir_op_fmul, 0, 32);
+         values[3].expression.srcs[1] = 1;
+         const uint16_t transition[] = {2};
+         std::vector<per_op_table> operations(nir_num_search_ops);
+         operations[nir_op_fadd] = {nullptr, 1, transition};
+         const struct transform transforms[] = {
+            {0, 0, ~0u}, {2, 3, 0}, {0, 0, ~0u},
+         };
+         const uint16_t offsets[] = {0, 0, 1};
+         nir_algebraic_table table = {};
+         table.transforms = transforms;
+         table.transform_offsets = offsets;
+         table.pass_op_table = operations.data();
+         table.values = values;
+         const bool enabled[] = {true};
+         ASSERT_TRUE(nir_algebraic_impl(current.impl, enabled, &table));
+         nir_alu_instr *replacement = nir_src_as_alu(store->src[0]);
+         ASSERT_NE(replacement, nullptr);
+         EXPECT_EQ(replacement->op, nir_op_fmul);
+         EXPECT_EQ(replacement->fp_math_ctrl,
+                   nir_op_valid_fp_math_ctrl(nir_op_fmul, control));
+         nir_validate_shader(current.shader, "root FP controls");
+      }
+   }
+}
+
+TEST_F(nir_opt_algebraic_test, fixed_output_root_preserves_input_components)
+{
+   for (int swizzle : {-1, 0, 1}) {
+      SCOPED_TRACE(swizzle);
+      nir_shader_compiler_options options = {};
+      nir_builder current = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &options, "fixed output root");
+      ralloc_steal(b->shader, current.shader);
+      nir_def *lhs = root_header_input(&current, 4, "lhs");
+      nir_def *rhs = root_header_input(&current, 4, "rhs");
+      nir_def *root = nir_fdot4(&current, lhs, rhs);
+      nir_intrinsic_instr *store = filter_store(&current, root);
+      nir_search_value_union values[3] = {};
+      filter_variable(values[0]);
+      filter_variable(values[1]);
+      values[1].variable.variable = 1;
+      values[0].variable.cond_index = 0;
+      values[1].variable.cond_index = 0;
+      filter_expression(values[2], nir_op_fdot4, 0, 32);
+      values[2].expression.srcs[1] = 1;
+      values[2].expression.comm_exprs = 1;
+      values[2].expression.comm_expr_mask = 1;
+      values[2].expression.swizzle = swizzle;
+      const uint16_t transition[] = {2};
+      std::vector<per_op_table> operations(nir_num_search_ops);
+      operations[nir_op_fdot4] = {nullptr, 1, transition};
+      const struct transform transforms[] = {
+         {0, 0, ~0u}, {2, 0, 0}, {0, 0, ~0u},
+      };
+      const uint16_t offsets[] = {0, 0, 1};
+      const nir_search_variable_cond conditions[] = {record_root_source};
+      nir_algebraic_table table = {};
+      table.transforms = transforms;
+      table.transform_offsets = offsets;
+      table.pass_op_table = operations.data();
+      table.values = values;
+      table.variable_cond = conditions;
+      const bool enabled[] = {true};
+      root_source_visits.clear();
+      EXPECT_EQ(nir_algebraic_impl(current.impl, enabled, &table), swizzle <= 0);
+      if (swizzle <= 0)
+         EXPECT_EQ(root_source_visits,
+                   (std::vector<std::pair<unsigned, unsigned>>{{0, 4}, {1, 4}}));
+      else {
+         EXPECT_TRUE(root_source_visits.empty());
+         EXPECT_EQ(store->src[0].ssa, root);
+      }
+      nir_validate_shader(current.shader, "fixed output root");
+   }
 }
 
 TEST_F(nir_opt_algebraic_test, bounds_agx_unsigned_end_and_bound)
