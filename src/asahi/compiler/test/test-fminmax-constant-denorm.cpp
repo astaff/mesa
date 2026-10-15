@@ -313,9 +313,11 @@ check_select(bool unknown)
    nir_store_ssbo(&b, out, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
                   .write_mask = 1, .align_mul = 4);
    ASSERT_TRUE(agx_nir_lower_fminmax(b.shader, false));
-   unsigned before = fadds(b.shader);
-   ASSERT_EQ(before, 1u);
-   EXPECT_EQ(agx_nir_opt_canonical_minmax(b.shader), !unknown);
+   /* The lowering may already prove a canonical select; either pass must
+    * leave exactly the unknown input's flush. */
+   const unsigned before = fadds(b.shader);
+   ASSERT_LE(before, 1u);
+   EXPECT_EQ(agx_nir_opt_canonical_minmax(b.shader), before > unsigned(unknown));
    EXPECT_EQ(fadds(b.shader), unsigned(unknown));
    nir_validate_shader(b.shader, "select-minmax result");
    ralloc_free(b.shader);
@@ -345,7 +347,9 @@ check_phi(bool unknown)
    nir_store_ssbo(&b, out, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
                   .write_mask = 1, .align_mul = 4);
    ASSERT_TRUE(agx_nir_lower_fminmax(b.shader, false));
-   EXPECT_EQ(agx_nir_opt_canonical_minmax(b.shader), !unknown);
+   const unsigned before = fadds(b.shader);
+   ASSERT_LE(before, 1u);
+   EXPECT_EQ(agx_nir_opt_canonical_minmax(b.shader), before > unsigned(unknown));
    EXPECT_EQ(fadds(b.shader), unsigned(unknown));
    nir_validate_shader(b.shader, "phi-minmax result");
    ralloc_free(b.shader);
