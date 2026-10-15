@@ -348,6 +348,28 @@ hk_nir_has_ray_query(nir_shader *nir)
    return false;
 }
 
+/* M5 lowers graphics-stage ray queries to intersect_ray_agx before the vertex
+ * ABI is assigned. Those shaders own uniform halves 0..167 for query state. */
+static bool
+hk_nir_has_m5_native_query(const struct hk_device *dev, nir_shader *nir)
+{
+   if (!dev->m5_native_rq)
+      return false;
+   if (hk_nir_has_ray_query(nir))
+      return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_intersect_ray_agx)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
@@ -5706,8 +5728,14 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
                unsigned nr = DIV_ROUND_UP(
                   BITSET_LAST_BIT(shader->info.vs.attrib_components_read), 4);
+               /* Native query state owns uniform halves 0..167; the vertex
+                * ABI then starts at 168, as the prolog key and the bound
+                * uniform ranges already assume. */
+               const bool query_prefix =
+                  (dev->gen1_native_graphics_rq && hk_nir_has_ray_query(clone)) ||
+                  hk_nir_has_m5_native_query(dev, clone);
                agx_nir_lower_non_monolithic_uniforms_at(clone, nr,
-                  dev->gen1_native_graphics_rq && hk_nir_has_ray_query(clone) ? 168 : 0);
+                                                        query_prefix ? 168 : 0);
             }
          }
 
