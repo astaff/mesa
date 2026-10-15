@@ -889,7 +889,7 @@ hk_get_device_features(
       const bool sparse = false;
       features->shaderResourceResidency = sparse;
       features->sparseBinding = sparse;
-      features->sparseResidencyAliased = sparse;
+      features->sparseResidencyAliased = false;
       features->sparseResidencyImage2D = sparse;
       features->sparseResidencyBuffer = sparse;
       /* The common Honeykrisp lowering duplicates a draw per view, writes
