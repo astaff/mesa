@@ -3307,7 +3307,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       root = vertex_uniform_base + AGX_ABI_VUNI_COUNT_VK(nr_vbos);
 
    const unsigned texture_uniform_base =
-      ((sw_stage == MESA_SHADER_COMPUTE && dev->gen1_native_rq) ||
+      ((sw_stage == MESA_SHADER_COMPUTE && dev->gen1_native_rq &&
+        hk_nir_has_ray_query(nir)) ||
        shader->info.agx3_gen1_fragment_rq) ? 168 : 0;
    if (sw_stage != MESA_SHADER_VERTEX || !shader->info.agx3_gen1_fragment_rq)
       root += texture_uniform_base;
