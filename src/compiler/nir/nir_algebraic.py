@@ -210,7 +210,7 @@ class Value(object):
       ${'true' if len(val.sources) > 1 and isinstance(val.sources[1], Constant) else 'false'},
       ${val.swizzle},
       ${val.c_opcode()},
-      ${val.comm_expr_idx}, ${val.comm_exprs},
+      ${val.comm_expr_mask}, ${val.comm_exprs},
       { ${', '.join(src.array_index for src in val.sources)} },
       ${val.cond_index},
 % endif
@@ -457,10 +457,11 @@ class Expression(Value):
            "2src_commutative" in opcodes[self.opcode].algebraic_properties and \
            len(self.sources) >= 2 and \
            not self.sources[0].equivalent(self.sources[1]):
-            self.comm_expr_idx = base_idx
+            self.comm_expr_mask = (1 << base_idx) if \
+                0 <= base_idx < nir_search_max_comm_ops else 0
             self.comm_exprs += 1
         else:
-            self.comm_expr_idx = -1
+            self.comm_expr_mask = 0
 
         for s in self.sources:
             if isinstance(s, Expression):

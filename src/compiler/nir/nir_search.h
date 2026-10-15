@@ -134,12 +134,7 @@ typedef struct {
    /* One of nir_op or nir_search_op */
    uint16_t opcode : 13;
 
-   /* Commutative expression index.  This is assigned by opt_algebraic.py when
-    * search structures are constructed and is a unique (to this structure)
-    * index within the commutative operation bitfield used for searching for
-    * all combinations of expressions containing commutative operations.
-    */
-   int8_t comm_expr_idx;
+   uint8_t comm_expr_mask;
 
    /* Number of commutative expressions in this expression including this one
     * (if it is commutative).

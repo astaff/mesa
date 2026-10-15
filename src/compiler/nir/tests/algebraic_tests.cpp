@@ -187,7 +187,7 @@ TEST_F(nir_opt_algebraic_test, matched_variable_preserves_def_bits_and_swizzles)
                expr.value.type = nir_search_value_expression;
                expr.opcode = nir_op_inot;
                expr.swizzle = -1;
-               expr.comm_expr_idx = -1;
+               expr.comm_expr_mask = 0;
                expr.cond_index = 0;
                expr.srcs[0] = level - 1;
             }
@@ -203,7 +203,7 @@ TEST_F(nir_opt_algebraic_test, matched_variable_preserves_def_bits_and_swizzles)
             replacement.value.bit_size = -int(variable) - 1;
             replacement.opcode = nir_op_iadd;
             replacement.swizzle = -1;
-            replacement.comm_expr_idx = -1;
+            replacement.comm_expr_mask = 0;
             replacement.cond_index = -1;
             replacement.srcs[0] = 0;
             replacement.srcs[1] = depth + 1;
@@ -332,7 +332,7 @@ TEST_F(nir_opt_algebraic_test, initial_worklist_order_and_flags)
          values[1].expression.value.type = nir_search_value_expression;
          values[1].expression.opcode = nir_op_inot;
          values[1].expression.swizzle = -1;
-         values[1].expression.comm_expr_idx = -1;
+         values[1].expression.comm_expr_mask = 0;
          values[1].expression.cond_index = 0;
          const struct transform transforms[] = {{1, 0, 0}, {0, 0, ~0u}};
          const uint16_t offsets[] = {1, 1, 0};
@@ -378,7 +378,7 @@ filter_expression(nir_search_value_union &value, uint16_t op, unsigned src,
    value.expression.opcode = op;
    value.expression.srcs[0] = src;
    value.expression.swizzle = -1;
-   value.expression.comm_expr_idx = -1;
+   value.expression.comm_expr_mask = 0;
    value.expression.cond_index = condition;
 }
 
@@ -759,6 +759,79 @@ TEST_F(nir_opt_idiv_const_test, irem)
          test_2src_op(nir_op_irem, INT32_MIN + i, d);
       for (int i = 0; i < 20; i++)
          test_2src_op(nir_op_irem, INT32_MAX - i, d);
+   }
+}
+
+static const nir_alu_instr *commutation_test_root;
+static unsigned commutation_root_attempts;
+
+static bool
+record_commutation_attempt(const nir_alu_instr *instr)
+{
+   if (instr == commutation_test_root)
+      ++commutation_root_attempts;
+   return true;
+}
+
+TEST_F(nir_opt_algebraic_test, commutation_masks_preserve_direction_order)
+{
+   static const nir_shader_compiler_options options = {};
+   for (int bit : {-1, 0, 1, 2, 3, 4, 5, 6, 7, 8}) {
+      for (bool swapped : {false, true}) {
+         for (unsigned components : {1u, 2u, 4u, 8u, 16u}) {
+            for (unsigned bits : {8u, 16u, 32u, 64u}) {
+               SCOPED_TRACE(bit);
+               SCOPED_TRACE(swapped);
+               SCOPED_TRACE(components);
+               SCOPED_TRACE(bits);
+               nir_builder current = nir_builder_init_simple_shader(
+                  MESA_SHADER_COMPUTE, &options, "commutation direction");
+               nir_def *input = nir_undef(&current, components, bits);
+               nir_def *zero = nir_imm_intN_t(&current, 0, bits);
+               nir_def *value = swapped ? nir_iadd(&current, input, zero) :
+                                         nir_iadd(&current, zero, input);
+               nir_intrinsic_instr *store = filter_store(&current, value);
+               nir_search_value_union values[3] = {};
+               values[0].constant.value.type = nir_search_value_constant;
+               values[0].constant.type = nir_type_uint;
+               values[0].constant.data.u = 0;
+               filter_variable(values[1], bits);
+               filter_expression(values[2], nir_op_iadd, 0, bits, 0);
+               values[2].expression.srcs[1] = 1;
+               const bool tracked = bit >= 0 && bit < 8;
+               values[2].expression.comm_expr_mask = tracked ?
+                  static_cast<uint8_t>(1u << bit) : 0;
+               values[2].expression.comm_exprs = static_cast<uint8_t>(bit + 1);
+               std::vector<per_op_table> operations(nir_num_search_ops);
+               const struct transform transforms[] = {{2, 1, 0}, {0, 0, ~0u}};
+               const uint16_t offsets[] = {0, 1, 1};
+               const nir_search_expression_cond predicates[] = {
+                  record_commutation_attempt,
+               };
+               nir_algebraic_table table = {};
+               table.transforms = transforms;
+               table.transform_offsets = offsets;
+               table.pass_op_table = operations.data();
+               table.values = values;
+               table.expression_cond = predicates;
+               const bool enabled[] = {true};
+               commutation_test_root = nir_def_as_alu(value);
+               commutation_root_attempts = 0;
+               nir_validate_shader(current.shader, "before commutation search");
+               bool progress = nir_algebraic_impl(current.impl, enabled, &table);
+               commutation_test_root = nullptr;
+               const bool expected_match = !swapped || tracked;
+               const unsigned combinations = 1u << MIN2(bit + 1, 8);
+               const unsigned expected_attempts = expected_match ?
+                  (swapped ? (1u << bit) + 1 : 1u) : combinations;
+               EXPECT_EQ(progress, expected_match);
+               EXPECT_EQ(commutation_root_attempts, expected_attempts);
+               EXPECT_EQ(store->src[0].ssa, expected_match ? input : value);
+               nir_validate_shader(current.shader, "after commutation search");
+               ralloc_free(current.shader);
+            }
+         }
+      }
    }
 }
 

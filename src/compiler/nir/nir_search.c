@@ -395,10 +395,7 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
     * to possibly flip the sources for the match.
     */
    unsigned comm_op_flip =
-      (expr->comm_expr_idx >= 0 &&
-       expr->comm_expr_idx < NIR_SEARCH_MAX_COMM_OPS)
-         ? ((state->comm_op_direction >> expr->comm_expr_idx) & 1)
-         : 0;
+      !!(state->comm_op_direction & expr->comm_expr_mask);
 
    bool matched = true;
    for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
@@ -688,6 +685,7 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
    state.table = table;
 
    STATIC_ASSERT(sizeof(state.comm_op_direction) * 8 >= NIR_SEARCH_MAX_COMM_OPS);
+   STATIC_ASSERT(sizeof(search->comm_expr_mask) * 8 >= NIR_SEARCH_MAX_COMM_OPS);
 
    unsigned comm_expr_combinations =
       1 << MIN2(search->comm_exprs, NIR_SEARCH_MAX_COMM_OPS);

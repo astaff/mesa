@@ -115,4 +115,36 @@ class ValidatorTests(unittest.TestCase):
             "The search expression bit size ('b2i', ('i2b', 'a')) and " \
             "replace expression bit size a may not be the same")
 
+class CommutativeMaskTests(unittest.TestCase):
+    def expression(self, tree):
+        return SearchAndReplace((tree, 'a'), AlgebraicPass("mask_test", [])).search
+
+    def masks(self, expression):
+        if not hasattr(expression, 'comm_expr_mask'):
+            return []
+        result = [expression.comm_expr_mask]
+        for source in expression.sources:
+            result.extend(self.masks(source))
+        return result
+
+    def test_all_direction_bits_and_untracked_expressions(self):
+        tree = 'a'
+        for _ in range(10):
+            tree = ('iadd', tree, 0)
+        expression = self.expression(tree)
+        self.assertEqual(expression.comm_exprs, 10)
+        self.assertEqual(self.masks(expression),
+                         [1, 2, 4, 8, 16, 32, 64, 128, 0, 0])
+
+    def test_noncommutative_root_does_not_consume_direction(self):
+        expression = self.expression(('isub', ('iadd', 'a', 0), 0))
+        self.assertEqual(expression.comm_exprs, 1)
+        self.assertEqual(self.masks(expression), [0, 1])
+
+    def test_equivalent_sources_do_not_consume_direction(self):
+        expression = self.expression(('iand', 'a', 'a'))
+        self.assertEqual(expression.comm_exprs, 0)
+        self.assertEqual(self.masks(expression), [0])
+
+
 unittest.main()
