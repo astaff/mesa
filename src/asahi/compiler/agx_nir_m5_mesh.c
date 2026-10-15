@@ -344,7 +344,13 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
          }
       }
    }
-   if(!counts)return false;
+   if (!counts) {
+      if (s->info.outputs_written || s->info.outputs_read)
+         return false;
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(s)));
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+   }
    if (physical_threads != threads || s->info.workgroup_size[2] > 1023) {
       /* Native output batches target vertex_base + physical lane. Pad at
        * most the first output SIMD group; later batches reuse it with the

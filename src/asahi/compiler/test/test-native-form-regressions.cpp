@@ -5230,3 +5230,48 @@ TEST(NativeForms, M5Independent3DSamplesUseSeparateStaging)
       }
    }
 }
+
+TEST(NativeForms, M5MeshWithoutOutputsKeepsMemoryWrites)
+{
+   for (unsigned threads : {1u, 32u}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+         &agx_nir_options, "memory-only mesh");
+      b.shader->info.workgroup_size[0] = threads;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+      b.shader->info.mesh.max_vertices_out = 3;
+      b.shader->info.mesh.max_primitives_out = 1;
+      b.shader->info.io_lowered = true;
+      nir_store_global(&b, nir_load_local_invocation_index(&b),
+                       nir_imm_int64(&b, 0x2000000),
+                       .write_mask=1, .align_mul=4);
+      ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
+      unsigned memory_writes = 0;
+      nir_foreach_function_impl(impl, b.shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_global)
+                  memory_writes++;
+            }
+         }
+      }
+      EXPECT_EQ(memory_writes, 1u);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, M5MeshOutputStillRequiresCount)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+      &agx_nir_options, "mesh output without count");
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+   b.shader->info.mesh.max_vertices_out = 3;
+   b.shader->info.mesh.max_primitives_out = 1;
+   b.shader->info.io_lowered = true;
+   b.shader->info.outputs_written = VARYING_BIT_POS;
+   EXPECT_FALSE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
+   ralloc_free(b.shader);
+}
