@@ -1969,6 +1969,7 @@ translate_atomic_opcode(nir_atomic_op op)
    case nir_atomic_op_ixor:    return AGX_ATOMIC_OPC_XOR;
    case nir_atomic_op_xchg:    return AGX_ATOMIC_OPC_XCHG;
    case nir_atomic_op_cmpxchg: return AGX_ATOMIC_OPC_CMPXCHG;
+   case nir_atomic_op_fadd:    return AGX_ATOMIC_OPC_FADD;
    /* Float atomics: the caller refuses the shader. */
    default: return (enum agx_atomic_opc)~0;
    }
@@ -7296,6 +7297,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * Re-enable once those two SR numbers are witnessed rather than guessed; a
     * wrong SR number would silently elect the wrong lane.
     */
+   NIR_PASS(_, nir, agx_nir_lower_atomics, byte_indices);
+
    if (uniform_atomics)
       NIR_PASS(progress, nir, nir_opt_uniform_atomics, true);
 
