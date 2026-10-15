@@ -238,6 +238,9 @@ struct hk_root_descriptor_table {
 
    /* Process-local on G17P; loaded through the root instead of cached code. */
    uint64_t printf_buffer_address;
+   uint32_t mesh_draw_id;
+   uint64_t mesh_grid_addr;
+   uint64_t mesh_prims_query;
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
@@ -666,6 +669,12 @@ struct hk_graphics_state {
       struct hk_tess_info info;
       enum mesa_prim prim;
    } tess;
+
+   
+   struct {
+      struct agx_ptr params;
+      uint64_t grid, object_program, object_params;
+   } mesh;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;
@@ -1284,8 +1293,13 @@ hk_bound_hw_vs(struct hk_graphics_state *gfx)
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
    struct hk_api_shader *tes = gfx->shaders[MESA_SHADER_TESS_EVAL];
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
+   struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
 
-   if (gs)
+   
+
+   if (mesh)
+      return &mesh->variants[HK_MESH_VARIANT_MAIN];
+   else if (gs)
       return &gs->variants[HK_GS_VARIANT_RAST];
    else if (tes)
       return &tes->variants[HK_VS_VARIANT_HW];
@@ -1299,6 +1313,11 @@ hk_bound_sw_vs(struct hk_graphics_state *gfx)
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
    struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
 
+   
+
+   if (!vs)
+      return hw_vs;
+
    if (hw_vs == &vs->variants[HK_VS_VARIANT_HW])
       return hw_vs;
    else
@@ -1311,6 +1330,10 @@ hk_bound_sw_vs_before_gs(struct hk_graphics_state *gfx)
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
    struct hk_api_shader *tes = gfx->shaders[MESA_SHADER_TESS_EVAL];
    struct hk_api_shader *api = tes ?: vs;
+
+   
+   if (!api)
+      return NULL;
 
    return &api->variants[HK_VS_VARIANT_SW];
 }
@@ -1775,6 +1798,9 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
                               const struct hk_shader *s);
 
+uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
+                                      struct hk_shader *s,
+                                      struct hk_linked_shader *linked, bool object);
 uint64_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
 

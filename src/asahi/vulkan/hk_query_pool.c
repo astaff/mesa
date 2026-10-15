@@ -71,6 +71,7 @@ hk_reports_per_query(struct hk_query_pool *pool)
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
@@ -688,6 +689,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       break;
    }
 
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT: {
       cmd->state.gfx.descriptors.root_dirty = true;
       cmd->state.gfx.descriptors.root.mesh_prims_query =
          end ? 0 : hk_query_report_addr(dev, pool, query);

@@ -9,6 +9,8 @@
 #include "agx_ioto_core.h"
 #include "agx_ioto_load_core.h"
 
+#include "util/u_debug.h"
+
 #include <string.h>
 
 /* Exact fixed regions surrounding the runtime state tail in the SPDX-MIT
@@ -84,7 +86,9 @@ g17p_fragment_pixrel_compose(unsigned colour_classes,
                              bool writes_sample_mask,
                              uint8_t out[G17P_FRAGMENT_PIXREL_SIZE])
 {
-   if (!out || colour_classes == 0 ||
+   if (!out ||
+       (colour_classes == 0 &&
+        !debug_get_bool_option("ASAHI_G17P_ZERO_COLOUR_RELEASE_DIAGNOSTIC", false)) ||
        colour_classes >= (1u << G17P_MAX_COLOUR_PARTITIONS))
       return false;
 

@@ -21,6 +21,7 @@
 #include "hk_device.h"
 #include "hk_device_memory.h"
 #include "hk_private.h"
+#include "hk_nir_lower_mesh.h"
 
 #include "nir_xfb_info.h"
 #include "nir.h"
@@ -106,10 +107,13 @@ struct hk_shader_info {
 
       struct poly_gs_info gs;
 
+
+
       /* Used to initialize the union for other stages */
       uint8_t _pad[32];
    };
 
+   struct hk_mesh_info mesh;
    struct agx_unlinked_uvs_layout uvs;
 
    /* Transform feedback buffer strides */
@@ -274,6 +278,27 @@ static const char *hk_gs_variant_name[] = {
 };
 /* clang-format on */
 
+enum hk_mesh_variant {
+   
+   HK_MESH_VARIANT_MAIN,
+
+   
+   HK_MESH_VARIANT_RAST,
+
+   
+   HK_MESH_VARIANT_PREDICATED_OBJECT,
+
+   HK_MESH_VARIANTS,
+};
+
+/* clang-format off */
+static const char *hk_mesh_variant_name[] = {
+   [HK_MESH_VARIANT_MAIN] = "Main",
+   [HK_MESH_VARIANT_RAST] = "Passthrough object",
+   [HK_MESH_VARIANT_PREDICATED_OBJECT] = "Predicated object",
+};
+/* clang-format on */
+
 static inline unsigned
 hk_num_variants(mesa_shader_stage stage)
 {
@@ -284,6 +309,9 @@ hk_num_variants(mesa_shader_stage stage)
 
    case MESA_SHADER_GEOMETRY:
       return HK_GS_VARIANTS;
+
+   case MESA_SHADER_MESH:
+      return HK_MESH_VARIANTS;
 
    default:
       return 1;
@@ -410,6 +438,9 @@ hk_variant_name(struct hk_api_shader *obj, struct hk_shader *variant)
    } else if (obj->vk.stage == MESA_SHADER_GEOMETRY) {
       assert(i < ARRAY_SIZE(hk_gs_variant_name));
       return hk_gs_variant_name[i];
+   } else if (obj->vk.stage == MESA_SHADER_MESH) {
+      assert(i < ARRAY_SIZE(hk_mesh_variant_name));
+      return hk_mesh_variant_name[i];
    } else {
       assert(i < 2);
       return i == HK_VS_VARIANT_SW ? "Software" : "Hardware";
@@ -473,6 +504,20 @@ static struct hk_shader *
 hk_pre_gs_variant(struct hk_api_shader *obj)
 {
    return &obj->variants[HK_GS_VARIANT_PRE];
+}
+
+static struct hk_shader *
+hk_main_mesh_variant(struct hk_api_shader *obj)
+{
+   assert(obj->vk.stage == MESA_SHADER_MESH);
+   return &obj->variants[HK_MESH_VARIANT_MAIN];
+}
+
+static struct hk_shader *
+hk_rast_mesh_variant(struct hk_api_shader *obj)
+{
+   assert(obj->vk.stage == MESA_SHADER_MESH);
+   return &obj->variants[HK_MESH_VARIANT_RAST];
 }
 
 #define HK_MAX_LINKED_USC_SIZE                                                 \

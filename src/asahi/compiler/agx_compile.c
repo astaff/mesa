@@ -1895,6 +1895,8 @@ agx_get_sr_native_width_to(agx_builder *b, agx_index dst, enum agx_sr sr)
    case AGX_SR_THREAD_INDEX_IN_THREADGROUP:
    case AGX_SR_THREAD_INDEX_IN_SUBGROUP:
    case AGX_SR_SUBGROUP_INDEX_IN_THREADGROUP:
+   case AGX_SR_MESH_PAYLOAD_HI:
+   case AGX_SR_MESH_PRIMITIVE_STORAGE_HI:
    case AGX_SR_BACKGROUND_LAYER_ID:
    case AGX_SR_SCS_THREAD_INDEX:
       narrow_agx3 = true;
@@ -3249,11 +3251,15 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_mesh_payload_address_agx: {
       agx_index parts[2]={agx_temp(b->shader,AGX_SIZE_32),
                           agx_temp(b->shader,AGX_SIZE_32)};
+      agx_get_sr_native_width_to(b,parts[0],AGX_SR_MESH_PAYLOAD_LO);
+      agx_get_sr_native_width_to(b,parts[1],AGX_SR_MESH_PAYLOAD_HI);
       return agx_emit_collect_to(b,dst,2,parts);
    }
    case nir_intrinsic_load_mesh_primitive_storage_agx: {
       agx_index parts[2]={agx_temp(b->shader,AGX_SIZE_32),
                           agx_temp(b->shader,AGX_SIZE_32)};
+      agx_get_sr_native_width_to(b,parts[0],AGX_SR_MESH_PRIMITIVE_STORAGE_LO);
+      agx_get_sr_native_width_to(b,parts[1],AGX_SR_MESH_PRIMITIVE_STORAGE_HI);
       return agx_emit_collect_to(b,dst,2,parts);
    }
    case nir_intrinsic_allocate_mesh_uvb_agx:
@@ -12001,8 +12007,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
       info->reads_tib = nir->info.fs.uses_fbfetch_output;
       info->early_fragment_tests = nir->info.fs.early_fragment_tests;
-   } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
-      info->imageblock_stride = nir->info.cs.image_block_size_per_thread_agx;
+   } else if (nir->info.stage == MESA_SHADER_COMPUTE ||
+              nir->info.stage == MESA_SHADER_MESH ||
+              nir->info.stage == MESA_SHADER_TASK) {
+      if (nir->info.stage == MESA_SHADER_COMPUTE)
+         info->imageblock_stride = nir->info.cs.image_block_size_per_thread_agx;
 
       for (unsigned i = 0; i < 3; ++i) {
          info->workgroup_size[i] = nir->info.workgroup_size[i];

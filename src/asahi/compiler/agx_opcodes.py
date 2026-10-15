@@ -121,6 +121,10 @@ NEST = immediate("nest")
 TARGET = immediate("target", "agx_block *")
 ZS = immediate("zs")
 SR = enum("sr", {
+   235: 'mesh_payload_lo',
+   236: 'mesh_payload_hi',
+   237: 'mesh_primitive_storage_lo',
+   238: 'mesh_primitive_storage_hi',
    0:  'threadgroup_position_in_grid.x',
    1:  'threadgroup_position_in_grid.y',
    2:  'threadgroup_position_in_grid.z',

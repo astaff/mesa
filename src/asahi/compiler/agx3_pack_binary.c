@@ -17,6 +17,7 @@
  * form could consume stale data.
  */
 
+#include "agx3_mesh_core.h"
 #include "agx3_alu_core.h"
 #include "agx3_atomic_core.h"
 #include "agx3_binder.h"
@@ -856,11 +857,27 @@ agx3_map_sr(enum agx_isa_encoding enc, enum agx_sr sr, uint8_t *apple,
       SR(AGX_SR_THREAD_POSITION_IN_THREADGROUP_Y, 10, AGX3_SR_W16);
       SR(AGX_SR_THREAD_POSITION_IN_THREADGROUP_Z, 11, AGX3_SR_W16);
       SR(AGX_SR_THREAD_INDEX_IN_THREADGROUP, 13, AGX3_SR_W16);
+      SR(AGX_SR_SCS_THREAD_INDEX, 59, AGX3_SR_W16);
       SR(AGX_SR_THREAD_INDEX_IN_SUBGROUP, 7, AGX3_SR_W16);
       SR(AGX_SR_SUBGROUP_INDEX_IN_THREADGROUP, 6, AGX3_SR_W16);
       SR(AGX_SR_THREAD_POSITION_IN_GRID_X, 23, AGX3_SR_W32);
       SR(AGX_SR_THREAD_POSITION_IN_GRID_Y, 24, AGX3_SR_W32);
       SR(AGX_SR_THREAD_POSITION_IN_GRID_Z, 25, AGX3_SR_W32);
+   case AGX_SR_MESH_PAYLOAD_LO:
+   case AGX_SR_MESH_PAYLOAD_HI:
+      if (enc != AGX_ISA_ENCODING_AGX3C) return false;
+      *apple = sr == AGX_SR_MESH_PAYLOAD_LO ? 62 : 63;
+      *width = sr == AGX_SR_MESH_PAYLOAD_LO ? AGX3_SR_W32 : AGX3_SR_W16;
+      return true;
+   case AGX_SR_MESH_PRIMITIVE_STORAGE_LO:
+   case AGX_SR_MESH_PRIMITIVE_STORAGE_HI:
+      
+
+      if (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C)
+         return false;
+      *apple = sr == AGX_SR_MESH_PRIMITIVE_STORAGE_LO ? 64 : 65;
+      *width = sr == AGX_SR_MESH_PRIMITIVE_STORAGE_LO ? AGX3_SR_W32 : AGX3_SR_W16;
+      return true;
    case AGX_SR_INPUT_SAMPLE_MASK:
       if (enc != AGX_ISA_ENCODING_AGX3B)
          return false;

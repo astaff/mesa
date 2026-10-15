@@ -3374,3 +3374,16 @@ load("viewport_z_range_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
 # Native G17P/G17X SR59 identifies the resident SCS thread.
 system_value("scs_thread_index_agx", 1, bit_sizes=[32])
 
+intrinsic("allocate_mesh_uvb_agx", [1, 1])
+intrinsic("store_mesh_uvb_agx", [2], indices=[FLAGS])
+intrinsic("store_object_childcount_agx", [1])
+
+intrinsic("load_mesh_payload_address_agx", dest_comp=2, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("load_mesh_primitive_storage_agx", dest_comp=2, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("mesh_payload_entry_barrier_agx")
+
+intrinsic("object_payload_exit_barrier_agx")

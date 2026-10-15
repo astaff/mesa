@@ -9,6 +9,8 @@
 #include "hk_shader.h"
 #include "hk_nir_sampler_bias.h"
 #include "hk_gen1_rt_indirect_contract.h"
+#include "asahi/compiler/agx_nir_m5_mesh.h"
+#include "asahi/compiler/agx3_mesh_core.h"
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
 #include "util/u_debug.h"
 
@@ -407,7 +409,8 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    }
 
    /* Optimize but allow copies because we haven't lowered them yet */
-   if (((struct hk_physical_device *)vk_pdev)->dev.chip == AGX_CHIP_G17P)
+   if (((struct hk_physical_device *)vk_pdev)->dev.chip == AGX_CHIP_G17P &&
+       nir->info.stage != MESA_SHADER_MESH)
       agx_preprocess_nir_g17p(nir);
    else
       agx_preprocess_nir(nir);
@@ -2169,6 +2172,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &soft_fault);
 
+   if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,
+               shared_var_info);
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_task_payload,
+               nir_address_format_32bit_offset);
+   }
    assert(nir->info.shared_size == 0);
 
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
@@ -2255,10 +2264,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    }
    NIR_PASS(_, nir, agx_nir_lower_multisampled_image_store);
 
-   if (dev->dev.chip == AGX_CHIP_G17P)
-      agx_preprocess_nir_g17p(nir);
-   else
-      agx_preprocess_nir(nir);
+   if (nir->info.stage != MESA_SHADER_MESH) {
+      if (dev->dev.chip == AGX_CHIP_G17P)
+         agx_preprocess_nir_g17p(nir);
+      else
+         agx_preprocess_nir(nir);
+   }
 
    nir_opt_peephole_select_options peephole_select_options = {
       .limit = 0,
@@ -2530,6 +2541,54 @@ kill_psiz_write(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    return true;
+}
+
+static bool
+hk_mesh_default_point_size(nir_builder *b, nir_intrinsic_instr *intr,
+                           void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_per_vertex_output ||
+       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_POS)
+      return false;
+
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_store_per_vertex_output(b, nir_imm_float(b, 1.0), intr->src[1].ssa,
+                               nir_imm_int(b, 0), .write_mask = 1,
+                               .src_type = nir_type_float32,
+                               .io_semantics = {
+                                  .location = VARYING_SLOT_PSIZ,
+                                  .num_slots = 1});
+   b->shader->info.outputs_written |= VARYING_BIT_PSIZ;
+   return true;
+}
+
+static bool
+kill_mesh_triangle_psiz_write(nir_builder *b, nir_intrinsic_instr *intr,
+                               void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_per_vertex_output ||
+       nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_PSIZ)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   b->shader->info.outputs_written &= ~VARYING_BIT_PSIZ;
+   return true;
+}
+
+static bool
+hk_nir_reads_intrinsic(const nir_shader *nir, nir_intrinsic_op op)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op)
+               return true;
+         }
+      }
+   }
+
+   return false;
 }
 
 static bool
@@ -3725,6 +3784,112 @@ hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
 
 /* twin_of: compile the custom-border-emulating twin of the shader that
  * saved these inputs; info then names its NIR and saved create inputs. */
+
+
+
+
+static nir_shader *
+hk_build_predicated_mesh_object(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TASK, &agx_nir_options, "native predicated mesh object");
+   b.shader->info.io_lowered = true;
+   b.shader->info.internal = true;
+   b.shader->info.workgroup_size[0] = 3;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   nir_def *params = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *grid = nir_load_global_constant(&b, 1, 64, params, .align_mul = 8);
+   nir_def *count = nir_load_global_constant(&b, 1, 64,
+      nir_iadd_imm(&b, params, 8), .align_mul = 8);
+   nir_def *predicate = nir_load_global_constant(&b, 1, 64,
+      nir_iadd_imm(&b, params, 16), .align_mul = 8);
+   nir_variable *enabled = nir_local_variable_create(nir_shader_get_entrypoint(b.shader),
+                                                    glsl_bool_type(), "enabled");
+   nir_store_var(&b, enabled, nir_imm_true(&b), 1);
+   nir_push_if(&b, nir_ine_imm(&b, count, 0));
+   {
+      nir_def *limit = nir_load_global_constant(&b, 1, 32, count, .align_mul = 4);
+      nir_def *draw_id = nir_load_global_constant(&b, 1, 32,
+         nir_iadd_imm(&b, params, 24), .align_mul = 4);
+      nir_store_var(&b, enabled, nir_ult(&b, draw_id, limit), 1);
+   }
+   nir_pop_if(&b, NULL);
+   nir_push_if(&b, nir_ine_imm(&b, predicate, 0));
+   {
+      nir_def *value = nir_load_global_constant(&b, 1, 32, predicate, .align_mul = 4);
+      nir_def *invert = nir_load_global_constant(&b, 1, 32,
+         nir_iadd_imm(&b, params, 28), .align_mul = 4);
+      nir_def *pass = nir_ixor(&b, nir_ine_imm(&b, value, 0), nir_ine_imm(&b, invert, 0));
+      nir_store_var(&b, enabled, nir_iand(&b, pass, nir_load_var(&b, enabled)), 1);
+   }
+   nir_pop_if(&b, NULL);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_def *value = nir_load_global_constant(&b, 1, 32,
+      nir_iadd(&b, grid, nir_u2u64(&b, nir_imul_imm(&b, lane, 4))), .align_mul = 4);
+   nir_store_object_childcount_agx(&b, nir_bcsel(&b, nir_load_var(&b, enabled),
+                                               value, nir_imm_int(&b, 0)));
+
+   agx_preprocess_nir_g17p(b.shader);
+   return b.shader;
+}
+
+static nir_def *
+hk_mesh_query_root(nir_builder *b, unsigned bit_size, unsigned offset)
+{
+   nir_def *addr = nir_iadd_imm(b, nir_load_root_agx(b), offset);
+   return nir_load_global_constant(b, 1, bit_size, addr,
+                                   .align_mul = bit_size / 8,
+                                   .access = ACCESS_CAN_SPECULATE);
+}
+
+static bool
+hk_lower_mesh_queries(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_MESH)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_intrinsic_instr *counts = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_set_vertex_and_primitive_count)
+            counts = nir_instr_as_intrinsic(instr);
+      }
+   }
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   const unsigned threads = nir->info.workgroup_size[0] *
+                            nir->info.workgroup_size[1] *
+                            nir->info.workgroup_size[2];
+   nir_def *flags = hk_mesh_query_root(
+      &b, 32, hk_root_descriptor_offset(draw.pipeline_stats_flags));
+   nir_def *first = nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0);
+   nir_push_if(&b, nir_iand(&b, first, nir_ine_imm(&b, nir_iand_imm(&b, flags,
+      VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT), 0)));
+   {
+      nir_def *addr = nir_load_stat_query_address_poly(
+         &b, .base = PIPE_STAT_QUERY_MS_INVOCATIONS);
+      nir_global_atomic(&b, 32, addr, nir_imm_int(&b, threads),
+                        .atomic_op = nir_atomic_op_iadd);
+   }
+   nir_pop_if(&b, NULL);
+
+   if (counts) {
+      b.cursor = nir_after_instr(&counts->instr);
+      nir_def *query = hk_mesh_query_root(
+         &b, 64, hk_root_descriptor_offset(mesh_prims_query));
+      nir_def *lane0 = nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0);
+      nir_push_if(&b, nir_iand(&b, lane0, nir_ine_imm(&b, query, 0)));
+      nir_global_atomic(&b, 32, query, nir_u2u32(&b, counts->src[1].ssa),
+                        .atomic_op = nir_atomic_op_iadd);
+      nir_pop_if(&b, NULL);
+   }
+
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 static VkResult
 hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *info,
                   const struct vk_graphics_pipeline_state *state,
@@ -3748,10 +3913,30 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    /* We consume the NIR, regardless of success or failure */
    nir_shader *nir = info->nir;
 
+   
+
+
+
+   const bool mesh_reads_draw_id =
+      nir->info.stage == MESA_SHADER_MESH &&
+      (nir->info.io_lowered ||
+       hk_nir_reads_intrinsic(nir, nir_intrinsic_load_draw_id));
+   const bool mesh_reads_num_workgroups =
+      nir->info.stage == MESA_SHADER_MESH &&
+      (nir->info.io_lowered ||
+       hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups));
+
    if (!nir->info.io_lowered) {
        hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
                     info->set_layout_count, info->set_layouts, features);
    }
+   if (dev->dev.chip == AGX_CHIP_G17P &&
+       nir->info.stage == MESA_SHADER_FRAGMENT &&
+       !agx_nir_lower_m5_mesh_fragment(nir)) {
+      ralloc_free(nir);
+      return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+   }
+
 
    /* G17P compiles the custom-border emulation in only once the physical
     * device has a sampler that needs it (hk_CreateSampler). Until then, drop
@@ -3892,8 +4077,190 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       NIR_PASS(_, nir, poly_nir_lower_tcs, false);
    }
 
-   /* Compile all variants up front */
-   if (sw_stage == MESA_SHADER_GEOMETRY) {
+   
+
+
+
+   if (sw_stage == MESA_SHADER_MESH) {
+      struct hk_shader *shader = hk_main_mesh_variant(obj);
+      if (dev->dev.chip != AGX_CHIP_G17P ||
+          hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE) {
+         ralloc_free(nir);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_UNKNOWN);
+      }
+      if (nir->info.mesh.primitive_type == MESA_PRIM_POINTS &&
+          !(nir->info.outputs_written & VARYING_BIT_PSIZ))
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                  hk_mesh_default_point_size, nir_metadata_control_flow, NULL);
+      if (nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES &&
+          !(nir->info.outputs_read & VARYING_BIT_PSIZ))
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                  kill_mesh_triangle_psiz_write,
+                  nir_metadata_control_flow, NULL);
+
+      shader->info.mesh.max_vertices = nir->info.mesh.max_vertices_out;
+      shader->info.mesh.max_primitives = nir->info.mesh.max_primitives_out;
+      shader->info.mesh.prim = nir->info.mesh.primitive_type;
+      shader->info.mesh.reads_draw_id = mesh_reads_draw_id;
+      shader->info.mesh.reads_num_workgroups = mesh_reads_num_workgroups;
+      for (unsigned i = 0; i < 3; ++i)
+         shader->info.mesh.local_size[i] = nir->info.workgroup_size[i];
+      
+
+
+      shader->info.mesh.vertex_outputs =
+         nir->info.outputs_written & ~nir->info.per_primitive_outputs;
+      shader->info.mesh.primitive_outputs =
+         nir->info.per_primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES;
+      
+
+
+
+
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, hk_lower_mesh_queries);
+      struct agx_m5_mesh_varyings varyings;
+      bool layout_ok = agx_m5_mesh_gather_varyings(nir, &varyings);
+
+      nir_builder layout = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "native mesh raster interface");
+      layout.shader->info.io_lowered = true;
+      layout.shader->info.outputs_written = VARYING_BIT_POS;
+      nir_store_output(&layout, nir_undef(&layout, 4, 32),
+         nir_imm_int(&layout, 0), .write_mask = 15,
+         .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
+      if (layout_ok && varyings.lv) {
+         layout.shader->info.outputs_written |= VARYING_BIT_LAYER;
+         nir_store_output(&layout, nir_undef(&layout, 1, 32),
+            nir_imm_int(&layout, 0), .write_mask = 1,
+            .src_type = nir_type_uint32,
+            .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
+      }
+      if (layout_ok && varyings.clip_count) {
+         layout.shader->info.clip_distance_array_size = varyings.clip_count;
+         for (unsigned slot = VARYING_SLOT_CLIP_DIST0;
+              slot <= VARYING_SLOT_CLIP_DIST1; ++slot) {
+            const unsigned n = varyings.components[slot];
+            if (!n)
+               continue;
+            layout.shader->info.outputs_written |= BITFIELD64_BIT(slot);
+            nir_store_output(&layout, nir_undef(&layout, n, 32),
+               nir_imm_int(&layout, 0), .write_mask = BITFIELD_MASK(n),
+               .src_type = nir_type_float32,
+               .io_semantics = {.location = slot, .num_slots = 1});
+         }
+      }
+      if (layout_ok && varyings.components[VARYING_SLOT_PSIZ]) {
+         layout.shader->info.outputs_written |= VARYING_BIT_PSIZ;
+         nir_store_output(&layout, nir_undef(&layout, 1, 32),
+            nir_imm_int(&layout, 0), .write_mask = 1,
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
+      }
+      for (unsigned slot = VARYING_SLOT_VAR0; layout_ok && slot < 64; ++slot) {
+         const unsigned n = varyings.components[slot];
+         if (!n)
+            continue;
+         layout.shader->info.outputs_written |= BITFIELD64_BIT(slot);
+         nir_store_output(&layout, nir_undef(&layout, n, 32),
+            nir_imm_int(&layout, 0), .write_mask = BITFIELD_MASK(n),
+            .src_type = nir_type_float32,
+            .io_semantics = {.location = slot, .num_slots = 1});
+      }
+      if (layout_ok && varyings.primitive_stride_B) {
+         const unsigned page_words = varyings.components[AGX_MESH_PRIMITIVE_PAGE_SLOT];
+         layout.shader->info.outputs_written |= BITFIELD64_BIT(AGX_MESH_PRIMITIVE_PAGE_SLOT);
+         nir_store_output(&layout, nir_undef(&layout, page_words, 32), nir_imm_int(&layout, 0),
+            .write_mask = BITFIELD_MASK(page_words), .src_type = nir_type_uint32,
+            .io_semantics = {.location = AGX_MESH_PRIMITIVE_PAGE_SLOT, .num_slots = 1});
+      }
+      agx_nir_lower_uvs(layout.shader, &shader->info.uvs, false);
+      shader->info.uvs.mesh_primitive_page = varyings.primitive_stride_B != 0;
+      shader->info.mesh.primitive_stride_B = varyings.primitive_stride_B;
+      ralloc_free(layout.shader);
+      if (layout_ok && varyings.dynamic &&
+          nir->info.known_interpolation_qualifiers) {
+         
+
+
+         struct agx_varyings_vs linked;
+         agx_assign_uvs(&linked, &shader->info.uvs,
+                        ~(nir->info.linear_varyings |
+                          nir->info.perspective_varyings),
+                        nir->info.linear_varyings);
+         for (unsigned slot = 0; slot < 64; ++slot) {
+            if (varyings.components[slot])
+               varyings.first[slot] = linked.slots[slot];
+         }
+         if (varyings.lv)
+            varyings.lv_first = shader->info.uvs.group_offs[UVS_LAYER_VIEWPORT];
+         varyings.dynamic = false;
+      }
+      layout_ok &= varyings.size == shader->info.uvs.size;
+      if (!layout_ok || !agx_nir_lower_m5_task_payload_probe(nir) ||
+          !agx_nir_lower_m5_mesh(nir, &varyings)) {
+         ralloc_free(nir);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "native mesh layout outside captured triangle contract");
+      }
+      agx_preprocess_nir_g17p(nir);
+      result = hk_compile_nir(dev, pAllocator, nir, info->flags,
+                             info->robustness, NULL, features, shader,
+                             sw_stage, true, NULL, info->set_layout_count,
+                             static_set_mask);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+      
+
+
+      struct hk_shader *object = &obj->variants[HK_MESH_VARIANT_RAST];
+      nir_shader *object_nir = hk_build_predicated_mesh_object();
+      if (!object_nir) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_UNKNOWN);
+      }
+      result = hk_compile_nir(dev, pAllocator, object_nir,
+                             info->flags, info->robustness, NULL, features,
+                             object, MESA_SHADER_TASK, true, NULL, 0, 0);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+      struct hk_shader *predicated =
+         &obj->variants[HK_MESH_VARIANT_PREDICATED_OBJECT];
+      object_nir = hk_build_predicated_mesh_object();
+      if (!object_nir) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_UNKNOWN);
+      }
+      result = hk_compile_nir(dev, pAllocator, object_nir,
+                             info->flags, info->robustness, NULL, features,
+                             predicated, MESA_SHADER_TASK, true, NULL, 0, 0);
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+   } else if (sw_stage == MESA_SHADER_TASK) {
+      
+
+
+
+      if (true) {
+         ralloc_free(nir);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "native task layout outside captured object contract");
+      }
+      agx_preprocess_nir_g17p(nir);
+      result = hk_compile_nir(dev, pAllocator, nir, info->flags,
+                             info->robustness, NULL, features, &obj->variants[0],
+                             sw_stage, true, NULL, info->set_layout_count,
+                             static_set_mask);
+   } else if (sw_stage == MESA_SHADER_GEOMETRY) {
       struct hk_shader *main_variant = hk_main_gs_variant(obj);
       struct hk_shader *count_variant = hk_count_gs_variant(obj);
 
@@ -4308,6 +4675,27 @@ hk_widen_integer_io(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static bool
+hk_fs_mesh_builtin_per_primitive(nir_builder *b, nir_intrinsic_instr *intr,
+                                 void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_input)
+      return false;
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location != VARYING_SLOT_LAYER &&
+       sem.location != VARYING_SLOT_VIEWPORT)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *repl = nir_load_per_primitive_input(
+      b, intr->def.num_components, intr->def.bit_size, intr->src[0].ssa,
+      .base = nir_intrinsic_base(intr),
+      .component = nir_intrinsic_component(intr),
+      .dest_type = nir_intrinsic_dest_type(intr), .io_semantics = sem);
+   nir_def_replace(&intr->def, repl);
+   return true;
+}
+
 static VkResult
 hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
@@ -4318,6 +4706,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    nir_shader *shaders[shader_count];
+   bool has_mesh = false;
 
    /* Lower shaders, notably lowering I/O. This is a prerequisite for
     * intershader optimization.
@@ -4329,15 +4718,35 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       enum hk_feature_key hk_features = hk_make_feature_key(features);
       nir_shader *nir = info->nir;
 
+      if (nir->info.stage == MESA_SHADER_MESH)
+         has_mesh = true;
+
+      if (nir->info.stage == MESA_SHADER_FRAGMENT && has_mesh) {
+         nir_foreach_shader_in_variable(var, nir) {
+            if (var->data.location == VARYING_SLOT_PRIMITIVE_ID ||
+                var->data.location == VARYING_SLOT_VIEWPORT ||
+                var->data.location == VARYING_SLOT_LAYER)
+               var->data.per_primitive = true;
+         }
+      }
+
       hk_lower_nir(dev, nir, info->robustness, is_multiview,
                    info->next_stage_mask, info->set_layout_count,
                     info->set_layouts, hk_features);
+      if (nir->info.stage == MESA_SHADER_FRAGMENT && has_mesh)
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                  hk_fs_mesh_builtin_per_primitive, nir_metadata_control_flow,
+                  NULL);
 
       if (dev->dev.chip == AGX_CHIP_G17P) {
          enum hk_nir_widen_16bit_varyings_mode mode = 0;
 
          if (nir->info.stage == MESA_SHADER_FRAGMENT) {
             mode = HK_NIR_WIDEN_16BIT_INPUTS;
+         } else if (nir->info.stage == MESA_SHADER_MESH) {
+            
+
+            mode = HK_NIR_WIDEN_16BIT_OUTPUTS;
          } else if (nir->info.stage == MESA_SHADER_VERTEX ||
                     nir->info.stage == MESA_SHADER_TESS_EVAL ||
                     nir->info.stage == MESA_SHADER_GEOMETRY) {
@@ -4391,6 +4800,22 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
    nir_opt_varyings_bulk(shaders, shader_count, true, UINT32_MAX, UINT32_MAX,
                          nir_opts, NULL);
+
+   /* A fragment shader compiled together with its mesh shader reads the
+    * per-primitive records with that mesh shader's record layout. */
+   if (dev->dev.chip == AGX_CHIP_G17P && has_mesh) {
+      nir_shader *mesh_nir = NULL, *fs_nir = NULL;
+      for (uint32_t i = 0; i < shader_count; i++) {
+         if (shaders[i]->info.stage == MESA_SHADER_MESH)
+            mesh_nir = shaders[i];
+         else if (shaders[i]->info.stage == MESA_SHADER_FRAGMENT)
+            fs_nir = shaders[i];
+      }
+      struct agx_m5_mesh_varyings mesh_varyings;
+      if (mesh_nir && fs_nir &&
+          agx_m5_mesh_gather_varyings(mesh_nir, &mesh_varyings))
+         agx_nir_lower_m5_mesh_fragment_layout(fs_nir, &mesh_varyings);
+   }
 
    /* Only a complete pipeline known to have no fragment shader can fix an
     * empty interpolation contract. A pre-raster library or shader object

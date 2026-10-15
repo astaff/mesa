@@ -29,6 +29,7 @@
 #include "agx_vdm_hal200_direct_draw_core.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
+#include "asahi/lib/agx_vdm_mesh_core.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
@@ -4968,6 +4969,32 @@ hk_emit_hal300_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    return true;
 }
 
+
+
+
+
+
+
+
+
+
+
+
+static unsigned
+hk_effective_viewport_count(struct hk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->shaders[MESA_SHADER_MESH]) {
+      const struct hk_mesh_info *mesh = &hk_bound_hw_vs(gfx)->info.mesh;
+      if (!((mesh->vertex_outputs | mesh->primitive_outputs) &
+            (VARYING_BIT_VIEWPORT | VARYING_BIT_LAYER)))
+         return 1;
+   }
+   return MAX2(dyn->vp.viewport_count, 1);
+}
+
 static void
 hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
 {
@@ -4984,7 +5011,9 @@ hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    /* We always need at least 1 viewport for the hardware. With rasterizer
     * discard the app may not supply any, but we can just program garbage.
     */
-   unsigned count = MAX2(dyn->vp.viewport_count, 1);
+   const unsigned count = hk_effective_viewport_count(cmd);
+   const unsigned api_viewports = MIN2(dyn->vp.viewport_count, count);
+   const unsigned api_scissors = MIN2(dyn->vp.scissor_count, count);
 
    unsigned minx[HK_MAX_VIEWPORTS] = {0}, miny[HK_MAX_VIEWPORTS] = {0};
    unsigned maxx[HK_MAX_VIEWPORTS] = {0}, maxy[HK_MAX_VIEWPORTS] = {0};
@@ -5013,7 +5042,7 @@ hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    }
 
    /* We additionally apply any API scissors */
-   for (unsigned i = 0; i < dyn->vp.scissor_count; ++i) {
+   for (unsigned i = 0; i < api_scissors; ++i) {
       const VkRect2D *s = &dyn->vp.scissors[i];
 
       minx[i] = MAX2(minx[i], s->offset.x);
@@ -5414,6 +5443,9 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    if (!agx_ppp_hal200_viewport_count_pack(
           dev->dev.chip, viewport_count, &output_fields.words[2]))
       return hk_g17p_bind_tail_refused(__LINE__);
+   if (dev->dev.chip == AGX_CHIP_G17P && vs->info.stage == MESA_SHADER_MESH &&
+       vs->info.uvs.mesh_primitive_page)
+      output_fields.words[1] = DIV_ROUND_UP(vs->info.mesh.primitive_stride_B, 4);
 
    struct agx_ppp_hal200_graphics_core primary_record;
    struct agx_ppp_hal200_graphics_fields primary_fields = {
@@ -5535,12 +5567,27 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       return hk_g17p_bind_tail_refused(__LINE__);
 
    struct agx_ppp_w_clamp_cull2_core w_cull2_record;
+   const char *native_mesh_primitive_address =
+      getenv("ASAHI_MESH_NATIVE_PRIMITIVE_ADDRESS_DIAGNOSTIC");
+   const bool native_mesh_primitive_address_enabled =
+      native_mesh_primitive_address &&
+      !strcmp(native_mesh_primitive_address, "1") &&
+      dev->dev.chip == AGX_CHIP_G17P &&
+      vs->info.stage == MESA_SHADER_MESH &&
+      vs->info.uvs.mesh_primitive_page &&
+      vs->info.mesh.primitive_stride_B != 0;
+   const char *native_mesh_wclamp =
+      getenv("ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC");
    const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
-      .w_clamp_raw = 0,
+      .w_clamp_raw = native_mesh_wclamp && !strcmp(native_mesh_wclamp, "1") &&
+                     dev->dev.chip == AGX_CHIP_G17P &&
+                     vs->info.stage == MESA_SHADER_MESH
+                        ? UINT32_C(0x00840002) : 0,
       /* The generated primitive-ID coefficient needs its rasterizer input
        * enabled as well as the matching VDM producer and output slot. */
       .cull2_raw = UINT32_C(0x80) |
-                   (gfx->generate_primitive_id ? UINT32_C(0x1000) : 0),
+                   (gfx->generate_primitive_id ? UINT32_C(0x1000) : 0) |
+                   (native_mesh_primitive_address_enabled ? UINT32_C(0x2000) : 0),
    };
 
    /* Only the first viewport_count entries are written and read. */
@@ -7088,8 +7135,13 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_shader *fs = hk_bound_fs(cmd);
    bool gt_dirty = IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL) ||
                    IS_SHADER_DIRTY(GEOMETRY);
-   bool vgt_dirty = IS_SHADER_DIRTY(VERTEX) || gt_dirty;
+   const bool native_mesh = gfx->shaders[MESA_SHADER_MESH] != NULL;
+   bool vgt_dirty = IS_SHADER_DIRTY(VERTEX) || IS_SHADER_DIRTY(MESH) || gt_dirty;
    bool fs_dirty = IS_SHADER_DIRTY(FRAGMENT);
+   if (native_mesh && gfx->linked[MESA_SHADER_VERTEX] != hw_vs->only_linked) {
+      gfx->linked[MESA_SHADER_VERTEX] = hw_vs->only_linked;
+      gfx->linked_dirty |= BITFIELD_BIT(MESA_SHADER_VERTEX);
+   }
    if (IS_DIRTY(CB_BLEND_CONSTANTS) &&
        memcmp(desc->root.draw.blend_constant, dyn->cb.blend_constants,
               sizeof(dyn->cb.blend_constants))) {
@@ -7183,7 +7235,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   if ((IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+   if (!native_mesh && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
         IS_DIRTY(VI_BINDING_STRIDES) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
         vgt_dirty || !gfx->fast_link_vs.valid)) {
       struct hk_fast_link_key_vs key;
@@ -7197,9 +7249,9 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    }
 
-   if (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+   if (!native_mesh && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
        IS_DIRTY(VI_BINDING_STRIDES) || vgt_dirty ||
-       (gfx->dirty & HK_DIRTY_VB)) {
+       (gfx->dirty & HK_DIRTY_VB))) {
 
       unsigned slot = 0;
       bool vertex_root_changed = false;
@@ -7327,8 +7379,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       gfx->g17p_draw_id_host_valid = false;
    }
 
-   if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || gt_dirty) {
-      enum mesa_prim prim = hk_rast_prim(cmd);
+   if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || gt_dirty || vgt_dirty) {
+      enum mesa_prim prim = native_mesh ? hw_vs->info.mesh.prim : hk_rast_prim(cmd);
 
       gfx->topology = translate_hw_primitive_topology(prim);
       gfx->object_type = translate_object_type(prim);
@@ -7517,10 +7569,87 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
       struct hk_linked_shader *linked_hw_vs =
          (hw_vs == sw_vs) ? linked_vs : hw_vs->only_linked;
-      const uint64_t pipeline_program =
-         hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
+      const uint64_t pipeline_program = native_mesh
+         ? hk_upload_native_mesh_program(cmd, hw_vs, linked_hw_vs, false)
+         : hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
+      if (native_mesh) {
+         struct hk_shader *object =
+            &gfx->shaders[MESA_SHADER_MESH]->variants[gfx->mesh.object_params
+            ? HK_MESH_VARIANT_PREDICATED_OBJECT : HK_MESH_VARIANT_RAST];
+         const uint64_t object_program = hk_upload_native_mesh_program(
+            cmd, object, object->only_linked, true);
+         uint32_t mesh_dimensions[3] = {hw_vs->b.info.workgroup_size[0],
+            hw_vs->b.info.workgroup_size[1],hw_vs->b.info.workgroup_size[2]};
+         uint32_t mesh_threadgroup;
+         if (!agx_vdm_mesh_threadgroup_pack(mesh_dimensions,&mesh_threadgroup)) {
+            vk_command_buffer_set_error(&cmd->vk,VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         if (dev->dev.chip == AGX_CHIP_G17P &&
+             (!hw_vs->info.mesh.max_vertices ||
+              hw_vs->info.mesh.max_vertices > 256 ||
+              !hw_vs->info.mesh.max_primitives ||
+              hw_vs->info.mesh.max_primitives > 256 ||
+              hw_vs->b.info.local_size > 32768 ||
+              hw_vs->b.info.has_preamble || object->b.info.has_preamble)) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         const char *native_raster =
+            getenv("ASAHI_MESH_NATIVE_RASTER_ENABLE_DIAGNOSTIC");
+         const bool native_raster_enabled = native_raster &&
+            !strcmp(native_raster, "1");
+         struct agx_vdm_mesh_state_info state = {
+            
 
-      switch (agx_chip_command_stream_generation(dev->dev.chip)) {
+
+            .raw_prefix = {dev->dev.chip == AGX_CHIP_G17P
+                           ? hw_vs->info.uvs.size |
+                             ((hw_vs->info.uvs.size + 1) << 8)
+                           : 0x500u|hw_vs->info.uvs.size,
+                           dev->dev.chip == AGX_CHIP_G17P
+                              ? (native_raster_enabled && !hk_rast_discard(cmd)
+                                 ? 0x10 : 0x30) |
+                                (hw_vs->info.mesh.primitive_stride_B ? 0x80 : 0)
+                              : 0, 0, 0},
+            .object_pipeline = object_program,
+            .mesh_pipeline = pipeline_program,
+            .raw_object_template = 0,
+            
+
+            .raw_mesh_template = dev->dev.chip == AGX_CHIP_G17P ? 0 : 0x40,
+            
+
+
+
+            .raw_tail = {0,
+               dev->dev.chip == AGX_CHIP_G17P
+                  ? ((hw_vs->info.mesh.max_primitives - 1) & 0x1ff) |
+                    (((hw_vs->info.mesh.max_primitives - 1) >> 4) << 16)
+                  : 1,
+               mesh_threadgroup,
+               dev->dev.chip == AGX_CHIP_G17P
+                  ? DIV_ROUND_UP(hw_vs->info.mesh.primitive_stride_B *
+                                 hw_vs->info.mesh.max_primitives, 4) : 0,
+               dev->dev.chip == AGX_CHIP_G17P
+                  ? DIV_ROUND_UP(hw_vs->b.info.local_size, 16) : 9},
+         };
+         if (!agx_vdm_mesh_state_pack(dev->dev.chip, &state, out)) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         out += AGX_VDM_MESH_STATE_LENGTH;
+         if (dev->dev.chip == AGX_CHIP_G17P) {
+            if (!hk_g17p_emit_native_bind_tail(cmd, cs, &out, false)) {
+               vk_command_buffer_set_error(&cmd->vk,
+                                           VK_ERROR_FEATURE_NOT_PRESENT);
+               cs->current = out;
+               return;
+            }
+            g17p_native_bind_tail_emitted = true;
+            *g17p_native_bind_tail_emitted_out = true;
+         }
+      } else switch (agx_chip_command_stream_generation(dev->dev.chip)) {
       case AGX_CS_GENERATION_AGX2:
          if (pipeline_program > UINT32_MAX) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -7849,7 +7978,8 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
          hk_cmd_bind_graphics_shader(cmd, stage, gfx->shaders[stage]);
    }
 
-   if (gfx->shaders[MESA_SHADER_VERTEX] == NULL) {
+   if (gfx->shaders[MESA_SHADER_VERTEX] == NULL &&
+       gfx->shaders[MESA_SHADER_MESH] == NULL) {
       mesa_loge("draw with no vertex shader bound; dropping it");
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return NULL;
@@ -7934,7 +8064,8 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    }
 
    /* TODO: Try to reduce draw overhead of this */
-   hk_handle_passthrough_gs(cmd, *draw);
+   if (!gfx->shaders[MESA_SHADER_MESH])
+      hk_handle_passthrough_gs(cmd, *draw);
    if (vk_command_buffer_has_error(&cmd->vk))
       return NULL;
 
@@ -8785,6 +8916,116 @@ static __attribute__((hot)) void
 hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw)
 {
    hk_draw_impl(cmd, draw_id, draw);
+}
+
+static void
+hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
+                     uint64_t count_address)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (dev->dev.chip != AGX_CHIP_G17P || !gfx->shaders[MESA_SHADER_MESH] ||
+       gfx->shaders[MESA_SHADER_TASK] || hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   gfx->mesh.grid = grid;
+   
+
+   const struct hk_mesh_info *mesh_info =
+      &hk_main_mesh_variant(gfx->shaders[MESA_SHADER_MESH])->info.mesh;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   if (mesh_info->reads_num_workgroups &&
+       desc->root.mesh_grid_addr != grid) {
+      desc->root.mesh_grid_addr = grid;
+      desc->root_dirty = true;
+   }
+   if (mesh_info->reads_draw_id && desc->root.mesh_draw_id != draw_id) {
+      desc->root.mesh_draw_id = draw_id;
+      desc->root_dirty = true;
+   }
+   const bool conditional = hk_conditional_render_is_active(
+      &cmd->state.conditional, cmd->in_meta, cmd->conditional_meta);
+   gfx->mesh.object_params = 0;
+   {
+      const struct {
+         uint64_t grid, count, predicate;
+         uint32_t draw_id, inverted;
+      } params = {grid, count_address,
+         conditional ? cmd->state.conditional.address : 0,
+         draw_id, conditional && cmd->state.conditional.inverted};
+      gfx->mesh.object_params = hk_pool_upload(cmd, &params, sizeof(params), 8);
+   }
+   gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_MESH);
+   struct agx_draw dummy = {.b = agx_1d(3)};
+   bool robust = false, tail = false;
+   struct hk_cs *cs = hk_flush_gfx_state(cmd, draw_id, &dummy, &robust,
+                                        &tail, NULL);
+   if (!cs || vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   cs->g17p_primitive_bound = UINT64_MAX;
+
+   if (tail) {
+      uint32_t draw_state_offset;
+      if (!hk_g17p_draw_state_offset(cmd, cs, &draw_state_offset)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      memcpy(cs->current, &draw_state_offset, sizeof(draw_state_offset));
+      cs->current += sizeof(draw_state_offset);
+   }
+   const struct agx_vdm_mesh_dispatch_info dispatch = {
+      .threads = {3, 1, 1}, .local_size = {3, 1, 1},
+   };
+   if (!agx_vdm_mesh_dispatch_pack(dev->dev.chip, &dispatch, cs->current)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   cs->current += AGX_VDM_MESH_DISPATCH_LENGTH;
+
+   cs->stats.calls++;
+   cs->stats.cmds++;
+   vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
+   gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
+   gfx->descriptors.root_dirty = false;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX,
+                      uint32_t groupCountY, uint32_t groupCountZ)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   if (!groupCountX || !groupCountY || !groupCountZ)
+      return;
+   const uint32_t grid[4] = {groupCountX, groupCountY, groupCountZ, 0};
+   hk_draw_mesh_native(cmd, hk_pool_upload(cmd, grid, sizeof(grid), 16), 0, 0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                              VkDeviceSize offset, uint32_t drawCount,
+                              uint32_t stride)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(hk_buffer, src, buffer);
+   for (unsigned i = 0; i < drawCount; ++i)
+      hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride), i, 0);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                   VkDeviceSize offset, VkBuffer countBuffer,
+                                   VkDeviceSize countBufferOffset,
+                                   uint32_t maxDrawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(hk_buffer, src, buffer);
+   VK_FROM_HANDLE(hk_buffer, count, countBuffer);
+   const uint64_t count_address = hk_buffer_address_rw(count, countBufferOffset);
+   for (unsigned i = 0; i < maxDrawCount; ++i)
+      hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
+                          i, count_address);
 }
 
 VKAPI_ATTR void VKAPI_CALL

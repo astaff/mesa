@@ -23,6 +23,7 @@
 #include "hk_memory_budget_core.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
+#include "hk_nir_lower_mesh.h"
 #include "hk_private.h"
 #include "hk_ray_tracing_core.h"
 #include "hk_shader.h"
@@ -278,6 +279,9 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_texel_buffer_alignment = true,
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
+      
+
+      .EXT_mesh_shader = false,
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = true,
       .EXT_ycbcr_2plane_444_formats = false,
@@ -306,6 +310,13 @@ hk_get_device_features(
       .independentBlend = true,
       .geometryShader = true,
       .tessellationShader = true,
+
+      
+      .taskShader = false,
+      .meshShader = supported_extensions->EXT_mesh_shader,
+      .multiviewMeshShader = false,
+      .primitiveFragmentShadingRateMeshShader = false,
+      .meshShaderQueries = supported_extensions->EXT_mesh_shader,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -897,6 +908,12 @@ hk_supported_shader_stages(const struct vk_features *features)
    if (features->geometryShader)
       stages |= VK_SHADER_STAGE_GEOMETRY_BIT;
 
+   if (features->taskShader)
+      stages |= VK_SHADER_STAGE_TASK_BIT_EXT;
+
+   if (features->meshShader)
+      stages |= VK_SHADER_STAGE_MESH_BIT_EXT;
+
    return stages;
 }
 
@@ -1060,6 +1077,40 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxTessellationControlTotalOutputComponents = 4216,
       .maxTessellationEvaluationInputComponents = 128,
       .maxTessellationEvaluationOutputComponents = max_vgt_output_components,
+
+      
+
+
+
+
+      .maxTaskWorkGroupTotalCount = 1u << 22,
+      .maxTaskWorkGroupCount = {65535, 65535, 65535},
+      .maxTaskWorkGroupInvocations = 1024,
+      .maxTaskWorkGroupSize = {1024, 1024, 1024},
+      .maxTaskPayloadSize = 16384,
+      .maxTaskSharedMemorySize = 32768,
+      .maxTaskPayloadAndSharedMemorySize = 32768,
+      .maxMeshWorkGroupTotalCount = 1u << 22,
+      .maxMeshWorkGroupCount = {65535, 65535, 65535},
+      .maxMeshWorkGroupInvocations = 1024,
+      .maxMeshWorkGroupSize = {1024, 1024, 1024},
+      .maxMeshSharedMemorySize = 28672,
+      .maxMeshPayloadAndSharedMemorySize = 28672 + 16384,
+      .maxMeshOutputMemorySize = 32768,
+      .maxMeshPayloadAndOutputMemorySize = 32768 + 16384,
+      .maxMeshOutputComponents = 128,
+      .maxMeshOutputVertices = 256,
+      .maxMeshOutputPrimitives = 256,
+      .maxMeshOutputLayers = 8,
+      .maxMeshMultiviewViewCount = 1,
+      .meshOutputPerVertexGranularity = 32,
+      .meshOutputPerPrimitiveGranularity = 32,
+      .maxPreferredTaskWorkGroupInvocations = 32,
+      .maxPreferredMeshWorkGroupInvocations = 32,
+      .prefersLocalInvocationVertexOutput = true,
+      .prefersLocalInvocationPrimitiveOutput = true,
+      .prefersCompactVertexOutput = true,
+      .prefersCompactPrimitiveOutput = true,
 
       /* Set to match maxVertexOutputComponents, hardware limit is higher. */
       .maxFragmentInputComponents = max_vgt_output_components,
@@ -1698,6 +1749,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    struct vk_features supported_features;
+   supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17P &&
+      hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 

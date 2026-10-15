@@ -523,6 +523,16 @@ lower_uvs_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    case nir_intrinsic_load_draw_id: {
       b->cursor = nir_instr_remove(&intrin->instr);
 
+      
+
+      if (args->sw_stage == MESA_SHADER_MESH &&
+          intrin->intrinsic == nir_intrinsic_load_draw_id) {
+         unsigned offset = hk_root_descriptor_offset(mesh_draw_id);
+         nir_def *val = load_root(b, 1, 32, nir_imm_int(b, offset), 4);
+         nir_def_rewrite_uses(&intrin->def, nir_u2uN(b, val, intrin->def.bit_size));
+         return true;
+      }
+
       unsigned base = args->uniform_base +
                       AGX_ABI_VUNI_FIRST_VERTEX(args->nr_vbos);
       unsigned size = 32;
@@ -546,10 +556,10 @@ lower_uvs_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
       unsigned off1 = hk_root_descriptor_offset(draw.pipeline_stats);
       unsigned off2 = hk_root_descriptor_offset(draw.pipeline_stats_flags);
-      static_assert(hk_root_descriptor_offset(draw.pipeline_stats) == 368,
+      static_assert(hk_root_descriptor_offset(draw.pipeline_stats) == 432,
                     "pipeline-statistics compiler oracle ABI");
       static_assert(hk_root_descriptor_offset(draw.pipeline_stats_flags) ==
-                       376,
+                       440,
                     "pipeline-statistics compiler oracle ABI");
 
       nir_def *base = load_root(b, 1, 64, nir_imm_int(b, off1), 8);
@@ -673,6 +683,15 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
 
    case nir_intrinsic_load_num_workgroups: {
       b->cursor = nir_instr_remove(&intrin->instr);
+
+      
+
+      if (b->shader->info.stage == MESA_SHADER_MESH) {
+         unsigned offset = hk_root_descriptor_offset(mesh_grid_addr);
+         nir_def *ptr = load_root(b, 1, 64, nir_imm_int(b, offset), 8);
+         nir_def_rewrite_uses(&intrin->def, load_speculatable(b, 3, 32, ptr, 4));
+         return true;
+      }
 
       unsigned offset = hk_root_descriptor_offset(cs.group_count_addr);
       nir_def *ptr = load_root(b, 1, 64, nir_imm_int(b, offset), 4);
