@@ -91,6 +91,15 @@ struct hk_code_heap {
    uint32_t offset;
 };
 
+struct hk_gen1_sparse_table {
+   struct agx_va *va;
+   struct util_dynarray pages;
+   uint32_t entry_bytes;
+   enum agx_bo_flags bo_flags;
+   uint32_t bind_flags;
+   const char *label;
+};
+
 struct hk_device {
    struct vk_device vk;
    struct agx_device dev;
@@ -116,6 +125,11 @@ struct hk_device {
    bool gen1_rq_instances, gen1_rq_candidates, gen1_as_lock_ready;
    simple_mtx_t gen1_as_lock;
    struct util_dynarray gen1_ases;
+   struct hash_table *gen1_as_ids;
+   struct hk_gen1_sparse_table gen1_as_table_pages;
+   struct hk_gen1_sparse_table gen1_as_metadata_pages;
+   struct hk_gen1_sparse_table gen1_as_address_pages;
+   struct hk_gen1_sparse_table gen1_vertex_directory_pages;
    struct agx_bo *gen1_as_metadata;
    struct agx_bo *gen1_as_addresses;
    struct agx_bo *gen1_as_query_bank;

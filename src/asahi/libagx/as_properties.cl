@@ -38,7 +38,8 @@ libagx_gen1_as_property(global uint64_t *image, global uint64_t *metadata,
 
 static inline uint32_t
 gen1_serial_id(global struct libagx_gen1_as_address *map, uint32_t count,
-               uint64_t address, volatile global uint64_t *addresses)
+               uint64_t address, volatile global uint64_t *addresses,
+               uint32_t id_bound)
 {
    uint32_t low = 0, high = count;
    while (low < high) {
@@ -49,7 +50,7 @@ gen1_serial_id(global struct libagx_gen1_as_address *map, uint32_t count,
    if (low < count && map[low].address == address &&
        addresses[map[low].resource_id] == address)
       return map[low].resource_id;
-   for (uint32_t id = 1; id < LIBAGX_GEN1_AS_METADATA_SLOTS; ++id)
+   for (uint32_t id = 1; id < id_bound; ++id)
       if (addresses[id] == address) return id;
    return 0;
 }
@@ -147,7 +148,7 @@ libagx_gen1_as_deserialize(global uint64_t *image, global uint64_t *serialized,
 KERNEL(32)
 libagx_gen1_as_deserialize_references(global uint64_t *image,
    global uint64_t *serialized, global struct libagx_gen1_as_address *map,
-   uint32_t map_count, volatile global uint64_t *addresses,
+   uint32_t map_count, volatile global uint64_t *addresses, uint32_t id_bound,
    global uint64_t *uuid, uint64_t destination_bytes)
 {
    for (uint32_t j = 0; j < 4; ++j)
@@ -165,7 +166,7 @@ libagx_gen1_as_deserialize_references(global uint64_t *image,
    if (i >= count) return;
    uint64_t address = serialized[7 + i];
    global uint32_t *record = (global uint32_t *)((global uint8_t *)image + records[i]);
-   record[1] = gen1_serial_id(map, map_count, address, addresses);
+   record[1] = gen1_serial_id(map, map_count, address, addresses, id_bound);
    *(global uint64_t *)((global uint8_t *)record + 88) = address;
 }
 
