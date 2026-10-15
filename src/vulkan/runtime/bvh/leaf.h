@@ -219,13 +219,31 @@ main(void)
    uint32_t global_id = gl_GlobalInvocationID.x;
    uint32_t primitive_id = args.geom_data.first_id + global_id;
 
-   uint32_t src_offset = global_id * args.geom_data.stride;
+   vk_bvh_geometry_data geom_data = args.geom_data;
+   bool in_range = true;
+   if (uint64_t(args.indirect) != 0) {
+      vk_build_range_info range = DEREF(args.indirect);
+      in_range = global_id < range.primitive_count;
+      if (geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+         geom_data.data = OFFSET(geom_data.data, range.first_vertex * geom_data.stride);
+         if (geom_data.index_format == VK_INDEX_TYPE_NONE_KHR)
+            geom_data.data = OFFSET(geom_data.data, range.primitive_offset);
+         else
+            geom_data.indices = OFFSET(geom_data.indices, range.primitive_offset);
+         if (geom_data.transform != NULL)
+            geom_data.transform = OFFSET(geom_data.transform, range.transform_offset);
+      } else {
+         geom_data.data = OFFSET(geom_data.data, range.primitive_offset);
+      }
+   }
 
-   uint32_t dst_stride = vk_ir_node_size(args.geom_data.geometry_type);
+   uint32_t src_offset = global_id * geom_data.stride;
+
+   uint32_t dst_stride = vk_ir_node_size(geom_data.geometry_type);
    uint32_t node_type;
-   if (args.geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+   if (geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR)
       node_type = vk_ir_node_triangle;
-   else if (args.geom_data.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR)
+   else if (geom_data.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR)
       node_type = vk_ir_node_aabb;
    else
       node_type = vk_ir_node_instance;
@@ -234,23 +252,25 @@ main(void)
    VOID_REF dst_ptr = OFFSET(args.bvh, dst_offset);
 
    vk_aabb bounds;
-   bool is_active;
-   if (args.geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
-      is_active = build_triangle(bounds, dst_ptr, args.geom_data, global_id);
-   } else if (args.geom_data.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR) {
-      VOID_REF src_ptr = OFFSET(args.geom_data.data, src_offset);
-      is_active = build_aabb(bounds, src_ptr, dst_ptr, args.geom_data.geometry_id, global_id);
+   bool is_active = false;
+   if (!in_range) {
+      is_active = false;
+   } else if (geom_data.geometry_type == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+      is_active = build_triangle(bounds, dst_ptr, geom_data, global_id);
+   } else if (geom_data.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR) {
+      VOID_REF src_ptr = OFFSET(geom_data.data, src_offset);
+      is_active = build_aabb(bounds, src_ptr, dst_ptr, geom_data.geometry_id, global_id);
    } else {
-      VOID_REF src_ptr = OFFSET(args.geom_data.data, src_offset);
+      VOID_REF src_ptr = OFFSET(geom_data.data, src_offset);
       /* arrayOfPointers */
-      if (args.geom_data.stride == 8) {
+      if (geom_data.stride == 8) {
          src_ptr = DEREF(REF(VOID_REF)(src_ptr));
       }
 
       is_active = build_instance(bounds, src_ptr, dst_ptr, global_id);
    }
 
-   if (VK_TEST_BUILD_FLAG_ALWAYS_ACTIVE)
+   if (VK_TEST_BUILD_FLAG_ALWAYS_ACTIVE && in_range)
       is_active = true;
 
    uint32_t id = is_active ? pack_ir_node_id(dst_offset, node_type) : VK_BVH_INVALID_NODE;

@@ -127,6 +127,8 @@ struct vk_scratch_layout {
 struct vk_acceleration_structure_build_state {
    const VkAccelerationStructureBuildGeometryInfoKHR *build_info;
    const VkAccelerationStructureBuildRangeInfoKHR *build_range_infos;
+   VkDeviceAddress indirect_addr;
+   uint32_t indirect_stride;
    uint32_t leaf_node_count;
    uint32_t internal_node_count;
    struct vk_scratch_layout scratch;
@@ -220,6 +222,16 @@ void vk_cmd_build_acceleration_structures(VkCommandBuffer cmdbuf,
                                           const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
                                           const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos,
                                           const struct vk_acceleration_structure_build_args *args);
+
+void vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer cmdbuf,
+                                                   struct vk_device *device,
+                                                   struct vk_meta_device *meta,
+                                                   uint32_t info_count,
+                                                   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+                                                   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos,
+                                                   const VkDeviceAddress *pIndirectDeviceAddresses,
+                                                   const uint32_t *pIndirectStrides,
+                                                   const struct vk_acceleration_structure_build_args *args);
 
 void vk_get_as_build_sizes(VkDevice _device, VkAccelerationStructureBuildTypeKHR buildType,
                            const VkAccelerationStructureBuildGeometryInfoKHR *pBuildInfo,

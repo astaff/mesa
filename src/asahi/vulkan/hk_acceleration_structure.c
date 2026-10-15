@@ -83,6 +83,7 @@ static const uint32_t agx3_refit_spv[] = {
 };
 
 static void hk_flush_buffer_write_cp(VkCommandBuffer);
+static uint64_t hk_as_native_va(struct vk_acceleration_structure *);
 static void hk_as_phase_begin(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_agx3_refit_phase(VkCommandBuffer,
@@ -165,10 +166,22 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
    const VkAllocationCallbacks *alloc, VkAccelerationStructureKHR *out)
 {
    VK_FROM_HANDLE(hk_device, dev, device);
+   VkAccelerationStructureCreateInfoKHR native_info;
+   const VkDeviceAddress replay_address = dev->g17p_native_as ? info->deviceAddress : 0;
+   if (replay_address) {
+      native_info = *info;
+      native_info.deviceAddress = 0;
+      info = &native_info;
+   }
    VkResult result = vk_common_CreateAccelerationStructureKHR(device, info, alloc, out);
    if (result != VK_SUCCESS || !dev->g17p_native_as)
       return result;
    VK_FROM_HANDLE(vk_acceleration_structure, as, *out);
+   if (replay_address && hk_as_native_va(as) != replay_address) {
+      vk_common_DestroyAccelerationStructureKHR(device, *out, alloc);
+      *out = VK_NULL_HANDLE;
+      return vk_error(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS);
+   }
    bool inserted = false;
    uint32_t id = 1;
    simple_mtx_lock(&dev->gen1_as_lock);
@@ -1635,20 +1648,17 @@ hk_gen1_capture_stress_input(struct hk_cmd_buffer *cmd,
    return true;
 }
 
-VKAPI_ATTR void VKAPI_CALL
-hk_CmdBuildAccelerationStructuresKHR(
+static void
+hk_cmd_build_acceleration_structures(
    VkCommandBuffer commandBuffer, uint32_t infoCount,
    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
-   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
+   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos,
+   const VkDeviceAddress *pIndirectDeviceAddresses,
+   const uint32_t *pIndirectStrides)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (dev->g17p_native_as && getenv("ASAHI_G17P_CAPTURE_STRESS_INPUT")) {
-      for (uint32_t i = 0; i < infoCount; ++i)
-         if (hk_gen1_capture_stress_input(cmd, &pInfos[i], ppBuildRangeInfos[i]))
-            return;
-   }
    uint32_t empty_count = 0;
    if (dev->g17p_native_as) {
       for (uint32_t i = 0; i < infoCount; ++i) {
@@ -1691,12 +1701,21 @@ hk_CmdBuildAccelerationStructuresKHR(
    const uint32_t nonempty_count = infoCount - empty_count;
    VkAccelerationStructureBuildGeometryInfoKHR *nonempty_infos = NULL;
    const VkAccelerationStructureBuildRangeInfoKHR **nonempty_ranges = NULL;
+   VkDeviceAddress *nonempty_indirect = NULL;
+   uint32_t *nonempty_strides = NULL;
    if (empty_count && nonempty_count) {
       nonempty_infos = malloc(nonempty_count * sizeof(*nonempty_infos));
       nonempty_ranges = malloc(nonempty_count * sizeof(*nonempty_ranges));
-      if (!nonempty_infos || !nonempty_ranges) {
+      if (pIndirectDeviceAddresses) {
+         nonempty_indirect = malloc(nonempty_count * sizeof(*nonempty_indirect));
+         nonempty_strides = malloc(nonempty_count * sizeof(*nonempty_strides));
+      }
+      if (!nonempty_infos || !nonempty_ranges ||
+          (pIndirectDeviceAddresses && (!nonempty_indirect || !nonempty_strides))) {
          free(nonempty_infos);
          free(nonempty_ranges);
+         free(nonempty_indirect);
+         free(nonempty_strides);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
          return;
       }
@@ -1724,6 +1743,10 @@ hk_CmdBuildAccelerationStructuresKHR(
                hk_as_native_va(dst), metadata, id, pInfos[i].flags,
                pInfos[i].geometryCount ? vk_get_as_geometry_type(&pInfos[i]) : VK_GEOMETRY_TYPE_TRIANGLES_KHR);
          } else if (nonempty_infos) {
+            if (nonempty_indirect) {
+               nonempty_indirect[n] = pIndirectDeviceAddresses[i];
+               nonempty_strides[n] = pIndirectStrides[i];
+            }
             nonempty_infos[n] = pInfos[i];
             nonempty_ranges[n++] = ppBuildRangeInfos[i];
          }
@@ -1731,14 +1754,69 @@ hk_CmdBuildAccelerationStructuresKHR(
       hk_flush_buffer_write_cp(commandBuffer);
    }
    if (nonempty_count)
-      vk_cmd_build_acceleration_structures(commandBuffer, &dev->vk, &dev->meta,
+      vk_cmd_build_acceleration_structures_indirect(commandBuffer, &dev->vk, &dev->meta,
          nonempty_count, nonempty_infos ? nonempty_infos : pInfos,
          nonempty_ranges ? nonempty_ranges : ppBuildRangeInfos,
+         nonempty_indirect ? nonempty_indirect : pIndirectDeviceAddresses,
+         nonempty_strides ? nonempty_strides : pIndirectStrides,
          &dev->accel_struct_args);
 
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
    free(nonempty_infos);
    free(nonempty_ranges);
+   free(nonempty_indirect);
+   free(nonempty_strides);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdBuildAccelerationStructuresKHR(
+   VkCommandBuffer commandBuffer, uint32_t infoCount,
+   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+   const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (dev->g17p_native_as && getenv("ASAHI_G17P_CAPTURE_STRESS_INPUT")) {
+      for (uint32_t i = 0; i < infoCount; ++i)
+         if (hk_gen1_capture_stress_input(cmd, &pInfos[i], ppBuildRangeInfos[i]))
+            return;
+   }
+   hk_cmd_build_acceleration_structures(commandBuffer, infoCount, pInfos,
+                                        ppBuildRangeInfos, NULL, NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdBuildAccelerationStructuresIndirectKHR(
+   VkCommandBuffer commandBuffer, uint32_t infoCount,
+   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+   const VkDeviceAddress *pIndirectDeviceAddresses,
+   const uint32_t *pIndirectStrides,
+   const uint32_t *const *ppMaxPrimitiveCounts)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   uint32_t geometry_count = 0;
+   for (uint32_t i = 0; i < infoCount; ++i)
+      geometry_count += pInfos[i].geometryCount;
+   VkAccelerationStructureBuildRangeInfoKHR *ranges =
+      calloc(MAX2(geometry_count, 1), sizeof(*ranges));
+   const VkAccelerationStructureBuildRangeInfoKHR **range_ptrs =
+      malloc(MAX2(infoCount, 1) * sizeof(*range_ptrs));
+   if (!ranges || !range_ptrs) {
+      free(ranges);
+      free(range_ptrs);
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   for (uint32_t i = 0, k = 0; i < infoCount; ++i) {
+      range_ptrs[i] = &ranges[k];
+      for (uint32_t g = 0; g < pInfos[i].geometryCount; ++g)
+         ranges[k++].primitiveCount = ppMaxPrimitiveCounts[i][g];
+   }
+   hk_cmd_build_acceleration_structures(commandBuffer, infoCount, pInfos, range_ptrs,
+                                        pIndirectDeviceAddresses, pIndirectStrides);
+   free(ranges);
+   free(range_ptrs);
 }
 
 VKAPI_ATTR void VKAPI_CALL
