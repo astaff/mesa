@@ -1460,8 +1460,7 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
       debug_get_bool_option("ASAHI_G17P_RQ_LIVE_AS_TABLE", false);
    dev->gen1_native_fragment_rq = dev->gen1_rq_candidates &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
-   dev->gen1_native_graphics_rq = dev->gen1_native_fragment_rq &&
-      debug_get_bool_option("ASAHI_G17P_GRAPHICS_STAGE_RQ_DIAGNOSTIC", false);
+   dev->gen1_native_graphics_rq = dev->gen1_native_fragment_rq;
    if (dev->g17p_native_as) {
       simple_mtx_init(&dev->gen1_as_lock, mtx_plain);
       util_dynarray_init(&dev->gen1_ases, NULL);
