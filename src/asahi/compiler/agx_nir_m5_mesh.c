@@ -284,7 +284,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
                     s->info.workgroup_size[2];
    if(s->info.stage!=MESA_SHADER_MESH || s->info.shared_size>32768 ||
-      s->info.workgroup_size_variable || threads==0 || threads>128 ||
+      s->info.workgroup_size_variable || threads==0 || threads>1024 ||
       s->info.mesh.max_vertices_out==0 || s->info.mesh.max_vertices_out>256 ||
       s->info.mesh.max_primitives_out==0 || s->info.mesh.max_primitives_out>256 ||
       s->info.mesh.primitive_type!=MESA_PRIM_TRIANGLES ||
@@ -345,7 +345,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       }
    }
    if(!counts)return false;
-   if (physical_threads != threads) {
+   if (physical_threads != threads || s->info.workgroup_size[2] > 1023) {
       /* Native output batches target vertex_base + physical lane. Pad at
        * most the first output SIMD group; later batches reuse it with the
        * captured high16 vertex_base field. Keep the original API body mask. */

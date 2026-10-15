@@ -10541,6 +10541,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 ctx->stage == MESA_SHADER_VERTEX &&
                 I->src[3].type != AGX_INDEX_IMMEDIATE) ||
                ctx->stage == MESA_SHADER_FRAGMENT ||
+               (enc == AGX_ISA_ENCODING_AGX3C &&
+                ctx->stage == MESA_SHADER_MESH) ||
                agx3_stage_runs_as_kernel(ctx->stage);
             /* imgwci takes its coordinates from staging halves 0/2, so in a
              * shader that also writes images a read stages its coordinates at

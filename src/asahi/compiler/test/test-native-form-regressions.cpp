@@ -5059,3 +5059,111 @@ TEST(NativeForms, M5MeshActiveSubgroupIndexReachesPacker)
       ralloc_free(mem);
    }
 }
+
+TEST(NativeForms, M5MeshLargeWorkgroupsCompile)
+{
+   const unsigned sizes[][3] = {
+      {129,1,1}, {256,1,1}, {512,1,1}, {1024,1,1},
+      {1,1024,1}, {1,1,1024}, {3,5,7}, {1025,1,1},
+   };
+   for (const auto &size : sizes) {
+      SCOPED_TRACE(size[0] * size[1] * size[2]);
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+         &agx_nir_options, "mesh workgroup bounds");
+      for (unsigned i = 0; i < 3; ++i)
+         b.shader->info.workgroup_size[i] = size[i];
+      b.shader->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+      b.shader->info.mesh.max_vertices_out = 1;
+      b.shader->info.mesh.max_primitives_out = 1;
+      b.shader->info.io_lowered = true;
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_def *id = nir_load_local_invocation_id(&b);
+      nir_def *value = nir_iadd(&b, lane, nir_channel(&b, id, 2));
+      nir_store_global(&b, value, nir_iadd(&b, nir_imm_int64(&b, 0x2000000),
+                       nir_u2u64(&b, nir_imul_imm(&b, lane, 4))),
+                       .write_mask=1, .align_mul=4);
+      nir_barrier(&b, .execution_scope=SCOPE_WORKGROUP,
+         .memory_scope=SCOPE_WORKGROUP, .memory_semantics=NIR_MEMORY_ACQ_REL,
+         .memory_modes=nir_var_mem_global);
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), nir_undef(&b, 1, 32));
+      bool valid = size[0] * size[1] * size[2] <= 1024;
+      ASSERT_EQ(agx_nir_lower_m5_mesh_triangle_probe(b.shader), valid);
+      if (!valid) {
+         EXPECT_EQ(b.shader->info.workgroup_size[0], size[0]);
+         ralloc_free(b.shader);
+         continue;
+      }
+      EXPECT_EQ(b.shader->info.workgroup_size[2], size[2] > 1023 ? 1u : size[2]);
+      agx_preprocess_nir_m5(b.shader);
+      agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17S;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.no_preamble = true;
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx_last_compile_refusal();
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, M5MeshImageReadStagesCoordinates)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_MESH;
+   agx_instr *read = agx_alloc_instr(b, AGX_OPCODE_IMAGE_LOAD, 1, 6);
+   read->dest[0] = agx_register(24, AGX_SIZE_32);
+   read->dest[0].channels_m1 = 3;
+   read->src[0] = agx_register(12, AGX_SIZE_32);
+   read->src[0].channels_m1 = 1;
+   read->src[1] = agx_immediate(0);
+   read->src[2] = agx_immediate(0);
+   read->src[3] = agx_register(18, AGX_SIZE_64);
+   read->src[4] = agx_immediate(0);
+   read->src[5] = agx_null();
+   read->dim = AGX_DIM_2D;
+   read->lod_mode = AGX_LOD_MODE_AUTO_LOD;
+   read->mask = 1;
+   agx_builder_insert(&b->cursor, read);
+   agx_stop(b);
+   util_dynarray bytes;
+   util_dynarray_init(&bytes, mem);
+   EXPECT_TRUE(agx3_pack_binary(b->shader, &bytes));
+   EXPECT_GT(b->shader->agx3_staging_halfs, 0u);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, M5MeshImageReadUsesNativeHeapIndex)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+      &agx_nir_options, "mesh native image descriptor");
+   nir_def *handle = agx_test_bindless_image_agx(&b, nir_imm_int(&b, 64), 2);
+   nir_def *coord = nir_imm_ivec4(&b, 0, 0, 0, 0);
+   nir_def *value = agx_test_bindless_image_load(&b, 4, 32, handle, coord,
+      nir_imm_int(&b, 0), nir_imm_int(&b, 0), GLSL_SAMPLER_DIM_2D,
+      PIPE_FORMAT_R32_UINT, ACCESS_COHERENT, nir_type_uint32);
+   nir_store_global(&b, value, nir_imm_int64(&b, 0x2000000),
+                    .write_mask=15, .align_mul=4);
+   ASSERT_TRUE(agx_nir_lower_g17g_indexed_reads(b.shader));
+   unsigned reads = 0;
+   nir_foreach_block(block, b.impl) nir_foreach_instr(in, block) {
+      if (in->type != nir_instr_type_intrinsic) continue;
+      nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+      if (i->intrinsic != nir_intrinsic_bindless_image_load) continue;
+      auto image = nir_src_as_intrinsic(i->src[0]);
+      ASSERT_NE(image, nullptr);
+      EXPECT_EQ(image->intrinsic, nir_intrinsic_bindless_image_agx);
+      EXPECT_EQ(image->src[0].ssa->bit_size, 64u);
+      EXPECT_EQ(nir_intrinsic_desc_set(image), 0u);
+      reads++;
+   }
+   EXPECT_EQ(reads, 1u);
+   nir_validate_shader(b.shader, "native mesh image index");
+   ralloc_free(b.shader);
+}

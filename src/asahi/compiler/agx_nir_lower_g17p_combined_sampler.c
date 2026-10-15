@@ -787,7 +787,8 @@ lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
 {
    if (!shader || (!g17p_explicit_lod_stage(shader->info.stage) &&
                    shader->info.stage != MESA_SHADER_FRAGMENT &&
-                   shader->info.stage != MESA_SHADER_COMPUTE))
+                   shader->info.stage != MESA_SHADER_COMPUTE &&
+                   !(m5 && shader->info.stage == MESA_SHADER_MESH)))
       return false;
 
    unsigned samples = 0, image_reads = 0;
@@ -816,7 +817,8 @@ lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
             /* Explicit levels and gradients need no fragment derivatives.
              * Gather uses the packer's existing non-fragment level-zero form.
              * Ordinary implicit samples and biases still remain closed. */
-            if (!fetch && g17p_explicit_lod_stage(shader->info.stage) &&
+            if (!fetch && (g17p_explicit_lod_stage(shader->info.stage) ||
+                           (m5 && shader->info.stage == MESA_SHADER_MESH)) &&
                 tex->op != nir_texop_txl && tex->op != nir_texop_txd &&
                 tex->op != nir_texop_tg4)
                return g17p_decline("vertex_implicit_sample", tex, NULL,
@@ -1003,7 +1005,8 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
 {
    if (!shader || (!g17p_explicit_lod_stage(shader->info.stage) &&
                    shader->info.stage != MESA_SHADER_FRAGMENT &&
-                   shader->info.stage != MESA_SHADER_COMPUTE))
+                   shader->info.stage != MESA_SHADER_COMPUTE &&
+                   shader->info.stage != MESA_SHADER_MESH))
       return false;
 
    unsigned reads = 0;
