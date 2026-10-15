@@ -459,8 +459,9 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                   UNUSED const struct vk_pipeline_robustness_state *rs)
 {
    hk_preprocess_nir_internal(vk_pdev, nir);
+   const enum agx_chip chip = ((struct hk_physical_device *)vk_pdev)->dev.chip;
    const bool g17p_compute_derivatives =
-      ((struct hk_physical_device *)vk_pdev)->dev.chip == AGX_CHIP_G17P &&
+      (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
       nir->info.stage == MESA_SHADER_COMPUTE &&
       nir->info.derivative_group != DERIVATIVE_GROUP_NONE;
    nir_lower_compute_system_values_options csv_options = {
