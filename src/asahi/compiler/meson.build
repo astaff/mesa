@@ -20,6 +20,7 @@ libasahi_agx_files = files(
   'agx_nir_gen1_ray_query.c',
   'agx_nir_lower_shared_bitsize.c',
   'agx_nir_lower_subgroups.c',
+  'agx_nir_lower_compute_derivatives.c',
   'agx_nir_lower_texture.c',
   'agx_nir_m5_mesh.c',
   'agx3_mesh_core.c',

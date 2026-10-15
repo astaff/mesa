@@ -8,6 +8,7 @@
 #include "util/u_debug.h"
 #include "vulkan/vulkan_core.h"
 #include "agx_abi.h"
+#include "agx_nir.h"
 #include "agx_nir_texture.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
@@ -762,8 +763,145 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
 
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex,
+          const struct lower_descriptors_ctx *ctx);
+
+static nir_def *
+compute_lod_lambda(nir_builder *b, nir_tex_instr *tex, nir_def *size)
+{
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const unsigned comps = tex->coord_components - (tex->is_array ? 1 : 0);
+   nir_def *c = nir_f2f32(b, nir_trim_vector(b, tex->src[coord_idx].src.ssa,
+                                             comps));
+   nir_def *dx = agx_nir_quad_ddx(b, c);
+   nir_def *dy = agx_nir_quad_ddy(b, c);
+
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+      nir_def *abs_p = nir_fabs(b, c);
+      nir_def *abs_x = nir_channel(b, abs_p, 0);
+      nir_def *abs_y = nir_channel(b, abs_p, 1);
+      nir_def *abs_z = nir_channel(b, abs_p, 2);
+      nir_def *cond_z = nir_fge(b, abs_z, nir_fmax(b, abs_x, abs_y));
+      nir_def *cond_y = nir_fge(b, abs_y, nir_fmax(b, abs_x, abs_z));
+      const unsigned yzx[3] = {1, 2, 0};
+      const unsigned xzy[3] = {0, 2, 1};
+      nir_def *q = nir_bcsel(b, cond_z, c,
+                             nir_bcsel(b, cond_y, nir_swizzle(b, c, xzy, 3),
+                                       nir_swizzle(b, c, yzx, 3)));
+      nir_def *dqdx = nir_bcsel(b, cond_z, dx,
+                                nir_bcsel(b, cond_y, nir_swizzle(b, dx, xzy, 3),
+                                          nir_swizzle(b, dx, yzx, 3)));
+      nir_def *dqdy = nir_bcsel(b, cond_z, dy,
+                                nir_bcsel(b, cond_y, nir_swizzle(b, dy, xzy, 3),
+                                          nir_swizzle(b, dy, yzx, 3)));
+      nir_def *recip = nir_frcp(b, nir_channel(b, q, 2));
+      nir_def *qxy = nir_trim_vector(b, q, 2);
+      nir_def *fdx = nir_fmul(
+         b, recip,
+         nir_fsub(b, nir_trim_vector(b, dqdx, 2),
+                  nir_fmul(b, qxy, nir_fmul(b, nir_channel(b, dqdx, 2), recip))));
+      nir_def *fdy = nir_fmul(
+         b, recip,
+         nir_fsub(b, nir_trim_vector(b, dqdy, 2),
+                  nir_fmul(b, qxy, nir_fmul(b, nir_channel(b, dqdy, 2), recip))));
+      nir_def *m = nir_fmax(b, nir_fdot(b, fdx, fdx), nir_fdot(b, fdy, fdy));
+      nir_def *l = nir_channel(b, size, 0);
+      return nir_fadd_imm(
+         b, nir_fmul_imm(b, nir_flog2(b, nir_fmul(b, nir_fmul(b, l, l), m)), 0.5),
+         -1.0);
+   }
+
+   nir_def *s = nir_trim_vector(b, size, comps);
+   nir_def *sx = nir_fmul(b, dx, s);
+   nir_def *sy = nir_fmul(b, dy, s);
+   nir_def *rho2 = nir_fmax(b, nir_fdot(b, sx, sx), nir_fdot(b, sy, sy));
+   return nir_fmul_imm(b, nir_flog2(b, rho2), 0.5);
+}
+
+static bool
+lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
+                        const struct lower_descriptors_ctx *ctx)
+{
+   if (tex->op != nir_texop_lod || ctx->descriptor_generation != 9 ||
+       b->shader->info.stage != MESA_SHADER_COMPUTE ||
+       b->shader->info.derivative_group == DERIVATIVE_GROUP_NONE ||
+       agx_nir_compute_implicit_lod_diagnostic())
+      return false;
+
+   const int sampler_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (sampler_idx < 0 || coord_idx < 0)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   const unsigned size_comps =
+      (tex->sampler_dim == GLSL_SAMPLER_DIM_1D ? 1
+       : tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3 : 2) +
+      (tex->is_array ? 1 : 0);
+   nir_def *size = nir_build_texture_query(b, tex, nir_texop_txs, size_comps,
+                                           nir_type_int32, false, true);
+   nir_def *levels = nir_build_texture_query(b, tex, nir_texop_query_levels, 1,
+                                             nir_type_int32, false, false);
+   lower_tex(b, nir_instr_as_tex(nir_def_instr(size)), ctx);
+   lower_tex(b, nir_instr_as_tex(nir_def_instr(levels)), ctx);
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_deref_instr *sampler = nir_src_as_deref(tex->src[sampler_idx].src);
+   const int plane_idx = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   const uint32_t plane =
+      plane_idx >= 0 ? nir_src_as_uint(tex->src[plane_idx].src) : 0;
+   const struct hk_sampled_image_descriptor_layout native =
+      hk_sampled_image_descriptor_layout(ctx->descriptor_generation);
+   const uint64_t plane_offset_B = plane * native.stride;
+
+   nir_def *index = load_resource_deref_desc(
+      b, 1, 16, sampler, plane_offset_B + native.sampler_index, ctx);
+   nir_def *api_bias = load_resource_deref_desc(
+      b, 1, 32, sampler,
+      plane_offset_B + native.sampler +
+         offsetof(struct hk_sampled_image_descriptor_sw, g17p.lod_bias),
+      ctx);
+   nir_def *heap = load_root(
+      b, 1, 64, nir_imm_int(b, hk_root_descriptor_offset(sampler_heap_address)),
+      8);
+   nir_def *addr = nir_iadd(
+      b, heap,
+      nir_imul_imm(b, nir_u2u64(b, index),
+                   agx_chip_sampler_heap_element_size(AGX_CHIP_G17P)));
+   nir_def *word = load_speculatable(b, 1, 32, addr, 8);
+   nir_def *min_lod =
+      nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, word, 0x3ff)), 1.0 / 64.0);
+   nir_def *max_lod = nir_fmul_imm(
+      b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, word, 10), 0x3ff)),
+      1.0 / 64.0);
+   nir_def *mip_filter = nir_iand_imm(b, nir_ushr_imm(b, word, 27), 3);
+
+   nir_def *lambda = nir_fadd(
+      b, compute_lod_lambda(b, tex, nir_i2f32(b, size)), api_bias);
+   nir_def *clamped = nir_fclamp(b, lambda, min_lod, max_lod);
+   nir_def *nearest =
+      nir_fadd_imm(b, nir_fceil(b, nir_fadd_imm(b, clamped, 0.5)), -1.0);
+   nir_def *level = nir_bcsel(
+      b, nir_ieq_imm(b, mip_filter, AGX_MIP_FILTER_NEAREST), nearest,
+      nir_bcsel(b, nir_ieq_imm(b, mip_filter, AGX_MIP_FILTER_LINEAR), clamped,
+                nir_imm_float(b, 0.0)));
+   nir_def *last = nir_i2f32(b, nir_iadd_imm(b, levels, -1));
+   level = nir_fclamp(b, level, nir_imm_float(b, 0.0), last);
+
+   nir_def *result = nir_vec2(b, level, lambda);
+   if (tex->def.bit_size != 32)
+      result = nir_f2fN(b, result, tex->def.bit_size);
+   nir_def_replace(&tex->def, result);
+   return true;
+}
+
+static bool
+lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx)
 {
+   if (lower_compute_lod_query(b, tex, ctx))
+      return true;
+
    b->cursor = nir_before_instr(&tex->instr);
 
    nir_def *texture = nir_steal_tex_src(tex, nir_tex_src_texture_deref);

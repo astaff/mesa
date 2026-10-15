@@ -874,6 +874,8 @@ hk_get_device_features(
        * inside divergent control flow.  The ordinary subgroup quad shuffles
        * exposed below do not establish that stronger execution guarantee. */
       features->shaderQuadControl = false;
+      features->computeDerivativeGroupQuads = true;
+      features->computeDerivativeGroupLinear = true;
    }
 
    /* A multiview promise for a stage this device does not expose is
@@ -1203,6 +1205,7 @@ hk_get_device_properties(const struct agx_device *dev,
          VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
          VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR,
       .subgroupQuadOperationsInAllStages = true,
+      .meshAndTaskShaderDerivatives = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
       .maxMultiviewViewCount = HK_MAX_MULTIVIEW_VIEW_COUNT,
       .maxMultiviewInstanceIndex = UINT32_MAX,
@@ -1747,6 +1750,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       /* This extension controls divergent quad derivatives, not the standard
        * subgroup quad shuffle operations exposed above. */
       supported_extensions.KHR_shader_quad_control = false;
+      supported_extensions.KHR_compute_shader_derivatives = true;
    }
 
    struct vk_features supported_features;

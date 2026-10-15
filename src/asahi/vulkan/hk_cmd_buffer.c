@@ -1273,6 +1273,10 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
 
    root->root_desc_addr = root_ptr.gpu;
    root->printf_buffer_address = dev->dev.printf_buffer_address;
+   root->sampler_heap_address =
+      dev->samplers.table.bo && dev->samplers.table.bo->va
+         ? dev->samplers.table.bo->va->addr
+         : 0;
 
    /* Dynamic buffers past the highest one ever bound are read by no bound
     * layout: copy the table around them. */
