@@ -185,6 +185,10 @@ main()
          status |= HK_AGX3_LEAF_NONFINITE;
       if (lo[a] > hi[a])
          status |= HK_AGX3_LEAF_RANGE;
+      if (extent[a] == 0.0) {
+         hi[a] = lo[a] + max(abs(lo[a]), 1.0) * 1.52587890625e-05;
+         extent[a] = hi[a] - lo[a];
+      }
    }
    precise float xy = extent.x * extent.y;
    precise float xz = extent.x * extent.z;
