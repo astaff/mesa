@@ -800,45 +800,66 @@ hk_sparse_image_opaque_bind_memory(
 {
    VK_FROM_HANDLE(hk_image, image, bind->image);
 
-   struct hk_bind_builder b =
-      hk_bind_builder(device, &image->vk.base, image->planes[0].va, NULL,
-                      image);
+   for (unsigned p = 0; p < image->plane_count; ++p) {
+      struct hk_image_plane *plane = &image->planes[p];
+      const uint64_t plane_start = plane->offset_B;
+      const uint64_t plane_end = plane_start + plane->va->size_B;
 
-   for (uint32_t i = 0; i < bind->bindCount; ++i) {
-      struct hk_device_memory *mem = NULL;
-      if (bind->pBinds[i].memory != VK_NULL_HANDLE)
-         mem = hk_device_memory_from_handle(bind->pBinds[i].memory);
+      struct hk_bind_builder b =
+         hk_bind_builder(device, &image->vk.base, plane->va, NULL, image);
 
-      VkDeviceSize resourceOffset = bind->pBinds[i].resourceOffset;
+      for (uint32_t i = 0; i < bind->bindCount; ++i) {
+         struct hk_device_memory *mem = NULL;
+         if (bind->pBinds[i].memory != VK_NULL_HANDLE)
+            mem = hk_device_memory_from_handle(bind->pBinds[i].memory);
 
-      /* Conceptually, the miptail is a single region at the end of the image,
-       * possibly layered. However, due to alignment requirements we need to
-       * use a non-layered miptail and internally fan out to each of the layers.
-       * This is facilitated by the HK_MIP_TAIL_START_OFFSET magic offset, see
-       * the comment where that is defined for more detail.
-       */
-      if (resourceOffset >= HK_MIP_TAIL_START_OFFSET) {
-         assert(resourceOffset == HK_MIP_TAIL_START_OFFSET &&
-                "must bind whole miptail... maybe...");
+         VkDeviceSize resourceOffset = bind->pBinds[i].resourceOffset;
 
-         const struct ail_layout *layout = &image->planes[0].layout;
-         unsigned tail_offset_B =
-            layout->level_offsets_B[layout->mip_tail_first_lod];
+         /* Conceptually, the miptail is a single region at the end of the
+          * image, possibly layered. However, due to alignment requirements we
+          * need to use a non-layered miptail and internally fan out to each of
+          * the layers. This is facilitated by the HK_MIP_TAIL_START_OFFSET
+          * magic offset, see the comment where that is defined for more
+          * detail.
+          */
+         if (resourceOffset >= HK_MIP_TAIL_START_OFFSET) {
+            if (p != 0)
+               continue;
+            assert(resourceOffset == HK_MIP_TAIL_START_OFFSET &&
+                   "must bind whole miptail... maybe...");
 
-         for (unsigned z = 0; z < layout->depth_px; ++z) {
-            uint64_t image_offs = tail_offset_B + (z * layout->layer_stride_B);
-            uint64_t mem_offs =
-               bind->pBinds[i].memoryOffset + (z * layout->mip_tail_stride);
+            const struct ail_layout *layout = &plane->layout;
+            unsigned tail_offset_B =
+               layout->level_offsets_B[layout->mip_tail_first_lod];
 
-            hk_add_bind(&b, mem, image_offs, layout->mip_tail_stride, mem_offs);
+            for (unsigned z = 0; z < layout->depth_px; ++z) {
+               uint64_t image_offs =
+                  tail_offset_B + (z * layout->layer_stride_B);
+               uint64_t mem_offs = bind->pBinds[i].memoryOffset +
+                                   (z * layout->mip_tail_stride);
+
+               hk_add_bind(&b, mem, image_offs, layout->mip_tail_stride,
+                           mem_offs);
+            }
+            continue;
          }
-      } else {
-         hk_add_bind(&b, mem, bind->pBinds[i].resourceOffset,
-                     bind->pBinds[i].size, bind->pBinds[i].memoryOffset);
+
+         const uint64_t start = MAX2(resourceOffset, plane_start);
+         const uint64_t end =
+            MIN2(resourceOffset + bind->pBinds[i].size, plane_end);
+         if (start >= end)
+            continue;
+
+         hk_add_bind(&b, mem, start - plane_start, end - start,
+                     bind->pBinds[i].memoryOffset + (start - resourceOffset));
       }
+
+      VkResult result = hk_bind_builder_finish(&b);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
-   return hk_bind_builder_finish(&b);
+   return VK_SUCCESS;
 }
 
 static void
