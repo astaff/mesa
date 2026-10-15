@@ -1899,6 +1899,11 @@ vtn_storage_class_to_mode(struct vtn_builder *b,
       mode = vtn_variable_mode_hit_attrib;
       nir_mode = nir_var_ray_hit_attrib;
       break;
+   case SpvStorageClassHitObjectAttributeNV:
+   case SpvStorageClassHitObjectAttributeEXT:
+      mode = vtn_variable_mode_private;
+      nir_mode = nir_var_shader_temp;
+      break;
    case SpvStorageClassShaderRecordBufferKHR:
       mode = vtn_variable_mode_shader_record;
       nir_mode = nir_var_mem_constant;
@@ -2139,6 +2144,12 @@ vtn_type_is_ray_query(struct vtn_type *type)
    return vtn_type_without_array(type)->base_type == vtn_base_type_ray_query;
 }
 
+static bool
+vtn_type_is_hit_object(struct vtn_type *type)
+{
+   return vtn_type_without_array(type)->base_type == vtn_base_type_hit_object;
+}
+
 static void
 vtn_create_variable(struct vtn_builder *b, struct vtn_value *val,
                     struct vtn_type *ptr_type, struct vtn_type *data_type,
@@ -2237,6 +2248,7 @@ vtn_create_variable(struct vtn_builder *b, struct vtn_value *val,
       var->var->data.mode = nir_mode;
       var->var->data.location = -1;
       var->var->data.ray_query = vtn_type_is_ray_query(var->type);
+      var->var->data.hit_object = vtn_type_is_hit_object(var->type);
       var->var->interface_type = NULL;
       break;
 

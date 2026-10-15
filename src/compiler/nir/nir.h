@@ -249,8 +249,30 @@ typedef enum {
    nir_ray_query_value_flags,
    nir_ray_query_value_world_ray_direction,
    nir_ray_query_value_world_ray_origin,
-   nir_ray_query_value_intersection_triangle_vertex_positions
+   nir_ray_query_value_intersection_triangle_vertex_positions,
+   nir_ray_query_value_intersection_instance_address
 } nir_ray_query_value;
+
+typedef enum {
+   nir_hit_object_value_kind,
+   nir_hit_object_value_ray_flags,
+   nir_hit_object_value_sbt_record_index,
+   nir_hit_object_value_world_ray_origin,
+   nir_hit_object_value_tmin,
+   nir_hit_object_value_world_ray_direction,
+   nir_hit_object_value_tmax,
+   nir_hit_object_value_primitive_index,
+   nir_hit_object_value_geometry_index,
+   nir_hit_object_value_instance_id,
+   nir_hit_object_value_instance_custom_index,
+   nir_hit_object_value_hit_kind,
+   nir_hit_object_value_object_ray_origin,
+   nir_hit_object_value_object_ray_direction,
+   nir_hit_object_value_object_to_world,
+   nir_hit_object_value_world_to_object,
+   nir_hit_object_value_shader_record_buffer_handle,
+   nir_hit_object_value_triangle_vertex_positions
+} nir_hit_object_value;
 
 /**
  * Intel resource flags
@@ -559,6 +581,8 @@ typedef struct nir_variable {
        * Is the variable a ray query?
        */
       unsigned ray_query : 1;
+
+      unsigned hit_object : 1;
 
       /**
        * Precision qualifier.
