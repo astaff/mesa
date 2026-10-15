@@ -36,6 +36,6 @@ agx_nir_gen1_load_candidate(struct nir_builder *b, nir_def *query,
 nir_def *agx_nir_gen1_candidate_instance_pointer(struct nir_builder *b,
                                                 nir_def *query, nir_def *lane);
 
-void agx_nir_gen1_refill_candidate_queue(struct nir_builder *b, nir_def *query,
+nir_def *agx_nir_gen1_refill_candidate_queue(struct nir_builder *b, nir_def *query,
                                         nir_def *lane, nir_def *id,
                                         nir_def *best_distance);

@@ -303,6 +303,14 @@ hk_nir_has_ray_query(nir_shader *nir)
    nir_foreach_function_impl(impl, nir) {
       if (hk_cf_list_has_ray_query(&impl->body))
          return true;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_intersect_ray_gen1_agx)
+               return true;
+         }
+      }
    }
    return false;
 }
@@ -3378,7 +3386,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * variants) run per-draw uniform work once in a native vertex constant
     * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
    const bool vs_cprog = dev->dev.chip == AGX_CHIP_G17P && hw &&
-                         nir->info.stage == MESA_SHADER_VERTEX;
+                         nir->info.stage == MESA_SHADER_VERTEX &&
+                         (!shader->info.agx3_gen1_fragment_rq ||
+                          debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_CPROG_DIAGNOSTIC", false));
    bool compiled = vs_cprog &&
       hk_g17p_compile_vs_cprog(dev, &nir, &backend_key, shader);
    if (!compiled && dev->dev.chip == AGX_CHIP_G17P &&

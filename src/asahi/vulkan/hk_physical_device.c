@@ -1678,7 +1678,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    if (hk_g17p_rt_enabled(pdev->dev.chip)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
-      supported_extensions.KHR_ray_query = true;
+      supported_extensions.KHR_ray_query =
+         (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY) != 0;
       supported_extensions.KHR_ray_tracing_pipeline = true;
       supported_extensions.EXT_pipeline_library_group_handles = true;
       supported_extensions.KHR_ray_tracing_maintenance1 = true;

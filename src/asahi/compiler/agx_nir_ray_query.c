@@ -195,20 +195,23 @@ agx_nir_gen1_ray_core_words(nir_builder *b, nir_def *origin,
    words[1] = nir_vec4(b, o[2], d[2], t_max, control);
 }
 
-void
+nir_def *
 agx_nir_gen1_trace_opaque_with_status(nir_builder *b, nir_def *bvh, nir_def *request,
                          nir_def *query_base, nir_def *lane,
                          nir_def *launch, unsigned context_uniform, unsigned status_uniform)
 {
    nir_intersect_ray_gen1_agx(b, bvh, request, launch, nir_imm_int(b,0),
                              .base=context_uniform);
-   agx_nir_gen1_wait_traversal(b, query_base, lane, status_uniform);
+   return agx_nir_gen1_wait_traversal(b, query_base, lane, status_uniform);
 }
 
-void
+nir_def *
 agx_nir_gen1_wait_traversal(nir_builder *b, nir_def *query_base, nir_def *lane,
                            unsigned status_uniform)
 {
+   nir_variable *completed = nir_local_variable_create(b->impl,
+      glsl_bool_type(), "rq_traversal_completed");
+   nir_store_var(b, completed, nir_imm_true(b), 1);
    nir_def *pending = nir_load_scs_base_agx(b,1,16,
       nir_iadd(b,query_base,nir_ishl_imm(b,lane,3)),
       .base=263,.format=PIPE_FORMAT_R8_UINT,.component=4,.flags=8);
@@ -216,6 +219,9 @@ agx_nir_gen1_wait_traversal(nir_builder *b, nir_def *query_base, nir_def *lane,
    nir_def *status_address=nir_iadd(b,query_base,nir_ishl_imm(b,lane,3));
    status_address=nir_iadd(b,status_address,
                           nir_load_preamble(b,1,32,.base=status_uniform));
+   nir_variable *polls = nir_local_variable_create(b->impl, glsl_uint_type(),
+      "rq_traversal_polls");
+   nir_store_var(b, polls, nir_imm_int(b, AGX_GEN1_TRAVERSAL_POLL_BOUND), 1);
    nir_push_loop(b);
    nir_def *status=nir_load_scs_base_agx(b,1,16,status_address,
       .base=7,.format=PIPE_FORMAT_R8_UINT,.component=4,.flags=4);
@@ -225,9 +231,14 @@ agx_nir_gen1_wait_traversal(nir_builder *b, nir_def *query_base, nir_def *lane,
    nir_continue_ray_gen1_agx(b, nir_load_scs_thread_index_agx(b));
    status=nir_load_scs_base_agx(b,1,16,status_address,
       .base=7,.format=PIPE_FORMAT_R8_UINT,.component=4,.flags=8);
-   nir_break_if(b,nir_ieq_imm(b,nir_iand_imm(b,status,64),0));
+   nir_def *done = nir_ieq_imm(b,nir_iand_imm(b,status,64),0);
+   nir_store_var(b, completed, done, 1);
+   nir_def *poll = nir_iadd_imm(b, nir_load_var(b, polls), -1);
+   nir_store_var(b, polls, poll, 1);
+   nir_break_if(b, nir_ior(b, done, nir_ieq_imm(b, poll, 0)));
    nir_pop_loop(b,NULL);
    nir_pop_if(b,NULL);
+   return nir_load_var(b, completed);
 }
 
 void

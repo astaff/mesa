@@ -6528,9 +6528,10 @@ hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
 
    *key = (struct hk_fast_link_key_vs){
       .prolog.hw = (sw_vs == hw_vs),
-      .prolog.uniform_base = sw_vs->info.agx3_indexed_sampler_valid
-                                ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
-                                : 0,
+      .prolog.uniform_base = (sw_vs->info.agx3_indexed_sampler_valid
+                                 ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
+                                 : 0) +
+                             (sw_vs->info.agx3_gen1_fragment_rq ? 168 : 0),
 
       /* FIXME: handle pipeline robustness "properly" */
       .prolog.robustness.level =

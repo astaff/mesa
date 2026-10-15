@@ -10,7 +10,7 @@ struct gen1_rq_state {
    nir_variable *flags;
    nir_variable *query;
    nir_variable *as, *origin, *direction, *tmin, *tmax, *mask, *active;
-   nir_variable *result[4], *candidate[4], *started, *cursor;
+   nir_variable *result[4], *candidate[4], *started, *cursor, *refills;
 };
 
 static const struct glsl_type *
@@ -145,7 +145,7 @@ static void
 gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *cursor,
                      nir_deref_instr *flags,nir_deref_instr *minimum,
                      nir_deref_instr *result[4],nir_deref_instr *candidate[4],
-                     nir_variable *more)
+                     nir_deref_instr *refills,nir_variable *more)
 {
    nir_def *id=nir_load_scs_thread_index_agx(b),*lane=nir_iand_imm(b,id,31);
    nir_def *query=nir_iadd_imm(b,nir_imul_imm(b,nir_ushr_imm(b,id,5),304*32),0x2f8000);
@@ -183,10 +183,15 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
    nir_store_var(b,more,nir_imm_true(b),1);nir_jump(b,nir_jump_break);
    nir_pop_if(b,NULL);nir_pop_if(b,NULL);nir_pop_if(b,NULL);
    nir_push_else(b,NULL);
-   nir_push_if(b,nir_ieq_imm(b,nir_iand_imm(b,control,1),0));
+   nir_def *refill=nir_iadd_imm(b,nir_load_deref(b,refills),1);
+   nir_store_deref(b,refills,refill,1);
+   nir_push_if(b,nir_ior(b,nir_ieq_imm(b,nir_iand_imm(b,control,1),0),
+      nir_ugt_imm(b,refill,AGX_GEN1_CANDIDATE_REFILL_BOUND)));
    nir_store_deref(b,active,nir_imm_false(b),1);nir_jump(b,nir_jump_break);
    nir_pop_if(b,NULL);
-   agx_nir_gen1_refill_candidate_queue(b,query,lane,id,nir_channel(b,nir_load_deref(b,result[1]),2));
+   nir_def *completed=agx_nir_gen1_refill_candidate_queue(b,query,lane,id,nir_channel(b,nir_load_deref(b,result[1]),2));
+   nir_store_deref(b,active,completed,1);
+   nir_break_if(b,nir_inot(b,completed));
    nir_store_deref(b,cursor,nir_imm_int(b,0),1);
    nir_pop_if(b,NULL);nir_pop_loop(b,NULL);
 }
@@ -377,6 +382,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          gen1_rq_field_type(state->query->type, glsl_bool_type()), "rq_started");
       state->cursor = nir_local_variable_create(impl,
          gen1_rq_field_type(state->query->type, glsl_uint_type()), "rq_cursor");
+      state->refills = nir_local_variable_create(impl,
+         gen1_rq_field_type(state->query->type, glsl_uint_type()), "rq_refills");
       for (unsigned i = 0; i < 4; ++i)
          state->candidate[i] = nir_local_variable_create(impl,
             gen1_rq_field_type(state->query->type, glsl_uvec4_type()), "rq_candidate");
@@ -424,6 +431,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          result[i] = gen1_rq_field_deref(&b, query, state->result[i]);
       nir_deref_instr *started=gen1_rq_field_deref(&b,query,state->started);
       nir_deref_instr *cursor=gen1_rq_field_deref(&b,query,state->cursor);
+      nir_deref_instr *refills=gen1_rq_field_deref(&b,query,state->refills);
       nir_deref_instr *candidate[4];
       for(unsigned i=0;i<4;i++) candidate[i]=gen1_rq_field_deref(&b,query,state->candidate[i]);
       nir_def *value = NULL;
@@ -448,6 +456,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          }
          nir_store_deref(&b,started,nir_imm_false(&b),1);
          nir_store_deref(&b,cursor,nir_imm_int(&b,0),1);
+         nir_store_deref(&b,refills,nir_imm_int(&b,0),1);
          nir_store_deref(&b, flags, intr->src[2].ssa, 1);
          nir_store_deref(&b, as, intr->src[1].ssa, 1);
          nir_store_deref(&b, origin, intr->src[4].ssa, 7);
@@ -568,12 +577,14 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             .base=256,.format=PIPE_FORMAT_R32_UINT,.component=2);
          if(layout->candidates)
             nir_store_scs_indexed_agx(&b,nir_imm_int(&b,8),query,lane,.base=1792,.component=2);
-         agx_nir_gen1_trace_opaque_with_status(&b,selector,
+         nir_def *completed=agx_nir_gen1_trace_opaque_with_status(&b,selector,
             nir_load_preamble(&b,1,64,.base=layout->candidates ? 12 : 112),query,lane,
             nir_iadd_imm(&b,id,layout->launch_header),layout->candidates ? 123 : 126,layout->status_uniform);
          if(layout->candidates) {
             nir_store_deref(&b,started,nir_imm_true(&b),1);
+            nir_store_deref(&b,active,completed,1);
          } else {
+         nir_push_if(&b,completed);
          for(unsigned i=0;i<2;i++)
             nir_store_deref(&b,result[i],nir_load_scs_uniform_agx(&b,4,32,
                base,index,.base=16*i,.format=PIPE_FORMAT_R32_UINT,.component=0),15);
@@ -604,6 +615,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
                nir_channel(&b,packet,0),nir_channel(&b,packet,1),
                nir_channel(&b,ids,1),nir_channel(&b,ids,0)),15);
          }
+         nir_pop_if(&b,NULL);
          nir_store_deref(&b, active, nir_imm_false(&b), 1);
          }
          nir_push_else(&b, NULL);
@@ -612,7 +624,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          if (layout->candidates) {
             nir_pop_if(&b, NULL);
             nir_push_if(&b, nir_load_deref(&b, active));
-            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,more);
+            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,refills,more);
             nir_pop_if(&b, NULL);
          }
          nir_pop_if(&b, NULL);
@@ -831,7 +843,7 @@ agx_nir_gen1_candidate_instance_pointer(nir_builder *b, nir_def *query,
       nir_ior(b, half[0], nir_ishl_imm(b, half[1], 16)), half[2]);
 }
 
-void
+nir_def *
 agx_nir_gen1_refill_candidate_queue(nir_builder *b, nir_def *query,
                                    nir_def *lane, nir_def *id,
                                    nir_def *best_distance)
@@ -844,5 +856,5 @@ agx_nir_gen1_refill_candidate_queue(nir_builder *b, nir_def *query,
       nir_load_preamble(b, 1, 64, .base = 118), nir_ishl_imm(b, id, 5),
       .base = 24, .format = PIPE_FORMAT_R32_UINT, .component = 0);
    nir_continue_ray_gen1_agx(b, id, .base = 1);
-   agx_nir_gen1_wait_traversal(b, query, lane, 128);
+   return agx_nir_gen1_wait_traversal(b, query, lane, 128);
 }
