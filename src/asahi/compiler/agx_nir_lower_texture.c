@@ -565,7 +565,7 @@ buffer_format_group_src(nir_src *src, void *data)
    return true;
 }
 
-static bool
+static unsigned
 lower_buffer_format_group(nir_shader *shader, nir_tex_instr *first,
                           const struct agx_texture_lower_options *options)
 {
@@ -597,7 +597,7 @@ lower_buffer_format_group(nir_shader *shader, nir_tex_instr *first,
    }
 
    if (count < 4)
-      return false;
+      return 0;
 
    for (nir_instr *instr = nir_instr_next(&first->instr); instr != last;) {
       nir_instr *next = nir_instr_next(instr);
@@ -651,7 +651,7 @@ lower_buffer_format_group(nir_shader *shader, nir_tex_instr *first,
       nir_def_rewrite_uses(&tex[i]->def, value);
       nir_instr_remove(&tex[i]->instr);
    }
-   return true;
+   return count;
 }
 
 static bool
@@ -662,38 +662,38 @@ lower_buffer_format_groups(nir_shader *shader,
        options->sparse_buffer_residency || shader->info.stage != MESA_SHADER_COMPUTE)
       return false;
 
-   unsigned buffers = 0;
-   nir_foreach_function_impl(impl, shader) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type == nir_instr_type_tex) {
-               nir_tex_instr *tex = nir_instr_as_tex(instr);
-               buffers += buffer_format_group_tex(tex, tex);
-            }
-         }
-      }
-   }
-   if (buffers < 4)
-      return false;
-
    bool progress = false;
    nir_foreach_function_impl(impl, shader) {
-restart:
+      struct util_dynarray candidates;
+      util_dynarray_init(&candidates, NULL);
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_tex)
                continue;
             nir_tex_instr *tex = nir_instr_as_tex(instr);
-            if (buffer_format_group_tex(tex, tex) &&
-                lower_buffer_format_group(shader, tex, options)) {
-               progress = true;
-               nir_progress(true, impl, nir_metadata_none);
-               goto restart;
-            }
+            if (buffer_format_group_tex(tex, tex))
+               util_dynarray_append(&candidates, tex);
          }
       }
+
+      unsigned total = util_dynarray_num_elements(&candidates, nir_tex_instr *);
+      for (unsigned i = 0; total >= 4 && i < total;) {
+         nir_tex_instr *tex =
+            *util_dynarray_element(&candidates, nir_tex_instr *, i);
+         unsigned count = lower_buffer_format_group(shader, tex, options);
+         if (count) {
+            assert(count <= total - i);
+            progress = true;
+            nir_progress(true, impl, nir_metadata_none);
+            i += count;
+         } else {
+            ++i;
+         }
+      }
+      util_dynarray_fini(&candidates);
       nir_progress(progress, impl, nir_metadata_none);
    }
+
    return progress;
 }
 

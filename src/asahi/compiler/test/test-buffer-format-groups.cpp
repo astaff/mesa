@@ -172,6 +172,7 @@ struct BufferGraphEvaluator {
             case nir_op_u2u32:
             case nir_op_u2u64: result[c] = src(0); break;
             case nir_op_uge: result[c] = src(0) >= src(1); break;
+            case nir_op_ieq: result[c] = src(0) == src(1); break;
             case nir_op_ine: result[c] = src(0) != src(1); break;
             case nir_op_iand: result[c] = src(0) & src(1); break;
             case nir_op_inot: result[c] = ~src(0); break;
@@ -463,4 +464,57 @@ TEST(BufferFormatGroups, PureHandlesRequireTheSameHeapAndOffset)
       EXPECT_TRUE(format_choices(b.shader).empty());
       ralloc_free(b.shader);
    }
+}
+
+TEST(BufferFormatGroups, WalksOriginalSequencesAcrossControlFlow)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &agx_nir_options, "groups across control flow");
+   nir_def *input = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *handle = nir_imm_int(&b, 7);
+   nir_def *lod = nir_imm_int(&b, 0);
+   nir_if *nif = nir_push_if(&b, nir_ieq_imm(&b, nir_iand_imm(&b, input, 1), 0));
+   for (unsigned path = 0; path < 2; ++path) {
+      if (path)
+         nir_push_else(&b, nif);
+      for (unsigned g = 0; g < (path ? 5u : 3u); ++g) {
+         unsigned count = (g & 1) ? 8 : 4;
+         std::vector<nir_def *> reads;
+         for (unsigned i = 0; i < count; ++i)
+            reads.push_back(&buffer_fetch(&b, handle, nir_iadd_imm(&b, input, 16*g+i), lod)->def);
+         for (unsigned i = 0; i < count; ++i)
+            nir_store_global(&b, reads[i], nir_imm_int64(&b, 0x200000+256*g+16*i));
+      }
+   }
+   nir_pop_if(&b, nif);
+   lower_buffer_shader(b.shader);
+   ASSERT_EQ(format_choices(b.shader).size(), 8u);
+   for (bool rgb : {false, true}) {
+      for (uint32_t elements : {0u, 1u, 37u, UINT32_MAX}) {
+         for (uint32_t tail : {0u, 1u, 0xfffffffcu}) {
+            for (uint32_t index : {0u, 1u, 17u, UINT32_MAX}) {
+               BufferGraphEvaluator eval;
+               eval.index = index; eval.elements = elements;
+               eval.tail = tail; eval.rgb32 = rgb;
+               eval.list(&nir_shader_get_entrypoint(b.shader)->body);
+               unsigned output = 0;
+               for (unsigned g = 0; g < ((index & 1) ? 5u : 3u); ++g) {
+                  for (unsigned i = 0; i < ((g & 1) ? 8u : 4u); ++i) {
+                     uint32_t coord = index+16*g+i;
+                     bool raw = rgb && coord < elements;
+                     uint32_t adjusted = coord+tail;
+                     uint64_t word = uint32_t(adjusted*3u);
+                     ASSERT_LT(output, eval.outputs.size());
+                     for (unsigned c = 0; c < 4; ++c) {
+                        uint32_t expected = raw ? (c < 3 ? BufferGraphEvaluator::raw_word(word+c) : 1u) : BufferGraphEvaluator::texture_word(coord >= elements ? UINT32_MAX : adjusted, c);
+                        EXPECT_EQ(eval.outputs[output][c], expected);
+                     }
+                     ++output;
+                  }
+               }
+               EXPECT_EQ(eval.outputs.size(), output);
+            }
+         }
+      }
+   }
+   ralloc_free(b.shader);
 }
