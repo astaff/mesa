@@ -11,7 +11,8 @@ bool
 agx3_analyze_preamble_uniform_inputs(agx_context *ctx, bool *has_inputs)
 {
    if (!has_inputs || !ctx->is_preamble || !ctx->num_blocks ||
-       ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+       (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+        ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C))
       return false;
 
    struct uniform_block {
@@ -125,7 +126,8 @@ fail:
 bool
 agx3_lower_uniform_half_exports(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B || !ctx->is_preamble)
+   if ((ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+        ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C) || !ctx->is_preamble)
       return false;
 
    bool occupied[512] = {false};

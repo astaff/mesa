@@ -662,7 +662,9 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
    b->shader->info.stage = MESA_SHADER_FRAGMENT;
    b->shader->info.name = "FS epilog";
 
-   struct agx_tilebuffer_layout tib = agx_build_tilebuffer_layout_with_limits(
+   struct agx_tilebuffer_layout tib =
+      (key->native_imageblock ? agx_build_tilebuffer_layout_for_imageblock
+                             : agx_build_tilebuffer_layout_with_limits)(
       key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples, true,
       key->max_sample_size_B, key->max_bytes_per_tile, key->max_samples_per_tile);
 
@@ -1249,6 +1251,8 @@ struct lower_epilog_ctx {
    struct agx_fs_epilog_link_info *info;
    nir_variable *masked_samples;
    bool preserve_early_demote;
+   bool preserve_memory_demote;
+   bool preserve_alpha_one;
 };
 
 static bool
@@ -1276,11 +1280,11 @@ lower_output_to_epilog(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    if (intr->intrinsic == nir_intrinsic_demote_samples &&
        (b->shader->info.fs.early_fragment_tests ||
+        (ctx->preserve_memory_demote && b->shader->info.writes_memory) ||
         (ctx->preserve_early_demote &&
-         (b->shader->info.writes_memory ||
-          (!b->shader->info.fs.uses_sample_shading &&
-           (b->shader->info.outputs_written &
-            BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK))))))) {
+         !b->shader->info.fs.uses_sample_shading &&
+         (b->shader->info.outputs_written &
+          BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK))))) {
 
       /* G17P carries the discard mask across the split for both early and
        * late tests. LSTCOL consumes it directly, and late DEPTHF must use it
@@ -1366,7 +1370,7 @@ lower_output_to_epilog(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       /* G17P's mixed-width MRT epilog cannot materialize the elided alpha
        * through AGX2's 16-bit immediate move. Keep it in the ordinary export
        * ABI, which is also what native multi-target shaders use. */
-      if (!ctx->preserve_early_demote && loc == 0 && c == 3 &&
+      if (!ctx->preserve_alpha_one && loc == 0 && c == 3 &&
           nir_scalar_is_const(s) &&
           nir_scalar_as_uint(s) == one_f) {
 
@@ -1384,11 +1388,14 @@ lower_output_to_epilog(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
 static bool
 lower_fs_output_to_epilog(nir_shader *s, struct agx_fs_epilog_link_info *out,
-                          bool preserve_early_demote)
+                          bool preserve_early_demote, bool preserve_memory_demote,
+                          bool preserve_alpha_one)
 {
    struct lower_epilog_ctx ctx = {
       .info = out,
       .preserve_early_demote = preserve_early_demote,
+      .preserve_memory_demote = preserve_memory_demote,
+      .preserve_alpha_one = preserve_alpha_one,
    };
 
    nir_shader_intrinsics_pass(s, lower_output_to_epilog,
@@ -1418,14 +1425,16 @@ bool
 agx_nir_lower_fs_output_to_epilog(nir_shader *s,
                                   struct agx_fs_epilog_link_info *out)
 {
-   return lower_fs_output_to_epilog(s, out, false);
+   return lower_fs_output_to_epilog(s, out, false, false, false);
 }
 
 bool
 agx_nir_lower_fs_output_to_epilog_for_device(
    nir_shader *s, enum agx_chip chip, struct agx_fs_epilog_link_info *out)
 {
-   return lower_fs_output_to_epilog(s, out, agx_chip_native_agx3(chip));
+   return lower_fs_output_to_epilog(
+      s, out, agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip),
+      agx_chip_native_agx3(chip), agx_chip_native_agx3(chip));
 }
 
 static bool
@@ -1650,7 +1659,7 @@ lower_g17p_tile_sample(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 bool
 agx_nir_lower_g17p_tile_samples(nir_shader *s, unsigned nr_samples)
 {
-   if (nr_samples != 1 && nr_samples != 2 && nr_samples != 4)
+   if (nr_samples != 1 && nr_samples != 2 && nr_samples != 4 && nr_samples != 8)
       return false;
 
    struct g17p_tile_sample_state state = {.samples = nr_samples};
@@ -1816,26 +1825,37 @@ agx_nir_fs_epilog_g17p(nir_builder *b, const void *key_)
  * and its epilog. Keep layout selection and the register-file limit together.
  */
 bool
-agx_nir_lower_g17p_sample_shading(nir_shader *nir,
-                                  struct agx_fs_epilog_link_info *link,
-                                  unsigned samples)
+agx_nir_lower_g17p_sample_shading_file(nir_shader *nir,
+                                       struct agx_fs_epilog_link_info *link,
+                                       unsigned samples, unsigned registers,
+                                       bool eight_samples)
 {
-   if (samples != 2 && samples != 4)
+   if (samples != 2 && samples != 4 && !(eight_samples && samples == 8))
       return false;
 
    struct agx_g17p_colour_layout layout;
    agx_g17p_colour_layout_init(&layout, link->loc_written, link->size_32,
                                link->colour_comps, false);
-   if (agx_g17p_sample_exports_end(&layout, samples) > AGX3B_NUM_REGS) {
+   if (agx_g17p_sample_exports_end(&layout, samples) > registers) {
       NIR_PASS(_, nir, agx_nir_pack_g17p_colour_exports, link);
       agx_g17p_colour_layout_init(&layout, link->loc_written, link->size_32,
                                   link->colour_comps, true);
    }
-   if (agx_g17p_sample_exports_end(&layout, samples) > AGX3B_NUM_REGS)
+   if (agx_g17p_sample_exports_end(&layout, samples) > registers)
       return false;
 
    NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
    NIR_PASS(_, nir, agx_nir_unroll_g17p_samples_layout, samples, &layout);
    nir->info.fs.uses_sample_shading = false;
    return true;
+}
+
+/* G17P: two or four samples within its 192-half register file. */
+bool
+agx_nir_lower_g17p_sample_shading(nir_shader *nir,
+                                  struct agx_fs_epilog_link_info *link,
+                                  unsigned samples)
+{
+   return agx_nir_lower_g17p_sample_shading_file(nir, link, samples,
+                                                 AGX3B_NUM_REGS, false);
 }

@@ -90,7 +90,7 @@ constant_use_accepts_uniform(agx_context *ctx, const agx_instr *I, unsigned s,
    if (agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s, uniform, size))
       return true;
 
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B || I->nr_srcs > 3 ||
+   if (I->nr_srcs > 3 ||
        uniform >= AGX_NUM_UNIFORMS)
       return false;
 
@@ -100,7 +100,41 @@ constant_use_accepts_uniform(agx_context *ctx, const agx_instr *I, unsigned s,
    candidate.src = sources;
    sources[s] = agx_replace_index(sources[s], agx_uniform(uniform, size));
    struct agx3_uniform_integer_desc desc;
-   return agx3_uniform_integer_instruction(&candidate, false, &desc);
+   return agx3_uniform_integer_for_encoding(ctx->key->dev.encoding,
+                                            &candidate, false, &desc);
+}
+
+/* The native R/U/U IMADD endpoint can promote two constants together.
+ * Probing C alone would falsely reject it before the multiplier is promoted.
+ * Do not admit the unwitnessed R/R/U endpoint to make that probe pass. */
+static bool
+m5_constant_mad_pair(agx_context *ctx, const agx_instr *I,
+                     const BITSET_WORD *is_immediate, unsigned uniform,
+                     unsigned *multiplier)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       I->op != AGX_OPCODE_IMAD || I->nr_srcs != 3 || uniform > 508 ||
+       I->src[0].type != AGX_INDEX_NORMAL ||
+       I->src[1].type != AGX_INDEX_NORMAL ||
+       I->src[2].type != AGX_INDEX_NORMAL ||
+       !BITSET_TEST(is_immediate, I->src[2].value))
+      return false;
+   const bool a = BITSET_TEST(is_immediate, I->src[0].value);
+   const bool b = BITSET_TEST(is_immediate, I->src[1].value);
+   if (a == b)
+      return false;
+   *multiplier = a ? 0 : 1;
+   agx_instr candidate = *I;
+   agx_index sources[3];
+   memcpy(sources, I->src, sizeof(sources));
+   candidate.src = sources;
+   sources[*multiplier] = agx_replace_index(
+      sources[*multiplier], agx_uniform(uniform, I->src[*multiplier].size));
+   sources[2] = agx_replace_index(sources[2],
+                                agx_uniform(uniform + 2, I->src[2].size));
+   struct agx3_uniform_integer_desc desc;
+   return agx3_uniform_integer_for_encoding(ctx->key->dev.encoding,
+                                            &candidate, false, &desc);
 }
 
 static void
@@ -133,6 +167,15 @@ pass(agx_context *ctx, void *memctx)
          BITSET_SET(is_immediate, I->dest[0].value);
          values[I->dest[0].value] = I->imm;
       } else {
+         unsigned multiplier;
+         if (m5_constant_mad_pair(ctx, I, is_immediate, probe_uniform,
+                                 &multiplier)) {
+            record_use(memctx, constants, values[I->src[multiplier].value],
+                       I->src[multiplier].size);
+            record_use(memctx, constants, values[I->src[2].value],
+                       I->src[2].size);
+            continue;
+         }
          agx_foreach_ssa_src(I, s) {
             if (BITSET_TEST(is_immediate, I->src[s].value) &&
                 constant_use_accepts_uniform(ctx, I, s, probe_uniform,
@@ -253,6 +296,21 @@ pass(agx_context *ctx, void *memctx)
 
    /* Promote in the IR */
    agx_foreach_instr_global(ctx, I) {
+      unsigned multiplier;
+      if (m5_constant_mad_pair(ctx, I, is_immediate, probe_uniform,
+                              &multiplier)) {
+         struct constant_info *m = _mesa_hash_table_u64_search(
+            constants, values[I->src[multiplier].value]);
+         struct constant_info *c = _mesa_hash_table_u64_search(
+            constants, values[I->src[2].value]);
+         if (m && c && m->promoted && c->promoted) {
+            /* Both values own aligned uniforms before either source changes. */
+            agx_replace_src(I, multiplier,
+                            agx_uniform(m->uniform, I->src[multiplier].size));
+            agx_replace_src(I, 2, agx_uniform(c->uniform, I->src[2].size));
+            continue;
+         }
+      }
       agx_foreach_ssa_src(I, s) {
          if (!BITSET_TEST(is_immediate, I->src[s].value))
             continue;

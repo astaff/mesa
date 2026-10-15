@@ -240,7 +240,8 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
    if (packed_ycbcr)
       p_format = packed_ycbcr == 8 ? PIPE_FORMAT_R8G8B8A8_UNORM :
                                     PIPE_FORMAT_R16G16B16A16_UNORM;
-   const bool padded_rgb = agx_native_graphics(&dev->dev) &&
+   const bool padded_rgb =
+      (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
                           hk_padded_image_format(p_format) != p_format;
    if (padded_rgb)
       p_format = hk_padded_image_format(p_format);
@@ -463,7 +464,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    unsigned layer = view->vk.base_array_layer;
 
    enum pipe_format p_format = format_for_plane(view, view_plane);
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       p_format = hk_padded_image_format(p_format);
       enum pipe_format integer = hk_scaled_texture_format(p_format);
       if (integer != PIPE_FORMAT_NONE)
@@ -479,7 +480,8 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    if (eot)
       p_format = util_format_linear(p_format);
 
-   if (eot && agx_native_graphics(&dev->dev))
+   if (eot && (agx_native_graphics(&dev->dev) ||
+                agx_chip_g17_m5(dev->dev.chip)))
       p_format = agx_g17p_rt0_pbe_format(p_format);
 
    const struct util_format_description *desc =
@@ -642,7 +644,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
        * sample count [62:63].  The
        * shader-side Gen9 decoder consumes this word independently of the
        * native PBE. */
-      if (atomic_sw_out && generation == 9 && !cfg.extended &&
+      if (atomic_sw_out && (generation == 9 || generation == 10) && !cfg.extended &&
           (layout->writeable_image || usage == HK_DESC_USAGE_EMRT)) {
          /* A linear image addresses texels through the native PBE's row
           * stride and is never layered here, so its sideband carries no tile
@@ -738,7 +740,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       if (!textures_valid)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-      if (agx_native_graphics(&dev->dev)) {
+      if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
          VkResult result = hk_descriptor_table_add(
             dev, &dev->sampled_images, &view->planes[p].sampled, 32,
             &view->planes[p].sampled_heap_index);
@@ -789,7 +791,8 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
          view->planes[p].emrt_pbe_valid = pack_pbe(
             dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
             &view->planes[p].emrt_atomic_sw);
-         if (agx_native_graphics(&dev->dev) &&
+         if ((agx_native_graphics(&dev->dev) ||
+              agx_chip_g17_m5(dev->dev.chip)) &&
              (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
              view->planes[p].emrt_pbe_valid) {
             const struct ail_layout *layout =
@@ -854,7 +857,7 @@ hk_DestroyImageView(VkDevice _device, VkImageView imageView,
    if (!view)
       return;
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       for (unsigned p = 0; p < view->plane_count; ++p) {
          if (view->planes[p].emrt_read_heap_index)
             hk_descriptor_table_remove(dev, &dev->sampled_images,

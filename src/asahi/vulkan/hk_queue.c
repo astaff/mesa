@@ -118,6 +118,7 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
    size_t len = cs->stream_linked ? 65536 /* XXX */ : (cs->current - cs->start);
 
    *cmd = (struct drm_asahi_cmd_compute){
+      .flags = cs->m5_matrix_ops ? DRM_ASAHI_COMPUTE_USES_MATRIX : 0,
       .cdm_ctrl_stream_base = cs->addr,
       .cdm_ctrl_stream_end = cs->addr + len,
 
@@ -195,8 +196,12 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
-   if (agx_native_graphics(&dev->dev)) {
-      c->isp_zls_pixels = hk_drm_g17p_zls_pixels(
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+      c->isp_zls_pixels = agx_chip_g17_m5(dev->dev.chip)
+         ? hk_drm_m5_zls_pixels(
+              cs->cr.zls_width, cs->cr.zls_height, cs->cr.depth.buffer,
+              cs->cr.depth.meta, cs->cr.stencil.buffer, cs->cr.stencil.meta)
+         : hk_drm_g17p_zls_pixels(
          cs->cr.zls_width, cs->cr.zls_height, cs->cr.depth.buffer,
          cs->cr.depth.meta, cs->cr.stencil.buffer, cs->cr.stencil.meta);
       c->isp_bgobjdepth = hk_drm_g17p_depth_clear(
@@ -226,7 +231,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
     * render pass whose known primitive count is at most four, and never for
     * a continued pass or one with uncounted (indirect, mesh) work. This
     * stream's bound counts every draw of the whole pass, so it proves that. */
-   if (agx_native_graphics(&dev->dev) &&
+   if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
        cs->g17p_pass_begins && cs->g17p_pass_ends &&
        cs->g17p_primitive_bound <= 4) {
@@ -424,9 +429,37 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
    if (dev->dev.is_virtio)
       u_rwlock_rdunlock(&dev->external_bos.lock);
 
-   if (ret)
+   if (ret) {
+      /* Opt-in diagnostic: preserve the exact rejected submission so the
+       * kernel's validation can be replayed offline. No effect unless set. */
+      const char *dump = os_get_option("ASAHI_SUBMIT_DUMP_ON_ERROR");
+      if (dump && *dump) {
+         const int err = errno;
+         static unsigned seq;
+         char path[512];
+         snprintf(path, sizeof(path), "%s/submit-%d-%u.bin", dump, (int)getpid(),
+                  p_atomic_inc_return(&seq));
+         FILE *f = fopen(path, "wb");
+         if (f) {
+            /* Header: errno, struct size, then the ioctl struct, the command
+             * stream, and the sync array (16 bytes per entry). */
+            const uint32_t hdr[4] = {(uint32_t)err, sizeof(*submit),
+                                     submit->cmdbuf_size,
+                                     submit->in_sync_count + submit->out_sync_count};
+            fwrite(hdr, sizeof(hdr), 1, f);
+            fwrite(submit, sizeof(*submit), 1, f);
+            fwrite((const void *)(uintptr_t)submit->cmdbuf, 1, submit->cmdbuf_size, f);
+            if (submit->syncs)
+               fwrite((const void *)(uintptr_t)submit->syncs,
+                      sizeof(struct drm_asahi_sync), hdr[3], f);
+            fclose(f);
+            mesa_loge("hk: rejected submission (errno %d) saved to %s", err, path);
+         }
+         errno = err;
+      }
       return vk_device_set_lost(&dev->vk,
                                 "DRM_IOCTL_ASAHI_SUBMIT failed: %m");
+   }
 
    return VK_SUCCESS;
 }
@@ -592,7 +625,7 @@ hk_flush_bind(struct hk_bind_builder *b)
       op = (struct drm_asahi_gem_bind_op){
          .handle = b->dev->dev.scratch_bo->uapi_handle,
          .flags = DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE |
-                  DRM_ASAHI_BIND_SINGLE_PAGE,
+                  agx_fill_bind_flags(&b->dev->dev),
          .addr = b->va->addr + b->resourceOffset,
          .range = b->size,
       };
@@ -642,6 +675,11 @@ hk_sparse_buffer_map_commit(struct hk_bind_builder *b)
       const uint64_t pages = DIV_ROUND_UP(op->range, AIL_PAGESIZE);
       const bool resident =
          op->handle != b->dev->dev.scratch_bo->uapi_handle;
+
+      VkResult result = hk_update_physical_sparse_map(
+         b->dev, op->addr, op->range, !resident);
+      if (result != VK_SUCCESS)
+         return result;
 
       for (uint64_t page = 0; page < pages; ++page) {
          if (first + page >= b->buffer->sparse_map_entries)
@@ -1046,7 +1084,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       if (result != VK_SUCCESS)
          return result;
 
-      flush_sstt = dev->dev.chip == AGX_CHIP_G17P &&
+      flush_sstt = (dev->dev.chip == AGX_CHIP_G17P ||
+                    agx_chip_g17_m5(dev->dev.chip)) &&
                    hk_sparse_submission_updates_sstt(submit);
    }
 
@@ -1083,11 +1122,14 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       queue->sync.submitted[HK_SYNC_VDM], queue->sync.submitted[HK_SYNC_CDM],
    };
 
-   /* G17P permits independent engines and physical render queues to finish
+   /* Independent engines and physical render queues may finish
     * out of order. Publish API signals from the cumulative queue point after
     * the ioctl, preserving independent execution while covering earlier work.
     */
-   const bool cumulative_signals = dev->dev.chip == AGX_CHIP_G17P;
+   const bool cumulative_signals =
+      dev->dev.chip == AGX_CHIP_G17P ||
+      (agx_chip_g17_m5(dev->dev.chip) &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
    const unsigned kernel_signal_count =
       cumulative_signals ? 0 : submit->signal_count;
    unsigned wait_count = 0;
@@ -1248,6 +1290,25 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                    cs->timestamp.end.handle || cs->timestamp.start.handle);
 
             asahi_append_compute_attachments(dev, &payload, cs);
+            if (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES) {
+               /* The header size is 16 bits; never let it truncate. */
+               if (cs->compute_resources.size > UINT16_MAX) {
+                  util_dynarray_fini(&payload);
+                  return vk_device_set_lost(
+                     &dev->vk, "M5 compute resource list too large (%u bytes)",
+                     cs->compute_resources.size);
+               }
+               const struct drm_asahi_cmd_header resources = {
+                  .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
+                  .size = cs->compute_resources.size,
+                  .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+                  .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+               };
+               util_dynarray_append(&payload, resources);
+               util_dynarray_append_array(&payload, uint8_t,
+                                         cs->compute_resources.data,
+                                         cs->compute_resources.size);
+            }
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
             asahi_fill_cdm_command(dev, cs, &cmd.legacy);
             cmd.legacy.flags |= hk_as_build_flags(dev->dev.chip,
@@ -1264,6 +1325,20 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                cmd.intersection_first=1;cmd.intersection_count=112;
                cmd.intersection_default_program=UINT64_C(0x10010020000);
                cmd.intersection_default_control=UINT64_C(0x16000000000);
+            } else if (cs->m5_native_rq) {
+               header.size = sizeof(cmd);
+               cmd.scs_layout = dev->m5_rq_instances
+                  ? ((debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_PROBE", false) || debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false))
+                     ? UINT64_C(0x01140000600100e8) /* 276-entry IFT50 tail */
+                     : UINT64_C(0x00480000600100e8))
+                  : UINT64_C(0x0028000060000070);
+               cmd.cdm_auxiliary_allocation = 14;
+               cmd.intersection_pool = dev->m5_rq_ift->va->addr;
+               cmd.intersection_pool_bytes = 0x8000;
+               cmd.intersection_first = 1;
+               cmd.intersection_count = 112;
+               cmd.intersection_default_program = dev->m5_rq_default_program;
+               cmd.intersection_default_control = dev->m5_rq_default_control;
             }
             if (queue->sync.exact_prior) {
                header.size = sizeof(cmd);
@@ -1287,6 +1362,38 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                    cs->timestamp.end.handle || cs->timestamp.start.handle);
 
             asahi_append_fragment_attachments(dev, &payload, cs);
+            if (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES) {
+               /* V2 kernels take 104-byte drm_asahi_render_program_v2 records
+                * through command 7; the tile record is widened to match. */
+               const bool v2 = dev->dev.params.features &
+                               DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2;
+               const struct drm_asahi_render_program_v2 tile = {
+                  .legacy = cs->tile_resources};
+               const size_t tile_bytes =
+                  v2 ? sizeof(tile) : sizeof(cs->tile_resources);
+               /* The header size is 16 bits; never let it truncate. */
+               if (cs->render_resources.size + tile_bytes > UINT16_MAX) {
+                  util_dynarray_fini(&payload);
+                  return vk_device_set_lost(
+                     &dev->vk, "M5 render resource list too large (%u bytes)",
+                     cs->render_resources.size);
+               }
+               const struct drm_asahi_cmd_header resources = {
+                  .cmd_type = v2 ? DRM_ASAHI_SET_RENDER_RESOURCES_V2
+                                 : DRM_ASAHI_SET_RENDER_RESOURCES,
+                  .size = cs->render_resources.size + tile_bytes,
+                  .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+                  .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+               };
+               util_dynarray_append(&payload, resources);
+               util_dynarray_append_array(
+                  &payload, uint8_t,
+                  v2 ? (const void *)&tile : (const void *)&cs->tile_resources,
+                  tile_bytes);
+               util_dynarray_append_array(&payload, uint8_t,
+                                         cs->render_resources.data,
+                                         cs->render_resources.size);
+            }
             struct drm_asahi_cmd_render_with_prior cmd = {0};
             asahi_fill_vdm_command(dev, cs, &cmd.legacy);
 
@@ -1306,7 +1413,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                  cs->sync.prior[HK_SYNC_VDM] != 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
             header.size = hk_drm_render_command_size(
-               agx_native_graphics(&dev->dev), queue->sync.exact_prior);
+               agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
+               queue->sync.exact_prior);
             if (queue->sync.exact_prior) {
                cmd.prior_vdm = command_prior[HK_SYNC_VDM];
                cmd.prior_cdm = command_prior[HK_SYNC_CDM];
@@ -1450,9 +1558,18 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* High-priority scheduling still needs kernel qualification. */
+   /* On M5, quantize relative priorities to the two unprivileged firmware
+    * classes. An explicit global class takes precedence; the kernel checks
+    * permission for elevated classes. No scheduling work is needed during
+    * submission. Elsewhere high-priority scheduling still needs kernel
+    * qualification.
+    */
    enum drm_asahi_priority drm_priority = translate_priority(priority);
-   if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH) {
+   if (agx_chip_g17_m5(dev->dev.chip)) {
+      if (!priority_info &&
+          pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
+         drm_priority = DRM_ASAHI_PRIORITY_LOW;
+   } else if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH) {
       vk_free(&dev->vk.alloc, queue);
       return VK_ERROR_NOT_PERMITTED_EXT;
    }
@@ -1495,7 +1612,8 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
     * reusing point 1 lets it return before the first submit has completed. */
    queue->drm.timeline_value = initial_value;
 
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if ((dev->dev.chip == AGX_CHIP_G17P ||
+        agx_chip_g17_m5(dev->dev.chip)) &&
        dev->vk.enabled_features.sparseBinding) {
       queue->g17p_sstt_flush_bo =
          agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "SSTT flush stream");
@@ -1506,9 +1624,9 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
 
       uint8_t *stream = agx_bo_map(queue->g17p_sstt_flush_bo);
       if (!stream ||
-          !agx3_cdm_sstt_flush_invalidate_pack(AGX_CHIP_G17P, stream) ||
+          !agx3_cdm_sstt_flush_invalidate_pack(dev->dev.chip, stream) ||
           !agx3_cdm_stream_terminate_pack(
-             AGX_CHIP_G17P,
+             dev->dev.chip,
              stream + AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE)) {
          hk_queue_finish(dev, queue);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);

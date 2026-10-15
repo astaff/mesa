@@ -71,6 +71,9 @@ struct ail_layout {
     */
    bool mipmapped_z;
 
+   /** Sparse residency maps address whole pages within each layer. */
+   bool sparse_residency;
+
    /** Tiling mode used */
    enum ail_tiling tiling;
 

@@ -16,6 +16,7 @@
 
 #include "hk_acceleration_structure.h"
 #include "hk_host_as.h"
+#include "hk_m5_acceleration_structure.h"
 #include "asahi/compiler/agx3_rt_gen1_default.h"
 #include "asahi/compiler/agx3_rt_gen1_triangle.h"
 #include "asahi/compiler/agx3_rt_gen1_aabb.h"
@@ -281,6 +282,10 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
    const VkAccelerationStructureCreateInfoKHR *info,
    const VkAllocationCallbacks *alloc, VkAccelerationStructureKHR *out)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_CreateAccelerationStructureKHR(device, info, alloc, out);
+
    VK_FROM_HANDLE(hk_device, dev, device);
    VkAccelerationStructureCreateInfoKHR native_info;
    const VkDeviceAddress replay_address = dev->g17p_native_as ? info->deviceAddress : 0;
@@ -340,6 +345,12 @@ VKAPI_ATTR void VKAPI_CALL
 hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR handle,
                                    const VkAllocationCallbacks *alloc)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip)) {
+      hk_m5_backend_DestroyAccelerationStructureKHR(device, handle, alloc);
+      return;
+   }
+
    VK_FROM_HANDLE(hk_device, dev, device);
    VK_FROM_HANDLE(vk_acceleration_structure, as, handle);
    if (as && dev->g17p_native_as) {
@@ -401,9 +412,9 @@ hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd)
 }
 
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
-static_assert(sizeof(struct hk_agx3_leaf_args) == 24, "native node push ABI");
+static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
-static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
+static_assert(sizeof(struct hk_agx3_envelope_args) == 72, "native envelope push ABI");
 
 static_assert(sizeof(struct hk_bvh_triangle_node) == 48, "node format");
 static_assert(sizeof(struct hk_bvh_aabb_node) == 32, "node format");
@@ -462,6 +473,14 @@ VkResult
 hk_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
                         const struct hk_agx3_leaf_args *args)
 {
+   struct hk_agx3_leaf_args gen1_args = *args;
+   gen1_args.gen1 = 1;
+   args = &gen1_args;
+   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
+   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_cmd_encode_agx3_nodes(command_buffer, args);
+
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
@@ -493,6 +512,14 @@ VkResult
 hk_cmd_finalize_agx3_as(VkCommandBuffer command_buffer,
                        const struct hk_agx3_envelope_args *args)
 {
+   struct hk_agx3_envelope_args gen1_args = *args;
+   gen1_args.gen1 = 1;
+   args = &gen1_args;
+   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
+   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_cmd_finalize_agx3_as(command_buffer, args);
+
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
@@ -523,6 +550,14 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                         VkDeviceAddress node_status,
                         VkDeviceAddress envelope_status)
 {
+   struct hk_agx3_plan_args gen1_args = *args;
+   gen1_args.gen1 = 1;
+   args = &gen1_args;
+   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
+   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_cmd_build_agx3_from_ir(command_buffer, args, node_status, envelope_status);
+
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
@@ -652,7 +687,7 @@ static VkDeviceSize
 hk_agx3_retained_offset(const struct vk_acceleration_structure_build_state *state)
 {
    struct hk_agx3_as_layout layout;
-   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+   if (!hk_gen1_as_layout_init(state->leaf_node_count, &layout))
       return 0;
    return ALIGN_POT(layout.as_bytes - LIBAGX_GEN1_AS_ALIGNMENT_SLACK +
       (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
@@ -678,7 +713,7 @@ static VkDeviceSize
 hk_get_native_as_size(const struct vk_acceleration_structure_build_state *state)
 {
    struct hk_agx3_as_layout layout;
-   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+   if (!hk_gen1_as_layout_init(state->leaf_node_count, &layout))
       return 0;
    if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
       return hk_agx3_retained_offset(state) + sizeof(struct vk_ir_header) +
@@ -728,7 +763,7 @@ hk_get_encode_scratch_size(VkDevice _device,
 {
    VK_FROM_HANDLE(hk_device, dev, _device);
    struct hk_agx3_as_layout layout;
-   return dev->g17p_native_as && hk_agx3_as_layout_init(state->leaf_node_count, &layout)
+   return dev->g17p_native_as && hk_gen1_as_layout_init(state->leaf_node_count, &layout)
              ? layout.encode_bytes + ALIGN_POT(sizeof(struct vk_ir_header), 8) -
                   sizeof(struct vk_ir_header) : 0;
 }
@@ -744,6 +779,10 @@ VKAPI_ATTR VkDeviceAddress VKAPI_CALL
 hk_GetAccelerationStructureDeviceAddressKHR(
    VkDevice _device, const VkAccelerationStructureDeviceAddressInfoKHR *info)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_GetAccelerationStructureDeviceAddressKHR(_device, info);
+
    VK_FROM_HANDLE(hk_device, dev, _device);
    VK_FROM_HANDLE(vk_acceleration_structure, as, info->accelerationStructure);
    return dev->g17p_native_as ? hk_as_native_va(as) : vk_acceleration_structure_get_va(as);
@@ -920,7 +959,7 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
          VK_FROM_HANDLE(vk_acceleration_structure, dst,
                         state->build_info->dstAccelerationStructure);
          struct hk_agx3_as_layout native;
-         if (!hk_agx3_as_layout_init(state->leaf_node_count, &native)) {
+         if (!hk_gen1_as_layout_init(state->leaf_node_count, &native)) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
             return;
          }
@@ -983,7 +1022,7 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_agx3_as_layout layout;
-   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout)) {
+   if (!hk_gen1_as_layout_init(state->leaf_node_count, &layout)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
    }
@@ -999,6 +1038,7 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       phase == 1 ? state->build_info->srcAccelerationStructure : state->build_info->dstAccelerationStructure);
    uint64_t scratch = state->build_info->scratchData.deviceAddress;
    struct hk_agx3_refit_args args = {
+      .gen1 = 1,
       .retained = hk_as_native_va(retained_as) + hk_agx3_retained_offset(state),
       .metadata = phase == 1 ? hk_gen1_as_metadata_addr(cmd, retained_as) : 0,
       .intermediate_bvh = scratch + state->scratch.ir_offset,
@@ -1039,7 +1079,7 @@ hk_update_scratch_size(VkDevice device,
    /* Leaf generation writes sort IDs, which alias native encode scratch.
     * Keep live refit parent/counter state beyond both workspaces. */
    struct hk_agx3_as_layout layout;
-   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+   if (!hk_gen1_as_layout_init(state->leaf_node_count, &layout))
       return 0;
    return (VkDeviceSize)state->scratch.size + (uint64_t)layout.node_bound * 16;
 }
@@ -1596,6 +1636,9 @@ fail:
 VkResult
 hk_device_init_accel_struct_state(struct hk_device *dev)
 {
+   if (agx_chip_g17_m5(dev->dev.chip))
+      return hk_m5_backend_device_init_accel_struct_state(dev);
+
    /* The native state below is large and lives as long as the device: the
     * ray query program image with its fixed binds, the AS tables, and, through
     * gen1_native_graphics_rq/fragment_rq, a render SCS reservation in every
@@ -1755,6 +1798,12 @@ hk_GetAccelerationStructureBuildSizesKHR(
    const uint32_t *pMaxPrimitiveCounts,
    VkAccelerationStructureBuildSizesInfoKHR *pSizeInfo)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip)) {
+      hk_m5_backend_GetAccelerationStructureBuildSizesKHR(_device, buildType, pBuildInfo, pMaxPrimitiveCounts, pSizeInfo);
+      return;
+   }
+
    VK_FROM_HANDLE(hk_device, dev, _device);
 
    if (dev->g17p_native_as) {
@@ -1763,7 +1812,7 @@ hk_GetAccelerationStructureBuildSizesKHR(
          leaves += pMaxPrimitiveCounts[i];
       if (!leaves) {
          struct hk_agx3_as_layout layout;
-         hk_agx3_as_layout_init(0, &layout);
+         hk_gen1_as_layout_init(0, &layout);
          pSizeInfo->accelerationStructureSize = layout.as_bytes;
          pSizeInfo->buildScratchSize = 256;
          pSizeInfo->updateScratchSize = 256;
@@ -1885,7 +1934,7 @@ hk_cmd_build_acceleration_structures(
          if ((pInfos[i].mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR &&
               pInfos[i].mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) ||
              !compatible || (!triangles && !instances && !aabbs) || primitives > UINT32_MAX ||
-             !hk_agx3_as_layout_init(primitives, &native)) {
+             !hk_gen1_as_layout_init(primitives, &native)) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
             return;
          }
@@ -1973,6 +2022,13 @@ hk_CmdBuildAccelerationStructuresKHR(
    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
    const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
 {
+   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, commandBuffer);
+   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip)) {
+      hk_m5_backend_CmdBuildAccelerationStructuresKHR(commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+      return;
+   }
+
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
@@ -2023,6 +2079,12 @@ hk_GetDeviceAccelerationStructureCompatibilityKHR(
    VkDevice _device, const VkAccelerationStructureVersionInfoKHR *pVersionInfo,
    VkAccelerationStructureCompatibilityKHR *pCompatibility)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip)) {
+      hk_m5_backend_GetDeviceAccelerationStructureCompatibilityKHR(_device, pVersionInfo, pCompatibility);
+      return;
+   }
+
    VK_FROM_HANDLE(hk_device, dev, _device);
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
@@ -2045,6 +2107,13 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyAccelerationStructureKHR(
    VkCommandBuffer commandBuffer, const VkCopyAccelerationStructureInfoKHR *info)
 {
+   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, commandBuffer);
+   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip)) {
+      hk_m5_backend_CmdCopyAccelerationStructureKHR(commandBuffer, info);
+      return;
+   }
+
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(vk_acceleration_structure, src, info->src);
    VK_FROM_HANDLE(vk_acceleration_structure, dst, info->dst);
@@ -2137,6 +2206,13 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyAccelerationStructureToMemoryKHR(VkCommandBuffer commandBuffer,
    const VkCopyAccelerationStructureToMemoryInfoKHR *info)
 {
+   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, commandBuffer);
+   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip)) {
+      hk_m5_backend_CmdCopyAccelerationStructureToMemoryKHR(commandBuffer, info);
+      return;
+   }
+
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(vk_acceleration_structure, src, info->src);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -2162,6 +2238,13 @@ VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
    const VkCopyMemoryToAccelerationStructureInfoKHR *info)
 {
+   VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, commandBuffer);
+   struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip)) {
+      hk_m5_backend_CmdCopyMemoryToAccelerationStructureKHR(commandBuffer, info);
+      return;
+   }
+
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(vk_acceleration_structure, dst, info->dst);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -2358,6 +2441,10 @@ hk_BuildAccelerationStructuresKHR(
    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
    const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_BuildAccelerationStructuresKHR(_device, deferredOperation, infoCount, pInfos, ppBuildRangeInfos);
+
    VK_FROM_HANDLE(hk_device, dev, _device);
    struct hk_host_as_run run;
    VkResult result = hk_host_as_begin(dev, &run);
@@ -2447,6 +2534,10 @@ hk_CopyAccelerationStructureKHR(VkDevice _device,
                                 VkDeferredOperationKHR deferredOperation,
                                 const VkCopyAccelerationStructureInfoKHR *pInfo)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_CopyAccelerationStructureKHR(_device, deferredOperation, pInfo);
+
    VK_FROM_HANDLE(hk_device, dev, _device);
    struct hk_host_as_run run;
    VkResult result = hk_host_as_begin(dev, &run);
@@ -2463,6 +2554,10 @@ hk_CopyMemoryToAccelerationStructureKHR(
    VkDevice _device, VkDeferredOperationKHR deferredOperation,
    const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_CopyMemoryToAccelerationStructureKHR(_device, deferredOperation, pInfo);
+
    VK_FROM_HANDLE(hk_device, dev, _device);
    uint64_t bytes;
    memcpy(&bytes, (const uint8_t *)pInfo->src.hostAddress + 32, sizeof(bytes));
@@ -2495,6 +2590,10 @@ hk_CopyAccelerationStructureToMemoryKHR(
    VkDevice _device, VkDeferredOperationKHR deferredOperation,
    const VkCopyAccelerationStructureToMemoryInfoKHR *pInfo)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_CopyAccelerationStructureToMemoryKHR(_device, deferredOperation, pInfo);
+
    VK_FROM_HANDLE(hk_device, dev, _device);
    VK_FROM_HANDLE(vk_acceleration_structure, src, pInfo->src);
    struct hk_host_as_run run;
@@ -2534,6 +2633,10 @@ hk_WriteAccelerationStructuresPropertiesKHR(
    const VkAccelerationStructureKHR *pAccelerationStructures,
    VkQueryType queryType, size_t dataSize, void *pData, size_t stride)
 {
+   VK_FROM_HANDLE(hk_device, m5_dispatch_dev, _device);
+   if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
+      return hk_m5_backend_WriteAccelerationStructuresPropertiesKHR(_device, accelerationStructureCount, pAccelerationStructures, queryType, dataSize, pData, stride);
+
    VK_FROM_HANDLE(hk_device, dev, _device);
    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
    if (!accelerationStructureCount)

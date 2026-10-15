@@ -8,6 +8,7 @@
 
 #include "hk_native_descriptor_pack.h"
 #include "asahi/lib/agx_abi.h"
+#include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx_pbe_agx3_core.h"
 
 #include <assert.h>
@@ -469,7 +470,12 @@ check_layered_multisample_pbe(void)
    semantic.layers = 0;
    assert(!hk_pack_native_pbe(9, &packed, &semantic));
    semantic.layers = 12;
-   assert(!hk_pack_native_pbe(10, &packed, &semantic));
+   assert(hk_pack_native_pbe(10, &packed, &semantic));
+   memcpy(&word0, (const uint8_t *)packed.opaque, sizeof(word0));
+   memcpy(&word1, (const uint8_t *)packed.opaque + 8, sizeof(word1));
+   assert((word0 & 0xf) == 8);
+   assert(((word0 >> 58) & 3) == 0);
+   assert(((word1 >> 44) & 0xffff) == 11);
 }
 
 static void
@@ -494,7 +500,12 @@ check_captured_rgba8_lossless_pbe(void)
    struct hk_native_pbe_descriptor actual;
    assert(hk_pack_native_pbe(9, &actual, &p));
    assert(memcmp(&actual, expected, sizeof(expected)) == 0);
-   assert(!hk_pack_native_pbe(10, &actual, &p));
+   const uint64_t expected10[4] = {
+      UINT64_C(0x2001ff83ffe40a22), UINT64_C(0x8000001000008000),
+      UINT64_C(0x0000001000048000), 0,
+   };
+   assert(hk_pack_native_pbe(10, &actual, &p));
+   assert(memcmp(&actual, expected10, sizeof(expected10)) == 0);
    const struct AGX_PBE original = p;
 #define REJECT_COMPRESSED(change) do { p = original; change; \
    assert(!hk_pack_native_pbe(9, &actual, &p)); } while (0)
@@ -510,9 +521,56 @@ check_captured_rgba8_lossless_pbe(void)
 #undef REJECT_COMPRESSED
 }
 
+static void
+check_sparse_translation(void)
+{
+   const struct AGX_TEXTURE texture = {
+      AGX_TEXTURE_header,
+      .dimension = AGX_TEXTURE_DIMENSION_2D,
+      .layout = AGX_LAYOUT_GPU,
+      .channels = AGX_CHANNELS_R32,
+      .type = AGX_TEXTURE_TYPE_UINT,
+      .width = 128,
+      .height = 64,
+      .address = 0x80000,
+      .mode = AGX_IMAGE_MODE_SPARSE,
+   };
+   struct hk_native_texture_descriptor packed;
+   assert(hk_pack_native_texture(10, &packed, &texture));
+   struct AGX_TEXTURE_GEN10 gen10;
+   assert(AGX_TEXTURE_GEN10_unpack(NULL, (const uint8_t *)packed.opaque,
+                                   &gen10));
+   /* The native HAL300 texture descriptor encoder: enabled with
+    * page size 0x4000 maps to selector1, not the legacy sparse mode3. */
+   assert(gen10.image_mode_enable);
+   assert(gen10.image_mode == 1);
+   assert((gen10.address & ~UINT64_C(0x30)) == texture.address);
+
+   assert(hk_pack_native_texture(9, &packed, &texture));
+   struct AGX_TEXTURE_GEN9 gen9;
+   assert(AGX_TEXTURE_GEN9_unpack(NULL, (const uint8_t *)packed.opaque,
+                                  &gen9));
+   assert((gen9.state_control & 3) == AGX_IMAGE_MODE_SPARSE);
+
+   /* Both native HALs emit this exact sparse-table maintenance command. */
+   const uint8_t expected[] = {0x02, 0x41, 0x02, 0x60};
+   const enum agx_chip chips[] = {
+      AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
+      uint8_t stream[AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE];
+      assert(agx3_cdm_sstt_flush_invalidate_pack(chips[i], stream));
+      assert(memcmp(stream, expected, sizeof(expected)) == 0);
+      assert(agx3_cdm_sstt_flush_invalidate_validate(chips[i], stream,
+                                                   sizeof(stream)));
+      assert(!agx3_cdm_sstt_flush_invalidate_validate(chips[i], stream, 3));
+   }
+}
+
 int
 main(void)
 {
+   check_sparse_translation();
    check_buffer_metadata();
    check_layered_multisample_pbe();
    uint64_t atomic_sw = 0;
@@ -1472,7 +1530,7 @@ main(void)
    assert(hk_pack_native_pbe(9, &native_pbe, &pbe));
    assert(memcmp(&native_pbe, gen9_array_pbe,
                  sizeof(gen9_array_pbe)) == 0);
-   assert(!hk_pack_native_pbe(10, &native_pbe, &pbe));
+   assert(hk_pack_native_pbe(10, &native_pbe, &pbe));
    /* A one-layer array keeps dimension 3 with a zero layer field. */
    pbe.layers = 1;
    uint8_t expected_layered[32];
@@ -1489,7 +1547,7 @@ main(void)
    assert(hk_pack_native_pbe(9, &native_pbe, &pbe));
    assert(memcmp(&native_pbe, expected_layered,
                  sizeof(expected_layered)) == 0);
-   assert(!hk_pack_native_pbe(10, &native_pbe, &pbe));
+   assert(hk_pack_native_pbe(10, &native_pbe, &pbe));
    /* A level of a mipmapped 3D or array texture keeps the whole chain's
     * geometry and adds the native mip extension: word0 bit58, word1 bit63,
     * level at word2[47:44] and levels-1 at word2[51:48]. */
@@ -1529,12 +1587,13 @@ main(void)
    pbe.level = 0;
    CHECK_PBE_REJECT(pbe.levels = 17);
    pbe.levels = 1;
-   /* Gen9 converts stores to sRGB with word1 bit 61; Gen10's field is not
-    * recovered. */
+   /* Gen9 and Gen10 convert stores to sRGB with word1 bit 61 (Gen10:
+    * hardware sweep, port/srgbsweep). */
    pbe.srgb = true;
    assert(hk_pack_native_pbe(9, &native_pbe, &pbe));
    assert(((const uint8_t *)&native_pbe)[15] & 0x20);
-   assert(!hk_pack_native_pbe(10, &native_pbe, &pbe));
+   assert(hk_pack_native_pbe(10, &native_pbe, &pbe));
+   assert(((const uint8_t *)&native_pbe)[15] & 0x20);
    pbe.srgb = false;
    CHECK_PBE_REJECT(pbe.mode = AGX_IMAGE_MODE_SPARSE);
    pbe.mode = AGX_IMAGE_MODE_NORMAL;
@@ -1562,6 +1621,74 @@ main(void)
    assert(memcmp(&null_pbe10, &(struct hk_native_pbe_descriptor){0},
                  sizeof(null_pbe10)) != 0);
 
+   {
+      const struct AGX_PBE linear = {
+         AGX_PBE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_LINEAR,
+         .channels = AGX_CHANNELS_R8G8B8A8,
+         .type = AGX_TEXTURE_TYPE_UNORM,
+         .swizzle_r = AGX_CHANNEL_R, .swizzle_g = AGX_CHANNEL_G,
+         .swizzle_b = AGX_CHANNEL_B, .swizzle_a = AGX_CHANNEL_A,
+         .width = 1920, .height = 1080,
+         .buffer = UINT64_C(0x5ffdf6c000), .stride = 7680 - 4,
+      };
+      const uint8_t expected[32] = {
+         0x02,0x0a,0xe4,0x7f,0x87,0x1b,0x02,0x00,
+         0x00,0x6c,0xdf,0xff,0x05,0xf0,0x1d,0x00,
+      };
+      struct hk_native_pbe_descriptor packed;
+      assert(hk_pack_native_pbe(10, &packed, &linear));
+      assert(!memcmp(&packed, expected, sizeof(expected)));
+      struct AGX_PBE oversized = linear;
+      oversized.stride = (1u << 20) + 16 - 4;
+      assert(!hk_pack_native_pbe(10, &packed, &oversized));
+   }
+   {
+      /* Pinned native Gen10 PBE and texture encoder offline oracle, 64x64
+       * RGBA8, one sample/layer/mip, data=0x12345000, aux=0x45678000.
+       * Gen10 moves the PBE compression flag from Gen9 bit59 to bit61. */
+      const uint64_t expected_pbe[4] = {
+         UINT64_C(0x20001f803fe40a22), UINT64_C(0x8000000001234500),
+         UINT64_C(0x4567800), 0,
+      };
+      struct AGX_PBE semantic = {
+         AGX_PBE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_GPU,
+         .channels = AGX_CHANNELS_R8G8B8A8,
+         .type = AGX_TEXTURE_TYPE_UNORM,
+         .swizzle_r = AGX_CHANNEL_R, .swizzle_g = AGX_CHANNEL_G,
+         .swizzle_b = AGX_CHANNEL_B, .swizzle_a = AGX_CHANNEL_A,
+         .width = 64, .height = 64, .buffer = UINT64_C(0x12345000),
+         .compressed = true, .extended = true,
+         .acceleration_buffer = UINT64_C(0x45678000),
+      };
+      struct hk_native_pbe_descriptor packed;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
+      assert(!memcmp(&packed, expected_pbe, sizeof(expected_pbe)));
+      struct agx_pbe_agx3_2d_fields decoded;
+      assert(agx_pbe_agx3_2d_unpack(10, &packed, sizeof(packed), &decoded));
+      assert(decoded.compressed &&
+             decoded.acceleration_buffer == semantic.acceleration_buffer);
+      semantic.buffer += 16;
+      assert(!hk_pack_native_pbe(10, &packed, &semantic));
+      semantic.buffer -= 16;
+      semantic.page_aligned_layers = true;
+      assert(!hk_pack_native_pbe(10, &packed, &semantic));
+      semantic.page_aligned_layers = false;
+      semantic.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
+      uint64_t array_expected[4];
+      memcpy(array_expected, expected_pbe, sizeof(array_expected));
+      array_expected[0] |= 1;
+      assert(!memcmp(&packed, array_expected, sizeof(array_expected)));
+      semantic.layers = 2;
+      assert(!hk_pack_native_pbe(10, &packed, &semantic));
+      semantic.layers = 1;
+      semantic.levels = 2;
+      assert(!hk_pack_native_pbe(10, &packed, &semantic));
+   }
    check_captured_rgba8_lossless_pbe();
    puts("honeykrisp native descriptor geometry/policy: passed");
    return 0;

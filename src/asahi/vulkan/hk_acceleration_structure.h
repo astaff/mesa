@@ -25,13 +25,18 @@ struct hk_agx3_plan_args;
 
 void hk_gen1_rq_finish(struct hk_device *dev);
 VkResult hk_device_init_accel_struct_state(struct hk_device *device);
+void hk_device_finish_accel_struct_state(struct hk_device *device);
+uint64_t hk_m5_upload_as_table(struct hk_cmd_buffer *cmd);
+void hk_m5_as_buffer_bound(struct hk_device *dev, struct vk_buffer *buffer);
+
 /* Native build phase; the caller owns job planning, validated output ranges,
- * barriers and meta state save/restore. Not wired to the public build path
- * until the complete native AS/query contract is implemented. */
+ * barriers and meta state save/restore. */
 VkResult hk_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
                                 const struct hk_agx3_leaf_args *args);
 VkResult hk_cmd_finalize_agx3_as(VkCommandBuffer command_buffer,
                                const struct hk_agx3_envelope_args *args);
+/* Plans, encodes and finalizes one triangle AS from common build IR, with
+ * internal phase barriers and a GPU-written indirect node count. */
 VkResult hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                                  const struct hk_agx3_plan_args *args,
                                  VkDeviceAddress node_status,

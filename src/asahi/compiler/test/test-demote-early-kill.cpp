@@ -27,6 +27,9 @@ enum shape {
    SUBGROUP_AFTER,
    NESTED_GUARDED,
    QUAD_BEFORE_SECOND_DEMOTE,
+   ACTIVE_COUNT_AFTER,
+   ACTIVE_INDEX_AFTER,
+   LOWERED_QUAD_BALLOT_AFTER,
 };
 
 static nir_shader *
@@ -156,6 +159,15 @@ build(enum shape s)
    case SUBGROUP_AFTER:
       out = nir_u2f32(&b, nir_channel(&b, nir_ballot(&b, 1, 32, d), 0));
       break;
+   case ACTIVE_COUNT_AFTER:
+      out = nir_u2f32(&b, nir_load_active_subgroup_count_agx(&b, 32));
+      break;
+   case ACTIVE_INDEX_AFTER:
+      out = nir_u2f32(&b, nir_load_active_subgroup_invocation_agx(&b, 32));
+      break;
+   case LOWERED_QUAD_BALLOT_AFTER:
+      out = nir_u2f32(&b, nir_quad_ballot_agx(&b, 16, d));
+      break;
    case QUAD_ONLY_BEFORE:
       out = nir_fadd(&b, out, x);
       break;
@@ -280,4 +292,20 @@ TEST_F(DemoteEarlyKill, NoDeadQuadKillBeforeSampledLoop)
 TEST_F(DemoteEarlyKill, EarlierDemoteReachesQuadBeforeLaterDemote)
 {
    EXPECT_FALSE(lower(QUAD_BEFORE_SECOND_DEMOTE));
+}
+
+TEST_F(DemoteEarlyKill, LoweredLaneOperationsKeepDeferredKill)
+{
+   EXPECT_FALSE(lower(ACTIVE_COUNT_AFTER));
+   EXPECT_FALSE(lower(ACTIVE_INDEX_AFTER));
+   EXPECT_FALSE(lower(LOWERED_QUAD_BALLOT_AFTER));
+
+   for (enum shape s : {ACTIVE_COUNT_AFTER, ACTIVE_INDEX_AFTER}) {
+      nir_shader *nir = build(s);
+      agx_nir_lower_discard_zs_emit(nir);
+      agx_nir_lower_sample_mask_deferred(nir);
+      nir_validate_shader(nir, "lowered subgroup operations");
+      EXPECT_EQ(count_quad_ballots(nir), 0u);
+      ralloc_free(nir);
+   }
 }

@@ -101,6 +101,8 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
    /* slot_reissuable[s] = the slot's outstanding generation was issued by an
     * instruction that reissues live slots itself. */
    bool slot_reissuable[9] = {false};
+   uint8_t slot_join_class[9] = {0};
+   uint8_t slot_join_count[9] = {0};
 
    unsigned next = 0; /* round-robin cursor into 0..nslots-1 */
 
@@ -111,6 +113,9 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
       if (I->preferred_slot > nslots || (!I->is_async && I->preferred_slot))
          return false;
       if (I->coalesce_src > I->nr_srcs || (!I->is_async && I->coalesce_src))
+         return false;
+      if ((I->join_class && (!I->is_async || !I->join_limit || I->join_limit > 8)) ||
+          (!I->join_class && (I->join_limit || I->prefer_join)))
          return false;
       const uint16_t valid_slots = (uint16_t)((1u << nslots) - 1u);
       if ((I->nr_srcs < 32 && (I->late_src_mask >> I->nr_srcs)) ||
@@ -233,12 +238,23 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
                    !(I->transient_slots & (1u << (producer_slot - 1))))
                   slot = producer_slot;
             }
+            if (I->prefer_join && !slot) {
+               for (unsigned t = 0; t < nslots && !slot; ++t) {
+                  const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
+                  if (!slot_waited[candidate] &&
+                      slot_join_class[candidate] == I->join_class &&
+                      slot_join_count[candidate] < I->join_limit)
+                     slot = candidate;
+               }
+            }
             for (unsigned t = 0; t < nslots && !slot; ++t) {
                const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
                if (slot_waited[candidate] ||
                    !agx3_slot_generation_live(reg_slot, reader_slots, candidate,
                                              token_count) ||
-                   (I->reissues_live_slot && slot_reissuable[candidate]))
+                   (I->reissues_live_slot && slot_reissuable[candidate]) ||
+                   (I->join_class && slot_join_class[candidate] == I->join_class &&
+                    slot_join_count[candidate] < I->join_limit))
                   slot = candidate;
             }
             if (!slot) {
@@ -255,6 +271,16 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
           * in-region generation. The external loader's generation is not
           * part of that protocol: retire it before any slot reuse. */
          if ((entry_pending & (1u << (slot - 1))) && !slot_waited[slot]) {
+            wait_mask |= (uint16_t)(1u << (slot - 1));
+            slot_waited[slot] = true;
+         }
+
+         /* A joined queue must complete before an incompatible producer
+          * replaces it. In particular, an SCS completion or a texture
+          * publication must not inherit a pending device-read generation. */
+         if (!slot_waited[slot] && slot_join_count[slot] &&
+             ((slot_join_class[slot] != I->join_class) ||
+              (I->join_class && slot_join_count[slot] >= I->join_limit))) {
             wait_mask |= (uint16_t)(1u << (slot - 1));
             slot_waited[slot] = true;
          }
@@ -277,6 +303,8 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
           * generation. Retire the old generation's register aliases before
           * publishing the new result, otherwise an unrelated later write can
           * consume the new generation's wait and hide it from its consumer. */
+         const bool new_join = slot_waited[slot] ||
+                               slot_join_class[slot] != I->join_class;
          if (slot_waited[slot]) {
             for (unsigned r = 0; r < token_count; ++r) {
                if (reg_slot[r] == slot)
@@ -285,6 +313,9 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
          }
          slot_waited[slot] = false; /* freshly outstanding */
          slot_reissuable[slot] = I->reissues_live_slot;
+         slot_join_count[slot] = I->join_class ?
+            (new_join ? 1 : slot_join_count[slot] + 1) : 0;
+         slot_join_class[slot] = I->join_class;
          for (unsigned d = 0; d < I->nr_dsts; ++d) {
             if (I->dst[d] >= AGX3_SLOT_NUM_TOKENS)
                return false;

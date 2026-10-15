@@ -46,8 +46,10 @@ struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
  * run it as early as the optimizer can use it and agx_compile_shader_nir()
  * still guarantees it for any AGX3 target. */
 bool agx_nir_lower_shared_element_index(struct nir_shader *s);
+bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_atomics(struct nir_shader *s, bool native_fadd);
+bool agx_nir_opt_canonical_minmax(struct nir_shader *s);
 
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias);
 bool agx_nir_lower_g17p_helper_samples(struct nir_shader *s);
@@ -137,6 +139,7 @@ agx_g17p_pack_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,
 #define AGX_G17P_EMRT_ALIGNED_WIDTH_OFFSET 80
 /* Declines without changing the shader, so callers need no copy. */
 bool agx_nir_lower_g17p_indexed_samplers(struct nir_shader *s);
+bool agx_nir_lower_g17g_indexed_reads(struct nir_shader *s);
 /* Packed native32 array handles are byte offsets; sampler handles already
  * name their native entry, including the reserved texel-fetch sampler0. */
 bool agx_nir_lower_g17p_native32_samplers(struct nir_shader *s, uint8_t texture_set);
@@ -224,3 +227,4 @@ bool agx_nir_lower_fma_rte(struct nir_shader *shader);
 struct nir_def *agx_nir_fma_rte_fixup(struct nir_builder *b, struct nir_def *a,
                                     struct nir_def *c, struct nir_def *z,
                                     struct nir_def *native);
+bool agx_nir_lower_cmat(struct nir_shader *s);

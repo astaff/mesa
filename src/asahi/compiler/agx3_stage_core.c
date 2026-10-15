@@ -227,8 +227,15 @@ clr_common(enum agx_isa_encoding enc, const struct agx3_field_kv *ov,
            unsigned n, uint8_t out[AGX3_STAGE_MAX_LENGTH], uint8_t *len)
 {
    const struct agx3_field_kv base[] = {KV(10, 2)};
-   if (agx3_bind_compose(enc, "clr", 0, base, 1, ov, n, out, len))
-      return true;
+   const struct agx3_field_kv m5_base[] = {
+      KV(10, 2), KV(14, 3), KV(15, 25),
+   };
+   const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
+   for (unsigned ep = 0; ep <= (m5 ? 1 : 0); ++ep) {
+      if (agx3_bind_compose(enc, "clr", ep, m5 ? m5_base : base,
+                           m5 ? 3 : 1, ov, n, out, len))
+         return true;
+   }
    memset(out, 0, AGX3_STAGE_MAX_LENGTH);
    *len = 0;
    return false;
@@ -243,7 +250,8 @@ agx3_clr(enum agx_isa_encoding enc, uint16_t dest, bool half, bool hint,
    memset(out, 0, AGX3_STAGE_MAX_LENGTH);
    *len = 0;
 
-   if (!b_only(enc) || dest >= 256 || (!half && (dest & 1)))
+   if ((!b_only(enc) && enc != AGX_ISA_ENCODING_AGX3C) ||
+       dest >= 256 || (!half && (dest & 1)))
       return false;
 
    struct agx3_field_kv ov[5];

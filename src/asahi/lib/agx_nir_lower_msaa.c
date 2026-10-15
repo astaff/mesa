@@ -349,7 +349,7 @@ agx_nir_unroll_g17p_samples_layout(nir_shader *shader, unsigned nr_samples,
                                    const struct agx_g17p_colour_layout *layout)
 {
    assert(shader->info.stage == MESA_SHADER_FRAGMENT);
-   assert(nr_samples == 2 || nr_samples == 4);
+   assert(nr_samples == 2 || nr_samples == 4 || nr_samples == 8);
 
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
 
@@ -411,7 +411,7 @@ agx_nir_unroll_g17p_samples_layout(nir_shader *shader, unsigned nr_samples,
     * end of the function, so gather them all there. */
    struct util_dynarray exports;
    util_dynarray_init(&exports, NULL);
-   nir_def *write_samples[4] = {NULL};
+   nir_def *write_samples[8] = {NULL};
    unsigned write_sample_count = 0;
    nir_foreach_block(block, impl) {
       nir_foreach_instr_safe(instr, block) {
@@ -701,7 +701,7 @@ bool
 agx_nir_lower_monolithic_msaa(nir_shader *shader, uint8_t nr_samples)
 {
    assert(shader->info.stage == MESA_SHADER_FRAGMENT);
-   assert(nr_samples == 1 || nr_samples == 2 || nr_samples == 4);
+   assert(nr_samples == 1 || nr_samples == 2 || nr_samples == 4 || nr_samples == 8);
 
    agx_nir_lower_sample_mask(shader);
 

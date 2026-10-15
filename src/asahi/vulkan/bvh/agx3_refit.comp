@@ -32,14 +32,14 @@ void main()
    uint internal_bound = args.node_bound - args.leaf_bound;
    if (args.phase <= 1) {
       uint64_t retained_base = args.retained;
-      if (args.phase == 1 && args.metadata != 0ul) {
+      if (args.gen1 != 0 && args.phase == 1 && args.metadata != 0ul) {
          libagx_gen1_as_metadata live =
             DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
          retained_base = live.native_base + live.retained_offset;
       }
       /* Preserve the actual binary topology, not unused internal capacity.
        * Restore counts come from the retained GPU header after copy/rebase. */
-      uint internal_count = args.phase == 0 ? DEREF(args.header).ir_internal_node_count
+      uint internal_count = args.gen1 == 0 ? internal_bound : args.phase == 0 ? DEREF(args.header).ir_internal_node_count
          : DEREF(REF(vk_ir_header)(retained_base)).ir_internal_node_count;
       uint words = header_words + internal_count * (SIZEOF(vk_ir_box_node) / 4);
       if (id < words) {

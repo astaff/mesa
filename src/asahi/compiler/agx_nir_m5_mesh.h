@@ -32,7 +32,8 @@ struct agx_m5_mesh_varyings {
    bool dynamic;
    uint8_t primitive_components;
    uint16_t primitive_stride_B;
-   uint8_t clip_first, clip_count;
+   union { uint8_t clip_first; uint8_t clip_distance_first; };
+   union { uint8_t clip_count; uint8_t clip_distance_count; };
    uint8_t lv_first;
    bool lv;
    uint8_t first[64];

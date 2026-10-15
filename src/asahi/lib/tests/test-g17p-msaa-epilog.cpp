@@ -281,6 +281,45 @@ TEST_F(G17PMSAAEpilog, BroadcastNoopPreservesBoundTargets)
    }
 }
 
+TEST(G17pMsaaEpilog, NativeLateSampleMaskCrossesEpilogBoundary)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G17P, AGX_CHIP_G17S}) {
+      for (bool sample_mask : {false, true}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "late coverage boundary");
+      b.shader->info.io_lowered = true;
+      b.shader->info.fs.uses_discard = true;
+      b.shader->info.writes_memory = !sample_mask;
+      b.shader->info.outputs_written =
+         BITFIELD64_BIT(FRAG_RESULT_DATA0) |
+         (sample_mask ? BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK) : 0);
+      nir_demote_samples(&b, nir_imm_intN_t(&b, 0x5555, 16));
+      nir_store_output(&b, nir_imm_vec4(&b, 1, 1, 0, 1),
+         nir_imm_int(&b, 0), .write_mask = 15, .src_type = nir_type_float32,
+         .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
+      struct agx_fs_epilog_link_info info = {};
+      ASSERT_TRUE(agx_nir_lower_fs_output_to_epilog_for_device(b.shader, chip, &info));
+      unsigned demotes = 0, masks = 0;
+      nir_foreach_block(block, b.impl) nir_foreach_instr(in, block) {
+         if (in->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(in);
+         demotes += intr->intrinsic == nir_intrinsic_demote_samples;
+         masks += intr->intrinsic == nir_intrinsic_export_agx &&
+            nir_intrinsic_base(intr) == AGX_ABI_FOUT_WRITE_SAMPLES;
+      }
+      const bool native = chip == AGX_CHIP_G17P ||
+         (chip == AGX_CHIP_G17S && sample_mask);
+      EXPECT_EQ(info.sample_mask_after_force_early, native);
+      EXPECT_EQ(info.loc0_w_1, chip != AGX_CHIP_G17P);
+      EXPECT_EQ(demotes, native ? 0u : 1u);
+      EXPECT_EQ(masks, native ? 1u : 0u);
+      nir_validate_shader(b.shader, "late coverage transport");
+      ralloc_free(b.shader);
+      }
+   }
+}
+
 TEST(LegacyFragments, EpilogUsesUpstreamDepthCoverage)
 {
    nir_builder b = nir_builder_init_simple_shader(

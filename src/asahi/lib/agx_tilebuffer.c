@@ -5,6 +5,7 @@
 
 #include "agx_tilebuffer.h"
 #include <assert.h>
+#include <string.h>
 #include "util/bitset.h"
 #include "util/format/u_format.h"
 #include "util/u_debug.h"
@@ -88,21 +89,24 @@ agx_build_tilebuffer_layout_bounded(const enum pipe_format *formats,
       formats, nr_cbufs, nr_samples, layered, max_sample_size_B, 0, 0);
 }
 
-struct agx_tilebuffer_layout
-agx_build_tilebuffer_layout_with_limits(const enum pipe_format *formats,
+static struct agx_tilebuffer_layout
+agx_build_tilebuffer_layout_internal(const enum pipe_format *formats,
                                       uint8_t nr_cbufs, uint8_t nr_samples,
                                       bool layered, uint8_t max_sample_size_B,
-                                      uint16_t max_bytes_per_tile,
-                                      uint16_t max_samples_per_tile)
+                                      uint32_t max_bytes_per_tile,
+                                      uint16_t max_samples_per_tile,
+                                      bool native_imageblock)
 {
    struct agx_tilebuffer_layout tib = {
       .nr_samples = nr_samples,
       .layered = layered,
+      .native_imageblock = native_imageblock,
       .max_sample_size_B = max_sample_size_B,
       .max_bytes_per_tile = max_bytes_per_tile,
       .max_samples_per_tile = max_samples_per_tile,
    };
    const unsigned max_bytes_per_sample =
+      native_imageblock ? max_sample_size_B :
       MIN2(max_sample_size_B ? max_sample_size_B : MAX_BYTES_PER_SAMPLE,
            MAX_ENCODABLE_BYTES_PER_SAMPLE);
    const unsigned tile_capacity =
@@ -156,6 +160,13 @@ agx_build_tilebuffer_layout_with_limits(const enum pipe_format *formats,
    if (nr_samples > 1)
       offset_B = MAX2(offset_B, 1);
 
+   /* M5 likewise reserves one eight-byte sample for a layered pass with no
+    * colour attachment: native layered attachmentless and depth-only passes
+    * carry imageblock sample size 8 (command +0x1fb0) at one and four samples
+    * (native-window/item1-layered). */
+   if (native_imageblock && layered)
+      offset_B = MAX2(offset_B, 1);
+
    tib.sample_size_B = align(offset_B, 8);
    tib.tile_size = agx_select_tile_size(
       tib.sample_size_B, nr_samples,
@@ -164,6 +175,30 @@ agx_build_tilebuffer_layout_with_limits(const enum pipe_format *formats,
 
    agx_tilebuffer_pack_usc(&tib);
    return tib;
+}
+
+struct agx_tilebuffer_layout
+agx_build_tilebuffer_layout_with_limits(
+   const enum pipe_format *formats, uint8_t nr_cbufs, uint8_t nr_samples,
+   bool layered, uint8_t max_sample_size_B, uint32_t max_bytes_per_tile,
+   uint16_t max_samples_per_tile)
+{
+   return agx_build_tilebuffer_layout_internal(
+      formats, nr_cbufs, nr_samples, layered, max_sample_size_B,
+      max_bytes_per_tile, max_samples_per_tile, false);
+}
+
+struct agx_tilebuffer_layout
+agx_build_tilebuffer_layout_for_imageblock(
+   const enum pipe_format *formats, uint8_t nr_cbufs, uint8_t nr_samples,
+   bool layered, uint8_t max_sample_size_B, uint32_t max_bytes_per_tile,
+   uint16_t max_samples_per_tile)
+{
+   assert(max_sample_size_B && !(max_sample_size_B & 7));
+   assert(max_bytes_per_tile);
+   return agx_build_tilebuffer_layout_internal(
+      formats, nr_cbufs, nr_samples, layered, max_sample_size_B,
+      max_bytes_per_tile, max_samples_per_tile, true);
 }
 
 /*
@@ -180,7 +215,8 @@ agx_tilebuffer_set_samples(struct agx_tilebuffer_layout *tib,
 {
    assert(tib->nr_samples == 0 && "must not be initialized");
 
-   *tib = agx_build_tilebuffer_layout_with_limits(
+   *tib = (tib->native_imageblock ? agx_build_tilebuffer_layout_for_imageblock
+                                  : agx_build_tilebuffer_layout_with_limits)(
       tib->logical_format, ARRAY_SIZE(tib->logical_format), nr_samples,
       tib->layered, tib->max_sample_size_B, tib->max_bytes_per_tile,
       tib->max_samples_per_tile);
@@ -215,6 +251,11 @@ agx_tilebuffer_total_size(struct agx_tilebuffer_layout *tib)
 void
 agx_tilebuffer_pack_usc(struct agx_tilebuffer_layout *tib)
 {
+   if (tib->native_imageblock) {
+      memset(&tib->usc, 0, sizeof(tib->usc));
+      return;
+   }
+
    agx_pack(&tib->usc, USC_SHARED, cfg) {
       if (tib->nr_samples > 0) {
          cfg.uses_shared_memory = true;
@@ -542,7 +583,7 @@ agx_g17p_classify_mrt(const struct agx_tilebuffer_layout *tib)
 
    /* Multisample multi-target layouts take the general mixed-format
     * programs, whose end-of-tile builtin has a multisample form. */
-   if (tib->nr_samples == 2 || tib->nr_samples == 4)
+   if (tib->nr_samples == 2 || tib->nr_samples == 4 || tib->nr_samples == 8)
       return agx_g17p_classify_mixed_mrt(tib, active_count);
    if (tib->nr_samples != 1)
       return AGX_G17P_MRT_NONE;

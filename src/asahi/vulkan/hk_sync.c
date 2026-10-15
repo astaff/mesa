@@ -373,6 +373,18 @@ hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    }
 }
 
+static void
+barrier_source_dependencies(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
+                            struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
+   hk_sync_src_dep(cmd, src_kinds, NULL, dep);
+
+   struct hk_sync_dep pending[HK_SYNC_NUM_SQ];
+   req_for_kinds(cmd, src_kinds, pending);
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+      dep_max(&dep[sq], &pending[sq]);
+}
+
 void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
@@ -382,7 +394,7 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
       return;
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, NULL, dep);
+   barrier_source_dependencies(cmd, src_kinds, dep);
 
    u_foreach_bit(d, dst_kinds) {
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
@@ -401,7 +413,7 @@ hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    st->epoch++;
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, NULL, dep);
+   barrier_source_dependencies(cmd, src_kinds, dep);
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       /* Neither scope includes work before the pass instance. */
       dep[sq].prior = 0;
@@ -713,6 +725,13 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
    hk_sync_stream_wait(cs, dep);
    cs->sync.kind |= kinds;
    note_last(cmd, cs);
+
+   if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+       cmd->sync.pending_start_ts.handle && !cs->timestamp.start.handle &&
+       !cs->timestamp.end.handle) {
+      cs->timestamp.start = cmd->sync.pending_start_ts;
+      cmd->sync.pending_start_ts = (struct agx_timestamp_req){0};
+   }
 }
 
 struct hk_cs *
@@ -771,7 +790,8 @@ hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd)
       return;
 
    const bool g17p_start =
-      agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
+      (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
       cs->timestamp.start.handle;
    if (cs->timestamp.end.handle || g17p_start) {
       stamp_carrier_launch(cmd);
@@ -1020,6 +1040,8 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    if (!src_kinds) {
       hk_sync_flush_pending_timestamp(cmd);
       st->pending_start_ts = req;
+      if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+         st->cs_check_pending = true;
       return;
    }
 

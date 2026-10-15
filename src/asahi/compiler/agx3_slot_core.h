@@ -90,6 +90,12 @@ struct agx3_slot_instr {
    uint8_t nr_srcs; /* dependency tokens this instruction reads */
    uint16_t dst[AGX3_SLOT_MAX_REGS];
    uint16_t src[AGX3_SLOT_MAX_REGS];
+   /* Compatible asynchronous producers can share a native completion queue.
+    * Zero keeps the one-generation policy. The count is bounded separately
+    * from the number of physical scoreboard slots. */
+   uint8_t join_class;
+   uint8_t join_limit;
+   bool prefer_join;
 };
 
 struct agx3_slot_result {

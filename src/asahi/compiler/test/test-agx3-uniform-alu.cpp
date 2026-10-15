@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: MIT */
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <set>
 #include <string>
 #include <gtest/gtest.h>
 #include "agx3_binder.h"
+#include "agx3_cf_core.h"
 #include "agx3_uniform_alu.h"
+#include "agx3_isel_core.h"
 #include "agx3_tex_core.h"
 #include "agx_test.h"
 #include "util/u_debug.h"
@@ -443,6 +446,129 @@ TEST(AGX3ArrayStaging, ReusedCompletionSlotRetainsCoordinateConsumer)
    ralloc_free(mem);
 }
 
+static void
+check_fetch_group(unsigned mode)
+{
+   struct option_guard {
+      bool had = getenv("ASAHI_M5_FETCH_REUSE") != nullptr;
+      std::string old = had ? getenv("ASAHI_M5_FETCH_REUSE") : "";
+      option_guard() { setenv("ASAHI_M5_FETCH_REUSE", "1", 1); }
+      ~option_guard() {
+         if (had) setenv("ASAHI_M5_FETCH_REUSE", old.c_str(), 1);
+         else unsetenv("ASAHI_M5_FETCH_REUSE");
+      }
+   } guard;
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 40;
+   for (unsigned i = 0; i < 3; ++i) {
+      if (mode == 3 && i == 1)
+         agx_mov_imm_to(b, agx_register(24, AGX_SIZE_32), 0);
+      agx_index coords = agx_register(mode == 1 && i ? 4 : 0, AGX_SIZE_32);
+      coords.channels_m1 = 1;
+      agx_index dest = agx_register(mode == 2 && !i ? 0 : 32 + i * 16,
+                                    AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_texture_load_to(b, dest, coords, agx_immediate(0), agx_immediate(0),
+                           agx_immediate(i), agx_immediate(0), agx_null(),
+                           AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 15, false, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
+   std::array<agx3_tex_fetch_desc, 3> fetches = {};
+   unsigned found = 0;
+   for (unsigned i = 0; i + 8 <= binary.size; ++i) {
+      agx3_tex_fetch_desc d;
+      if (agx3_tex_decode_fetch(AGX_ISA_ENCODING_AGX3C, bytes + i, 8, &d)) {
+         ASSERT_LT(found, fetches.size());
+         fetches[found++] = d;
+         i += 7;
+      }
+   }
+   ASSERT_EQ(found, 3u);
+   EXPECT_EQ(fetches[0].coord_kill, mode != 0);
+   EXPECT_FALSE(fetches[1].coord_kill);
+   EXPECT_TRUE(fetches[2].coord_kill);
+   EXPECT_EQ(fetches[1].coord, fetches[2].coord);
+   EXPECT_EQ(fetches[2].wait_mask, 0u);
+   if (mode == 0) {
+      EXPECT_EQ(fetches[0].coord, fetches[1].coord);
+      EXPECT_EQ(fetches[1].wait_mask, 0u);
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
+TEST(AGX3FetchGroups, SameCoordinates) { check_fetch_group(0); }
+TEST(AGX3FetchGroups, ChangedCoordinates) { check_fetch_group(1); }
+TEST(AGX3FetchGroups, OverwrittenCoordinates) { check_fetch_group(2); }
+TEST(AGX3FetchGroups, InterveningInstruction) { check_fetch_group(3); }
+
+TEST(AGX3FetchBanks, EightIndependentCoordinates)
+{
+   struct option_guard {
+      const char *name;
+      bool had;
+      std::string old;
+      option_guard(const char *n, const char *value) : name(n), had(getenv(n)),
+         old(had ? getenv(n) : "") { setenv(n, value, 1); }
+      ~option_guard() {
+         if (had) setenv(name, old.c_str(), 1);
+         else unsetenv(name);
+      }
+   } reuse("ASAHI_M5_FETCH_REUSE", "0"), banks("ASAHI_M5_FETCH_BANKS", "8");
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 63;
+   for (unsigned i = 0; i < 8; ++i) {
+      agx_index coords = agx_register(i * 4, AGX_SIZE_32);
+      coords.channels_m1 = 1;
+      agx_index dest = agx_register(64 + i * 8, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_texture_load_to(b, dest, coords, agx_immediate(0), agx_immediate(0),
+                           agx_immediate(i), agx_immediate(0), agx_null(),
+                           AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 15, false, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
+   for (unsigned i = 0; i < 8; ++i) {
+      agx3_tex_fetch_desc d = {};
+      d.dest = 64 + i * 8;
+      d.coord = i * 8;
+      d.width = AGX3_TEX_W32;
+      d.mask = 15;
+      d.texture = i;
+      d.slot = i + 1;
+      d.wait_mask = 1u << i;
+      d.coord_kill = true;
+      d.final = i == 7;
+      uint8_t expected[AGX3_TEX_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3C, &d, expected, &len));
+      bool found = false;
+      for (unsigned j = 0; j + len <= binary.size; ++j)
+         found |= std::memcmp(bytes + j, expected, len) == 0;
+      EXPECT_TRUE(found) << "bank " << i;
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
 TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingBlocks)
 {
    for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
@@ -496,4 +622,489 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingElse)
    EXPECT_EQ(jump->op, AGX_OPCODE_JMP_EXEC_NONE_AFTER);
    EXPECT_EQ(jump->target, body);
    ralloc_free(mem);
+}
+
+TEST(AGX3UniformALU, M5NativeMultiplyAndFmaUniformWitnesses)
+{
+   const struct {
+      agx3_uniform_float_op op; uint16_t dest; bool sat, cache; uint8_t wait;
+      agx3_uniform_float_src src[3]; uint8_t length; uint8_t expected[16];
+   } cases[] = {
+      {AGX3_UNIFORM_FMA, 14, false, true, 2, {{AGX3_FLOAT_REGISTER, 20, false, false, true, false},{AGX3_FLOAT_UNIFORM, 22, false, true, false, false},{AGX3_FLOAT_REGISTER, 12, false, false, false, true}}, 8, {0x79,0x95,0x26,0x17,0x81,0x0c,0x02,0x4a}},
+      {AGX3_UNIFORM_FMA, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false},{AGX3_FLOAT_UNIFORM, 20, false, true, false, false},{AGX3_FLOAT_REGISTER, 10, false, false, false, true}}, 8, {0x59,0x93,0x26,0x15,0x81,0x0a,0x02,0x0a}},
+      {AGX3_UNIFORM_FMUL, 18, true, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false},{AGX3_FLOAT_REGISTER, 18, false, false, false, true},{}}, 8, {0x99,0x1d,0x35,0x13,0x81,0x00,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true},{AGX3_FLOAT_UNIFORM, 36, false, false, false, false},{}}, 6, {0x59,0x01,0x2d,0x25,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true},{AGX3_FLOAT_UNIFORM, 38, false, false, false, false},{AGX3_FLOAT_REGISTER, 10, false, false, false, true}}, 6, {0x19,0x03,0x2e,0x27,0xa0,0x0a}},
+      {AGX3_UNIFORM_FMA, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true},{AGX3_FLOAT_UNIFORM, 34, false, false, false, false},{AGX3_FLOAT_REGISTER, 2, false, false, false, true}}, 6, {0x29,0x05,0x2e,0x23,0xa0,0x02}},
+      {AGX3_UNIFORM_FMUL, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true},{AGX3_FLOAT_UNIFORM, 22, false, false, false, false},{}}, 6, {0x59,0x0b,0x2d,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true},{AGX3_FLOAT_UNIFORM, 22, false, false, false, false},{AGX3_FLOAT_REGISTER, 6, false, false, false, true}}, 6, {0x29,0x05,0x2e,0x17,0xa0,0x06}},
+      {AGX3_UNIFORM_FMUL, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true},{AGX3_FLOAT_UNIFORM, 150, false, false, false, false},{}}, 6, {0x09,0x01,0x3d,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true},{AGX3_FLOAT_UNIFORM, 158, false, false, false, false},{}}, 6, {0x19,0x03,0x3d,0x1f,0x00,0x02}},
+   };
+   for (const auto &c : cases) {
+      uint8_t bytes[16], length = 0;
+      ASSERT_TRUE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C, c.op,
+                  c.dest, c.src, c.sat, c.cache, c.wait, bytes, &length));
+      ASSERT_EQ(length, c.length);
+      EXPECT_EQ(std::memcmp(bytes, c.expected, length), 0);
+   }
+}
+
+TEST(AGX3UniformALU, M5LoweringRetainsWitnessedFloatUniforms)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   agx_index value = agx_mov(b, agx_register(0, AGX_SIZE_32));
+   agx_instr *mul = agx_fmul_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                              value, agx_uniform(158, AGX_SIZE_32));
+   agx_instr *add = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                              value, agx_uniform(158, AGX_SIZE_32));
+   agx_lower_uniform_sources(b->shader);
+   EXPECT_EQ(mul->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_NE(add->src[1].type, AGX_INDEX_UNIFORM);
+   ralloc_free(mem);
+}
+
+TEST(AGX3UniformALU, M5FloatUniformEightCompletionSlots)
+{
+   const agx3_uniform_float_src src[3] = {
+      {AGX3_FLOAT_REGISTER, 26}, {AGX3_FLOAT_UNIFORM, 294},
+      {AGX3_FLOAT_REGISTER, 40},
+   };
+   for (auto op : {AGX3_UNIFORM_FMUL, AGX3_UNIFORM_FMA}) {
+      std::set<std::string> unique;
+      for (unsigned wait = 0; wait < 256; ++wait) {
+         uint8_t bytes[16], length = 0;
+         ASSERT_TRUE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C, op,
+                      26, src, false, true, wait, bytes, &length));
+         unique.emplace(reinterpret_cast<char *>(bytes), length);
+      }
+      EXPECT_EQ(unique.size(), 256u);
+   }
+}
+
+TEST(AGX3UniformALU, M5NativeIntegerUniformSelectWitnesses)
+{
+   {
+      agx3_isel_desc d = {};
+      d.dest = 6;
+      d.dest_cache = true;
+      d.cmp0 = 28;
+      d.cmp1 = 30;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)1;
+      d.explicit_hints = true;
+      d.sel_true = 28;
+      d.sel_false = 30;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x32,0x1d,0x2e,0x1f,0x05,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 0;
+      d.dest_cache = true;
+      d.cmp0 = 26;
+      d.cmp1 = 30;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)1;
+      d.explicit_hints = true;
+      d.sel_true = 26;
+      d.sel_false = 30;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x02,0x1b,0x2e,0x1f,0x05,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 12;
+      d.dest_cache = true;
+      d.cmp0 = 4;
+      d.cmp1 = 16;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 4;
+      d.sel_false = 16;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x62,0x05,0x2e,0x11,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 10;
+      d.dest_cache = true;
+      d.cmp0 = 6;
+      d.cmp1 = 16;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 6;
+      d.sel_false = 16;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x52,0x07,0x2e,0x11,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 6;
+      d.dest_cache = true;
+      d.cmp0 = 4;
+      d.cmp1 = 16;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 4;
+      d.sel_false = 16;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x32,0x05,0x2e,0x11,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 4;
+      d.dest_cache = true;
+      d.cmp0 = 4;
+      d.cmp1 = 18;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 4;
+      d.sel_false = 18;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x22,0x05,0x2e,0x13,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 16;
+      d.dest_cache = true;
+      d.cmp0 = 14;
+      d.cmp1 = 18;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 14;
+      d.sel_false = 18;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x82,0x0f,0x2e,0x13,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 14;
+      d.dest_cache = true;
+      d.cmp0 = 14;
+      d.cmp1 = 18;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 14;
+      d.sel_false = 18;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x72,0x0f,0x2e,0x13,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 10;
+      d.dest_cache = true;
+      d.cmp0 = 2;
+      d.cmp1 = 154;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)1;
+      d.explicit_hints = true;
+      d.sel_true = 156;
+      d.sel_false = 0;
+      d.true_kind = AGX3_ISEL_UNIFORM;
+      d.false_kind = AGX3_ISEL_REGISTER;
+      d.wait_mask = 1;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = false;
+      d.discard[3] = true;
+      const uint8_t expected[] = {0x52,0x03,0x3f,0x1b,0xa2,0x1c,0x05,0x22,0x80,0x00};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 4;
+      d.dest_cache = false;
+      d.cmp0 = 40;
+      d.cmp1 = 0;
+      d.cmp1_immediate = true;
+      d.cmp1_uniform = false;
+      d.cond = (agx3_isel_icond)4;
+      d.explicit_hints = true;
+      d.sel_true = 144;
+      d.sel_false = 36;
+      d.true_kind = AGX3_ISEL_UNIFORM;
+      d.false_kind = AGX3_ISEL_REGISTER;
+      d.wait_mask = 0;
+      d.cache[0] = true;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = false;
+      d.discard[1] = false;
+      d.discard[2] = false;
+      d.discard[3] = true;
+      const uint8_t expected[] = {0x22,0xa9,0x07,0x80,0xa6,0x10,0x07,0x02,0x80,0x24};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 6;
+      d.dest_cache = false;
+      d.cmp0 = 40;
+      d.cmp1 = 0;
+      d.cmp1_immediate = true;
+      d.cmp1_uniform = false;
+      d.cond = (agx3_isel_icond)4;
+      d.explicit_hints = true;
+      d.sel_true = 144;
+      d.sel_false = 14;
+      d.true_kind = AGX3_ISEL_UNIFORM;
+      d.false_kind = AGX3_ISEL_REGISTER;
+      d.wait_mask = 1;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = false;
+      d.discard[3] = true;
+      const uint8_t expected[] = {0x32,0x29,0x0f,0x80,0xa6,0x10,0x07,0x22,0x80,0x0e};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+}
+
+TEST(AGX3UniformALU, M5IntegerUniformSelectLowering)
+{
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->is_preamble = mode == 1;
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index bound = agx_uniform(mode == 3 ? 379 : 378, AGX_SIZE_32);
+      agx_instr *I = agx_icmpsel_to(b,
+         agx_temp(b->shader, mode == 2 ? AGX_SIZE_16 : AGX_SIZE_32),
+         x, bound, agx_uniform(374, AGX_SIZE_32), agx_immediate(0), AGX_ICOND_ULT);
+      agx_lower_uniform_sources(b->shader);
+      EXPECT_EQ(I->src[1].type == AGX_INDEX_UNIFORM, mode == 0);
+      EXPECT_EQ(I->src[2].type == AGX_INDEX_UNIFORM, mode == 0);
+      EXPECT_EQ(I->icond, AGX_ICOND_ULT);
+      ralloc_free(mem);
+   }
+}
+
+TEST(AGX3UniformALU, M5IntegerUniformSelectEightCompletionSlots)
+{
+   agx3_isel_desc d = {};
+   d.dest = 40; d.cmp0 = 36; d.cmp1 = 378; d.cmp1_uniform = true;
+   d.cond = AGX3_ISEL_ICOND_ULT; d.explicit_hints = true;
+   d.true_kind = AGX3_ISEL_UNIFORM; d.sel_true = 374;
+   d.false_kind = AGX3_ISEL_IMMEDIATE; d.sel_false = 0;
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      d.cmp1 = mode == 0 ? 378 : mode == 1 ? 38 : 7;
+      d.cmp1_uniform = mode == 0;
+      d.cmp1_immediate = mode == 2;
+      d.false_kind = mode == 0 ? AGX3_ISEL_IMMEDIATE :
+                     mode == 1 ? AGX3_ISEL_REGISTER : AGX3_ISEL_UNIFORM;
+      d.sel_false = mode == 0 ? 0 : mode == 1 ? 42 : 376;
+      std::set<std::string> unique;
+      for (unsigned wait = 0; wait < 256; ++wait) {
+         d.wait_mask = wait;
+         uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+         ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+         unique.emplace(reinterpret_cast<char *>(bytes), length);
+      }
+      EXPECT_EQ(unique.size(), 256u);
+   }
+}
+
+TEST(AGX3UniformALU, M5IntegerUniformSelectInvalidFormsAreTransactional)
+{
+   agx3_isel_desc good = {};
+   good.dest = 40; good.cmp0 = 36; good.cmp1 = 378;
+   good.cmp1_uniform = true; good.cond = AGX3_ISEL_ICOND_ULT;
+   good.explicit_hints = true;
+   good.true_kind = AGX3_ISEL_UNIFORM; good.sel_true = 374;
+   good.false_kind = AGX3_ISEL_IMMEDIATE; good.sel_false = 0;
+   for (unsigned mode = 0; mode < 12; ++mode) {
+      agx3_isel_desc d = good;
+      switch (mode) {
+      case 0: d.cmp0_uniform = true; break;
+      case 1: d.dest_16 = true; break;
+      case 2: d.cmp_16 = true; break;
+      case 3: d.cmp_mixed_width = true; break;
+      case 4: d.cmp1 = 379; break;
+      case 5: d.cmp1 = 512; break;
+      case 6: d.cmp1_immediate = true; break;
+      case 7: d.cache[1] = true; break;
+      case 8: d.discard[1] = true; break;
+      case 9: d.sel_true = 375; break;
+      case 10: d.sel_true = 512; break;
+      case 11: d.discard[2] = true; break;
+      }
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], expected[AGX3_ISEL_MAX_LENGTH];
+      std::memset(bytes, 0xa5, sizeof(bytes));
+      std::memset(expected, 0xa5, sizeof(expected));
+      uint8_t length = 0xa5;
+      EXPECT_FALSE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      EXPECT_EQ(std::memcmp(bytes, expected, sizeof(bytes)), 0);
+      EXPECT_EQ(length, 0xa5);
+   }
+}
+
+TEST(AGX3UniformALU, M5NativeUniformBranchWitnesses)
+{
+   uint8_t out[AGX3_CF_MAX_LENGTH], length = 0;
+   const uint8_t reg_uniform[] = {0x0a,0x05,0x23,0x09,0x06,0x00,0x07,0x02,0x00,0x00};
+   ASSERT_TRUE(agx3_cf_icmp_reg_uniform32(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 4, 8, {false,false}, out, &length));
+   ASSERT_EQ(length, sizeof(reg_uniform));
+   EXPECT_EQ(std::memcmp(out, reg_uniform, length), 0);
+   const uint8_t uniform_zero[] = {0x0a,0x09,0x23,0x80,0x06,0x00,0x87,0x02,0x00,0x00};
+   ASSERT_TRUE(agx3_cf_icmp_uniform_imm(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 8, 0, out, &length));
+   ASSERT_EQ(length, sizeof(uniform_zero));
+   EXPECT_EQ(std::memcmp(out, uniform_zero, length), 0);
+   EXPECT_FALSE(agx3_cf_icmp_uniform_imm(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 9, 0, out, &length));
+   EXPECT_FALSE(agx3_cf_icmp_reg_uniform32(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 4, 256, {false,false}, out, &length));
 }

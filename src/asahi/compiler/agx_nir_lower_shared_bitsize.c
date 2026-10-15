@@ -188,3 +188,72 @@ agx_nir_lower_shared_element_index(nir_shader *shader)
    return nir_shader_intrinsics_pass(shader, element_index,
                                      nir_metadata_control_flow, NULL);
 }
+
+/* Element-index lowering leaves byte additions beneath the shift/narrowing:
+ * u2u16((byte_address + constant) >> log2(element_size)).  Extract a small,
+ * aligned constant into LDTG/STTG's byte offset.  Both the source addition and
+ * the narrowed element index must be proven not to wrap: moving an add across
+ * either wrap would change the accessed address. */
+static bool
+fold_byte_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_shared &&
+       intr->intrinsic != nir_intrinsic_store_shared)
+      return false;
+
+   const unsigned bits = intr->intrinsic == nir_intrinsic_load_shared
+                            ? intr->def.bit_size
+                            : nir_src_bit_size(intr->src[0]);
+   if (bits != 16 && bits != 32)
+      return false;
+   const unsigned shift = util_logbase2(bits / 8);
+   nir_src *offset = nir_get_io_offset_src(intr);
+   nir_scalar s = nir_scalar_resolved(offset->ssa, 0);
+   if (s.def->bit_size != 16 || !nir_scalar_is_alu(s) ||
+       nir_scalar_alu_op(s) != nir_op_u2u16)
+      return false;
+   s = nir_scalar_chase_alu_src(s, 0);
+   if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_ushr)
+      return false;
+   nir_scalar amount = nir_scalar_chase_alu_src(s, 1);
+   if (!nir_scalar_is_const(amount) || nir_scalar_as_uint(amount) != shift)
+      return false;
+   s = nir_scalar_chase_alu_src(s, 0);
+   if (s.def->bit_size != 32 || !nir_scalar_is_alu(s) ||
+       nir_scalar_alu_op(s) != nir_op_iadd)
+      return false;
+
+   const unsigned base = nir_intrinsic_base(intr);
+   if (base > 255)
+      return false;
+   for (unsigned c = 0; c < 2; ++c) {
+      nir_scalar constant = nir_scalar_chase_alu_src(s, c);
+      if (!nir_scalar_is_const(constant))
+         continue;
+      const uint32_t add = nir_scalar_as_uint(constant);
+      if (!add || add > 255 - base || (add & ((1u << shift) - 1)))
+         continue;
+      nir_scalar variable = nir_scalar_chase_alu_src(s, 1 - c);
+      const uint32_t limit = ((UINT32_C(1) << (16 + shift)) - 1) - add;
+      if (nir_unsigned_upper_bound(b->shader, data, variable) > limit)
+         continue;
+
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *index = nir_ushr_imm(b, nir_mov_scalar(b, variable), shift);
+      nir_src_rewrite(offset, nir_u2u16(b, index));
+      nir_intrinsic_set_base(intr, base + add);
+      return true;
+   }
+   return false;
+}
+
+bool
+agx_nir_opt_shared_byte_offsets(nir_shader *shader)
+{
+   struct hash_table *ranges = _mesa_pointer_hash_table_create(NULL);
+   bool progress = nir_shader_intrinsics_pass(shader, fold_byte_offset,
+                                              nir_metadata_control_flow,
+                                              ranges);
+   _mesa_hash_table_destroy(ranges, NULL);
+   return progress;
+}

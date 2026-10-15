@@ -25,7 +25,7 @@
 #include "util/macros.h"
 #include <sys/mman.h>
 
-const char *targets[] = {"g13g", "g13x", "g17p", "g15s"};
+const char *targets[] = {"g13g", "g13x", "g17p", "g15s", "g17g"};
 
 #define foreach_target(target)                                                 \
    for (const char **target = &targets[0];                                     \
@@ -36,6 +36,8 @@ target_chip(const char *target)
 {
    if (!strcmp(target, "g17p"))
       return AGX_CHIP_G17P;
+   else if (!strcmp(target, "g17g"))
+      return AGX_CHIP_G17G;
    else if (!strcmp(target, "g15s"))
       return AGX_CHIP_G15S;
    else if (!strcmp(target, "g13x"))
@@ -49,6 +51,15 @@ static bool
 target_is_native_agx3(const char *target)
 {
    return agx_chip_native_agx3(target_chip(target));
+}
+
+/* Whether a target executes AGX3 code: the native AGX3B path or the M5 AGX3C
+ * one. */
+static bool
+target_is_agx3(const char *target)
+{
+   const enum agx_chip chip = target_chip(target);
+   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
 }
 
 static const struct spirv_to_nir_options spirv_options = {
@@ -281,6 +292,9 @@ remap_variant(nir_function *func, unsigned variant, const char *target)
 static bool
 target_supports_program(const char *target, const nir_function *func)
 {
+   if (!strcmp(target, "g17g") &&
+       !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))
+      return false;
    /* The range copy uses the native query command's producer ordering and
     * volatile WAIT loop. Never select this program for the AGX2/G13 path. */
    if (!strcmp(func->name, "libagx_copy_query_g17p"))
@@ -290,7 +304,12 @@ target_supports_program(const char *target, const nir_function *func)
     * Ioto/CDM launch contract. Keep unqualified slots NULL and fail closed.
     * Fast clear is required by the qualified G17P compressed color shapes;
     * compressed render-pass clears dispatch this program for metadata/body. */
-   return !target_is_native_agx3(target) ||
+   return !target_is_agx3(target) ||
+          /* M5 native acceleration-structure copy, compaction,
+           * serialization and property kernels (copy.cl, C87 GPU-side AS
+           * operations). Native AS images exist only on G17S. */
+          (!strcmp(target, "g17g") &&
+           !strncmp(func->name, "libagx_agx3_as_", strlen("libagx_agx3_as_"))) ||
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
@@ -314,6 +333,17 @@ target_supports_program(const char *target, const nir_function *func)
            * is behind HK_G17P_UNVERIFIED_FEATURES.  Do not read this entry as
            * a claim that it runs. */
           !strcmp(func->name, "libagx_trace_rays_indirect_setup") ||
+          /* Its per-raygen-kernel sibling: the same one-invocation shape
+           * (constant loads of the record, the raygen handle and the launch
+           * dimensions; one VkDispatchIndirectCommand store per kernel; the
+           * same shift/compare arithmetic, with hk_rt_launch_group_count as
+           * the host oracle).  No atomics, barriers, printf or scratch.
+           * Qualifying its compilation here is not an execution claim; the
+           * hardware test of the per-raygen dispatch covers it. */
+          !strcmp(func->name, "libagx_trace_rays_select_setup") ||
+          /* Its single-kick sibling (opt-in): same reads, plus 11 global
+           * stores of a launch template into a stream slot. */
+          !strcmp(func->name, "libagx_trace_rays_select_launch") ||
           !strcmp(func->name, "libagx_draw_indirect_byte_count") ||
           !strcmp(func->name, "libagx_conditional_render") ||
           !strcmp(func->name, "libagx_draw_robust_index") ||
@@ -323,6 +353,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_prefix_sum_geom") ||
           /* Query batches use the same native pointer loads/global stores as
            * the existing copy-query helpers; qualify their batch launch too. */
+          !strcmp(func->name, "libagx_write_u32") ||
           !strcmp(func->name, "libagx_write_u32s") ||
           !strcmp(func->name, "libagx_reset_query") ||
           !strcmp(func->name, "libagx_copy_uchar") ||
@@ -561,15 +592,17 @@ main(int argc, char **argv)
 
                .reserved_preamble = layout.size_B / 2,
                .is_helper = is_helper,
-               .no_preamble = target_is_native_agx3(*target),
+               .no_preamble = target_is_agx3(*target),
 
                /* AGX3 has a smaller register file than AGX2, so the largest
                 * kernels spill to thread-private storage like API shaders.
                 */
-               .has_scratch = target_is_native_agx3(*target),
+               .has_scratch = target_is_agx3(*target),
             };
 
-            key.dev.encoding = target_is_native_agx3(*target)
+            key.dev.encoding = !strcmp(*target, "g17g")
+                                  ? AGX_ISA_ENCODING_AGX3C
+                                  : target_is_native_agx3(*target)
                                   ? AGX_ISA_ENCODING_AGX3B
                                   : AGX_ISA_ENCODING_AGX2;
             key.dev.chip = target_chip(*target);
@@ -591,7 +624,7 @@ main(int argc, char **argv)
             }
 
             uint16_t printf_uniform = 0;
-            if (target_is_native_agx3(*target)) {
+            if (target_is_agx3(*target)) {
                /* Both frontends publish the allocator-owned printf buffer.
                 * Keep that runtime ABI instead of dropping kernel assertions
                 * as upstream did before this branch supplied the address. */
@@ -614,8 +647,9 @@ main(int argc, char **argv)
                }
             }
             if (!agx_compile_shader_nir(clone, &key, &compiled)) {
-               fprintf(stderr, "Failed to compile %s for %s\n",
-                       libfunc->name, *target);
+               extern const char *agx_last_compile_refusal(void);
+               fprintf(stderr, "Failed to compile %s for %s: %s\n",
+                       libfunc->name, *target, agx_last_compile_refusal());
                ralloc_free(clone);
                return 1;
             }
@@ -625,7 +659,7 @@ main(int argc, char **argv)
             ralloc_free(clone);
 
             assert((compiled.info.scratch_size == 0 ||
-                    target_is_native_agx3(*target)) &&
+                    target_is_agx3(*target)) &&
                    "only AGX3 internal shaders spill");
 
             assert(compiled.info.preamble_scratch_size == 0 &&

@@ -55,9 +55,58 @@ check_chip(enum agx_chip chip, enum agx_sampler_generation generation,
    }
 }
 
+/* Full sampler words from the native HAL300 Gen5 constructor at
+ * macOS 26A428, with normalized
+ * coordinates, linear min/mag filters, no mip filter and clamp-to-edge.
+ * Exercise reduction alongside both LOD bias signs and anisotropy. */
+static void
+check_native_minmax(void)
+{
+   static const struct {
+      unsigned reduction, anisotropy;
+      float bias;
+      uint64_t word;
+   } cases[] = {
+      {1, 1, 0.00f, UINT64_C(0x00000080028e0000)},
+      {1, 4, 0.00f, UINT64_C(0x0000008002ae0000)},
+      {1, 16, 0.00f, UINT64_C(0x0000008002ce0000)},
+      {1, 1, 1.50f, UINT64_C(0x00030080028e0000)},
+      {1, 4, 1.50f, UINT64_C(0x0003008002ae0000)},
+      {1, 16, 1.50f, UINT64_C(0x0003008002ce0000)},
+      {1, 1, -2.25f, UINT64_C(0x003b8080028e0000)},
+      {1, 4, -2.25f, UINT64_C(0x003b808002ae0000)},
+      {1, 16, -2.25f, UINT64_C(0x003b808002ce0000)},
+      {2, 1, 0.00f, UINT64_C(0x00000100028e0000)},
+      {2, 4, 0.00f, UINT64_C(0x0000010002ae0000)},
+      {2, 16, 0.00f, UINT64_C(0x0000010002ce0000)},
+      {2, 1, 1.50f, UINT64_C(0x00030100028e0000)},
+      {2, 4, 1.50f, UINT64_C(0x0003010002ae0000)},
+      {2, 16, 1.50f, UINT64_C(0x0003010002ce0000)},
+      {2, 1, -2.25f, UINT64_C(0x003b8100028e0000)},
+      {2, 4, -2.25f, UINT64_C(0x003b810002ae0000)},
+      {2, 16, -2.25f, UINT64_C(0x003b810002ce0000)},
+   };
+   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+      struct hk_native_sampler_state state = {
+         .maximum_lod = 14.0f,
+         .maximum_anisotropy = cases[i].anisotropy,
+         .lod_bias = cases[i].bias,
+         .magnify = AGX_FILTER_LINEAR,
+         .minify = AGX_FILTER_LINEAR,
+         .reduction_mode = (enum hk_sampler_reduction_mode)cases[i].reduction,
+      };
+      struct hk_native_sampler_descriptor out;
+      assert(hk_pack_native_sampler(AGX_CHIP_G17G, &out, &state));
+      uint64_t word;
+      memcpy(&word, out.opaque, sizeof(word));
+      assert(word == cases[i].word);
+   }
+}
+
 int
 main(void)
 {
+   check_native_minmax();
    check_chip(AGX_CHIP_G13G, AGX_SAMPLER_GENERATION_GEN4, 8);
    check_chip(AGX_CHIP_G13X, AGX_SAMPLER_GENERATION_GEN4, 8);
    check_chip(AGX_CHIP_G14G, AGX_SAMPLER_GENERATION_GEN4, 8);

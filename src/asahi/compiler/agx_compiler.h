@@ -24,6 +24,9 @@ extern "C" {
 #define AGX_NUM_REGS (256)
 
 
+/* G17G/S native allocation ends at r125; r126/r127 are not GPRs. */
+#define AGX3C_NUM_REGS (252)
+
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 
@@ -376,6 +379,7 @@ typedef struct {
       uint64_t imm;
       uint32_t writeout;
       uint32_t truth_table;
+      uint32_t matrix_type;
       uint32_t component;
       uint32_t channels;
       uint32_t bfi_mask;
@@ -450,9 +454,9 @@ typedef struct {
     * and are never inferred from generic memory IR. */
    bool scs_zero_extend : 1;
    bool scs_c_load_marker : 1;
-   bool scs_c_status_load;
-   /* Native G17P traversal publishes completion on scoreboard slot 6. */
+   bool scs_c_status_load : 1;
    bool scs_rt_wait : 1;
+   bool scs_rt_completion : 1;
    uint8_t scs_address_selector;
 
    /* Final st_vary op */
@@ -666,6 +670,9 @@ typedef struct {
 
    /* Beginning of stack allocation used for parallel copy lowering */
    bool has_spill_pcopy_reserved;
+
+   /* M5 CEM owns halves 8..15, beyond CF/shuffle/parallel-copy scratch. */
+   bool agx3_cem_low_scratch;
 
    /* The remat-only spiller had to spill a value to scratch; register
     * allocation must finish with real spilling under the full budget. */
@@ -1232,7 +1239,9 @@ bool agx3_analyze_preamble_uniform_inputs(agx_context *ctx, bool *has_inputs);
 static inline unsigned
 agx_reserved_registers(const agx_context *ctx)
 {
-   if (ctx->has_spill_pcopy_reserved)
+   if (ctx->agx3_cem_low_scratch)
+      return 16;
+   else if (ctx->has_spill_pcopy_reserved)
       return 8;
    else if (ctx->any_quad_divergent_shuffle)
       return ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2 ? 2 : 4;
@@ -1243,6 +1252,7 @@ agx_reserved_registers(const agx_context *ctx)
 }
 
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
+bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
@@ -1311,10 +1321,18 @@ struct agx_copy {
 void agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
                               unsigned n);
 
+/* As above, with an optional free 32-bit GPR (two aligned halves that no
+ * copy reads or writes and that holds no live value at this point).  Register
+ * cycles are then broken with one move through it instead of a three-XOR
+ * swap per element.  Pass agx_null() when no such register is known. */
+void agx_emit_parallel_copies_temp(agx_builder *b, struct agx_copy *copies,
+                                   unsigned num_copies, agx_index temp);
+
 void agx_compute_liveness(agx_context *ctx);
 void agx_liveness_ins_update(struct u_sparse_bitset *live, agx_instr *I);
 
-bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p);
+bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p,
+                          bool agx3c);
 bool agx_nir_remove_unused_preamble_exports(nir_shader *s, unsigned reserved);
 bool agx_nir_coalesce_preamble_half_exports(nir_shader *s, unsigned reserved,
                                           unsigned allocated);

@@ -455,6 +455,18 @@ agx_pressure_schedule(agx_context *ctx)
 /* Samples a fragment block may issue ahead of the first unissued one. */
 #define AGX_ILP_FS_HOIST_SAMPLES 6
 
+/* A sample for the sample-issue schedule. M5 encodes a storage-image read as
+ * the same native SMP as a texture fetch (Apple's texture.read), so it has
+ * the same latency to hide and is batched the same way. */
+static bool
+ilp_is_sample(const agx_context *ctx, const agx_instr *I)
+{
+   return I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+          I->op == AGX_OPCODE_TEXTURE_LOAD ||
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+           I->op == AGX_OPCODE_IMAGE_LOAD);
+}
+
 static unsigned
 ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
 {
@@ -805,9 +817,8 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
          return false;
       unsigned ordinal = 0;
       for (unsigned i = 0; i < n; ++i) {
-         const enum agx_opcode op = nodes[i]->instr->op;
-         first_sample[i] = (op == AGX_OPCODE_TEXTURE_SAMPLE ||
-                            op == AGX_OPCODE_TEXTURE_LOAD) ? ordinal++ : ~0u;
+         first_sample[i] =
+            ilp_is_sample(ctx, nodes[i]->instr) ? ordinal++ : ~0u;
       }
       for (unsigned i = n; i-- > 0;) {
          util_dynarray_foreach(&dependents[i], unsigned, d)
@@ -906,8 +917,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
       done[best] = true;
       order[step] = nodes[best];
-      issued_samples += nodes[best]->instr->op == AGX_OPCODE_TEXTURE_SAMPLE ||
-                        nodes[best]->instr->op == AGX_OPCODE_TEXTURE_LOAD;
+      issued_samples += ilp_is_sample(ctx, nodes[best]->instr);
       changed |= (unsigned)best != step;
       cycle = best_t + 1;
       const unsigned lat = ilp_latency(nodes[best]->instr, alu_latency, load_latency);
@@ -927,7 +937,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       for (unsigned i = 0; i < n; ++i)
          changed |= order[i]->index != i;
    }
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+   if (agx_isa_is_agx3(ctx->key->dev.encoding)) {
       ilp_sink_pixel_waits(order, n, dependents);
       changed = false;
       for (unsigned i = 0; i < n; ++i)
@@ -1006,13 +1016,11 @@ ilp_block_has_memory(const agx_block *block)
 }
 
 static unsigned
-ilp_block_samples(const agx_block *block)
+ilp_block_samples(const agx_context *ctx, const agx_block *block)
 {
    unsigned samples = 0;
-   agx_foreach_instr_in_block(block, I) {
-      samples += I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
-                 I->op == AGX_OPCODE_TEXTURE_LOAD;
-   }
+   agx_foreach_instr_in_block(block, I)
+      samples += ilp_is_sample(ctx, I);
    return samples;
 }
 
@@ -1023,7 +1031,7 @@ ilp_block_samples(const agx_block *block)
 static bool
 ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
        ctx->stage != MESA_SHADER_FRAGMENT)
       return false;
 
@@ -1073,6 +1081,32 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
    return loads == 1 && stores == 1 && load_target == store_target;
 }
 
+/* M5 compute sample-issue budget: register halves kept free below an
+ * occupancy bucket for allocation alignment, and the register file size. */
+#define AGX_ILP_M5_OCCUPANCY_MARGIN 8
+#define AGX_ILP_M5_MAX_HALVES 256
+
+/* Absolute peak register pressure of a block in source order, in halves:
+ * its live-out values plus the relative peak walking back from them. */
+static signed
+ilp_block_peak(agx_context *ctx, agx_block *block, const uint8_t *size16,
+               void *memctx)
+{
+   struct u_sparse_bitset live;
+   u_sparse_bitset_init(&live, ctx->alloc, memctx);
+   u_sparse_bitset_dup(&live, &block->live_out);
+   signed out = 0;
+   U_SPARSE_BITSET_FOREACH_SET(&live, v)
+      out += size16[v];
+   signed pressure = 0, peak = 0;
+   agx_foreach_instr_in_block_rev(block, I) {
+      pressure += calculate_pressure_delta(I, &live);
+      peak = MAX2(peak, pressure);
+      agx_liveness_ins_update(&live, I);
+   }
+   return out + peak;
+}
+
 void
 agx_ilp_schedule(agx_context *ctx)
 {
@@ -1110,10 +1144,82 @@ agx_ilp_schedule(agx_context *ctx)
       }
    }
 
+   const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
+   const bool m5_compute =
+      m5 && ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble;
+   const bool m5_sample_probe = m5_compute &&
+      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP_PROBE", false);
+   /* ASAHI_M5_ILP_PROBE keeps its whole-policy experiment. Otherwise M5
+    * compute uses only the sample-issue schedule below, as Apple's compute
+    * kernels issue independent samples back to back (svgfVariance: nine SMP
+    * in a row, then the accumulation); ASAHI_M5_SAMPLE_ILP=0 disables it. */
+   const bool m5_full = m5_compute &&
+      debug_get_bool_option("ASAHI_M5_ILP_PROBE", false);
+   const bool m5_samples = m5_compute &&
+      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
+   uint8_t *size16 = NULL;
+   signed m5_occupancy_cap = 0;
+   if (m5_samples && !m5_full) {
+      size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
+      if (!size16) {
+         ralloc_free(memctx);
+         return;
+      }
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d)
+            size16[I->dest[d].value] = agx_index_size_16(I->dest[d]);
+      }
+      signed program_peak = 0;
+      agx_foreach_block(ctx, block)
+         program_peak = MAX2(program_peak,
+                             ilp_block_peak(ctx, block, size16, memctx));
+      /* Keep a margin for register-allocation alignment. */
+      if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <= AGX_ILP_M5_MAX_HALVES) {
+         m5_occupancy_cap = agx_occupancy_for_register_count(
+            program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
+            AGX_ILP_M5_OCCUPANCY_MARGIN;
+      }
+   }
+
    agx_foreach_block(ctx, block) {
       if (block->index >= nr_blocks)
          continue;
-      if (in_loop[block->index] && !ilp_block_has_memory(block)) {
+      /* M5 compute: only the occupancy-capped sample-issue schedule (the
+       * whole policy under ASAHI_M5_ILP_PROBE). Other M5 stages take the
+       * shared AGX3 policy below, as agx_isa_is_agx3() gates it. */
+      if (m5_compute && !m5_full) {
+         if (m5_samples && (!in_loop[block->index] || m5_sample_probe) &&
+             ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
+            /* Let the block's peak grow only up to the largest register
+             * count with the occupancy the whole program already has, so
+             * batching never costs threads; a program at or past the last
+             * bucket (the spilling raygens) may not grow at all. */
+            const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+            const signed growth = m5_occupancy_cap > peak
+                                     ? m5_occupancy_cap - peak : 0;
+            ilp_schedule_block(ctx, block, memctx, native_uniforms,
+                               alu_latency, 16 * alu_latency, growth, 0,
+                               false, true, AGX_ILP_FS_SAMPLE_HALVES,
+                               AGX_ILP_FS_HOIST_SAMPLES, &dag_state);
+         }
+         continue;
+      }
+      /* The old ALU-only classifier predates native SCS traversal. On M5,
+       * treat every ordered memory operation and completion barrier as
+       * memory, keeping RT polling out of the ALU loop scheduling policy. */
+      bool m5_ordered_memory = false;
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+         agx_foreach_instr_in_block(block, I) {
+            const enum agx_schedule_class cls =
+               agx_opcodes_info[I->op].schedule_class;
+            m5_ordered_memory |= cls == AGX_SCHEDULE_CLASS_LOAD ||
+                                  cls == AGX_SCHEDULE_CLASS_STORE ||
+                                  cls == AGX_SCHEDULE_CLASS_ATOMIC ||
+                                  cls == AGX_SCHEDULE_CLASS_BARRIER;
+         }
+      }
+      if (in_loop[block->index] && !ilp_block_has_memory(block) &&
+          !m5_ordered_memory) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, true, false, 0, 0,
                             &dag_state);
@@ -1121,9 +1227,10 @@ agx_ilp_schedule(agx_context *ctx)
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, true, false, 0, 0, &dag_state);
-      } else if (!in_loop[block->index] && !ctx->is_preamble &&
-                 ctx->stage == MESA_SHADER_FRAGMENT &&
-                 ilp_block_samples(block) >= AGX_ILP_FS_MIN_SAMPLES) {
+      } else if ((!in_loop[block->index] || m5_sample_probe) &&
+                 !ctx->is_preamble &&
+                 (ctx->stage == MESA_SHADER_FRAGMENT || m5_sample_probe) &&
+                 ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.
           * Apple's fragment programs issue independent samples back to back

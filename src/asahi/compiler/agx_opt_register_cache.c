@@ -162,7 +162,7 @@ agx_opt_register_cache(agx_context *ctx)
     * reads are at the top of the loop, across the back edge. Cache a loop
     * compare's register source when the loop header reads it with an ALU
     * instruction before writing it, unless this read is its last use. */
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding))
       return;
 
    agx_foreach_block(ctx, block) {

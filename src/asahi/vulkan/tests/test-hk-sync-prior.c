@@ -723,6 +723,42 @@ test_classic_submission_order(void)
       DRM_ASAHI_BARRIER_NONE && compute->sync.prior[0] == 0);
 }
 
+static void
+test_barrier_chains_without_work(void)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   cmd->sync.kind_override = HK_SYNC_XFER;
+   struct hk_cs *copy = add(cmd, true);
+   cmd->sync.kind_override = 0;
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_COMPUTE);
+   hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+   struct hk_cs *draw = add(cmd, false);
+   T("transfer-compute-graphics chain retains transfer source",
+     draw->sync.dep[HK_SYNC_CDM].cut == copy);
+   T("transfer-compute-graphics chain reaches vertex work",
+     draw->sync.dep_ta[HK_SYNC_CDM].cut == copy);
+
+   cmd = new_cmd();
+   cmd->sync.kind_override = HK_SYNC_XFER;
+   copy = add(cmd, true);
+   cmd->sync.kind_override = 0;
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_COMPUTE);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+   draw = add(cmd, false);
+   T("disjoint barrier scopes do not serialize unrelated graphics",
+     draw->sync.dep[HK_SYNC_CDM].cut == NULL);
+
+   cmd = new_cmd();
+   cmd->sync.kind_override = HK_SYNC_XFER;
+   copy = add(cmd, true);
+   cmd->sync.kind_override = 0;
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_GFX_FRAG);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+   struct hk_cs *compute = add(cmd, true);
+   T("fragment destination chains into a later graphics source",
+     compute->sync.dep[HK_SYNC_CDM].cut == copy);
+}
+
 int
 main(void)
 {
@@ -730,6 +766,7 @@ main(void)
    test_classic_submission_order();
    if (!test_context)
       return EXIT_FAILURE;
+   test_barrier_chains_without_work();
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
    test_loaded_color_preservation();

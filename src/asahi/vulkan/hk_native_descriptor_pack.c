@@ -179,7 +179,9 @@ hk_pack_native_texture(unsigned generation,
          .unk_mipmapped = legacy->unk_mipmapped,
          .compressed = legacy->compressed,
          .image_mode_enable = legacy->mode != AGX_IMAGE_MODE_NORMAL,
-         .image_mode = legacy->mode,
+         /* The HAL300 texture encoder writes 1 for 16 KiB, 2 for 64 KiB and 3
+          * for 256 KiB sparse pages. AIL uses 16 KiB pages. */
+         .image_mode = legacy->mode == AGX_IMAGE_MODE_SPARSE ? 1 : legacy->mode,
          .address = legacy->address,
          .srgb = legacy->srgb,
          .srgb_2_channel = legacy->srgb_2_channel,
@@ -231,33 +233,35 @@ hk_pack_native_pbe(unsigned generation,
       return false;
 
    /* The recovered subset excludes fields whose Gen9/10 semantic placement
-    * remains incomplete: sparse mode, Gen10 gamma and the software-addressing
-    * sideband. The host-only HAL200 StateFields oracle matches the complete
+    * remains incomplete: sparse mode and the software-addressing sideband. The host-only HAL200 PBE encoder oracle matches the complete
     * GPU-tiled 2D compressed packet, including the metadata GPU address and
     * mip extension. Other compressed shapes remain closed. */
-   const bool array = generation == 9 &&
+   const bool array = (generation == 9 || generation == 10) &&
                       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
    const bool array_multisample =
-      generation == 9 &&
+      (generation == 9 || generation == 10) &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED;
-   const bool three_d = generation == 9 &&
+   const bool three_d = (generation == 9 || generation == 10) &&
                         legacy->dimension == AGX_TEXTURE_DIMENSION_3D;
    const bool layered = array || array_multisample || three_d;
-   /* Multisample stores use the recovered Gen9 dimension-4 packet for one
-    * layer and dimension 8 for a layered render target. */
+   /* Both generations have native dimension-4 single-layer MS stores.
+    * Gen9 additionally has the qualified dimension-8 array packet. */
    const bool multisample =
-      generation == 9 &&
+      (generation == 9 || generation == 10) &&
       (legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED ||
        array_multisample);
    const bool interchange = legacy->layout == AGX_LAYOUT_INTERCHANGE;
-   const bool compressed_2d = legacy->compressed && generation == 9 &&
-                              legacy->dimension == AGX_TEXTURE_DIMENSION_2D &&
-                              (legacy->layout == AGX_LAYOUT_GPU || interchange) &&
-                              !multisample;
+   const bool compressed_2d = legacy->compressed &&
+      (generation == 9 || generation == 10) &&
+      (legacy->dimension == AGX_TEXTURE_DIMENSION_2D ||
+       (generation == 10 && array && legacy->layers == 1 &&
+        legacy->level == 0 && legacy->levels == 1)) &&
+      (legacy->layout == AGX_LAYOUT_GPU || (generation == 9 && interchange)) &&
+      !multisample;
    if ((!layered && !multisample &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        (legacy->layout == AGX_LAYOUT_LINEAR &&
-        (generation != 9 || legacy->level != 0 || legacy->levels != 1 ||
+        (legacy->level != 0 || legacy->levels != 1 ||
          legacy->unk_mipmapped)) ||
        (legacy->layout != AGX_LAYOUT_LINEAR &&
         legacy->layout != AGX_LAYOUT_TWIDDLED &&
@@ -266,7 +270,8 @@ hk_pack_native_pbe(unsigned generation,
           legacy->level == 0 && legacy->levels == 1)) ||
        legacy->unk_52 || legacy->rotate_90 || legacy->flip_vertical ||
        (multisample ? (legacy->samples != AGX_SAMPLE_COUNT_2 &&
-                       legacy->samples != AGX_SAMPLE_COUNT_4)
+                       legacy->samples != AGX_SAMPLE_COUNT_4 &&
+                       !(generation == 10 && legacy->samples == AGX_SAMPLE_COUNT_8))
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
        (legacy->compressed && !compressed_2d) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
@@ -274,9 +279,6 @@ hk_pack_native_pbe(unsigned generation,
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
                         legacy->unk_mipmapped || legacy->compressed)) ||
-       (generation != 9 && (legacy->level != 0 || legacy->levels != 1 ||
-                            legacy->unk_mipmapped)) ||
-       (generation != 9 && legacy->srgb) ||
        (legacy->extended != legacy->compressed) ||
        (legacy->layout == AGX_LAYOUT_LINEAR || interchange
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4
@@ -313,9 +315,11 @@ hk_pack_native_pbe(unsigned generation,
       ? (array_multisample
             ? agx_pbe_agx3_2d_array_multisample_pack(
                  generation, &fields, legacy->layers,
+                 legacy->samples == AGX_SAMPLE_COUNT_8 ? 8u :
                  legacy->samples == AGX_SAMPLE_COUNT_4 ? 4u : 2u, &packed)
             : agx_pbe_agx3_2d_multisample_pack(
                  generation, &fields,
+                 legacy->samples == AGX_SAMPLE_COUNT_8 ? 8u :
                  legacy->samples == AGX_SAMPLE_COUNT_4 ? 4u : 2u, &packed))
       : layered
       ? (array ? agx_pbe_agx3_2d_array_mip_pack(
@@ -324,10 +328,8 @@ hk_pack_native_pbe(unsigned generation,
                : agx_pbe_agx3_3d_mip_pack(generation, &fields, legacy->layers,
                                           legacy->level, legacy->levels,
                                           &packed))
-      : generation == 9
-         ? agx_pbe_agx3_2d_mip_pack(generation, &fields, legacy->level,
-                                    legacy->levels, &packed)
-         : agx_pbe_agx3_2d_pack(generation, &fields, &packed);
+      : agx_pbe_agx3_2d_mip_pack(generation, &fields, legacy->level,
+                                 legacy->levels, &packed);
    if (!valid)
       return false;
 

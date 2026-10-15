@@ -11,10 +11,34 @@ uniform_float_encode(enum agx_isa_encoding encoding,
                      bool uniform_dest,
                      uint8_t output[16], uint8_t *length)
 {
-   if (encoding != AGX_ISA_ENCODING_AGX3B || !src || !output || !length ||
+   const bool m5 = encoding == AGX_ISA_ENCODING_AGX3C;
+   if ((!m5 && encoding != AGX_ISA_ENCODING_AGX3B) || !src || !output || !length ||
        (unsigned)op > AGX3_UNIFORM_FMA || dest >= 256 ||
-       (!half && (dest & 1)) || wait_mask > 0x3f)
+       (!half && (dest & 1)) || wait_mask > (m5 ? 0xff : 0x3f))
       return false;
+
+   /* Retained native G17G shaders witness R/U MUL and R/U/R
+    * FMA. Keep other source shapes and half/uniform destinations outside
+    * this first M5 admission. Negative uniform FMA multiplicands occur in
+    * svgfReproject; plain uniform MUL occurs in both native ray kernels. */
+   if (m5) {
+      if (half || uniform_dest || op == AGX3_UNIFORM_FADD ||
+          (op == AGX3_UNIFORM_FMA && saturate) || dest >= 252 ||
+          !((src[0].kind == AGX3_FLOAT_REGISTER &&
+             src[1].kind == AGX3_FLOAT_UNIFORM) ||
+            (src[1].kind == AGX3_FLOAT_REGISTER &&
+             src[0].kind == AGX3_FLOAT_UNIFORM)) ||
+          (op == AGX3_UNIFORM_FMA && src[2].kind != AGX3_FLOAT_REGISTER))
+         return false;
+      for (unsigned i = 0; i < (op == AGX3_UNIFORM_FMA ? 3 : 2); ++i) {
+         /* Mixed half uniform sources are AGX3B witnesses only. */
+         if (src[i].abs || src[i].half ||
+             (src[i].kind == AGX3_FLOAT_REGISTER &&
+                           (src[i].neg || src[i].value >= 252)) ||
+             (op == AGX3_UNIFORM_FMUL && src[i].neg))
+            return false;
+      }
+   }
 
    /* Direct uniform destinations are witnessed in constant programs, with
     * aligned low-file f32 results and plain GPR/immediate sources. Keep the
@@ -40,7 +64,7 @@ uniform_float_encode(enum agx_isa_encoding encoding,
          if (src[i].value >= 512 || (!source_half && (src[i].value & 1)) ||
              src[i].abs ||
              (src[i].neg &&
-              (source_half || op != AGX3_UNIFORM_FMA || i != 2)) ||
+              (source_half || op != AGX3_UNIFORM_FMA || (!m5 && i != 2))) ||
              src[i].cache || src[i].discard)
             return false;
          break;
@@ -78,6 +102,9 @@ uniform_float_encode(enum agx_isa_encoding encoding,
                                                             : "f32fma");
    uint8_t best[16], best_length = 0;
    for (unsigned swap = 0; swap < 2; ++swap) {
+      if (m5 && op == AGX3_UNIFORM_FMA &&
+          src[1 ^ swap].kind != AGX3_FLOAT_UNIFORM)
+         continue;
       struct agx3_field_kv fields[48] = {
          {uniform_dest ? 3 : 2, dest},
          {9, uniform_dest ? 3 : 2}, {10, half ? 1 : 2},
@@ -112,24 +139,38 @@ uniform_float_encode(enum agx_isa_encoding encoding,
          fields[n++] = (struct agx3_field_kv){77, 2};
          fields[n++] = (struct agx3_field_kv){91, 2};
       }
+      if (m5) {
+         fields[n++] = (struct agx3_field_kv){op == AGX3_UNIFORM_FMA ? 95 : 78, 3};
+         fields[n++] = (struct agx3_field_kv){op == AGX3_UNIFORM_FMA ? 96 : 79,
+                                            op == AGX3_UNIFORM_FMA ? 55 : 62};
+      }
       const unsigned wait_base = half ? (op == AGX3_UNIFORM_FMA ? 68 : 51)
                                  : op == AGX3_UNIFORM_FADD ? 52
                                  : op == AGX3_UNIFORM_FMUL ? 80
                                                            : 97;
-      for (unsigned i = 0; i < 6; ++i)
+      for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
          fields[n++] =
             (struct agx3_field_kv){wait_base + i, (wait_mask >> i) & 1};
 
-      const unsigned last_ep = op == AGX3_UNIFORM_FMA ? 5 : 3;
+      /* M5 adds the slot-seven/eight endpoints, and its MUL endpoints
+       * are not ordered by length. Use the same complete endpoint domain
+       * as the native register-only FALU encoder. */
+      const unsigned last_ep = m5 ? (op == AGX3_UNIFORM_FMA ? 7 : 5)
+                                  : op == AGX3_UNIFORM_FMA ? 5 : 3;
       /* Compact wait selectors express one slot. Use the independent fields
        * for multiple producers, without draining unrelated outstanding work. */
-      const unsigned first_ep = (wait_mask & (wait_mask - 1)) ? last_ep : 0;
+      const unsigned first_ep = (wait_mask & (wait_mask - 1))
+                                   ? (m5 && op == AGX3_UNIFORM_FMUL ? 3 : last_ep)
+                                   : 0;
       for (unsigned ep = first_ep; ep <= last_ep; ++ep) {
          /* Only a strictly shorter encoding can replace the first swap's,
           * and the endpoints grow in length: stop trying once they reach it. */
          if (best_length &&
-             agx3_bind_form_size(encoding, mnemonic, ep) >= best_length)
+             agx3_bind_form_size(encoding, mnemonic, ep) >= best_length) {
+            if (m5)
+               continue;
             break;
+         }
          uint8_t bytes[16], size;
          if (agx3_bind_compose(encoding, mnemonic, ep, NULL, 0, fields, n,
                                bytes, &size)) {

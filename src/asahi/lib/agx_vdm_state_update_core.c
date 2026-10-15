@@ -333,14 +333,15 @@ agx_g17p_vertex_program_info(
    const bool preamble_ok =
       compiler_info &&
       (compiler_info->has_preamble
-          ? compiler_info->constant_program_allowed &&
+          ? agx_chip_native_agx3(chip) && compiler_info->constant_program_allowed &&
                compiler_info->preamble_staging_known &&
                compiler_info->nr_preamble_gprs != 0 &&
                compiler_info->nr_preamble_gprs <= 256
           : compiler_info->nr_preamble_gprs == 0 &&
                compiler_info->preamble_scratch_size == 0);
 
-   if (!agx_chip_native_agx3(chip) || !compiler_info || !program ||
+   if ((!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip)) ||
+       !compiler_info || !program ||
        !compiler_info->hardware_vertex || !preamble_ok ||
        compiler_info->position_off != 0 || compiler_info->varyings_off != 4 ||
        compiler_info->psiz_off != 4 + compiler_info->user_size ||
@@ -383,7 +384,8 @@ agx_g17p_vertex_program_info(
             .raw_vs_output_count_1_extra = false,
             .raw_vs_output_selector = 0,
             .raw_vs_output_flag_6 = false,
-            .pre_hal300_flag_group_nonzero = true,
+            .pre_hal300_flag_group_nonzero =
+               !agx_vdm_state_update_is_hal300(chip),
             .pre_hal300_flag_bit_4 = false,
             .variant = AGX_VDM_STATE_UPDATE_TEMPLATE_00,
             .raw_active_context_selector = UINT32_MAX,

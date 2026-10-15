@@ -4,6 +4,7 @@ hk_files = files(
   'hk_barrier.c',
   'hk_barrier.h',
   'hk_acceleration_structure.c',
+  'hk_m5_acceleration_structure.c',
   'hk_host_as.c',
   'hk_acceleration_structure.h',
   'hk_buffer.c',
@@ -223,6 +224,17 @@ if with_tests
     )
 
   endif
+
+  test(
+    'hk_render_resource_span',
+    executable(
+      'hk_render_resource_span_test',
+      files('tests/test-hk-render-resource-span.c', 'hk_drm_render_core.c'),
+      include_directories : [include_directories('.'), inc_include],
+      c_args : [c_msvc_compat_args],
+    ),
+    suite : ['asahi'],
+  )
 
   test(
     'hk_query_program',

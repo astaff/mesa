@@ -38,6 +38,10 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
       dev->samplers.table.bo && dev->samplers.table.bo->va
          ? dev->samplers.table.bo->va->addr
          : 0;
+   root->physical_sparse_map = dev->physical_sparse_map
+      ? dev->physical_sparse_map->va->addr : 0;
+   root->physical_sparse_base = dev->dev.main_heap_base;
+   root->physical_sparse_size = dev->dev.main_heap_size;
 
    /* Dynamic buffers past the highest one ever bound are read by no bound
     * layout. Never read the uninitialized hole in an earlier upload. */

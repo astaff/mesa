@@ -285,6 +285,9 @@ quad_dependent_instr(const nir_instr *instr)
    case nir_intrinsic_ddy_coarse:
    case nir_intrinsic_is_helper_invocation:
    case nir_intrinsic_load_helper_invocation:
+   case nir_intrinsic_load_active_subgroup_invocation_agx:
+   case nir_intrinsic_load_active_subgroup_count_agx:
+   case nir_intrinsic_quad_ballot_agx:
       return true;
    default:
       return false;
@@ -553,6 +556,10 @@ subgroup_instr(const nir_instr *instr)
 {
    if (instr->type != nir_instr_type_intrinsic)
       return false;
+   const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+   if (op == nir_intrinsic_load_active_subgroup_invocation_agx ||
+       op == nir_intrinsic_load_active_subgroup_count_agx)
+      return true;
    /* Quad operations are also flagged SUBGROUP; they only read their own
     * quad, which a dead-quad kill never leaves partially alive. */
    const unsigned flags =

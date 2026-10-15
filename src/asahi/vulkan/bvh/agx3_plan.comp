@@ -21,10 +21,18 @@
 #include "hk_build_interface.h"
 
 layout(local_size_x = 64) in;
+#ifdef HK_AGX3_BATCH
+layout(push_constant) uniform CONSTS
+{
+   hk_agx3_batch_args batch;
+};
+hk_agx3_plan_args args;
+#else
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_plan_args args;
 };
+#endif
 
 void
 fail(uint flag)
@@ -39,7 +47,16 @@ leaf_size()
    return args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
              ? SIZEOF(vk_ir_instance_node)
              : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                ? SIZEOF(vk_ir_aabb_node) : SIZEOF(vk_ir_triangle_node);
+                  ? SIZEOF(vk_ir_aabb_node) : SIZEOF(vk_ir_triangle_node);
+}
+
+uint
+leaf_kind()
+{
+   return args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
+             ? vk_ir_node_instance
+             : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                  ? vk_ir_node_aabb : vk_ir_node_triangle;
 }
 
 uint
@@ -48,7 +65,7 @@ source_index(uint ir_id)
    if (ir_id == VK_BVH_INVALID_NODE)
       return 0xffffffffu;
    uint offset = ir_id_to_offset(ir_id), kind = ir_id_to_type(ir_id);
-   if (kind == (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR ? vk_ir_node_instance : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR ? vk_ir_node_aabb : vk_ir_node_triangle) && offset < args.root_offset &&
+   if (kind == leaf_kind() && offset < args.root_offset &&
        offset % leaf_size() == 0) {
       uint i = offset / leaf_size();
       if (i < args.leaf_bound)
@@ -245,7 +262,7 @@ classify(uint id)
          ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
                ? HK_AGX3_NODE_INSTANCES
                : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                  ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF)
+                    ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF)
          : HK_AGX3_NODE_INNER;
    for (uint i = 0; i < 8; i++)
       output_job.triangle_offsets[i] = 0;
@@ -301,10 +318,14 @@ emit(uint id)
       fail(HK_AGX3_PLAN_SHAPE);
       return;
    }
+   /* Instances take two slots each; triangles one record slot each plus one
+    * quantized block per four; 48-byte bounding-box records are packed
+    * contiguously (native record class 4) and rounded up to whole slots. */
    uint slots = leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
                            ? 2u * count
                            : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                              ? count : count + (count + 3u) / 4u) : count;
+                                ? args.gen1 != 0 ? count : (count * (args.reserved == 64u ? 64u : 48u) + 63u) / 64u
+                                : count + (count + 3u) / 4u) : count;
    uint first = atomicAdd(DEREF(args.state).next_slot, slots);
    if (slots > args.slot_bound || first > args.slot_bound - slots) {
       fail(HK_AGX3_PLAN_ALLOCATION);
@@ -343,6 +364,8 @@ finish(uint id)
       DEREF(args.state).error == 0 ? DEREF(args.header).active_leaf_count : 0;
    job.node_count = DEREF(args.state).job_count;
    job.depth = DEREF(args.state).depth;
+   /* Internal job sentinel only: an all-inactive tree has no native nodes.
+    * Other planner errors remain errors; do not publish them as empty. */
    job.opaque_build_word = DEREF(args.state).error == HK_AGX3_PLAN_EMPTY
                              ? HK_AGX3_PLAN_EMPTY : 0;
    job.resource_id = args.resource_id;
@@ -353,10 +376,106 @@ finish(uint id)
       DEREF(args.state).job_count = 0;
 }
 
+/* A single active common leaf collapses to the same one-job native cluster
+ * as the general planner. No IR internal node, Morton ordering, parent walk
+ * or atomic allocation is needed. The leaf shader still decides inactivity. */
+void
+plan_single_leaf()
+{
+   hk_agx3_plan_state state;
+   state.job_count = 0;
+   state.groups_y = 1;
+   state.groups_z = 1;
+   state.next_slot = 3;
+   state.depth = 0;
+   state.error = 0;
+   state.reserved[0] = 0;
+   state.reserved[1] = 0;
+   uint active_count = DEREF(args.header).active_leaf_count;
+   if (active_count == 0)
+      state.error = HK_AGX3_PLAN_EMPTY;
+   if (args.leaf_bound != 1 || args.node_bound < 2 || active_count > 1 ||
+       args.root_offset != leaf_size() ||
+       (args.geometry_type != VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+        args.geometry_type != VK_GEOMETRY_TYPE_AABBS_KHR) ||
+       args.output_bvh == 0 || (args.output_bvh & 1023ul) != 0 ||
+       args.output_bvh >= (1ul << 48) ||
+       uint64_t(args.slot_bound) * 64ul + 184ul > (1ul << 48) - args.output_bvh ||
+       args.slot_bound < 5)
+      state.error |= HK_AGX3_PLAN_INDEX;
+   if (state.error == 0) {
+      hk_agx3_leaf_job job;
+      job.intermediate_bvh = args.intermediate_bvh;
+      job.output_bvh = args.output_bvh;
+      job.root_slot = 0;
+      job.child_slot = 3;
+      job.child_count = 1;
+      job.node_kind = args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                        ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF;
+      for (uint i = 0; i < 8; ++i)
+         job.triangle_offsets[i] = 0;
+      DEREF(INDEX(hk_agx3_leaf_job, args.jobs, 0)) = job;
+      state.job_count = 1;
+      state.depth = 1;
+      state.next_slot = args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
+                           ? 4 : 5;
+   }
+   hk_agx3_envelope_job envelope;
+   envelope.bounds = REF(vk_ir_node)(args.intermediate_bvh);
+   envelope.output_bvh = args.output_bvh;
+   envelope.end_slot = state.next_slot;
+   envelope.primitive_count = state.error == 0 ? 1 : 0;
+   envelope.node_count = state.job_count;
+   envelope.depth = state.depth;
+   envelope.opaque_build_word = state.error == HK_AGX3_PLAN_EMPTY
+                                 ? HK_AGX3_PLAN_EMPTY : 0;
+   envelope.resource_id = args.resource_id;
+   envelope.geometry_type = args.geometry_type;
+   envelope.leaf_bound = 1;
+   DEREF(args.envelope) = envelope;
+   DEREF(args.state) = state;
+}
+
 void
 main()
 {
    uint id = gl_GlobalInvocationID.x;
+#ifdef HK_AGX3_BATCH
+   uint build = gl_WorkGroupID.y;
+   if (build >= batch.job_count)
+      return;
+   REF(hk_agx3_batch_job) entry = INDEX(hk_agx3_batch_job, batch.jobs, build);
+   args = DEREF(entry).plan;
+   args.phase = batch.phase;
+   /* Snapshot the final number of independently writable jobs. Allocation
+    * is bounded by the host's sum of node bounds. Planner failures still
+    * produce mapped entries whose consumer observes the error and returns. */
+   if (args.phase == 3 && id == 0) {
+      uint count = DEREF(args.state).error == 0 ? DEREF(args.state).job_count : 0;
+      DEREF(entry).first_job = atomicAdd(DEREF(batch.dispatch).x, count);
+      DEREF(entry).encode_count = count;
+   }
+   if (args.phase == 4 && id < DEREF(entry).encode_count) {
+      hk_agx3_batch_map mapping;
+      mapping.build = build;
+      mapping.node = id;
+      DEREF(INDEX(hk_agx3_batch_map, batch.map,
+                  DEREF(entry).first_job + id)) = mapping;
+   }
+   if (DEREF(entry).single_leaf != 0) {
+      if (args.phase == 0 && id == 0)
+         plan_single_leaf();
+      return;
+   }
+#endif
+#if !HK_AGX3_GEN1
+   /* The single-leaf phase is dispatched by the M5 backend only. */
+   if (args.phase == 5) {
+      if (id == 0)
+         plan_single_leaf();
+      return;
+   }
+#endif
    if (args.phase == 0) {
       initialize(id);
       return;

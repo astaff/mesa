@@ -333,7 +333,8 @@ struct agx_fs_epilog_key {
    uint8_t nr_samples;
    /* agx_tilebuffer_layout::max_sample_size_B of the render pass. */
    uint8_t max_sample_size_B;
-   uint16_t max_bytes_per_tile;
+   bool native_imageblock;
+   uint32_t max_bytes_per_tile;
    uint16_t max_samples_per_tile;
    bool force_small_tile;
    bool preserve_zero_mask;
@@ -392,6 +393,9 @@ void agx_nir_fs_epilog_agx2(struct nir_builder *b, const void *key_);
 void agx_nir_fs_epilog_g17p(struct nir_builder *b, const void *key);
 bool agx_nir_lower_g17p_sample_shading(
    nir_shader *nir, struct agx_fs_epilog_link_info *link, unsigned samples);
+bool agx_nir_lower_g17p_sample_shading_file(
+   nir_shader *nir, struct agx_fs_epilog_link_info *link, unsigned samples,
+   unsigned registers, bool eight_samples);
 void agx_nir_fs_prolog(struct nir_builder *b, const void *key_);
 
 bool agx_nir_gather_vs_inputs(nir_shader *s,

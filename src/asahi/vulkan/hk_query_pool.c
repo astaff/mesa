@@ -109,7 +109,8 @@ hk_query_command_cs(struct hk_cmd_buffer *cmd)
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, HK_SYNC_ALL, cmd->current_cs.cs, dep);
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs && agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev))
+   if (cs && (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+              agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)))
       cs->g17p_timestamp_query = true;
    return cs;
 }
@@ -174,12 +175,23 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-
-   /* Live sidecar metadata includes retained update topology. Serialization
-    * requires the matching native serialization format and
-    * relocation path; do not invent a size for an unimplemented format. */
-   if (!dev->g17p_native_as || pool->vk.query_type != queryType ||
-       !hk_is_acceleration_structure_query(queryType) ||
+   uint32_t kind;
+   switch (queryType) {
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
+      kind = 0;
+      break;
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
+      kind = 1;
+      break;
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
+      kind = 2;
+      break;
+   default:
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if ((!dev->g17p_native_as && !dev->m5_native_as) || pool->vk.query_type != queryType ||
        firstQuery > pool->vk.query_count ||
        accelerationStructureCount > pool->vk.query_count - firstQuery) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -187,24 +199,26 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
    }
    if (!accelerationStructureCount || !hk_query_command_cs(cmd))
       return;
-
    for (uint32_t i = 0; i < accelerationStructureCount; ++i) {
       VK_FROM_HANDLE(vk_acceleration_structure, as, pAccelerationStructures[i]);
-      uint64_t metadata = hk_gen1_as_metadata_addr(cmd, as);
-      if (!metadata)
-         return;
-      libagx_gen1_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
-         libagx_gen1_as_native_address(vk_acceleration_structure_get_va(as)),
-         metadata, hk_query_report_addr(dev, pool, firstQuery + i),
-         queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? 0 :
-         queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? 1 :
-         queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ? 2 : 3);
+      if (dev->g17p_native_as) {
+         uint64_t metadata = hk_gen1_as_metadata_addr(cmd, as);
+         if (!metadata)
+            return;
+         libagx_gen1_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
+            libagx_gen1_as_native_address(vk_acceleration_structure_get_va(as)),
+            metadata, hk_query_report_addr(dev, pool, firstQuery + i),
+            queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? 0 :
+            queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? 1 :
+            queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ? 2 : 3);
+      } else {
+         libagx_agx3_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
+            ALIGN_POT(vk_acceleration_structure_get_va(as), UINT64_C(1024)),
+            hk_query_report_addr(dev, pool, firstQuery + i), kind);
+      }
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
-      /* The helper's strong barrier completes the value before the existing
-       * queue-write path makes availability system-wide coherent. */
-      hk_queue_write(cmd, hk_query_available_addr(pool, firstQuery + i), 1,
-                      false);
+      hk_queue_write(cmd, hk_query_available_addr(pool, firstQuery + i), 1, false);
    }
 }
 
