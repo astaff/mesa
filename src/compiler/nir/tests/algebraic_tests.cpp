@@ -948,6 +948,101 @@ TEST_F(nir_opt_algebraic_test, rejected_constant_binding_does_not_commit_state)
    }
 }
 
+
+static std::vector<unsigned> seen_binding_callback_visits;
+
+static bool
+record_seen_binding_callback(const nir_search_state *, const nir_alu_instr *,
+                             unsigned src, unsigned, const uint8_t *)
+{
+   seen_binding_callback_visits.push_back(src);
+   return true;
+}
+
+TEST_F(nir_opt_algebraic_test, seen_binding_conditions_precede_SSA_rejection)
+{
+   for (bool wrong_width : {false, true}) {
+      SCOPED_TRACE(wrong_width);
+      nir_shader_compiler_options options = {};
+      nir_builder current = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &options, "seen binding callback");
+      ralloc_steal(b->shader, current.shader);
+      nir_def *lhs = binding_input(&current, 4, "lhs");
+      nir_def *rhs = binding_input(&current, 4, "rhs");
+      nir_def *root = nir_iadd(&current, lhs, rhs);
+      nir_intrinsic_instr *store = filter_store(&current, root);
+      nir_search_value_union values[3] = {};
+      filter_variable(values[0]);
+      filter_variable(values[1], wrong_width ? 64 : 32);
+      values[1].variable.cond_index = 0;
+      filter_expression(values[2], nir_op_iadd, 0);
+      values[2].expression.srcs[1] = 1;
+      values[2].expression.comm_exprs = 1;
+      values[2].expression.comm_expr_mask = 1;
+      const uint16_t transition[] = {2};
+      std::vector<per_op_table> operations(nir_num_search_ops);
+      operations[nir_op_iadd] = {nullptr, 1, transition};
+      const struct transform transforms[] = {
+         {0, 0, ~0u}, {2, 0, 0}, {0, 0, ~0u},
+      };
+      const uint16_t offsets[] = {0, 0, 1};
+      const nir_search_variable_cond conditions[] = {record_seen_binding_callback};
+      nir_algebraic_table table = {};
+      table.transforms = transforms;
+      table.transform_offsets = offsets;
+      table.pass_op_table = operations.data();
+      table.values = values;
+      table.variable_cond = conditions;
+      const bool enabled[] = {true};
+      seen_binding_callback_visits.clear();
+      EXPECT_FALSE(nir_algebraic_impl(current.impl, enabled, &table));
+      EXPECT_EQ(store->src[0].ssa, root);
+      if (wrong_width)
+         EXPECT_TRUE(seen_binding_callback_visits.empty());
+      else
+         EXPECT_EQ(seen_binding_callback_visits, (std::vector<unsigned>{1, 0}));
+      nir_validate_shader(current.shader, "seen binding callback");
+   }
+}
+
+TEST_F(nir_opt_algebraic_test, same_variable_loads_keep_distinct_SSA_bindings)
+{
+   for (unsigned components : {1u, 4u, 16u}) {
+      SCOPED_TRACE(components);
+      nir_shader_compiler_options options = {};
+      nir_builder current = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &options, "distinct binding identity");
+      ralloc_steal(b->shader, current.shader);
+      nir_variable *variable = nir_local_variable_create(
+         current.impl, glsl_vector_type(GLSL_TYPE_UINT, components), "value");
+      nir_def *lhs = nir_load_var(&current, variable);
+      nir_def *rhs = nir_load_var(&current, variable);
+      ASSERT_NE(lhs, rhs);
+      nir_def *root = nir_iadd(&current, lhs, rhs);
+      nir_intrinsic_instr *store = filter_store(&current, root);
+      nir_search_value_union values[2] = {};
+      filter_variable(values[0]);
+      filter_expression(values[1], nir_op_iadd, 0);
+      values[1].expression.srcs[1] = 0;
+      const uint16_t transition[] = {2};
+      std::vector<per_op_table> operations(nir_num_search_ops);
+      operations[nir_op_iadd] = {nullptr, 1, transition};
+      const struct transform transforms[] = {
+         {0, 0, ~0u}, {1, 0, 0}, {0, 0, ~0u},
+      };
+      const uint16_t offsets[] = {0, 0, 1};
+      nir_algebraic_table table = {};
+      table.transforms = transforms;
+      table.transform_offsets = offsets;
+      table.pass_op_table = operations.data();
+      table.values = values;
+      const bool enabled[] = {true};
+      EXPECT_FALSE(nir_algebraic_impl(current.impl, enabled, &table));
+      EXPECT_EQ(store->src[0].ssa, root);
+      nir_validate_shader(current.shader, "distinct binding identity");
+   }
+}
+
 TEST_F(nir_opt_algebraic_test, bounds_agx_unsigned_end_and_bound)
 {
    for (unsigned bits : {8u, 16u, 32u, 64u}) {

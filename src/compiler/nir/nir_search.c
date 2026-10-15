@@ -255,10 +255,14 @@ match_value(const nir_algebraic_table *table,
    if (value->type == nir_search_value_variable) {
       const nir_search_variable *var = nir_search_value_as_variable(value);
       assert(var->variable < NIR_SEARCH_MAX_VARIABLES);
-      if (var->cond_index == -1 &&
-          !(state->variables_seen & (1 << var->variable))) {
-         new_swizzle = state->variables[var->variable].swizzle;
-         memset(new_swizzle, 0, NIR_MAX_VEC_COMPONENTS);
+      if (var->cond_index == -1) {
+         if (state->variables_seen & (1 << var->variable)) {
+            if (state->variables[var->variable].def != instr->src[src].src.ssa)
+               return false;
+         } else {
+            new_swizzle = state->variables[var->variable].swizzle;
+            memset(new_swizzle, 0, NIR_MAX_VEC_COMPONENTS);
+         }
       }
    }
 
