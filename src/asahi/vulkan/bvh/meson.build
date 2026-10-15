@@ -16,7 +16,8 @@ foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
              ['agx3_leaf.comp', 'hk_agx3_leaf'],
              ['agx3_envelope.comp', 'hk_agx3_envelope'],
              ['agx3_plan.comp', 'hk_agx3_plan'],
-             ['agx3_refit.comp', 'hk_agx3_refit']]
+             ['agx3_refit.comp', 'hk_agx3_refit'],
+             ['vertex_table.comp', 'hk_vertex_table']]
   command = [
     prog_glslang, '-V',
     '-I' + vk_bvh_include_dir,

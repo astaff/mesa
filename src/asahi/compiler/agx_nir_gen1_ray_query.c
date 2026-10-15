@@ -32,10 +32,29 @@ gen1_rq_field_deref(nir_builder *b, nir_deref_instr *query, nir_variable *field)
       gen1_rq_field_deref(b, nir_deref_instr_parent(query), field), query);
 }
 
+nir_def *
+agx_nir_gen1_vertex_position_address(nir_builder *b, nir_def *instance,
+                                     nir_def *geometry, nir_def *primitive)
+{
+   nir_def *blas = nir_load_global(b, 1, 64, nir_iadd_imm(b, instance, 88), .align_mul = 8);
+   nir_def *id = nir_load_global(b, 1, 32, nir_iadd_imm(b, blas, 176), .align_mul = 4);
+   nir_def *entry = nir_iadd_imm(b, nir_u2u64(b, nir_imul_imm(b, nir_iand_imm(b, id, 0x7ff), 16)),
+                                 AGX_GEN1_VERTEX_DIRECTORY_VA);
+   nir_def *table = nir_load_global(b, 1, 64, entry, .align_mul = 8);
+   nir_def *vertices = nir_load_global(b, 1, 32, nir_iadd_imm(b, table, 8), .align_mul = 4);
+   nir_def *base = nir_load_global(b, 1, 32,
+      nir_iadd(b, nir_iadd_imm(b, table, 16), nir_u2u64(b, nir_imul_imm(b, geometry, 4))), .align_mul = 4);
+   nir_def *index = nir_iadd(b, base, primitive);
+   return nir_iadd(b, nir_iadd(b, table, nir_u2u64(b, vertices)),
+                   nir_u2u64(b, nir_imul_imm(b, index, 36)));
+}
+
 static bool
-gen1_rq_supported_load(const nir_intrinsic_instr *intr, bool instances)
+gen1_rq_supported_load(const nir_intrinsic_instr *intr, bool instances, bool position_fetch)
 {
    switch (nir_intrinsic_ray_query_value(intr)) {
+   case nir_ray_query_value_intersection_triangle_vertex_positions:
+      return position_fetch && instances && nir_intrinsic_committed(intr);
    case nir_ray_query_value_flags:
    case nir_ray_query_value_tmin:
    case nir_ray_query_value_world_ray_origin:
@@ -57,9 +76,11 @@ gen1_rq_supported_load(const nir_intrinsic_instr *intr, bool instances)
 }
 
 static bool
-gen1_candidate_supported_load(const nir_intrinsic_instr *intr)
+gen1_candidate_supported_load(const nir_intrinsic_instr *intr, bool position_fetch)
 {
    switch(nir_intrinsic_ray_query_value(intr)) {
+   case nir_ray_query_value_intersection_triangle_vertex_positions:
+      return position_fetch;
    case nir_ray_query_value_intersection_type:
    case nir_ray_query_value_intersection_t:
    case nir_ray_query_value_intersection_primitive_index:
@@ -307,8 +328,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
                   GEN1_RQ_UNSUPPORTED();
                break;
             case nir_intrinsic_rq_load:
-               if (!gen1_rq_supported_load(intr, layout->instance_traversal) &&
-                   !(layout->candidates && gen1_candidate_supported_load(intr)))
+               if (!gen1_rq_supported_load(intr, layout->instance_traversal, layout->position_fetch) &&
+                   !(layout->candidates && gen1_candidate_supported_load(intr, layout->position_fetch)))
                   GEN1_RQ_UNSUPPORTED();
                break;
             case nir_intrinsic_rq_generate_intersection:
@@ -662,6 +683,18 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             value = nir_ilt_imm(&b,
                nir_channel(&b, nir_load_deref(&b, result[2]), 1), 0);
             break;
+         case nir_ray_query_value_intersection_triangle_vertex_positions: {
+            nir_def *node = nir_pack_64_2x32(&b,
+               nir_channels(&b, nir_load_deref(&b, result[0]), 3));
+            nir_def *primitive = nir_iand_imm(
+               &b, nir_channel(&b, nir_load_deref(&b, result[2]), 0), 0x3fffffff);
+            nir_def *geometry = nir_iand_imm(&b,
+               nir_channel(&b, nir_load_deref(&b, result[2]), 1), 0xffffff);
+            value = nir_load_global(&b, 3, 32, nir_iadd_imm(&b,
+               agx_nir_gen1_vertex_position_address(&b, node, geometry, primitive),
+               12 * nir_intrinsic_column(intr)), .align_mul = 4);
+            break;
+         }
          case nir_ray_query_value_intersection_instance_sbt_index:
          case nir_ray_query_value_intersection_object_ray_direction:
          case nir_ray_query_value_intersection_object_ray_origin:
@@ -743,10 +776,10 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
    return true;
 unsupported:
    if (debug_get_bool_option("ASAHI_G17P_RQ_LOWERING_DIAGNOSTIC", false))
-      fprintf(stderr, "Gen1 ray-query refusal stage=%u line=%u queries=%zu operations=%zu\n",
+      fprintf(stderr, "Gen1 ray-query refusal stage=%u line=%u queries=%zu operations=%zu instances=%d candidates=%d position_fetch=%d feature=%d\n",
               shader->info.stage, refusal_line,
               util_dynarray_num_elements(&queries, struct gen1_rq_state),
-              util_dynarray_num_elements(&ops, nir_intrinsic_instr *));
+              util_dynarray_num_elements(&ops, nir_intrinsic_instr *), layout->instance_traversal, layout->candidates, layout->position_fetch, layout->diagnostic_features);
 #undef GEN1_RQ_UNSUPPORTED
    util_dynarray_fini(&ops);
    util_dynarray_fini(&queries);

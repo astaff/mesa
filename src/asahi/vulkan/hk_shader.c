@@ -2110,6 +2110,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                 (nir->info.stage == MESA_SHADER_TESS_EVAL &&
                  !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT))),
             .compute_kernel = dev->gen1_native_graphics_rq,
+            .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch &&
+                              dev->gen1_vertex_directory != NULL,
+            .diagnostic_features = dev->vk.enabled_features.rayTracingPositionFetch,
             .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
                ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
          };

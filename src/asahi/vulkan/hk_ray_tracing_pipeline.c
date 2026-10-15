@@ -22,6 +22,7 @@
  */
 
 #include "hk_ray_tracing_pipeline.h"
+#include "asahi/compiler/agx_nir_gen1_ray_query.h"
 
 #include "hk_buffer.h"
 #include "hk_bvh.h"
@@ -1080,6 +1081,9 @@ hk_rt_native_load_hit_state(nir_builder *b, struct hk_rt_shader_state *state,
    nir_def *geometry = nir_rq_load(b, 1, 32, q, .committed = committed,
       .ray_query_value = nir_ray_query_value_intersection_geometry_index);
    nir_store_var(b, state->geometry_id_and_flags, geometry, 1);
+   if (state->primitive_addr)
+      nir_store_var(b, state->primitive_addr,
+         agx_nir_gen1_vertex_position_address(b, instance, geometry, primitive), 1);
    nir_def *distance = nir_rq_load(b, 1, 32, q, .committed = committed,
       .ray_query_value = nir_ray_query_value_intersection_t);
    nir_store_var(b, state->tmax, distance, 1);

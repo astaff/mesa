@@ -23,6 +23,8 @@
 #include "asahi/compiler/agx3_rt_gen1_runtime_tables.h"
 #include "util/u_dl.h"
 #include "hk_agx3_as_layout.h"
+#include "util/hash_table.h"
+#include "asahi/compiler/agx_nir_gen1_ray_query.h"
 #include "hk_gen1_rt_indirect_contract.h"
 #include "asahi/lib/agx_va_runtime_hole.h"
 #include "asahi/libagx/gen1_as.h"
@@ -48,6 +50,20 @@ static const uint32_t encode_spv[] = {
 
 static const uint32_t write_spv[] = {
 #include "bvh/hk_bvh_write.spv.h"
+};
+
+static const uint32_t vertex_table_spv[] = {
+#include "bvh/hk_vertex_table.spv.h"
+};
+
+struct hk_vertex_table_layout {
+   uint64_t offset, bytes;
+   uint32_t geometry_count, primitives, vertices_offset;
+};
+
+struct hk_vertex_table_args {
+   uint64_t leaves, table;
+   uint32_t leaf_count, geometry_count, vertices_offset, leaf_stride;
 };
 
 static const uint32_t agx3_node_spv[] = {
@@ -186,6 +202,13 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
    VK_FROM_HANDLE(vk_acceleration_structure, as, handle);
    if (as && dev->g17p_native_as) {
       simple_mtx_lock(&dev->gen1_as_lock);
+      if (dev->gen1_vertex_tables) {
+         struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_vertex_tables, as);
+         if (entry) {
+            free(entry->data);
+            _mesa_hash_table_remove(dev->gen1_vertex_tables, entry);
+         }
+      }
       uint32_t id = 1;
       util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
          if (*p == as) {
@@ -508,22 +531,60 @@ hk_agx3_retained_offset(const struct vk_acceleration_structure_build_state *stat
           ? (uint64_t)state->leaf_node_count * 80 : 0), 8);
 }
 
+static bool
+hk_vertex_table_wanted(const struct hk_device *dev,
+                       const struct vk_acceleration_structure_build_state *state)
+{
+   return dev->g17p_native_as && dev->gen1_vertex_directory &&
+          dev->vk.enabled_features.rayTracingPositionFetch &&
+          vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+          (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR) &&
+          state->build_info->geometryCount > 0;
+}
+
+static VkDeviceSize
+hk_get_native_as_size(const struct vk_acceleration_structure_build_state *state)
+{
+   struct hk_agx3_as_layout layout;
+   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+      return 0;
+   if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+      return hk_agx3_retained_offset(state) + sizeof(struct vk_ir_header) +
+             (uint64_t)state->internal_node_count * sizeof(struct vk_ir_box_node) +
+             LIBAGX_GEN1_AS_ALIGNMENT_SLACK;
+   return layout.as_bytes +
+      (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
+          ? (uint64_t)state->leaf_node_count * 80 : 0);
+}
+
+static bool
+hk_vertex_table_layout(const struct hk_device *dev,
+                       const struct vk_acceleration_structure_build_state *state,
+                       struct hk_vertex_table_layout *out)
+{
+   if (!hk_vertex_table_wanted(dev, state))
+      return false;
+   const uint64_t base = hk_get_native_as_size(state);
+   if (base <= LIBAGX_GEN1_AS_ALIGNMENT_SLACK)
+      return false;
+   out->offset = ALIGN_POT(base - LIBAGX_GEN1_AS_ALIGNMENT_SLACK, UINT64_C(16));
+   out->geometry_count = state->build_info->geometryCount;
+   out->primitives = state->leaf_node_count;
+   out->vertices_offset = ALIGN_POT(16 + 4 * out->geometry_count, 16);
+   out->bytes = (uint64_t)out->vertices_offset + (uint64_t)out->primitives * 36;
+   return true;
+}
+
 static VkDeviceSize
 hk_get_as_size(VkDevice _device,
                const struct vk_acceleration_structure_build_state *state)
 {
    VK_FROM_HANDLE(hk_device, dev, _device);
    if (dev->g17p_native_as) {
-      struct hk_agx3_as_layout layout;
-      if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
-         return 0;
-      if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
-         return hk_agx3_retained_offset(state) + sizeof(struct vk_ir_header) +
-                (uint64_t)state->internal_node_count * sizeof(struct vk_ir_box_node) +
-                LIBAGX_GEN1_AS_ALIGNMENT_SLACK;
-      return layout.as_bytes +
-         (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
-             ? (uint64_t)state->leaf_node_count * 80 : 0);
+      struct hk_vertex_table_layout table;
+      if (hk_vertex_table_layout(dev, state, &table))
+         return table.offset + table.bytes + LIBAGX_GEN1_AS_ALIGNMENT_SLACK;
+      return hk_get_native_as_size(state);
    }
    return hk_as_size(vk_get_as_geometry_type(state->build_info),
                      state->leaf_node_count);
@@ -595,6 +656,96 @@ hk_encode_as(VkCommandBuffer commandBuffer,
                              internal_bound + state->leaf_node_count, 1, 1);
 }
 
+static void hk_write_buffer_cp(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
+                               void *data, uint32_t size);
+
+static void
+hk_vertex_table_publish(VkCommandBuffer commandBuffer, struct hk_device *dev,
+                        struct vk_acceleration_structure *as,
+                        const struct hk_vertex_table_layout *table)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   const uint32_t id = hk_gen1_as_id(dev, as);
+   if (!id || id * 16 >= AGX_GEN1_VERTEX_DIRECTORY_BYTES) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   const uint64_t table_va = hk_as_native_va(as) + table->offset;
+   uint32_t entry[4] = {(uint32_t)table_va, (uint32_t)(table_va >> 32),
+                        table->geometry_count, table->primitives};
+   hk_cmd_buffer_retain_bo(cmd, dev->gen1_vertex_directory);
+   hk_write_buffer_cp(commandBuffer, AGX_GEN1_VERTEX_DIRECTORY_VA + (uint64_t)id * 16,
+                      entry, sizeof(entry));
+   simple_mtx_lock(&dev->gen1_as_lock);
+   if (dev->gen1_vertex_tables) {
+      struct hash_entry *existing = _mesa_hash_table_search(dev->gen1_vertex_tables, as);
+      struct hk_vertex_table_layout *copy = existing ? existing->data : malloc(sizeof(*copy));
+      if (copy) {
+         *copy = *table;
+         if (!existing)
+            _mesa_hash_table_insert(dev->gen1_vertex_tables, as, copy);
+      }
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+}
+
+static void
+hk_vertex_table_build(VkCommandBuffer commandBuffer,
+                      const struct vk_acceleration_structure_build_state *state,
+                      struct vk_acceleration_structure *dst)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_vertex_table_layout table;
+   if (!hk_vertex_table_layout(dev, state, &table))
+      return;
+   if (table.offset + table.bytes > dst->size) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   const uint64_t table_va = hk_as_native_va(dst) + table.offset;
+   uint32_t header[4] = {AGX_GEN1_VERTEX_TABLE_MAGIC, table.geometry_count,
+                         table.vertices_offset, table.primitives};
+   hk_write_buffer_cp(commandBuffer, table_va, header, sizeof(header));
+   uint32_t bases[28];
+   uint32_t running = 0, pending = 0, first = 0;
+   for (uint32_t g = 0; g < table.geometry_count; ++g) {
+      bases[pending++] = running;
+      running += state->build_range_infos[g].primitiveCount;
+      if (pending == 28 || g + 1 == table.geometry_count) {
+         hk_write_buffer_cp(commandBuffer, table_va + 16 + (uint64_t)first * 4,
+                            bases, pending * 4);
+         first += pending;
+         pending = 0;
+      }
+   }
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   VkResult result = get_pipeline_spv(dev, "hk-vertex-table", vertex_table_spv,
+                                      sizeof(vertex_table_spv),
+                                      sizeof(struct hk_vertex_table_args),
+                                      &pipeline, &layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   const struct hk_vertex_table_args args = {
+      .leaves = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset,
+      .table = table_va,
+      .leaf_count = table.primitives,
+      .geometry_count = table.geometry_count,
+      .vertices_offset = table.vertices_offset,
+      .leaf_stride = sizeof(struct vk_ir_triangle_node),
+   };
+   vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                              sizeof(args), &args);
+   hk_cmd_dispatch_unaligned(commandBuffer, table.primitives, 1, 1);
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   hk_vertex_table_publish(commandBuffer, dev, dst, &table);
+}
+
 static void
 hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
           struct vk_meta_device *meta,
@@ -664,6 +815,7 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
             vk_command_buffer_set_error(&cmd->vk, result);
             return;
          }
+         hk_vertex_table_build(commandBuffer, state, dst);
       }
       return;
    }
@@ -939,6 +1091,22 @@ hk_gen1_rq_finish(struct hk_device *dev)
    dev->gen1_rq_code_alias=NULL;dev->gen1_rq_bound_maps=0;
    dev->gen1_native_rq=false;
    hk_device_finish_gen1_as_chunks(dev);
+   if (dev->gen1_vertex_directory) {
+      agx_bo_bind(&dev->dev, NULL, AGX_GEN1_VERTEX_DIRECTORY_VA,
+                  AGX_GEN1_VERTEX_DIRECTORY_BYTES, 0, DRM_ASAHI_BIND_UNBIND);
+      agx_bo_unreference(&dev->dev, dev->gen1_vertex_directory);
+      dev->gen1_vertex_directory = NULL;
+   }
+   if (dev->gen1_vertex_directory_va) {
+      agx_va_free(&dev->dev, dev->gen1_vertex_directory_va, false);
+      dev->gen1_vertex_directory_va = NULL;
+   }
+   if (dev->gen1_vertex_tables) {
+      hash_table_foreach(dev->gen1_vertex_tables, entry)
+         free(entry->data);
+      _mesa_hash_table_destroy(dev->gen1_vertex_tables, NULL);
+      dev->gen1_vertex_tables = NULL;
+   }
    if (dev->gen1_as_lock_ready) {
       util_dynarray_fini(&dev->gen1_ases);
       simple_mtx_destroy(&dev->gen1_as_lock);
@@ -1298,6 +1466,26 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
       simple_mtx_init(&dev->gen1_as_lock, mtx_plain);
       util_dynarray_init(&dev->gen1_ases, NULL);
       dev->gen1_as_lock_ready=true;
+      dev->gen1_vertex_tables = _mesa_pointer_hash_table_create(NULL);
+      dev->gen1_vertex_directory_va = agx_va_alloc(&dev->dev, AGX_GEN1_VERTEX_DIRECTORY_BYTES,
+         0x4000, AGX_VA_USC | AGX_VA_FIXED, AGX_GEN1_VERTEX_DIRECTORY_VA);
+      dev->gen1_vertex_directory = agx_bo_create(&dev->dev, AGX_GEN1_VERTEX_DIRECTORY_BYTES,
+         0x4000, AGX_BO_WRITEBACK, "Gen1 vertex table directory");
+      if (!dev->gen1_vertex_directory_va || !dev->gen1_vertex_directory ||
+          agx_bo_bind(&dev->dev, dev->gen1_vertex_directory, AGX_GEN1_VERTEX_DIRECTORY_VA,
+                      AGX_GEN1_VERTEX_DIRECTORY_BYTES, 0,
+                      DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
+         mesa_loge("Gen1 vertex table directory unavailable (va=%p bo=%p)",
+                   (void *)dev->gen1_vertex_directory_va, (void *)dev->gen1_vertex_directory);
+         if (dev->gen1_vertex_directory)
+            agx_bo_unreference(&dev->dev, dev->gen1_vertex_directory);
+         if (dev->gen1_vertex_directory_va)
+            agx_va_free(&dev->dev, dev->gen1_vertex_directory_va, false);
+         dev->gen1_vertex_directory = NULL;
+         dev->gen1_vertex_directory_va = NULL;
+      } else {
+         memset(agx_bo_map(dev->gen1_vertex_directory), 0, AGX_GEN1_VERTEX_DIRECTORY_BYTES);
+      }
       if (dev->gen1_rq_live_as_table) {
          simple_mtx_init(&dev->gen1_as_chunk_cache_lock, mtx_plain);
          for (unsigned i = 0; i < 2; ++i) {
@@ -1607,6 +1795,20 @@ hk_CmdCopyAccelerationStructureKHR(
                       AGX_BARRIER_ALL, hk_as_native_va(dst),
                       hk_as_native_va(src), dst_metadata, src_metadata, dst_id,
                       info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR);
+   if (info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR &&
+       dev->gen1_vertex_tables) {
+      struct hk_vertex_table_layout table;
+      bool found = false;
+      simple_mtx_lock(&dev->gen1_as_lock);
+      struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_vertex_tables, src);
+      if (entry) {
+         table = *(struct hk_vertex_table_layout *)entry->data;
+         found = true;
+      }
+      simple_mtx_unlock(&dev->gen1_as_lock);
+      if (found && table.offset + table.bytes <= dst->size)
+         hk_vertex_table_publish(commandBuffer, dev, dst, &table);
+   }
 }
 
 static uint64_t

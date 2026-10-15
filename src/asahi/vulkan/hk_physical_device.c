@@ -449,6 +449,8 @@ hk_get_device_features(
       /* VK_KHR_ray_tracing_maintenance1 */
       .rayTracingMaintenance1 =
          supported_extensions->KHR_ray_tracing_maintenance1,
+      .rayTracingPositionFetch =
+         supported_extensions->KHR_ray_tracing_position_fetch,
       .rayTracingPipelineTraceRaysIndirect2 =
          supported_extensions->KHR_ray_tracing_maintenance1,
       .bufferDeviceAddressMultiDevice = false,
@@ -1680,6 +1682,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_ray_tracing_pipeline = true;
       supported_extensions.EXT_pipeline_library_group_handles = true;
       supported_extensions.KHR_ray_tracing_maintenance1 = true;
+      supported_extensions.KHR_ray_tracing_position_fetch = true;
    }
 
 

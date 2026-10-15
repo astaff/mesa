@@ -10,7 +10,14 @@ struct agx_gen1_ray_query_layout {
    bool fragment_shader;
    bool graphics_stage;
    bool compute_kernel;
+   bool position_fetch;
+   bool diagnostic_features;
 };
+#define AGX_GEN1_VERTEX_DIRECTORY_VA UINT64_C(0x10040000000)
+#define AGX_GEN1_VERTEX_DIRECTORY_BYTES 0x8000u
+#define AGX_GEN1_VERTEX_TABLE_MAGIC 0x534f5056u
+nir_def *agx_nir_gen1_vertex_position_address(struct nir_builder *b, nir_def *instance,
+                                              nir_def *geometry, nir_def *primitive);
 bool agx_nir_lower_gen1_ray_query(nir_shader *shader,
    const struct agx_gen1_ray_query_layout *layout);
 
