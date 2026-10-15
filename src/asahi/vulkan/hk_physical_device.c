@@ -262,6 +262,8 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_sampler_filter_minmax = false,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
+      .EXT_shader_atomic_float = false,
+      .EXT_shader_atomic_float2 = false,
       .EXT_shader_image_atomic_int64 = false,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_shader_module_identifier = true,
@@ -743,6 +745,34 @@ hk_get_device_features(
       .robustBufferAccess2 = true,
       .robustImageAccess2 = true,
       .nullDescriptor = true,
+
+      /* VK_EXT_shader_atomic_float */
+      .shaderBufferFloat32Atomics = supported_extensions->EXT_shader_atomic_float,
+      .shaderBufferFloat32AtomicAdd = supported_extensions->EXT_shader_atomic_float,
+      .shaderBufferFloat64Atomics = false,
+      .shaderBufferFloat64AtomicAdd = false,
+      .shaderSharedFloat32Atomics = supported_extensions->EXT_shader_atomic_float,
+      .shaderSharedFloat32AtomicAdd = supported_extensions->EXT_shader_atomic_float,
+      .shaderSharedFloat64Atomics = false,
+      .shaderSharedFloat64AtomicAdd = false,
+      .shaderImageFloat32Atomics = supported_extensions->EXT_shader_atomic_float,
+      .shaderImageFloat32AtomicAdd = supported_extensions->EXT_shader_atomic_float,
+      .sparseImageFloat32Atomics = false,
+      .sparseImageFloat32AtomicAdd = false,
+
+      /* VK_EXT_shader_atomic_float2 */
+      .shaderBufferFloat16Atomics = false,
+      .shaderBufferFloat16AtomicAdd = false,
+      .shaderBufferFloat16AtomicMinMax = false,
+      .shaderBufferFloat32AtomicMinMax = supported_extensions->EXT_shader_atomic_float2,
+      .shaderBufferFloat64AtomicMinMax = false,
+      .shaderSharedFloat16Atomics = false,
+      .shaderSharedFloat16AtomicAdd = false,
+      .shaderSharedFloat16AtomicMinMax = false,
+      .shaderSharedFloat32AtomicMinMax = supported_extensions->EXT_shader_atomic_float2,
+      .shaderSharedFloat64AtomicMinMax = false,
+      .shaderImageFloat32AtomicMinMax = supported_extensions->EXT_shader_atomic_float2,
+      .sparseImageFloat32AtomicMinMax = false,
 
       /* VK_EXT_shader_image_atomic_int64 */
       .shaderImageInt64Atomics = false,
@@ -1754,6 +1784,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        * subgroup quad shuffle operations exposed above. */
       supported_extensions.KHR_shader_quad_control = false;
       supported_extensions.KHR_compute_shader_derivatives = true;
+      supported_extensions.EXT_shader_atomic_float = true;
+      supported_extensions.EXT_shader_atomic_float2 = true;
    }
 
    struct vk_features supported_features;

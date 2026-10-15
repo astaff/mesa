@@ -8,6 +8,7 @@ libasahi_agx_files = files(
   'agx_liveness.c',
   'agx_insert_waits.c',
   'agx_nir_lower_address.c',
+  'agx_nir_lower_atomics.c',
   'agx_nir_opt_select_load.c',
   'agx_nir_lower_cull_distance.c',
   'agx_nir_lower_fminmax.c',

@@ -181,6 +181,7 @@ ATOMIC_OPC = enum("atomic_opc", {
 	8: 'and',
 	9: 'or',
 	10: 'xor',
+	11: 'fadd',
 })
 
 INTERPOLATION = enum("interpolation", {
