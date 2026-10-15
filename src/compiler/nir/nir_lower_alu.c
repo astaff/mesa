@@ -250,7 +250,6 @@ lower_alu_instr(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
       /* Fallback on the emulation */
       if (!lowered) {
          nir_def *iminmax = max ? nir_imax(b, s0, s1) : nir_imin(b, s0, s1);
-         iminmax = nir_fcanonicalize(b, iminmax);
 
          /* The inner operation may also select a zero when its operands
           * differ.  Its NSZ flag permits changing that zero's sign, so
@@ -259,10 +258,10 @@ lower_alu_instr(nir_builder *b, nir_alu_instr *instr, UNUSED void *cb_data)
           */
          nir_def *zero = nir_imm_floatN_t(b, 0.0, s0->bit_size);
          nir_def *zero_src = nir_bcsel(b, nir_feq(b, s0, zero), s0, s1);
-         zero_src = nir_fcanonicalize(b, zero_src);
          nir_def *non_tie = nir_bcsel(b, nir_feq(b, fminmax, zero),
                                      zero_src, fminmax);
          lowered = nir_bcsel(b, nir_feq(b, s0, s1), iminmax, non_tie);
+         lowered = nir_fcanonicalize(b, lowered);
       }
 
       break;

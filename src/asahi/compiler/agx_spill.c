@@ -276,15 +276,39 @@ reconstruct_index(struct spill_ctx *ctx, unsigned node)
    return agx_get_vec_index(node, ctx->size[node], ctx->channels[node]);
 }
 
+bool
+agx_has_uniform_store(const agx_context *ctx)
+{
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_UNIFORM_STORE)
+         return true;
+   }
+   return false;
+}
+
+bool
+agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I)
+{
+   return ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          !ctx->is_preamble && !ctx->uniforms_written &&
+          I->op == AGX_OPCODE_MOV && I->nr_dests == 1 && I->nr_srcs == 1 &&
+          I->dest[0].type == AGX_INDEX_NORMAL && !I->dest[0].memory &&
+          I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1 &&
+          I->src[0].type == AGX_INDEX_UNIFORM && !I->src[0].memory &&
+          I->src[0].size == AGX_SIZE_32 && agx_channels(I->src[0]) == 1 &&
+          I->src[0].value < 512 && !(I->src[0].value & 1) && !I->src[0].abs &&
+          !I->src[0].neg;
+}
+
 static bool
-can_remat(agx_instr *I)
+can_remat(agx_context *ctx, agx_instr *I)
 {
    switch (I->op) {
    case AGX_OPCODE_MOV_IMM:
    case AGX_OPCODE_GET_SR:
       return true;
    default:
-      return false;
+      return agx_can_rematerialize_uniform(ctx, I);
    }
 }
 
@@ -292,9 +316,11 @@ static agx_instr *
 remat_to(agx_builder *b, agx_index dst, struct spill_ctx *ctx, unsigned node)
 {
    agx_instr *I = ctx->remat[node];
-   assert(can_remat(I));
+   assert(can_remat(b->shader, I));
 
    switch (I->op) {
+   case AGX_OPCODE_MOV:
+      return agx_mov_to(b, dst, I->src[0]);
    case AGX_OPCODE_MOV_IMM:
       return agx_mov_imm_to(b, dst, I->imm);
    case AGX_OPCODE_GET_SR:
@@ -302,6 +328,16 @@ remat_to(agx_builder *b, agx_index dst, struct spill_ctx *ctx, unsigned node)
    default:
       UNREACHABLE("invalid remat");
    }
+}
+
+static void
+record_spill(struct spill_ctx *ctx)
+{
+   if (ctx->remat_only) {
+      assert(ctx->shader->key->has_scratch && "remat fallback needs scratch");
+      ctx->shader->remat_fallback_spilled = true;
+   }
+   ctx->shader->has_spill_pcopy_reserved = true;
 }
 
 static void
@@ -313,18 +349,10 @@ insert_spill(agx_builder *b, struct spill_ctx *ctx, unsigned node)
        * let register allocation finish with real spilling under the full
        * budget instead of failing the compile
        * (ssbo.phys.layout.random.8bit.nested_structs_arrays.20). */
-      if (ctx->remat_only) {
-         assert(b->shader->key->has_scratch && "remat fallback needs scratch");
-         b->shader->remat_fallback_spilled = true;
-      }
+      record_spill(ctx);
 
       agx_index idx = reconstruct_index(ctx, node);
       agx_mov_to(b, agx_index_as_mem(idx, ctx->spill_base), idx);
-
-      /* We only need the extra registers reserved if we actually spilled
-       * instead of just remat.
-       */
-      b->shader->has_spill_pcopy_reserved = true;
    }
 }
 
@@ -502,6 +530,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
             agx_mov_to(&b, gpr, I->src[s]);
 
          agx_mov_to(&b, mem, gpr);
+         record_spill(ctx);
          I->src[s] = mem;
          continue;
       }
@@ -529,6 +558,7 @@ insert_coupling_code(struct spill_ctx *ctx, agx_block *pred, agx_block *succ)
 
          remat_to(&b, tmp, ctx, node);
          agx_mov_to(&b, agx_index_as_mem(idx, ctx->spill_base), tmp);
+         record_spill(ctx);
       }
 
       /* Use the spilled version */
@@ -1173,6 +1203,7 @@ validate_next_use_info(UNUSED agx_context *ctx,
 void
 agx_spill(agx_context *ctx, unsigned k, bool remat_only)
 {
+   ctx->uniforms_written = agx_has_uniform_store(ctx);
    void *memctx = ralloc_context(NULL);
 
    /* Spilling needs extra registers for memory-memory swaps. Rematerializing
@@ -1187,7 +1218,7 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    agx_instr **remat = rzalloc_array(memctx, agx_instr *, ctx->alloc);
 
    agx_foreach_instr_global(ctx, I) {
-      if (can_remat(I))
+      if (can_remat(ctx, I))
          remat[I->dest[0].value] = I;
 
       /* Measure vectors */
@@ -1255,6 +1286,7 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
          .W = W,
          .S = S,
          .spill_base = n,
+         .remat_only = remat_only,
       };
 
       agx_foreach_predecessor(block, pred) {

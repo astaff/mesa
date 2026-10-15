@@ -12,6 +12,7 @@
 #include "asahi/compiler/agx_nir_m5_mesh.h"
 #include "asahi/compiler/agx3_mesh_core.h"
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
+#include "hk_nir_border_index.h"
 #include "util/u_debug.h"
 
 #include "hk_nir_ray_tracing.h"
@@ -1490,7 +1491,7 @@ agx_nir_lower_custom_border(nir_shader *nir)
  * clamp-to-0 index c is not negative, i.e. `if (c >= 0)`, with tex_0 sampling
  * c without its integer-border bit (hk_nir_lower_descriptors()). */
 static bool
-hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0)
+hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
 {
    const int s = nir_tex_instr_src_index(tex_0, nir_tex_src_sampler_handle);
    if (s < 0)
@@ -1513,8 +1514,20 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0)
       return false;
 
    nir_scalar tested = nir_scalar_chase_movs(nir_scalar_chase_alu_src(cond, 0));
-   return nir_scalar_equal(tested, nir_scalar_chase_movs(c)) &&
-          nir_scalar_is_zero(nir_scalar_chase_alu_src(cond, 1));
+   c = nir_scalar_chase_movs(c);
+   if (!nir_scalar_is_zero(nir_scalar_chase_alu_src(cond, 1)))
+      return false;
+   if (nir_scalar_equal(tested, c))
+      return true;
+   if (!g17p)
+      return false;
+   const struct hk_sampled_image_descriptor_layout native =
+      hk_sampled_image_descriptor_layout(9);
+   return hk_nir_border_indices_same_descriptor(
+      tested, c,
+      native.clamp_0_sampler_index - native.sampler -
+         offsetof(struct hk_sampled_image_descriptor_sw,
+                  g17p.unbiased_clamp_0_sampler_index));
 }
 
 /* The branches of the custom-border emulation, which hold the only
@@ -1522,7 +1535,7 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0)
  * emulation, unless every clamp-to-0 sample sits directly in the then-list
  * of its branch (hk_is_border_emulation_if()). */
 static bool
-hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs)
+hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -1541,8 +1554,9 @@ hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs)
             foreach_list_typed(nir_cf_node, node, node, &nif->then_list)
                in_then |= node == &block->cf_node;
             if (!in_then ||
-                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr)))
+                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p)) {
                return false;
+            }
 
             bool known = false;
             util_dynarray_foreach(ifs, nir_if *, seen)
@@ -1572,8 +1586,12 @@ hk_drop_border_emulation(struct util_dynarray *ifs)
  * uses integer texels; the shader performs the Vulkan numerical conversion.
  * The descriptor's existing type/channel fields avoid a new software ABI. */
 static bool
-lower_scaled_storage(nir_builder *b, nir_intrinsic_instr *intr, void *unused)
+lower_scaled_storage(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   const struct hk_physical_device *pdev = data;
+   if (!b->shader->info.internal && pdev && !pdev->scaled_storage)
+      return false;
+
    const bool load = intr->intrinsic == nir_intrinsic_bindless_image_load;
    const bool store = intr->intrinsic == nir_intrinsic_bindless_image_store;
    if ((!load && !store) || nir_intrinsic_format(intr) != PIPE_FORMAT_NONE ||
@@ -2255,7 +2273,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
    if (agx_chip_descriptor_generation(dev->dev.chip) == 9) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_scaled_storage,
-               nir_metadata_none, NULL);
+               nir_metadata_none, hk_device_physical(dev));
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_scaled_sample,
                hk_scaled_sample_guard(nir) ? nir_metadata_none
                                            : nir_metadata_control_flow,
@@ -3961,7 +3979,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       struct hk_physical_device *pdev = hk_device_physical(dev);
       struct util_dynarray ifs;
       util_dynarray_init(&ifs, NULL);
-      if (hk_find_border_emulation(nir, &ifs) && ifs.size) {
+      if (hk_find_border_emulation(nir, &ifs, dev->dev.chip == AGX_CHIP_G17P) &&
+          ifs.size) {
          if (twin_of || p_atomic_read(&pdev->border_emulation)) {
             border_emulating = true;
          } else {

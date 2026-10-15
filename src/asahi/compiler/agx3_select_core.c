@@ -349,10 +349,6 @@ agx3_select_encode(enum agx_isa_encoding encoding,
          return true;
       }
 
-      /* A move is a bitop that returns its first source unchanged. No AGX3
-       * truth table is the identity, so Apple materializes it as `iadd d, s,
-       * #0` -- a bit-exact copy that also serves a modifier-free fmov, since a
-       * move is bitwise. */
       if ((I->truth_table & 0xfu) == AGX3_SEL_TT_MOV) {
          struct agx3_encoded_iadd_u32_imm8 e;
          if (I->nr_srcs < 1 ||

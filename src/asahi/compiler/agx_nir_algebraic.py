@@ -160,6 +160,16 @@ for bits in range(1, 32):
          ('ubitfield_extract', a, b, bits))
     ])
 
+fold_byte_swap = [
+    (('ior', ('ushr(is_used_once)', 'a@32', 24),
+             ('ior(is_used_once)',
+                ('iand(is_used_once)', ('ushr(is_used_once)', a, 8), 0xff00),
+                ('ior(is_used_once)', ('ishl(is_used_once)', a, 24),
+                   ('iand(is_used_once)', ('ishl(is_used_once)', a, 8), 0xff0000)))),
+     ('ior', ('iand', ('extr_agx', a, a, 8, 0), 0xff00ff00),
+             ('iand', ('extr_agx', a, a, 24, 0), 0x00ff00ff))),
+]
+
 # (x * y) + s = (x * y) + (s << 0)
 def imad(x, y, z):
     return ('imadshl_agx', x, y, z, 0)
@@ -365,6 +375,24 @@ for bits in range(1, 16):
          ('ubitfield_extract', a, 16, bits)),
     ])
 
+fold_aligned_bounds = []
+for shift in (1, 2):
+    size = 1 << shift
+    for component in range(4):
+        delta = component * size
+        folded_offset = a if delta == 0 else ('iadd', a, delta)
+        fold_aligned_bounds.append(
+            (('ult(agx_has_reusable_bound_store_index)',
+               ('iadd', ('iand', 'a@32', -size),
+                              delta + size - 1), 'b@32'),
+             ('ult', ('ushr', folded_offset, shift), ('ushr', b, shift))))
+
+fold_selected_f2i32 = [
+    (('bcsel@32(agx_selected_f2i32_controls_match)', 'a@1',
+      ('f2i32(is_used_once)', 'b@32'), ('f2i32(is_used_once)', 'c@32')),
+     ('f2i32', ('bcsel', a, b, c))),
+]
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--import-path', required=True)
@@ -376,6 +404,27 @@ def run():
     import nir_algebraic  # pylint: disable=import-error
 
     print('#include "agx_nir.h"')
+    print('#include "agx_nir_aligned_bounds.h"')
+    print('#include "nir.h"')
+    print("""
+static bool
+agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
+{
+   if (instr->op != nir_op_bcsel || instr->def.bit_size != 32 ||
+       instr->def.num_components != 1)
+      return false;
+   nir_instr *left_instr = nir_def_instr(instr->src[1].src.ssa);
+   nir_instr *right_instr = nir_def_instr(instr->src[2].src.ssa);
+   if (left_instr->type != nir_instr_type_alu ||
+       right_instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *left = nir_instr_as_alu(left_instr);
+   const nir_alu_instr *right = nir_instr_as_alu(right_instr);
+   return left->op == nir_op_f2i32 && right->op == nir_op_f2i32 &&
+          left->def.num_components == 1 && right->def.num_components == 1 &&
+          left->fp_math_ctrl == right->fp_math_ctrl;
+}
+""")
 
     print(nir_algebraic.AlgebraicPass("agx_nir_cleanup_amul", cleanup_amul).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_lea", fuse_lea).render())
@@ -392,7 +441,9 @@ def run():
                                       fold_extract16_bfe).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
-                                      fuse_imad + ixor_bcsel).render())
+                                      fuse_imad + ixor_bcsel +
+                                      fold_aligned_bounds + fold_byte_swap +
+                                      fold_selected_f2i32).render())
 
 
 if __name__ == '__main__':

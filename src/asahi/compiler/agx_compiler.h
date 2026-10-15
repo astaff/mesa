@@ -474,6 +474,7 @@ typedef struct {
    bool agx3_tex_coord_component : 1;
    bool agx3_tex_coord_start : 1;
    bool agx3_tex_coords_staged : 1;
+   bool agx3_cube_scalar_coords  : 1;
 
 } agx_instr;
 
@@ -567,7 +568,9 @@ typedef struct agx_block {
 typedef struct {
    nir_shader *nir;
    mesa_shader_stage stage;
+   struct util_dynarray collect_split_hints;
    bool is_preamble;
+   bool uniforms_written;
    unsigned scratch_size_B;
    /* The input mask/compact ranks are frozen before native import selection.
     * Later DCE may remove a read without changing this external interface. */
@@ -1168,9 +1171,15 @@ void agx_lower_pseudo(agx_context *ctx);
 void agx_lower_spill(agx_context *ctx);
 void agx3_split_vector_stack_access(agx_context *ctx);
 bool agx3_lower_texture_publications(agx_context *ctx);
+bool agx3_fuse_fma_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_texture_publications(agx_context *ctx);
+bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
+bool agx_opt_collect_split(agx_context *ctx);
+void agx_opt_cse_pressure(agx_context *ctx);
+bool agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I);
+bool agx_has_uniform_store(const agx_context *ctx);
 void agx_opt_compact_constants(agx_context *ctx);
 void agx_opt_promote_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
@@ -1231,6 +1240,8 @@ void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
+bool agx3_is_async(const agx_instr *I);
+unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
 
 void agx_lower_64bit_postra(agx_context *ctx);

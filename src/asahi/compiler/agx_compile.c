@@ -12,6 +12,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_range_analysis.h"
 #include "util/bitset.h"
 #include "util/glheader.h"
 #include "util/half_float.h"
@@ -687,7 +688,7 @@ static bool
 agx_emit_load_vary_agx3(agx_builder *b, agx_index dest, agx_index cf,
                         agx_index sample_index, unsigned components,
                         enum agx_interpolation interp, bool perspective,
-                        nir_alu_type dest_type)
+                        nir_alu_type dest_type, unsigned read_mask)
 {
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX2 ||
        (dest.size != AGX_SIZE_16 && dest.size != AGX_SIZE_32) ||
@@ -754,6 +755,10 @@ agx_emit_load_vary_agx3(agx_builder *b, agx_index dest, agx_index cf,
 
    agx_index channels[4];
    for (unsigned c = 0; c < components; ++c) {
+      if (!(read_mask & BITFIELD_BIT(c))) {
+         channels[c] = agx_undef(dest.size);
+         continue;
+      }
       agx_index channel_cf = cf;
       channel_cf.value += c;
 
@@ -808,7 +813,8 @@ agx_emit_load_vary(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
    agx_index I = cf_for_intrinsic(b, instr);
 
    if (agx_emit_load_vary_agx3(b, dest, I, sample_index, components, interp,
-                               perspective, nir_intrinsic_dest_type(instr))) {
+                               perspective, nir_intrinsic_dest_type(instr),
+                               nir_def_components_read(&instr->def))) {
       agx_emit_cached_split(b, dest, components);
       return;
    }
@@ -3900,11 +3906,24 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
       }
 
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+      bool has_full_gpr = false;
+      unsigned half_uniforms = 0;
+      agx_foreach_src(I, s) {
+         has_full_gpr |= (I->src[s].type == AGX_INDEX_NORMAL ||
+                          I->src[s].type == AGX_INDEX_REGISTER) &&
+                         I->src[s].size == AGX_SIZE_32;
+         half_uniforms += I->src[s].type == AGX_INDEX_UNIFORM &&
+                          I->src[s].size == AGX_SIZE_16;
+      }
       agx_foreach_src(I, s) {
          if (I->src[s].size != AGX_SIZE_16 ||
              I->src[s].type == AGX_INDEX_IMMEDIATE ||
              I->src[s].type == AGX_INDEX_NULL || I->src[s].abs ||
              I->src[s].neg)
+            continue;
+         if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+             agx_channels(I->dest[0]) == 1 && has_full_gpr &&
+             half_uniforms == 1 && I->src[s].type == AGX_INDEX_UNIFORM)
             continue;
 
          agx_index widened = agx_temp(ctx, AGX_SIZE_32);
@@ -7229,12 +7248,9 @@ static bool agx3_nir_lower_uniform_dma(nir_shader *nir,
                                        const struct agx_shader_key *key,
                                        struct agx_shader_info *info);
 
-static bool agx_rte_fma_filter(const nir_instr *instr, const void *data);
-static nir_def *agx_rte_fma_boundary(nir_builder *b, nir_instr *instr, void *data);
-
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
-                 bool byte_indices, bool discard_word, bool agx3_fma,
+                 bool byte_indices, bool discard_word,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
                  struct agx_shader_info *dma_info)
@@ -7348,6 +7364,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * conversions remain.
     */
    progress = false;
+   if (byte_indices)
+      NIR_PASS(progress, nir, agx_nir_scalarize_int64);
    NIR_PASS(progress, nir, nir_lower_int64);
 
    /* If we lowered actual int64 arithmetic (not folded into the address
@@ -7449,6 +7467,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * We need to lower int64 again to deal with the resulting 64-bit csels.
     */
    NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
+   if (byte_indices)
+      NIR_PASS(_, nir, agx_nir_scalarize_int64);
    NIR_PASS(_, nir, nir_lower_int64);
 
    /* We need to lower fmin/fmax again after nir_opt_algebraic_late due to f2fmp
@@ -7501,22 +7521,6 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(_, nir, nir_opt_cse);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
-
-   /* Final algebraic lowering may reconstruct FMA. Repair its explicit
-    * fp32 RTE boundary after those rewrites, then lower the integer math. */
-   if (agx3_fma &&
-       nir_is_rounding_mode_rtne(nir->info.float_controls_execution_mode, 32)) {
-      NIR_PASS(_, nir, nir_shader_lower_instructions, agx_rte_fma_filter,
-               agx_rte_fma_boundary, NULL);
-      NIR_PASS(_, nir, nir_lower_int64);
-      NIR_PASS(_, nir, agx_nir_lower_imul64);
-      NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
-      NIR_PASS(_, nir, nir_opt_constant_folding);
-      NIR_PASS(_, nir, nir_opt_copy_prop);
-      NIR_PASS(_, nir, nir_opt_dce);
-      NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
-      NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
-   }
 
    /* Cleanup optimizations */
    nir_move_options move_all = nir_move_const_undef | nir_move_load_ubo |
@@ -9310,16 +9314,17 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
 
    AGX_PASS(ctx, agx_lower_uniform_sources);
 
-   /* Legalization can introduce repeated half-to-float conversions and
-    * uniform-source copies after the main CSE pass. Merge them before vertex
-    * register allocation, retaining the legalized operand types. The existing
-    * DMA path also needs this for descriptor words used by several operations.
-    * Do not run copy propagation here: it could undo source legalization. */
+
    if (((key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-         ctx->stage == MESA_SHADER_VERTEX) ||
+         (ctx->stage == MESA_SHADER_VERTEX || !ctx->is_preamble)) ||
         (key->g17p_uniform_dma && out->agx3_uniform_dma_count)) &&
-       !(agx_compiler_debug & AGX_DBG_NOOPT))
-      AGX_PASS(ctx, agx_opt_cse);
+       !(agx_compiler_debug & AGX_DBG_NOOPT)) {
+      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
+          ctx->stage != MESA_SHADER_VERTEX)
+         AGX_PASS(ctx, agx_opt_cse_pressure);
+      else
+         AGX_PASS(ctx, agx_opt_cse);
+   }
 
    if (native_cprog && ctx->is_preamble &&
        key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
@@ -9364,10 +9369,23 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    /* Expose independent coordinate inputs before register allocation. Resource
     * values have no GPR destination; remove any now-unused coordinate collect.
     */
+   if (agx3_lower_scalar_cube_coordinates(ctx)) {
+      agx_validate(ctx, "scalar cube coordinates");
+      AGX_PASS(ctx, agx_dce, true);
+   }
    if (agx3_lower_scalar_texture_publications(ctx)) {
       agx_validate(ctx, "scalar texture publications");
       AGX_PASS(ctx, agx_dce, true);
    }
+
+
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       agx_opt_collect_split(ctx)) {
+      agx_validate(ctx, "collect/split folding");
+      AGX_PASS(ctx, agx_dce, true);
+   }
+
+   AGX_PASS(ctx, agx3_fuse_fma_texture_publications);
 
    if (!agx3_tile_store_payloads_fit(ctx)) {
       agx_set_refusal(ctx, "tile-store payload bank overflow", __LINE__);
@@ -11370,81 +11388,6 @@ agx_max_vertex_attribs(const struct agx_device_key *dev)
    return MIN2(attribs, AGX_MAX_ATTRIBS);
 }
 
-/* A native FMA can flush an exact subnormal before RTE would round it to
- * the minimum normal. Only repair zero results under explicit fp32 RTE;
- * integer mantissas classify that boundary without another rounding step. */
-static bool
-agx_rte_fma_filter(const nir_instr *instr, const void *data)
-{
-   if (instr->type != nir_instr_type_alu)
-      return false;
-   const nir_alu_instr *alu = nir_instr_as_alu(instr);
-   return alu->op == nir_op_ffma && alu->def.bit_size == 32 &&
-          alu->def.num_components == 1;
-}
-
-static nir_def *
-agx_rte_fma_boundary(nir_builder *b, nir_instr *instr, void *data)
-{
-   nir_alu_instr *alu = nir_instr_as_alu(instr);
-   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
-   nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
-   nir_def *z = nir_ssa_for_alu_src(b, alu, 2);
-   nir_def *zero = nir_ieq_imm(b, nir_iand_imm(b, &alu->def, 0x7fffffff), 0);
-   nir_push_if(b, zero);
-   nir_def *ax = nir_iand_imm(b, x, 0x7fffffff);
-   nir_def *ay = nir_iand_imm(b, y, 0x7fffffff);
-   nir_def *az = nir_iand_imm(b, z, 0x7fffffff);
-   nir_def *ex = nir_ushr_imm(b, ax, 23);
-   nir_def *ey = nir_ushr_imm(b, ay, 23);
-   nir_def *ez = nir_ushr_imm(b, az, 23);
-   nir_def *finite = nir_iand(b, nir_ine_imm(b, ex, 255),
-      nir_iand(b, nir_ine_imm(b, ey, 255), nir_ine_imm(b, ez, 255)));
-   nir_def *mx = nir_bcsel(b, nir_ieq_imm(b, ex, 0), nir_imm_int(b, 0),
-      nir_ior_imm(b, nir_iand_imm(b, ax, 0x7fffff), 0x800000));
-   nir_def *my = nir_bcsel(b, nir_ieq_imm(b, ey, 0), nir_imm_int(b, 0),
-      nir_ior_imm(b, nir_iand_imm(b, ay, 0x7fffff), 0x800000));
-   nir_def *mz = nir_ior_imm(b, nir_iand_imm(b, az, 0x7fffff), 0x800000);
-   nir_def *prod = nir_pack_64_2x32_split(b, nir_imul(b, mx, my),
-                                       nir_umul_high(b, mx, my));
-   nir_def *shift = nir_iadd_imm(b, nir_iadd(b, ex, ey), -150);
-   nir_def *negshift = nir_ineg(b, shift);
-   nir_def *t = nir_imm_int64(b, 0xffffff);
-   nir_def *left = nir_ishl(b, t, nir_umin(b, negshift, nir_imm_int(b, 40)));
-   nir_def *right = nir_iadd(b,
-      nir_ushr(b, t, nir_umin(b, shift, nir_imm_int(b, 24))),
-      nir_b2i64(b, nir_ine_imm(b, shift, 0)));
-   nir_def *threshold = nir_bcsel(b, nir_ilt_imm(b, shift, 0), left, right);
-   nir_def *prod_correct = nir_iand(b, nir_ilt_imm(b, shift, 0),
-      nir_iand(b, nir_ult_imm(b, negshift, 41), nir_uge(b, prod, left)));
-   nir_def *k = nir_isub(b, ez, shift);
-   nir_def *scaled_z = nir_ishl(b, nir_u2u64(b, mz),
-      nir_umin(b, k, nir_imm_int(b, 40)));
-   nir_def *prod_larger = nir_uge(b, prod, scaled_z);
-   nir_def *diff = nir_bcsel(b, prod_larger, nir_isub(b, prod, scaled_z),
-                           nir_isub(b, scaled_z, prod));
-   nir_def *close = nir_iand(b, nir_ige_imm(b, k, 0), nir_ilt_imm(b, k, 41));
-   nir_def *close_correct = nir_iand(b, close, nir_uge(b, diff, threshold));
-   nir_def *gap = nir_ishl(b, nir_imm_int64(b, 1),
-      nir_umin(b, negshift, nir_imm_int(b, 63)));
-   nir_def *far_correct = nir_iand(b, nir_ige_imm(b, k, 41),
-      nir_iand(b, nir_ieq_imm(b, az, 0x800000),
-         nir_ior(b, nir_ige_imm(b, negshift, 48), nir_uge(b, gap, prod))));
-   nir_def *psign = nir_iand_imm(b, nir_ixor(b, x, y), 0x80000000);
-   nir_def *zsign = nir_iand_imm(b, z, 0x80000000);
-   nir_def *opposite = nir_ine(b, psign, zsign);
-   nir_def *correct = nir_bcsel(b, nir_ieq_imm(b, ez, 0), prod_correct,
-      nir_iand(b, opposite, nir_ior(b, close_correct, far_correct)));
-   nir_def *sign = nir_bcsel(b, nir_ieq_imm(b, ez, 0), psign,
-      nir_bcsel(b, nir_iand(b, close, prod_larger), psign, zsign));
-   correct = nir_iand(b, correct, finite);
-   nir_def *fixed = nir_bcsel(b, correct, nir_ior_imm(b, sign, 0x800000), &alu->def);
-   nir_push_else(b, NULL);
-   nir_def *unchanged = &alu->def;
-   nir_pop_if(b, NULL);
-   return nir_if_phi(b, fixed, unchanged);
-}
-
 /* Separate pure kills from testing updates before lowering their different
  * pixel-class lifetimes. The testing arm needs a real empty-EXEC skip. */
 static bool
@@ -11838,7 +11781,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
    agx_optimize_nir(
       nir, key->dev.soft_fault, uniform_atomics,
-      key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word, is_agx3,
+      key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
       form_preamble ? &info->push_count : NULL,
       (form_preamble && key->promote_textures) ? &info->texture_state_count
                                               : NULL,

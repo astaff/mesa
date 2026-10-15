@@ -377,11 +377,13 @@ coords_for_buffer_texture(nir_builder *b, nir_def *coord)
  */
 static bool
 lower_buffer_texture(nir_builder *b, nir_tex_instr *tex, bool buffer_metadata,
-                     const struct agx_texture_lower_options *options)
+                     const struct agx_texture_lower_options *options,
+                     int fixed_format, bool known_in_bounds, nir_def **result)
 {
    nir_def *coord = nir_steal_tex_src(tex, nir_tex_src_coord);
    nir_def *size = nir_get_texture_size(b, tex);
-   nir_def *oob = nir_uge(b, coord, size);
+   nir_def *oob = known_in_bounds ? nir_imm_bool(b, false) :
+      nir_uge(b, coord, size);
 
    /* Apply the buffer offset after calculating oob but before remapping */
    nir_def *desc = buffer_texture_descriptor_ptr(b, tex, options);
@@ -411,7 +413,9 @@ lower_buffer_texture(nir_builder *b, nir_tex_instr *tex, bool buffer_metadata,
    /* Lower RGB32 reads if the format requires. If we are out-of-bounds, we use
     * the hardware path so we get a zero texel.
     */
-   nir_def *is_rgb32 = buffer_metadata
+   nir_def *is_rgb32 = fixed_format >= 0
+      ? nir_imm_bool(b, fixed_format)
+      : buffer_metadata
       ? nir_ine_imm(b, load_buffer_metadata(
            b, desc, AGX_G17P_BUFFER_TEXTURE_RGB32_OFFSET, 32), 0)
       : libagx_texture_is_rgb32(b, desc);
@@ -471,10 +475,226 @@ lower_buffer_texture(nir_builder *b, nir_tex_instr *tex, bool buffer_metadata,
    if (resident) {
       b->cursor = nir_after_phis(phi_instr->instr.block);
       nir_def *zero = nir_imm_zero(b, phi->num_components, phi->bit_size);
-      nir_def_rewrite_uses_after(phi, nir_bcsel(b, resident, phi, zero));
+      nir_def *masked = nir_bcsel(b, resident, phi, zero);
+      nir_def_rewrite_uses_after(phi, masked);
+      phi = masked;
+   }
+
+   if (result)
+      *result = phi;
+
+   return true;
+}
+
+static bool
+buffer_format_group_value_equal(nir_src a, nir_src b)
+{
+   if (nir_srcs_equal(a, b))
+      return true;
+   if (!nir_src_is_const(a) || !nir_src_is_const(b) ||
+       a.ssa->bit_size != b.ssa->bit_size ||
+       a.ssa->num_components != b.ssa->num_components)
+      return false;
+
+   const nir_const_value *av = nir_src_as_const_value(a);
+   const nir_const_value *bv = nir_src_as_const_value(b);
+   for (unsigned i = 0; i < a.ssa->num_components; ++i) {
+      if (nir_const_value_as_uint(av[i], a.ssa->bit_size) !=
+          nir_const_value_as_uint(bv[i], b.ssa->bit_size))
+         return false;
+   }
+   return true;
+}
+
+static bool
+buffer_format_group_source_equal(nir_src a, nir_src b)
+{
+   if (buffer_format_group_value_equal(a, b))
+      return true;
+
+   nir_intrinsic_instr *ai = nir_src_as_intrinsic(a);
+   nir_intrinsic_instr *bi = nir_src_as_intrinsic(b);
+   if (!ai || !bi || ai->intrinsic != nir_intrinsic_bindless_image_agx ||
+       bi->intrinsic != nir_intrinsic_bindless_image_agx ||
+       a.ssa->bit_size != b.ssa->bit_size ||
+       a.ssa->num_components != b.ssa->num_components ||
+       nir_intrinsic_desc_set(ai) != nir_intrinsic_desc_set(bi))
+      return false;
+
+   return buffer_format_group_value_equal(ai->src[0], bi->src[0]);
+}
+
+static bool
+buffer_format_group_tex(nir_tex_instr *tex, nir_tex_instr *first)
+{
+   if (tex->op != nir_texop_txf || tex->sampler_dim != GLSL_SAMPLER_DIM_BUF ||
+       tex->is_sparse || tex->num_srcs != first->num_srcs ||
+       tex->dest_type != first->dest_type ||
+       tex->def.num_components != first->def.num_components ||
+       tex->def.bit_size != first->def.bit_size ||
+       tex->texture_index != first->texture_index ||
+       tex->sampler_index != first->sampler_index ||
+       tex->backend_flags != first->backend_flags || tex->is_array ||
+       tex->is_shadow || nir_tex_instr_src_index(tex, nir_tex_src_backend1) >= 0)
+      return false;
+
+   for (unsigned i = 0; i < tex->num_srcs; ++i) {
+      if (tex->src[i].src_type != first->src[i].src_type)
+         return false;
+      if (tex->src[i].src_type != nir_tex_src_coord &&
+          !buffer_format_group_source_equal(tex->src[i].src, first->src[i].src))
+         return false;
    }
 
    return true;
+}
+
+struct buffer_format_group_sources {
+   nir_tex_instr **tex;
+   unsigned count;
+};
+
+static bool
+buffer_format_group_src(nir_src *src, void *data)
+{
+   const struct buffer_format_group_sources *group = data;
+   for (unsigned i = 0; i < group->count; ++i) {
+      if (src->ssa == &group->tex[i]->def)
+         return false;
+   }
+   return true;
+}
+
+static unsigned
+lower_buffer_format_group(nir_shader *shader, nir_tex_instr *first,
+                          const struct agx_texture_lower_options *options)
+{
+   nir_tex_instr *tex[32];
+   unsigned count = 0;
+   nir_instr *last = NULL;
+   struct buffer_format_group_sources group = {tex, 0};
+
+   for (nir_instr *instr = &first->instr; instr; instr = nir_instr_next(instr)) {
+      if (!nir_foreach_src(instr, buffer_format_group_src, &group))
+         break;
+
+      if (instr->type == nir_instr_type_tex) {
+         nir_tex_instr *current = nir_instr_as_tex(instr);
+         if (!buffer_format_group_tex(current, first))
+            break;
+         tex[count++] = current;
+         group.count = count;
+         last = instr;
+         if (count == ARRAY_SIZE(tex))
+            break;
+      } else if (instr->type != nir_instr_type_alu &&
+                 instr->type != nir_instr_type_load_const &&
+                 !(instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic ==
+                      nir_intrinsic_bindless_image_agx)) {
+         break;
+      }
+   }
+
+   if (count < 4)
+      return 0;
+
+   for (nir_instr *instr = nir_instr_next(&first->instr); instr != last;) {
+      nir_instr *next = nir_instr_next(instr);
+      if (instr->type != nir_instr_type_tex)
+         nir_instr_move(nir_before_instr(&first->instr), instr);
+      instr = next;
+   }
+
+   nir_builder b = nir_builder_at(nir_before_instr(&first->instr));
+   nir_def *desc = buffer_texture_descriptor_ptr(&b, first, options);
+   nir_def *format = nir_ine_imm(&b, load_buffer_metadata(
+      &b, desc, AGX_G17P_BUFFER_TEXTURE_RGB32_OFFSET, 32), 0);
+   nir_def *values[2][32];
+   nir_if *nif = nir_push_if(&b, format);
+   nir_def *largest = first->src[nir_tex_instr_src_index(first, nir_tex_src_coord)].src.ssa;
+   for (unsigned i = 1; i < count; ++i) {
+      nir_def *coord = tex[i]->src[nir_tex_instr_src_index(tex[i], nir_tex_src_coord)].src.ssa;
+      largest = nir_umax(&b, largest, coord);
+   }
+   nir_def *size = load_buffer_metadata(
+      &b, desc, AGX_G17P_BUFFER_TEXTURE_SIZE_OFFSET, 32);
+   nir_if *all = nir_push_if(&b, nir_ult(&b, largest, size));
+   nir_def *rgb[2][32];
+   for (unsigned path = 0; path < 2; ++path) {
+      if (path)
+         nir_push_else(&b, all);
+      for (unsigned i = 0; i < count; ++i) {
+         nir_tex_instr *copy = nir_instr_as_tex(nir_instr_clone(shader,
+                                                               &tex[i]->instr));
+         nir_builder_instr_insert(&b, &copy->instr);
+         b.cursor = nir_before_instr(&copy->instr);
+         lower_buffer_texture(&b, copy, true, options, 1, !path,
+                              &rgb[path][i]);
+      }
+   }
+   nir_pop_if(&b, all);
+   for (unsigned i = 0; i < count; ++i)
+      values[0][i] = nir_if_phi(&b, rgb[0][i], rgb[1][i]);
+   nir_push_else(&b, nif);
+   for (unsigned i = 0; i < count; ++i) {
+      nir_tex_instr *copy = nir_instr_as_tex(nir_instr_clone(shader,
+                                                            &tex[i]->instr));
+      nir_builder_instr_insert(&b, &copy->instr);
+      b.cursor = nir_before_instr(&copy->instr);
+      lower_buffer_texture(&b, copy, true, options, 0, false, &values[1][i]);
+   }
+   nir_pop_if(&b, nif);
+
+   for (unsigned i = 0; i < count; ++i) {
+      nir_def *value = nir_if_phi(&b, values[0][i], values[1][i]);
+      nir_def_rewrite_uses(&tex[i]->def, value);
+      nir_instr_remove(&tex[i]->instr);
+   }
+   return count;
+}
+
+static bool
+lower_buffer_format_groups(nir_shader *shader,
+                           const struct agx_texture_lower_options *options)
+{
+   if (!options->gen9 || !options->buffer_metadata ||
+       options->sparse_buffer_residency || shader->info.stage != MESA_SHADER_COMPUTE)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, shader) {
+      struct util_dynarray candidates;
+      util_dynarray_init(&candidates, NULL);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (buffer_format_group_tex(tex, tex))
+               util_dynarray_append(&candidates, tex);
+         }
+      }
+
+      unsigned total = util_dynarray_num_elements(&candidates, nir_tex_instr *);
+      for (unsigned i = 0; total >= 4 && i < total;) {
+         nir_tex_instr *tex =
+            *util_dynarray_element(&candidates, nir_tex_instr *, i);
+         unsigned count = lower_buffer_format_group(shader, tex, options);
+         if (count) {
+            assert(count <= total - i);
+            progress = true;
+            nir_progress(true, impl, nir_metadata_none);
+            i += count;
+         } else {
+            ++i;
+         }
+      }
+      util_dynarray_fini(&candidates);
+      nir_progress(progress, impl, nir_metadata_none);
+   }
+
+   return progress;
 }
 
 /* A texel offset counts as immediate when every component resolves to a
@@ -524,7 +744,7 @@ lower_regular_texture(nir_builder *b, nir_instr *instr, void *data)
 
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
       return lower_buffer_texture(b, tex, options && options->buffer_metadata,
-                                  options);
+                                  options, -1, false, NULL);
    }
 
    /* Don't lower twice */
@@ -1665,6 +1885,7 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
     * 16-bit multisample indices) but before lowering queries (as the lowering
     * generates txs for array textures).
     */
+   NIR_PASS(progress, s, lower_buffer_format_groups, &options);
    NIR_PASS(progress, s, nir_shader_instructions_pass, lower_regular_texture,
             nir_metadata_none, (void *)&options);
    NIR_PASS(progress, s, nir_shader_instructions_pass, lower_tex_crawl,

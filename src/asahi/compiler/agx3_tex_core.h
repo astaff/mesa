@@ -356,6 +356,12 @@ bool agx3_tex_cube_cem_calc(enum agx_isa_encoding enc, uint16_t x,
                             uint16_t y, uint16_t z, uint8_t axis,
                             bool discard,
                             uint8_t out[AGX3_TEX_MAX_LENGTH], uint8_t *len);
+bool agx3_tex_cube_cem_calc_hints_to(enum agx_isa_encoding enc, uint16_t x,
+                                     uint16_t y, uint16_t z, uint16_t dest,
+                                     uint8_t axis, const bool discard[3],
+                                     uint8_t out[AGX3_TEX_MAX_LENGTH],
+                                     uint8_t *len);
+
 bool agx3_tex_cube_cem_calc_to(enum agx_isa_encoding enc, uint16_t x,
                                uint16_t y, uint16_t z, uint16_t dest,
                                uint8_t axis, bool discard,

@@ -44,7 +44,8 @@ agx_dce(agx_context *ctx, bool partial)
             }
          }
 
-         if (!needed && agx_opcodes_info[I->op].can_eliminate) {
+         if (!needed && agx_opcodes_info[I->op].can_eliminate &&
+             !I->agx3_tex_coord_stage) {
             agx_remove_instruction(I);
          } else {
             agx_foreach_ssa_src(I, s) {

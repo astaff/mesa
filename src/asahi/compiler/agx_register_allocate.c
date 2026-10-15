@@ -96,6 +96,7 @@ struct ra_ctx {
     * when shuffling.
     */
    bool early_killed;
+   bool transient_texture_used;
 
    /* Maintained while assigning registers. Count of registers required, i.e.
     * the maximum register assigned + 1.
@@ -104,6 +105,7 @@ struct ra_ctx {
 
    /* For affinities */
    agx_instr **src_to_collect_phi;
+   BITSET_WORD *early_scalar_export;
    struct phi_web_node *phi_web;
 
    /* If bit i of used_regs is set, and register i is the first consecutive
@@ -215,7 +217,7 @@ agx_split_width(const agx_instr *I)
  * classes. Becuase we allocate in SSA, this calculation is exact in
  * linear-time. Depends on liveness information.
  */
-static unsigned
+unsigned
 agx_calc_register_demand(agx_context *ctx, bool remat)
 {
    /* Print detailed demand calculation, helpful to debug spilling */
@@ -229,7 +231,8 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
    enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
 
    agx_foreach_instr_global(ctx, I) {
-      if (I->op == AGX_OPCODE_MOV_IMM && remat)
+      if (remat && (I->op == AGX_OPCODE_MOV_IMM ||
+                    agx_can_rematerialize_uniform(ctx, I)))
          continue;
 
       agx_foreach_ssa_dest(I, d) {
@@ -273,7 +276,8 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
          if (I->op == AGX_OPCODE_PHI)
             continue;
 
-         if (I->op == AGX_OPCODE_MOV_IMM && remat)
+         if (remat && (I->op == AGX_OPCODE_MOV_IMM ||
+                       agx_can_rematerialize_uniform(ctx, I)))
             continue;
 
          if (debug) {
@@ -939,6 +943,10 @@ agx_emit_moves_before_phi(struct ra_ctx *rctx, agx_block *block,
    util_dynarray_fini(&defs);
 }
 
+static bool
+pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
+                              unsigned count, unsigned standard, unsigned *out);
+
 static unsigned
 find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
           unsigned align)
@@ -950,7 +958,14 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
    unsigned minimum = dest_minimum(rctx, I, dest_idx);
    unsigned limit = dest_limit(rctx, I, dest_idx);
 
-   if (find_regs_simple(rctx, cls, count, align, minimum, limit, &reg)) {
+   bool simple = find_regs_simple(rctx, cls, count, align, minimum, limit, &reg);
+   unsigned transient;
+   if (pick_transient_texture_region(rctx, I, dest_idx, count,
+                                    simple ? reg : ~0u, &transient)) {
+      rctx->transient_texture_used = true;
+      return transient;
+   }
+   if (simple) {
       return reg;
    } else {
       assert(!rctx->early_killed && "no live range splits with early kill");
@@ -1167,6 +1182,62 @@ try_coalesce_with(struct ra_ctx *rctx, agx_index ssa, unsigned count,
    return true;
 }
 
+static bool
+pick_collect_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
+                      unsigned count, unsigned align, unsigned *out)
+{
+   agx_index idx = I->dest[d];
+   agx_instr *collect = rctx->src_to_collect_phi[idx.value];
+   if (!collect || collect->op != AGX_OPCODE_COLLECT)
+      return false;
+   const enum ra_class cls = ra_class_for_index(idx);
+   const unsigned minimum = dest_minimum(rctx, I, d);
+   const unsigned limit = dest_limit(rctx, I, d);
+   unsigned our_source = ~0u;
+   agx_foreach_ssa_src(collect, s) {
+      if (agx_is_equiv(collect->src[s], idx)) {
+         our_source = s;
+         break;
+      }
+   }
+   assert(our_source < collect->nr_srcs);
+   agx_foreach_ssa_src(collect, s) {
+      if (!BITSET_TEST(rctx->visited, collect->src[s].value))
+         continue;
+      unsigned base = affinity_base_of_collect(rctx, collect, s);
+      if (base >= rctx->bound[cls])
+         continue;
+      unsigned reg = base + our_source * align;
+      if (reg < minimum || reg + count > limit || reg % align)
+         continue;
+      if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count)) {
+         *out = reg;
+         return true;
+      }
+   }
+   unsigned collect_align = rctx->ncomps[collect->dest[0].value];
+   unsigned offset = our_source * align;
+   for (unsigned base = 0; base + collect->nr_srcs * align <= limit;
+        base += collect_align) {
+      if (base + offset >= minimum &&
+          !BITSET_TEST_COUNT(rctx->used_regs[cls], base, collect->nr_srcs * align)) {
+         *out = base + offset;
+         return true;
+      }
+   }
+   if (collect_align > align) {
+      for (unsigned reg = offset; reg + collect_align <= limit;
+           reg += collect_align) {
+         if (reg >= minimum &&
+             !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count)) {
+            *out = reg;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
 /*
  * A destination with a G17P bank constraint (e.g. a colour tile-store payload,
  * limited to the tile-store bank by agx3_tile_store_bank()) used to skip every
@@ -1224,7 +1295,56 @@ pick_bank_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
       }
    }
 
-   return false;
+   return pick_collect_affinity(rctx, I, d, count, align, out);
+}
+
+static bool
+pick_phi_edge_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
+                       unsigned count, unsigned align, unsigned *out)
+{
+   if (I->op != AGX_OPCODE_PHI ||
+       rctx->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+      return false;
+   enum ra_class cls = ra_class_for_index(I->dest[d]);
+   unsigned first = ~0u;
+   agx_foreach_ssa_src(I, s) {
+      if (!I->src[s].has_reg || ra_class_for_index(I->src[s]) != cls)
+         continue;
+      unsigned reg = I->src[s].reg;
+      if (reg % align || reg < dest_minimum(rctx, I, d) ||
+          reg + count > dest_limit(rctx, I, d) ||
+          BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count))
+         continue;
+      bool private = true;
+      agx_foreach_phi_in_block(rctx->block, other) {
+         if (other == I)
+            continue;
+         agx_foreach_ssa_src(other, edge) {
+            agx_index src = other->src[edge];
+            if (ra_class_for_index(src) != cls)
+               continue;
+            agx_index own = I->src[edge];
+            bool identity = own.type == AGX_INDEX_NORMAL && own.has_reg &&
+                            ra_class_for_index(own) == cls && own.reg == reg;
+            if (identity)
+               continue;
+            if (!src.has_reg ||
+                (src.reg < reg + count &&
+                 reg < src.reg + rctx->ncomps[other->dest[0].value])) {
+               private = false;
+               break;
+            }
+         }
+         if (!private)
+            break;
+      }
+      if (private)
+         first = MIN2(first, reg);
+   }
+   if (first == ~0u)
+      return false;
+   *out = first;
+   return true;
 }
 
 static unsigned
@@ -1258,7 +1378,8 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
    if (dest_minimum(rctx, I, d) > 0 ||
        dest_limit(rctx, I, d) < rctx->bound[cls]) {
       unsigned out;
-      if (pick_bank_affinity(rctx, I, d, count, align, &out))
+      if (pick_bank_affinity(rctx, I, d, count, align, &out) ||
+          pick_phi_edge_affinity(rctx, I, d, count, align, &out))
          return out;
       return find_regs(rctx, I, d, count, align);
    }
@@ -1284,6 +1405,9 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
 
    /* Try to allocate phis compatibly with their sources */
    if (I->op == AGX_OPCODE_PHI) {
+      unsigned edge_reg;
+      if (pick_phi_edge_affinity(rctx, I, d, count, align, &edge_reg))
+         return edge_reg;
       agx_foreach_ssa_src(I, s) {
          /* Loop headers have phis with a source preceding the definition */
          bool may_be_unvisited = rctx->block->loop_header;
@@ -1320,8 +1444,15 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
       unsigned reg = collect_phi->imm;
 
       if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align) &&
-          (reg % align) == 0)
+          (reg % align) == 0) {
+         unsigned lower;
+         if (BITSET_TEST(rctx->early_scalar_export, idx.value) &&
+             reg + count > *rctx->count[cls] &&
+             find_regs_simple(rctx, cls, count, align, dest_minimum(rctx, I, d),
+                              reg, &lower))
+            return lower;
          return reg;
+      }
    }
 
    /* Try to coalesce vector exports */
@@ -1338,72 +1469,9 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
       }
    }
 
-   /* Try to allocate sources of collects contiguously */
-   if (collect_phi && collect_phi->op == AGX_OPCODE_COLLECT) {
-      agx_instr *collect = collect_phi;
-
-      assert(count == align && "collect sources are scalar");
-
-      /* Find our offset in the collect. If our source is repeated in the
-       * collect, this may not be unique. We arbitrarily choose the first.
-       */
-      unsigned our_source = ~0;
-      agx_foreach_ssa_src(collect, s) {
-         if (agx_is_equiv(collect->src[s], idx)) {
-            our_source = s;
-            break;
-         }
-      }
-
-      assert(our_source < collect->nr_srcs && "source must be in the collect");
-
-      /* See if we can allocate compatibly with any source of the collect */
-      agx_foreach_ssa_src(collect, s) {
-         if (!BITSET_TEST(rctx->visited, collect->src[s].value))
-            continue;
-
-         /* Determine where the collect should start relative to the source */
-         unsigned base = affinity_base_of_collect(rctx, collect, s);
-         if (base >= rctx->bound[cls])
-            continue;
-
-         unsigned our_reg = base + (our_source * align);
-
-         /* Don't allocate past the end of the register file */
-         if ((our_reg + align) > rctx->bound[cls])
-            continue;
-
-         /* If those registers are free, then choose them */
-         if (!BITSET_TEST_COUNT(rctx->used_regs[cls], our_reg, align))
-            return our_reg;
-      }
-
-      unsigned collect_align = rctx->ncomps[collect->dest[0].value];
-      unsigned offset = our_source * align;
-
-      /* Prefer ranges of the register file that leave room for all sources of
-       * the collect contiguously.
-       */
-      for (unsigned base = 0;
-           base + (collect->nr_srcs * align) <= rctx->bound[cls];
-           base += collect_align) {
-         if (!BITSET_TEST_COUNT(rctx->used_regs[cls], base,
-                                collect->nr_srcs * align))
-            return base + offset;
-      }
-
-      /* Try to respect the alignment requirement of the collect destination,
-       * which may be greater than the sources (e.g. pack_64_2x32_split). Look
-       * for a register for the source such that the collect base is aligned.
-       */
-      if (collect_align > align) {
-         for (unsigned reg = offset; reg + collect_align <= rctx->bound[cls];
-              reg += collect_align) {
-            if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count))
-               return reg;
-         }
-      }
-   }
+   unsigned collect_reg;
+   if (pick_collect_affinity(rctx, I, d, count, align, &collect_reg))
+      return collect_reg;
 
    /* Try to allocate phi sources compatibly with their phis */
    if (collect_phi && collect_phi->op == AGX_OPCODE_PHI) {
@@ -1469,6 +1537,376 @@ try_kill_early_sources(struct ra_ctx *rctx, const agx_instr *I,
          I->src[s].kill = false;
       }
    }
+}
+
+static bool
+transient_texture_program(const agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble || ctx->any_cf ||
+       ctx->scratch_size_B || list_length(&ctx->blocks) != 1)
+      return false;
+   bool terminal_tile = false;
+   agx_foreach_instr_global(ctx, I) {
+      const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
+      if (info->can_reorder && info->can_eliminate &&
+          info->schedule_class == AGX_SCHEDULE_CLASS_NONE)
+         continue;
+      switch (I->op) {
+      case AGX_OPCODE_PRELOAD:
+      case AGX_OPCODE_UNIT_TEST:
+      case AGX_OPCODE_EXPORT:
+      case AGX_OPCODE_INTERP_AGX3:
+      case AGX_OPCODE_RHW_INTERP_AGX3:
+      case AGX_OPCODE_GET_SR:
+      case AGX_OPCODE_PUBLISH_TEXTURE_AGX3:
+      case AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3:
+         break;
+      case AGX_OPCODE_ST_TILE:
+      case AGX_OPCODE_SIGNAL_PIX:
+         terminal_tile = true;
+         break;
+      case AGX_OPCODE_WAIT_PIX:
+      case AGX_OPCODE_STOP:
+         break;
+      case AGX_OPCODE_TEXTURE_SAMPLE:
+         if (terminal_tile || I->sparse || I->shadow || I->offset || I->query_lod ||
+             I->gather != AGX_GATHER_NONE ||
+             (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_CUBE) ||
+             I->lod_mode != AGX_LOD_MODE_AUTO_LOD)
+            return false;
+         break;
+      default:
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+texture_region_retired(struct ra_ctx *rctx, agx_instr *I, unsigned reg,
+                       unsigned count)
+{
+   agx_foreach_instr_in_block(rctx->block, producer) {
+      if (producer == I)
+         break;
+      if (!agx3_is_async(producer))
+         continue;
+      agx_foreach_ssa_dest(producer, d) {
+         agx_index value = producer->dest[d];
+         if (value.memory || !value.has_reg ||
+             value.reg >= reg + count ||
+             reg >= value.reg + rctx->ncomps[value.value])
+            continue;
+         BITSET_WORD *alias = BITSET_CALLOC(rctx->shader->alloc);
+         if (!alias)
+            return false;
+         BITSET_SET(alias, value.value);
+         bool retired = false;
+         for (struct list_head *node = producer->link.next; node != &I->link;
+              node = node->next) {
+            agx_instr *use = list_entry(node, agx_instr, link);
+            bool reads = false;
+            agx_foreach_ssa_src(use, q)
+               reads |= BITSET_TEST(alias, use->src[q].value);
+            if (!reads)
+               continue;
+            bool wiring = use->op == AGX_OPCODE_SPLIT ||
+                          use->op == AGX_OPCODE_COLLECT ||
+                          use->op == AGX_OPCODE_PHI;
+            if (use->op == AGX_OPCODE_MOV && use->nr_dests == 1 &&
+                use->nr_srcs == 1 && use->dest[0].has_reg &&
+                use->src[0].has_reg && use->dest[0].reg == use->src[0].reg &&
+                use->dest[0].size == use->src[0].size &&
+                !use->src[0].abs && !use->src[0].neg)
+               wiring = true;
+            if (use->op == AGX_OPCODE_EXPORT && use->src[0].has_reg &&
+                use->src[0].reg == use->imm)
+               wiring = true;
+            if (wiring) {
+               agx_foreach_ssa_dest(use, q)
+                  BITSET_SET(alias, use->dest[q].value);
+            } else {
+               retired = true;
+               break;
+            }
+         }
+         free(alias);
+         if (!retired)
+            return false;
+      }
+   }
+   return true;
+}
+
+static bool
+texture_tail_cost(struct ra_ctx *rctx, agx_instr *I, agx_instr *split,
+                  unsigned reg, unsigned *peak, unsigned *copies)
+{
+   struct ra_ctx model = *rctx;
+   BITSET_DECLARE(used, AGX_NUM_REGS);
+   memcpy(used, rctx->used_regs[RA_GPR], sizeof(used));
+   model.used_regs[RA_GPR] = used;
+   model.ssa_to_reg = mem_dup(rctx->ssa_to_reg,
+                             rctx->shader->alloc * sizeof(uint16_t));
+   model.visited = mem_dup(rctx->visited,
+                           BITSET_BYTES(rctx->shader->alloc));
+   model.phi_web = mem_dup(rctx->phi_web,
+                           rctx->shader->alloc * sizeof(struct phi_web_node));
+   unsigned footprint = *rctx->count[RA_GPR], moves = 0;
+   model.count[RA_GPR] = &footprint;
+   model.transient_texture_used = true;
+   bool ok = false;
+   if (!model.ssa_to_reg || !model.visited || !model.phi_web)
+      goto done;
+   assign_regs(&model, I->dest[0], reg);
+   agx_foreach_ssa_src(I, q) {
+      if (I->src[q].kill && !I->src[q].memory)
+         BITSET_CLEAR_COUNT(used, model.ssa_to_reg[I->src[q].value],
+                            model.ncomps[I->src[q].value]);
+   }
+   for (struct list_head *node = &split->link;
+        node != &rctx->block->instructions; node = node->next) {
+      agx_instr *next = list_entry(node, agx_instr, link);
+      agx_instr proxy = *next;
+      agx_instr *proxy_ptr = &proxy;
+      agx_index sources[256], destinations[256];
+      memcpy(sources, next->src, next->nr_srcs * sizeof(agx_index));
+      memcpy(destinations, next->dest, next->nr_dests * sizeof(agx_index));
+      proxy.src = sources;
+      proxy.dest = destinations;
+      model.instr = &proxy;
+      agx_foreach_ssa_src(proxy_ptr, q) {
+         if (proxy.src[q].memory ||
+             !BITSET_TEST(model.visited, proxy.src[q].value))
+            goto done;
+      }
+      if (proxy.op == AGX_OPCODE_SPLIT && proxy.src[0].kill) {
+         unsigned base = model.ssa_to_reg[proxy.src[0].value];
+         unsigned width = agx_size_align_16(agx_split_width(&proxy));
+         BITSET_CLEAR_COUNT(used, base, model.ncomps[proxy.src[0].value]);
+         agx_foreach_ssa_dest(proxy_ptr, q)
+            assign_regs(&model, proxy.dest[q], base + q * width);
+         continue;
+      }
+      if (proxy.op == AGX_OPCODE_PRELOAD || proxy.op == AGX_OPCODE_PHI ||
+          proxy.agx3_cube_scalar_coords || proxy.op == AGX_OPCODE_FFS ||
+          proxy.op == AGX_OPCODE_BFEIL || proxy.op == AGX_OPCODE_BITOP ||
+          proxy.op == AGX_OPCODE_IADD)
+         goto done;
+      unsigned source_regs[256];
+      agx_foreach_ssa_src(proxy_ptr, q)
+         source_regs[q] = model.ssa_to_reg[proxy.src[q].value];
+      model.early_killed = false;
+      if (proxy.nr_dests == 1 && proxy.dest[0].type == AGX_INDEX_NORMAL) {
+         unsigned first_source = 0, end = 0, base = 0;
+         agx_foreach_ssa_src(proxy_ptr, q) {
+            if (!proxy.src[q].kill)
+               continue;
+            unsigned current = source_regs[q];
+            if (base == end || current != end) {
+               try_kill_early_sources(&model, &proxy, first_source, q, end, base);
+               first_source = q;
+               base = current;
+            }
+            end = current + model.ncomps[proxy.src[q].value];
+         }
+         if (proxy.nr_srcs)
+            try_kill_early_sources(&model, &proxy, first_source,
+                                   proxy.nr_srcs - 1, end, base);
+      }
+      agx_foreach_ssa_dest(proxy_ptr, q) {
+         unsigned count = model.ncomps[proxy.dest[q].value], available;
+         if (proxy.dest[q].memory ||
+             !find_regs_simple(&model, RA_GPR, count, count,
+                               dest_minimum(&model, &proxy, q),
+                               dest_limit(&model, &proxy, q), &available))
+            goto done;
+         unsigned chosen = pick_regs(&model, &proxy, q);
+         assign_regs(&model, proxy.dest[q], chosen);
+      }
+      if (proxy.op == AGX_OPCODE_COLLECT) {
+         unsigned base = model.ssa_to_reg[proxy.dest[0].value];
+         unsigned width = agx_size_align_16(proxy.dest[0].size);
+         agx_foreach_src(proxy_ptr, q) {
+            if (proxy.src[q].type == AGX_INDEX_UNDEF || agx_is_null(proxy.src[q]))
+               continue;
+            if (proxy.src[q].type != AGX_INDEX_NORMAL)
+               goto done;
+            moves += source_regs[q] != base + q * width;
+         }
+      } else if (proxy.op == AGX_OPCODE_SPLIT) {
+         unsigned base = source_regs[0];
+         unsigned width = agx_size_align_16(agx_split_width(&proxy));
+         agx_foreach_ssa_dest(proxy_ptr, q)
+            moves += model.ssa_to_reg[proxy.dest[q].value] != base + q * width;
+      } else if (proxy.op == AGX_OPCODE_EXPORT) {
+         moves += proxy.src[0].type != AGX_INDEX_NORMAL ||
+                  source_regs[0] != proxy.imm;
+         footprint = MAX2(footprint, proxy.imm +
+                         agx_size_align_16(proxy.src[0].size));
+      } else if (proxy.op == AGX_OPCODE_MOV) {
+         if (proxy.nr_dests != 1 || proxy.dest[0].type != AGX_INDEX_NORMAL)
+            goto done;
+         moves += proxy.src[0].type != AGX_INDEX_NORMAL ||
+                  proxy.src[0].size != proxy.dest[0].size ||
+                  model.ssa_to_reg[proxy.dest[0].value] != source_regs[0];
+      }
+      agx_foreach_ssa_src(proxy_ptr, q) {
+         if (proxy.src[q].kill)
+            BITSET_CLEAR_COUNT(used, source_regs[q],
+                               model.ncomps[proxy.src[q].value]);
+      }
+   }
+   ok = true;
+   *peak = footprint;
+   *copies = moves;
+done:
+   free(model.ssa_to_reg);
+   free(model.visited);
+   free(model.phi_web);
+   return ok;
+}
+
+static bool
+pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
+                              unsigned count, unsigned standard, unsigned *out)
+{
+   if (rctx->transient_texture_used ||
+       I->op != AGX_OPCODE_TEXTURE_SAMPLE || count != 8 || d ||
+       I->dest[0].size != AGX_SIZE_32 ||
+       I->link.next == &rctx->block->instructions)
+      return false;
+   agx_instr *split = list_entry(I->link.next, agx_instr, link);
+   if (split->op != AGX_OPCODE_SPLIT || split->nr_srcs != 1 ||
+       split->nr_dests != 4 || !split->src[0].kill ||
+       !agx_is_equiv(split->src[0], I->dest[0]) ||
+       agx_split_width(split) != AGX_SIZE_32)
+      return false;
+   agx_foreach_ssa_dest(split, q) {
+      if (split->dest[q].memory || rctx->ncomps[split->dest[q].value] != 2)
+         return false;
+   }
+   unsigned remaining = 0;
+   agx_foreach_ssa_dest(split, q)
+      remaining |= 1u << q;
+   for (struct list_head *node = split->link.next;
+        remaining && node != &rctx->block->instructions; node = node->next) {
+      agx_instr *next = list_entry(node, agx_instr, link);
+      agx_foreach_ssa_dest(next, q) {
+         if (!next->dest[q].memory &&
+             rctx->ncomps[next->dest[q].value] > 2)
+            return false;
+      }
+      agx_foreach_ssa_src(next, q) {
+         if (!next->src[q].kill)
+            continue;
+         agx_foreach_ssa_dest(split, c) {
+            if (agx_is_equiv(next->src[q], split->dest[c]))
+               remaining &= ~(1u << c);
+         }
+      }
+   }
+   if (remaining)
+      return false;
+   unsigned reg;
+   if (!find_regs_simple(rctx, RA_GPR, count, 2, dest_minimum(rctx, I, d),
+                         dest_limit(rctx, I, d), &reg) || reg >= standard ||
+       !transient_texture_program(rctx->shader) ||
+       !texture_region_retired(rctx, I, reg, count))
+      return false;
+   for (unsigned base = ROUND_DOWN_TO(reg, count); base < reg + count;
+        base += count) {
+      if (!BITSET_TEST_COUNT(rctx->used_regs[RA_GPR], base, count)) {
+         return false;
+      }
+   }
+   struct ra_ctx model = *rctx;
+   BITSET_DECLARE(used, AGX_NUM_REGS);
+   memcpy(used, rctx->used_regs[RA_GPR], sizeof(used));
+   model.used_regs[RA_GPR] = used;
+   model.ssa_to_reg = mem_dup(rctx->ssa_to_reg,
+                             rctx->shader->alloc * sizeof(uint16_t));
+   model.visited = mem_dup(rctx->visited,
+                           BITSET_BYTES(rctx->shader->alloc));
+   model.phi_web = mem_dup(rctx->phi_web,
+                           rctx->shader->alloc * sizeof(struct phi_web_node));
+   unsigned footprint = *rctx->count[RA_GPR];
+   model.count[RA_GPR] = &footprint;
+   bool ok = false;
+   if (!model.ssa_to_reg || !model.visited || !model.phi_web)
+      goto done;
+   assign_regs(&model, I->dest[0], reg);
+   agx_foreach_ssa_src(I, q) {
+      if (I->src[q].kill && !I->src[q].memory)
+         BITSET_CLEAR_COUNT(used, model.ssa_to_reg[I->src[q].value],
+                            model.ncomps[I->src[q].value]);
+   }
+   BITSET_CLEAR_COUNT(used, reg, count);
+   agx_foreach_ssa_dest(split, q)
+      assign_regs(&model, split->dest[q], reg + 2 * q);
+   struct list_head *node = split->link.next;
+   for (unsigned step = 0; step < 8 && node != &rctx->block->instructions;
+        ++step, node = node->next) {
+      agx_instr *next = list_entry(node, agx_instr, link);
+      if ((next->op != AGX_OPCODE_FADD && next->op != AGX_OPCODE_FMUL &&
+           next->op != AGX_OPCODE_FFMA) || next->nr_dests != 1 ||
+          next->dest[0].type != AGX_INDEX_NORMAL || next->dest[0].memory ||
+          model.ncomps[next->dest[0].value] != 2)
+         break;
+      bool reads = false, simple = true;
+      agx_foreach_ssa_src(next, q) {
+         simple &= !next->src[q].memory &&
+            model.ncomps[next->src[q].value] == 2;
+         agx_foreach_ssa_dest(split, c)
+            reads |= agx_is_equiv(next->src[q], split->dest[c]);
+      }
+      if (!simple)
+         break;
+      model.instr = next;
+      agx_foreach_ssa_src(next, q) {
+         if (next->src[q].kill)
+            BITSET_CLEAR_COUNT(used, model.ssa_to_reg[next->src[q].value], 2);
+      }
+      if (reads) {
+         agx_instr *export =
+            model.src_to_collect_phi[next->dest[0].value];
+         if (export && export->op == AGX_OPCODE_EXPORT &&
+             export->imm < reg + count && reg < export->imm + 2 &&
+             !(standard < export->imm + 2 &&
+               export->imm < standard + count) &&
+             BITSET_TEST_COUNT(used, export->imm, 2))
+            break;
+         ok = true;
+         break;
+      }
+      unsigned available;
+      if (!find_regs_simple(&model, RA_GPR, 2, 2,
+                            dest_minimum(&model, next, 0),
+                            dest_limit(&model, next, 0), &available))
+         break;
+      unsigned chosen = pick_regs(&model, next, 0);
+      if (chosen < reg + count && reg < chosen + 2)
+         break;
+      assign_regs(&model, next->dest[0], chosen);
+   }
+done:
+   free(model.ssa_to_reg);
+   free(model.visited);
+   free(model.phi_web);
+   if (ok) {
+      unsigned candidate_peak, baseline_peak, candidate_copies, baseline_copies;
+      ok = standard != ~0u &&
+         texture_tail_cost(rctx, I, split, reg, &candidate_peak,
+                           &candidate_copies) &&
+         texture_tail_cost(rctx, I, split, standard, &baseline_peak,
+                           &baseline_copies) &&
+         candidate_peak <= baseline_peak && candidate_copies <= baseline_copies;
+   }
+   if (ok) {
+      *out = reg;
+   }
+   return ok;
 }
 
 /** Assign registers to SSA values in a block. */
@@ -1556,6 +1994,49 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          continue;
       }
 
+      if (I->agx3_cube_scalar_coords && I->nr_dests == 1 &&
+          I->dest[0].type == AGX_INDEX_NORMAL) {
+         unsigned released[3], nr_released = 0;
+         for (unsigned c = 0; c < 3; ++c) {
+            unsigned src = c ? c + 5 : 0;
+            if (I->src[src].type != AGX_INDEX_NORMAL || !I->src[src].kill)
+               continue;
+            bool duplicate = false;
+            for (unsigned n = 0; n < nr_released; ++n)
+               duplicate |= agx_is_equiv(I->src[src], I->src[released[n]]);
+            if (duplicate)
+               continue;
+            kill_source(rctx, I, src);
+            released[nr_released++] = src;
+         }
+         unsigned count = rctx->ncomps[I->dest[0].value], reg;
+         bool found =
+            nr_released && find_regs_simple(rctx, RA_GPR, count, count,
+                                            dest_minimum(rctx, I, 0),
+                                            dest_limit(rctx, I, 0), &reg);
+         if (found) {
+            reg = pick_regs(rctx, I, 0);
+            assign_regs(rctx, I->dest[0], reg);
+            agx_foreach_ssa_src(I, src) {
+               if (!I->src[src].kill)
+                  continue;
+               bool already = false;
+               for (unsigned n = 0; n < nr_released; ++n)
+                  already |= agx_is_equiv(I->src[src], I->src[released[n]]);
+               if (!already)
+                  kill_source(rctx, I, src);
+            }
+            agx_set_sources(rctx, I);
+            agx_set_dests(rctx, I);
+            continue;
+         }
+         for (unsigned n = 0; n < nr_released; ++n) {
+            unsigned src = released[n];
+            BITSET_SET_COUNT(used_regs_gpr, ssa_to_reg[I->src[src].value],
+                             rctx->ncomps[I->src[src].value]);
+         }
+      }
+
       /* AGX3b device atomics return the old value in-place over their value
        * operand.  When that operand dies here, assign the destination to its
        * exact base before the generic allocator can choose a different free
@@ -1625,7 +2106,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          I->src[0].type == AGX_INDEX_NORMAL &&
          I->src[1].type == AGX_INDEX_NORMAL;
 
-      if (I->nr_dests == 1 && !g17p_ft1 && !g17p_srl_boundary &&
+      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) &&
+          !g17p_ft1 && !g17p_srl_boundary &&
           !g17p_reg_isub && !g17p_reg_and) {
          unsigned first_src = 0;
          unsigned end = 0;
@@ -1953,7 +2435,7 @@ agx3_cube_register_budget(agx_context *ctx)
       agx_foreach_ssa_dest(I, d)
          alignment = MAX2(alignment,
                          util_next_power_of_two(agx_index_size_16(I->dest[d])));
-      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs < 6 ||
           (I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY))
          continue;
 
@@ -1969,9 +2451,68 @@ agx3_cube_register_budget(agx_context *ctx)
    return ROUND_DOWN_TO(budget, alignment);
 }
 
+static bool
+pair_peer_publication_consumed_early(agx_context *ctx, unsigned value)
+{
+   if (list_length(&ctx->blocks) != 1)
+      return false;
+   bool found = false;
+   agx_block *block = list_first_entry(&ctx->blocks, agx_block, link);
+   agx_foreach_instr_in_block(block, P) {
+      bool reads = false;
+      agx_foreach_ssa_src(P, q)
+         reads |= P->src[q].value == value;
+      const struct agx_opcode_info *info = &agx_opcodes_info[P->op];
+      if (!reads || (info->can_reorder && info->can_eliminate &&
+                     info->schedule_class == AGX_SCHEDULE_CLASS_NONE))
+         continue;
+      if (!agx_is_texture_publication(P))
+         return false;
+      bool consumed = false;
+      for (struct list_head *node = P->link.next; node != &block->instructions;
+           node = node->next) {
+         agx_instr *sample = list_entry(node, agx_instr, link);
+         if (agx_texture_resource(sample) != P->imm || sample->nr_dests != 1 ||
+             sample->dest[0].type != AGX_INDEX_NORMAL)
+            continue;
+         BITSET_WORD *result = BITSET_CALLOC(ctx->alloc);
+         if (!result)
+            return false;
+         BITSET_SET(result, sample->dest[0].value);
+         for (struct list_head *next_node = sample->link.next;
+              next_node != &block->instructions; next_node = next_node->next) {
+            agx_instr *I = list_entry(next_node, agx_instr, link);
+            if (I->op == AGX_OPCODE_TEXTURE_SAMPLE)
+               break;
+            bool uses = false;
+            agx_foreach_ssa_src(I, q)
+               uses |= BITSET_TEST(result, I->src[q].value);
+            if (!uses)
+               continue;
+            if (I->op == AGX_OPCODE_SPLIT || I->op == AGX_OPCODE_COLLECT) {
+               agx_foreach_ssa_dest(I, d)
+                  BITSET_SET(result, I->dest[d].value);
+               continue;
+            }
+            const struct agx_opcode_info *use_info = &agx_opcodes_info[I->op];
+            consumed = use_info->can_reorder && use_info->can_eliminate &&
+                       use_info->schedule_class == AGX_SCHEDULE_CLASS_NONE;
+            break;
+         }
+         free(result);
+         break;
+      }
+      if (!consumed)
+         return false;
+      found = true;
+   }
+   return found;
+}
+
 void
 agx_ra(agx_context *ctx)
 {
+   ctx->uniforms_written = agx_has_uniform_store(ctx);
    agx_lower_agx3b_atomic_returns(ctx);
 
    bool force_spilling =
@@ -2116,6 +2657,7 @@ agx_ra(agx_context *ctx)
       }
    }
 
+   const bool ssa_renumbered = spilling || remat;
    if (spilling || remat) {
       assert((remat || ctx->key->has_scratch) &&
              "internal shaders are unspillable");
@@ -2139,6 +2681,24 @@ agx_ra(agx_context *ctx)
 
       /* The resulting program can now be assigned registers */
       assert(effective_demand <= max_possible_regs && "spiller post-condition");
+   }
+
+   unsigned original_hints =
+      util_dynarray_num_elements(&ctx->collect_split_hints, agx_instr *);
+   if (ssa_renumbered || ctx->scratch_size_B) {
+      agx_foreach_instr_global(ctx, I) {
+         if (!I->agx3_cube_scalar_coords || I->nr_srcs != 8)
+            continue;
+         if (!ctx->collect_split_hints.data)
+            util_dynarray_init(&ctx->collect_split_hints, ctx);
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         agx_instr *hint = agx_alloc_instr(&b, AGX_OPCODE_COLLECT, 1, 3);
+         hint->dest[0] = agx_vec_temp(ctx, AGX_SIZE_32, 3);
+         hint->src[0] = I->src[0];
+         hint->src[1] = I->src[6];
+         hint->src[2] = I->src[7];
+         util_dynarray_append(&ctx->collect_split_hints, hint);
+      }
    }
 
    /* Record all phi webs. First initialize the union-find data structure with
@@ -2171,10 +2731,21 @@ agx_ra(agx_context *ctx)
    BITSET_WORD *high_gpr = BITSET_CALLOC(ctx->alloc);
    BITSET_WORD *tex_low128 = BITSET_CALLOC(ctx->alloc);
    unsigned max_ncomps = 1;
+   unsigned *definition_order = calloc(ctx->alloc, sizeof(unsigned));
+   BITSET_WORD *early_scalar_export = BITSET_CALLOC(ctx->alloc);
+   BITSET_WORD *effectful_use = BITSET_CALLOC(ctx->alloc);
+   unsigned instruction_order = 0;
 
    const unsigned tile_gpr_limit = agx3_tile_store_bank(ctx);
 
    agx_foreach_instr_global(ctx, I) {
+      instruction_order++;
+      const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
+      if (!info->can_reorder || !info->can_eliminate ||
+          info->schedule_class != AGX_SCHEDULE_CLASS_NONE) {
+         agx_foreach_ssa_src(I, q)
+            BITSET_SET(effectful_use, I->src[q].value);
+      }
       /* The G17P funop encoder and fused quadrant selects use the bounded
        * seven-bit operand forms. Constrain only their SSA webs; unrelated
        * values retain the complete register file. */
@@ -2226,6 +2797,12 @@ agx_ra(agx_context *ctx)
            I->op == AGX_OPCODE_IMAGE_LOAD)) {
          if (I->src[0].type == AGX_INDEX_NORMAL)
             BITSET_SET(texture_gpr, I->src[0].value);
+         if (I->agx3_cube_scalar_coords) {
+            for (unsigned s = 6; s < 8; ++s) {
+               if (I->src[s].type == AGX_INDEX_NORMAL)
+                  BITSET_SET(texture_gpr, I->src[s].value);
+            }
+         }
 
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
              I->lod_mode == AGX_LOD_MODE_LOD_GRAD &&
@@ -2282,9 +2859,65 @@ agx_ra(agx_context *ctx)
          ncomps_unrounded[v] = agx_index_size_16(I->dest[d]);
          ncomps[v] = util_next_power_of_two(ncomps_unrounded[v]);
          sizes[v] = I->dest[d].size;
+         definition_order[v] = instruction_order;
          classes[v] = ra_class_for_index(I->dest[d]);
 
          max_ncomps = MAX2(max_ncomps, ncomps[v]);
+      }
+   }
+
+   {
+      unsigned hint_index = 0;
+      util_dynarray_foreach(&ctx->collect_split_hints, agx_instr *, hint) {
+         if (hint_index++ < original_hints &&
+             (ssa_renumbered || ctx->scratch_size_B))
+            continue;
+         agx_instr *collect = *hint;
+         unsigned dest = collect->dest[0].value;
+         unsigned width = agx_size_align_16(collect->dest[0].size);
+         unsigned span = collect->nr_srcs * width;
+         if (ncomps[dest] || !span || span > 16)
+            continue;
+         bool valid = true;
+         agx_foreach_src(collect, s) {
+            agx_index src = collect->src[s];
+            if (src.type == AGX_INDEX_UNDEF || agx_is_null(src))
+               continue;
+            if (src.type == AGX_INDEX_NORMAL && !ncomps[src.value]) {
+               collect->src[s] = agx_undef(src.size);
+               continue;
+            }
+            valid &= src.type == AGX_INDEX_NORMAL && !src.memory &&
+               src.size == collect->dest[0].size && agx_channels(src) == 1 &&
+               !src.abs && !src.neg && ncomps[src.value] == width;
+         }
+         if (!valid)
+            continue;
+         unsigned last_unexported = 0, last_unexported_source = 0;
+         agx_foreach_ssa_src(collect, s) {
+            unsigned value = collect->src[s].value;
+            if (!src_to_collect_phi[value] ||
+                src_to_collect_phi[value]->op != AGX_OPCODE_EXPORT) {
+               last_unexported = MAX2(last_unexported, definition_order[value]);
+               last_unexported_source = s;
+            }
+         }
+         ncomps[dest] = util_next_power_of_two(span);
+         agx_foreach_ssa_src(collect, s) {
+            unsigned value = collect->src[s].value;
+            agx_instr *affinity = src_to_collect_phi[value];
+            if (affinity && affinity->op == AGX_OPCODE_EXPORT) {
+               if (s > 0 && definition_order[value] < last_unexported &&
+                   (s < last_unexported_source ||
+                    (collect->nr_srcs == 2 &&
+                     (!BITSET_TEST(effectful_use, collect->src[0].value) ||
+                      pair_peer_publication_consumed_early(
+                         ctx, collect->src[0].value)))))
+                  BITSET_SET(early_scalar_export, value);
+            } else if (!affinity || affinity->op == AGX_OPCODE_COLLECT) {
+               src_to_collect_phi[value] = collect;
+            }
+         }
       }
    }
 
@@ -2354,6 +2987,7 @@ agx_ra(agx_context *ctx)
          .shader = ctx,
          .block = block,
          .src_to_collect_phi = src_to_collect_phi,
+         .early_scalar_export = early_scalar_export,
          .phi_web = phi_web,
          .ncomps = ncomps,
          .ncomps_unrounded = ncomps_unrounded,
@@ -2531,6 +3165,9 @@ agx_ra(agx_context *ctx)
    free(high_gpr);
    free(tex_low128);
    free(src_to_collect_phi);
+   free(definition_order);
+   free(early_scalar_export);
+   free(effectful_use);
    free(ncomps);
    free(ncomps_unrounded);
    free(sizes);

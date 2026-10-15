@@ -17,6 +17,7 @@
 #include "util/os_misc.h"
 #include "git_sha1.h"
 #include "hk_buffer.h"
+#include "hk_buffer_view.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
@@ -1781,8 +1782,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * sampled-image or input-attachment features for its format, so if no
     * scaled format has them, no valid descriptor carries a nonzero kind. */
    pdev->scaled_sampling = false;
+   pdev->scaled_storage = false;
    for (VkFormat f = VK_FORMAT_UNDEFINED + 1;
-        f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK && !pdev->scaled_sampling; ++f) {
+        f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK &&
+        !(pdev->scaled_sampling && pdev->scaled_storage); ++f) {
       if (hk_scaled_texture_format(hk_format_to_pipe_format(f)) ==
           PIPE_FORMAT_NONE)
          continue;
@@ -1790,10 +1793,14 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
          VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
          VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
          VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
-      pdev->scaled_sampling =
-         (hk_get_image_format_features(pdev, f, VK_IMAGE_TILING_OPTIMAL) |
-          hk_get_image_format_features(pdev, f, VK_IMAGE_TILING_LINEAR)) &
-         sampled;
+      const VkFormatFeatureFlags2 images =
+         hk_get_image_format_features(pdev, f, VK_IMAGE_TILING_OPTIMAL) |
+         hk_get_image_format_features(pdev, f, VK_IMAGE_TILING_LINEAR);
+      pdev->scaled_sampling |= (images & sampled) != 0;
+      pdev->scaled_storage |=
+         (images & VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT) != 0 ||
+         (hk_get_buffer_format_features(pdev, f) &
+          VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT) != 0;
    }
 
    hk_physical_device_init_pipeline_cache(pdev);

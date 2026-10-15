@@ -731,6 +731,16 @@ agx_native_descriptor_rejected(struct agx_device *dev, const char *operation)
    abort();
 }
 
+static enum agx_channel
+agx_rgb32_buffer_fallback_channel(enum agx_channel channel)
+{
+   if (channel == AGX_CHANNEL_G || channel == AGX_CHANNEL_B)
+      return AGX_CHANNEL_0;
+   if (channel == AGX_CHANNEL_A)
+      return AGX_CHANNEL_1;
+   return channel;
+}
+
 static bool
 agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
                  struct agx_gallium_texture_descriptor *out,
@@ -898,6 +908,17 @@ agx_pack_texture(enum agx_descriptor_generation descriptor_generation,
          cfg.extended = true;
          cfg.acceleration_buffer = cfg.address + range_B;
       }
+   }
+
+   if (state->target == PIPE_BUFFER &&
+       descriptor_generation == AGX_DESCRIPTOR_GENERATION_9 &&
+       cfg.channels == AGX_CHANNELS_R32G32B32_EMULATED) {
+      cfg.channels = AGX_CHANNELS_R32;
+      cfg.stride = cfg.width * sizeof(uint32_t) - 16;
+      cfg.swizzle_r = agx_rgb32_buffer_fallback_channel(cfg.swizzle_r);
+      cfg.swizzle_g = agx_rgb32_buffer_fallback_channel(cfg.swizzle_g);
+      cfg.swizzle_b = agx_rgb32_buffer_fallback_channel(cfg.swizzle_b);
+      cfg.swizzle_a = agx_rgb32_buffer_fallback_channel(cfg.swizzle_a);
    }
 
    const bool valid =

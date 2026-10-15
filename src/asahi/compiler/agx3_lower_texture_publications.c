@@ -3,6 +3,7 @@
  */
 #include "agx_builder.h"
 #include "agx_compiler.h"
+#include "agx3_resource_ir.h"
 #include "agx3_staging.h"
 #include <string.h>
 
@@ -184,6 +185,91 @@ scalar_publication_source(agx_index src)
 }
 
 static bool
+scalar_cube_sample(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+       I->nr_dests != 1 || I->dim != AGX_DIM_CUBE || I->shadow || I->offset ||
+       I->query_lod || I->sparse || I->gather != AGX_GATHER_NONE ||
+       I->lod_mode != AGX_LOD_MODE_AUTO_LOD || I->agx3_tex_coords_staged ||
+       I->src[0].type != AGX_INDEX_NORMAL || I->src[0].memory ||
+       I->src[0].size != AGX_SIZE_32 || agx_channels(I->src[0]) != 3 ||
+       I->src[0].abs || I->src[0].neg ||
+       I->src[1].type != AGX_INDEX_IMMEDIATE || I->src[1].value != 0 ||
+       !agx_is_null(I->src[5]))
+      return false;
+   for (unsigned q = 3; q <= 4; ++q) {
+      if (I->src[q].type != AGX_INDEX_UNIFORM &&
+          I->src[q].type != AGX_INDEX_IMMEDIATE)
+         return false;
+   }
+   return true;
+}
+
+bool
+agx3_lower_scalar_cube_coordinates(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+      return false;
+
+   agx_instr **defs = rzalloc_array(ctx, agx_instr *, ctx->alloc);
+   BITSET_WORD *vector_uses =
+      rzalloc_array(ctx, BITSET_WORD, BITSET_WORDS(ctx->alloc));
+   if (!defs || !vector_uses)
+      return false;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         defs[I->dest[d].value] = I;
+      bool scalar_sample = scalar_cube_sample(I);
+      agx_foreach_ssa_src(I, q) {
+         if (q != 0 || !scalar_sample)
+            BITSET_SET(vector_uses, I->src[q].value);
+      }
+   }
+
+   bool progress = false;
+   agx_foreach_instr_global_safe(ctx, I) {
+      if (!scalar_cube_sample(I))
+         continue;
+      if (BITSET_TEST(vector_uses, I->src[0].value))
+         continue;
+      agx_instr *collect = defs[I->src[0].value];
+      if (!collect || collect->op != AGX_OPCODE_COLLECT ||
+          collect->nr_srcs != 3)
+         continue;
+      bool eligible = true;
+      for (unsigned c = 0; c < 3; ++c) {
+         agx_index src = collect->src[c];
+         eligible &= scalar_publication_source(src) &&
+                     (src.type != AGX_INDEX_REGISTER || src.value <= 126);
+      }
+      if (!eligible)
+         continue;
+      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+      agx_instr *sample = agx_alloc_instr(&b, I->op, 1, 8);
+      memcpy(&sample->op, &I->op, sizeof(*I) - offsetof(agx_instr, op));
+      sample->nr_srcs = 8;
+      sample->dest[0] = I->dest[0];
+      memcpy(sample->src, I->src, 6 * sizeof(agx_index));
+      sample->src[0] = collect->src[0];
+      sample->src[6] = collect->src[1];
+      sample->src[7] = collect->src[2];
+      sample->agx3_cube_scalar_coords = true;
+      if (!ctx->collect_split_hints.data)
+         util_dynarray_init(&ctx->collect_split_hints, ctx);
+      agx_instr *hint = agx_alloc_instr(&b, AGX_OPCODE_COLLECT, 1, 3);
+      hint->dest[0] = collect->dest[0];
+      for (unsigned c = 0; c < 3; ++c)
+         hint->src[c] = collect->src[c];
+      util_dynarray_append(&ctx->collect_split_hints, hint);
+      agx_builder_insert(&b.cursor, sample);
+      agx_remove_instruction(I);
+      progress = true;
+   }
+   return progress;
+}
+
+static bool
 ssa_preserves_publications(const agx_instr *I)
 {
    if (agx_texture_resource(I))
@@ -303,5 +389,234 @@ agx3_lower_scalar_texture_publications(agx_context *ctx)
       }
    }
    ralloc_free(defs);
+   return progress;
+}
+
+static bool
+texture_publications_fit(agx_context *ctx)
+{
+   unsigned count = 0, capacity = 0, use_capacity = 0, max_id = 0;
+   agx_foreach_instr_global(ctx, I) {
+      count++;
+      capacity += I->agx3_tex_coord_start || agx_is_texture_publication(I);
+      use_capacity += I->agx3_tex_coords_staged || agx_texture_resource(I);
+      max_id = MAX3(max_id, agx_publication_resource(I), agx_texture_resource(I));
+   }
+   void *mem = ralloc_context(NULL);
+   struct agx3_resource_value *values =
+      rzalloc_array(mem, struct agx3_resource_value, capacity);
+   struct agx3_resource_use *uses =
+      rzalloc_array(mem, struct agx3_resource_use, use_capacity);
+   struct agx3_slot_instr *base =
+      rzalloc_array(mem, struct agx3_slot_instr, count);
+   uint32_t *ids = rzalloc_array(mem, uint32_t, max_id + 1);
+   uint16_t *placements = rzalloc_array(mem, uint16_t, capacity);
+   bool ok = false;
+   if (!mem || !values || !uses || !base || !ids || !placements)
+      goto done;
+   unsigned value_count = 0, use_count = 0, k = 0, active = UINT32_MAX;
+   agx_foreach_instr_global(ctx, I) {
+      base[k].is_async = I->agx3_tex_coord_start ||
+         agx_is_texture_publication(I) || I->op == AGX_OPCODE_TEXTURE_SAMPLE;
+      if (I->agx3_tex_coord_start) {
+         if (active != UINT32_MAX)
+            goto done;
+         active = value_count++;
+         values[active] = (struct agx3_resource_value){
+            .producer = k, .halves = 4, .alignment = 4,
+            .fixed_base = I->op == AGX_OPCODE_FFMA ? UINT16_MAX : 0,
+         };
+      }
+      if (agx_is_texture_publication(I)) {
+         const bool scalar = I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3;
+         if (!I->imm || ids[I->imm])
+            goto done;
+         if (I->agx3_tex_coords_staged) {
+            if (active == UINT32_MAX)
+               goto done;
+            ids[I->imm] = active + 1;
+            active = UINT32_MAX;
+         } else {
+            ids[I->imm] = ++value_count;
+            values[value_count - 1] = (struct agx3_resource_value){
+               .producer = k,
+               .halves = agx_is_null(I->src[scalar ? 2 : 1]) ? 4 : 6,
+               .alignment = 4, .fixed_base = UINT16_MAX,
+            };
+         }
+      } else if (I->agx3_tex_coords_staged) {
+         if (active == UINT32_MAX)
+            goto done;
+         uses[use_count++] = (struct agx3_resource_use){
+            .instruction = k, .value = active, .count = 4,
+            .through_completion = true,
+         };
+         active = UINT32_MAX;
+      }
+      unsigned id = agx_texture_resource(I);
+      if (id) {
+         if (!ids[id])
+            goto done;
+         uses[use_count++] = (struct agx3_resource_use){
+            .instruction = k, .value = ids[id] - 1,
+            .count = agx_index_size_16(I->src[0]), .through_completion = true,
+         };
+      }
+      k++;
+   }
+   ok = active == UINT32_MAX &&
+      agx3_resource_lower(values, value_count, uses, use_count, base, count,
+                           AGX3_STAGING_HALFS, placements, base);
+done:
+   ralloc_free(mem);
+   return ok;
+}
+
+static bool
+fma_staging_producer(const agx_instr *I, bool immutable_uniforms)
+{
+   if (!I || I->op != AGX_OPCODE_FFMA || I->nr_srcs != 3 || I->nr_dests != 1 ||
+       I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].size != AGX_SIZE_32 ||
+       agx_channels(I->dest[0]) != 1 || I->saturate || I->agx3_tex_coord_stage)
+      return false;
+   unsigned special = 0;
+   for (unsigned i = 0; i < 3; ++i) {
+      const agx_index src = I->src[i];
+      const bool immediate = src.type == AGX_INDEX_IMMEDIATE;
+      if (src.size != (immediate ? AGX_SIZE_16 : AGX_SIZE_32) ||
+          agx_channels(src) != 1 || src.memory || src.abs || src.neg)
+         return false;
+      if (immediate) {
+         if (i == 2 || src.value >= 256)
+            return false;
+         special++;
+      } else if (src.type == AGX_INDEX_UNIFORM) {
+         if (!immutable_uniforms || i == 2 || src.value >= 256 ||
+             (src.value & 1))
+            return false;
+         special++;
+      } else if (src.type != AGX_INDEX_NORMAL)
+         return false;
+   }
+   return special <= 1;
+}
+
+bool
+agx3_fuse_fma_texture_publications(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
+       ctx->key->fs.ignore_tib_dependencies || list_length(&ctx->blocks) != 1)
+      return false;
+   agx_instr **defs = rzalloc_array(ctx, agx_instr *, ctx->alloc);
+   unsigned *uses = rzalloc_array(ctx, unsigned, ctx->alloc);
+   if (!defs || !uses)
+      return false;
+   bool immutable = true;
+   agx_foreach_instr_global(ctx, I) {
+      immutable &= I->op != AGX_OPCODE_UNIFORM_STORE &&
+                   I->op != AGX_OPCODE_UNIFORM_FADD_AGX3 &&
+                   I->op != AGX_OPCODE_UNIFORM_FMUL_AGX3 &&
+                   I->op != AGX_OPCODE_UNIFORM_FFMA_AGX3;
+      agx_foreach_ssa_src(I, i)
+         uses[I->src[i].value]++;
+      agx_foreach_ssa_dest(I, i)
+         defs[I->dest[i].value] = I;
+   }
+   bool measured = false;
+   bool progress = false;
+   unsigned demand = 0;
+   agx_foreach_instr_global_safe(ctx, publication) {
+      if (publication->op != AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 ||
+          publication->agx3_tex_coords_staged ||
+          publication->nr_srcs != 3 || !agx_is_null(publication->src[2]))
+         continue;
+      agx_instr *producer[2];
+      bool valid = true;
+      for (unsigned c = 0; c < 2; ++c) {
+         const agx_index src = publication->src[c];
+         if (src.type != AGX_INDEX_NORMAL || src.size != AGX_SIZE_32 ||
+             agx_channels(src) != 1 || src.abs || src.neg || src.memory ||
+             uses[src.value] != 1 ||
+             !fma_staging_producer(defs[src.value], immutable)) {
+            valid = false;
+            break;
+         }
+         producer[c] = defs[src.value];
+      }
+      if (!valid || producer[0] == producer[1])
+         continue;
+      unsigned earlier = 0, found = 0;
+      agx_foreach_instr_global(ctx, I) {
+         if (I == publication)
+            break;
+         if (I == producer[0] || I == producer[1]) {
+            unsigned c = I == producer[1];
+            if (!found)
+               earlier = c;
+            found |= 1u << c;
+         } else if (found &&
+                    (I->op == AGX_OPCODE_BEGIN_CF ||
+                     agx_opcodes_info[I->op].schedule_class ==
+                        AGX_SCHEDULE_CLASS_INVALID ||
+                     (agx_opcodes_info[I->op].schedule_class ==
+                         AGX_SCHEDULE_CLASS_COVERAGE &&
+                      (!I->nr_dests || !agx_opcodes_info[I->op].can_reorder)))) {
+            valid = false;
+            break;
+         }
+      }
+      if (!valid || found != 3)
+         continue;
+      if (!measured) {
+         agx_compute_liveness(ctx);
+         demand = agx_calc_register_demand(ctx, false);
+         measured = true;
+      }
+      struct list_head *next[2] = {producer[0]->link.next,
+                                   producer[1]->link.next};
+      struct list_head *publication_next = publication->link.next;
+      agx_index dest[2] = {producer[0]->dest[0], producer[1]->dest[0]};
+      agx_index src[2] = {publication->src[0], publication->src[1]};
+      for (unsigned late = 0; late < 2; ++late) {
+         struct list_head *anchor = late ? publication_next : next[earlier ^ 1];
+         if (anchor == &publication->link)
+            anchor = publication_next;
+         list_del(&publication->link);
+         for (unsigned c = 0; c < 2; ++c) {
+            list_del(&producer[c]->link);
+            list_addtail(&producer[c]->link, anchor);
+            producer[c]->dest[0] = agx_null();
+            producer[c]->dest[0].size = AGX_SIZE_32;
+            publication->src[c] = agx_null();
+            producer[c]->agx3_tex_coord_stage = true;
+            producer[c]->agx3_tex_coord_component = c;
+         }
+         list_addtail(&publication->link, anchor);
+         producer[0]->agx3_tex_coord_start = true;
+         publication->agx3_tex_coords_staged = true;
+         agx_compute_liveness(ctx);
+         if (agx_calc_register_demand(ctx, false) <= demand &&
+             texture_publications_fit(ctx)) {
+            progress = true;
+            break;
+         }
+         publication->agx3_tex_coords_staged = false;
+         for (unsigned c = 0; c < 2; ++c) {
+            producer[c]->dest[0] = dest[c];
+            publication->src[c] = src[c];
+            producer[c]->agx3_tex_coord_stage = false;
+            producer[c]->agx3_tex_coord_start = false;
+            producer[c]->agx3_tex_coord_component = 0;
+         }
+         list_del(&publication->link);
+         list_addtail(&publication->link, publication_next);
+         list_del(&producer[0]->link);
+         list_del(&producer[1]->link);
+         list_addtail(&producer[earlier ^ 1]->link, next[earlier ^ 1]);
+         list_addtail(&producer[earlier]->link, next[earlier]);
+         agx_compute_liveness(ctx);
+      }
+   }
    return progress;
 }
