@@ -60,9 +60,11 @@ test_g17g_programs(enum agx_chip chip)
             (chip == AGX_CHIP_G17S ? 2 : 1));
 
 
-      if (fragment) {
-         const unsigned d[] = {320, 512};
+      {
+         const unsigned d[] = {256, 288, 320, 512};
          const uint8_t expected_spectpr[][10] = {
+            {0x07,0x04,0x00,0x0d,0,0,0,0,0,0},
+            {0x87,0x04,0x00,0x0d,0,0,0,0,0,0},
             {0x07,0x05,0x00,0x0d,0,0,0,0,0,0},
             {0x07,0x08,0x00,0x0d,0,0,0,0,0,0},
          };
@@ -90,7 +92,7 @@ test_g17g_programs(enum agx_chip chip)
          CHECK(memcmp(spill_output.bytes, output.bytes, 24) == 0);
       }
       struct agx3_g17p_graphics_program_desc too_wide = desc;
-      too_wide.compiler_d = fragment ? 513 : 257;
+      too_wide.compiler_d = 513;
       CHECK(!agx3_g17g_graphics_program_generate(chip, &too_wide, &output));
 
 

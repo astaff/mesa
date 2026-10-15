@@ -49,7 +49,8 @@ g17g_graphics_program_generate(
        !desc->compiler_d_valid ||
 
        desc->compiler_d >
-          ((desc->fragment || stage == AGX_IOTO_G17G_PROGRAM_COMPUTE) ? 512 : 256) ||
+          ((desc->fragment || stage == AGX_IOTO_G17G_PROGRAM_COMPUTE ||
+            stage == AGX_IOTO_G17G_PROGRAM_VERTEX) ? 512 : 256) ||
        (desc->writes_sample_mask && !desc->fragment) ||
        (desc->threadgroup_memory_size_B &&
         ((stage != AGX_IOTO_G17G_PROGRAM_COMPUTE && !mesh) ||

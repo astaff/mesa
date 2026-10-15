@@ -5167,3 +5167,66 @@ TEST(NativeForms, M5MeshImageReadUsesNativeHeapIndex)
    nir_validate_shader(b.shader, "native mesh image index");
    ralloc_free(b.shader);
 }
+
+TEST(NativeForms, M5Independent3DSamplesUseSeparateStaging)
+{
+   for (auto stage : {MESA_SHADER_VERTEX, MESA_SHADER_COMPUTE}) {
+      for (bool gradient : {false, true}) {
+         const unsigned span = gradient ? (stage == MESA_SHADER_VERTEX ? 40u : 32u) : 8u;
+         for (unsigned count : {2u, std::min(8u, 256u / span)}) {
+         SCOPED_TRACE(count);
+         SCOPED_TRACE(stage);
+         SCOPED_TRACE(gradient);
+         void *mem = ralloc_context(NULL);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = AGX_CHIP_G17S;
+         agx_builder *b = agx_test_builder(mem);
+         b->shader->key = &key;
+         b->shader->stage = stage;
+         b->shader->max_reg = 63;
+         agx_index coords = agx_register(64, AGX_SIZE_32);
+         coords.channels_m1 = 2;
+         agx_index lod = agx_immediate(0);
+         if (gradient) {
+            lod = agx_register(72, AGX_SIZE_32);
+            lod.channels_m1 = 5;
+         }
+         for (unsigned n = 0; n < count; ++n) {
+            unsigned dest = 8 * n;
+            agx_index value = agx_register(dest, AGX_SIZE_32);
+            value.channels_m1 = 3;
+            agx_texture_sample_to(b, value, coords, lod,
+               agx_immediate(0), agx_immediate(0), agx_immediate(0),
+               agx_null(), AGX_DIM_3D,
+               gradient ? AGX_LOD_MODE_LOD_GRAD : AGX_LOD_MODE_LOD_MIN,
+               15, false, false, false, AGX_GATHER_NONE, false);
+         }
+         agx_fadd_to(b, agx_register(96, AGX_SIZE_32),
+                     agx_register(0, AGX_SIZE_32),
+                     agx_register(8, AGX_SIZE_32));
+         for (unsigned n = 2; n < count; ++n)
+            agx_fadd_to(b, agx_register(96, AGX_SIZE_32),
+                        agx_register(96, AGX_SIZE_32),
+                        agx_register(8 * n, AGX_SIZE_32));
+         agx_stop(b);
+         util_dynarray binary;
+         util_dynarray_init(&binary, mem);
+         ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+         EXPECT_GE(b->shader->agx3_staging_halfs, count * span);
+         uint8_t expected[AGX3_TEX_COPY_MAX_LENGTH], len;
+         ASSERT_TRUE(agx3_tex_stage_copy_hints(AGX_ISA_ENCODING_AGX3C,
+            (count - 1) * span + (gradient ? 8 : 0),
+            gradient ? 72 : 64, count, 0,
+            true, false, expected, &len));
+         const auto *data = static_cast<const uint8_t *>(binary.data);
+         bool found = false;
+         for (unsigned i = 0; i + len <= binary.size; ++i)
+            found |= memcmp(data + i, expected, len) == 0;
+         EXPECT_TRUE(found);
+         util_dynarray_fini(&binary);
+         ralloc_free(mem);
+         }
+      }
+   }
+}

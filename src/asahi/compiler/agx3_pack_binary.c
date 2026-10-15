@@ -2109,8 +2109,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    const bool register_bias = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS &&
                               I->src[1].type != AGX_INDEX_IMMEDIATE;
    const bool implicit_lod = I->lod_mode == AGX_LOD_MODE_AUTO_LOD || zero_bias;
-   /* Explicit gradients. The four scalars are staged into their own banks
-    * and the sample names coordinate bank 0, as every witness does. */
+   /* Gradient operands share the sample coordinate base. */
    const bool gradient_lod = I->lod_mode == AGX_LOD_MODE_LOD_GRAD || gradient_min;
    /* Gather uses the implicit-LOD selector for 2D, array and cube forms,
     * including compute where it reads level zero. Map the IR component
@@ -2406,21 +2405,26 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
     * test_linked_staging_witnesses. Additional operands retain the existing
     * mode-specific ABI; only the relocatable profile can choose a new base.
     */
+   const bool m5_banked_3d = enc == AGX_ISA_ENCODING_AGX3C && three_d &&
+      (vertex_stage || compute_stage) && !shadow && !offset && !query_lod &&
+      !min_lod && (immediate_lod || gradient_lod);
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
         native_staged_coords ||
-        /* The vertex-stage array/3D admissions are AGX3B witnesses only. */
         (array && !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage &&
                     explicit_lod && immediate_lod && !shadow && !offset)) ||
-        (three_d && !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage)) ||
-        cube || gradient_lod || bias_min || gradient_min || query_lod ||
+        (three_d && !m5_banked_3d &&
+         !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage)) ||
+        cube || (gradient_lod && !m5_banked_3d) || bias_min || gradient_min || query_lod ||
         (enc == AGX_ISA_ENCODING_AGX3B &&
          ((explicit_lod && !immediate_lod) || register_bias)) ||
         (enc == AGX_ISA_ENCODING_AGX3C &&
          (((explicit_lod && !immediate_lod) || register_bias) &&
           (bank_base & 7))) ||
         register_offset || (bank_base & 3) ||
-        bank_base > AGX3_STAGING_HALFS - ((array || three_d) ? 8 : 4)))
+        bank_base > AGX3_STAGING_HALFS -
+           (m5_banked_3d && gradient_lod
+               ? (vertex_stage ? 40 : 32) : (array || three_d) ? 8 : 4)))
       return agx3_tex_decline(I, __LINE__);
    const uint16_t coord = (enc == AGX_ISA_ENCODING_AGX3B ||
                            enc == AGX_ISA_ENCODING_AGX3C ||
@@ -2790,7 +2794,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       };
 
       for (unsigned i = 0; i < gradient_channels; ++i) {
-         if (!agx3_tex_stage_copy_hints(enc, bank[i],
+         if (!agx3_tex_stage_copy_hints(enc, bank_base + bank[i],
                                         I->src[1].value + (2 * i), stage_slot,
                                         0, enc == AGX_ISA_ENCODING_AGX3C
                                               ? !I->src[1].discard
@@ -10743,11 +10747,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             /* Relocation is an operand-ABI property. Other forms retain
              * their fixed operand locations and wait only for overlapping
              * live ranges before publishing into those locations. */
+            const bool m5_banked_3d =
+               enc == AGX_ISA_ENCODING_AGX3C && I->dim == AGX_DIM_3D &&
+               (ctx->stage == MESA_SHADER_VERTEX ||
+                ctx->stage == MESA_SHADER_COMPUTE) &&
+               !I->shadow && !I->offset && !I->query_lod &&
+               ((I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+                 I->src[1].type == AGX_INDEX_IMMEDIATE) ||
+                I->lod_mode == AGX_LOD_MODE_LOD_GRAD);
             const bool relocatable_coordinates =
                (enc == AGX_ISA_ENCODING_AGX3B ||
                 enc == AGX_ISA_ENCODING_AGX3C) && slot != 0 &&
                !native_staged_coords &&
-               (I->dim == AGX_DIM_2D ||
+               (m5_banked_3d || I->dim == AGX_DIM_2D ||
                 (enc == AGX_ISA_ENCODING_AGX3B &&
                  (I->dim == AGX_DIM_3D ||
                   (I->dim == AGX_DIM_2D_ARRAY && !I->shadow && !I->offset)) &&
