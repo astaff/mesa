@@ -120,6 +120,31 @@ hash_alu(uint32_t hash, const nir_alu_instr *instr)
    v[3] = 0;
    uint32_t op = instr->op;
    memcpy(v + 4, &op, sizeof(op));
+   const nir_op_info *info = &nir_op_infos[instr->op];
+   if (sizeof(uintptr_t) == 8 && instr->def.num_components == 1 &&
+       info->num_inputs == 2 && info->input_sizes[0] <= 1 &&
+       info->input_sizes[1] <= 1) {
+      STATIC_ASSERT(NIR_MAX_VEC_COMPONENTS <= 16);
+      uint64_t a = (uint64_t)(uintptr_t)instr->src[0].src.ssa;
+      uint64_t b = (uint64_t)(uintptr_t)instr->src[1].src.ssa;
+      uint8_t sa = instr->src[0].swizzle[0];
+      uint8_t sb = instr->src[1].swizzle[0];
+      if ((info->algebraic_properties & NIR_OP_IS_2SRC_COMMUTATIVE) &&
+          (a > b || (a == b && sa > sb))) {
+         uint64_t tmp = a;
+         a = b;
+         b = tmp;
+         uint8_t ts = sa;
+         sa = sb;
+         sb = ts;
+      }
+      uint8_t key[24];
+      memcpy(key, v, sizeof(v));
+      key[3] = sa | (sb << 4);
+      memcpy(key + 8, &a, 8);
+      memcpy(key + 16, &b, 8);
+      return XXH32(key, sizeof(key), hash);
+   }
    hash = XXH32(v, sizeof(v), hash);
 
    if (nir_op_infos[instr->op].algebraic_properties & NIR_OP_IS_2SRC_COMMUTATIVE) {
