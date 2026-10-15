@@ -1894,6 +1894,14 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.EXT_texture_compression_astc_hdr = true;
    }
 
+   /* AGX3C has no witnessed native float atomic; agx_nir_lower_atomics turns
+    * fp32 add/min/max on buffers, shared memory and (lowered) images into
+    * compare-and-swap loops, so the same feature set is exact on M5. */
+   if (agx_chip_g17_m5(pdev->dev.chip)) {
+      supported_extensions.EXT_shader_atomic_float = true;
+      supported_extensions.EXT_shader_atomic_float2 = true;
+   }
+
    struct vk_features supported_features;
    if (pdev->dev.chip == AGX_CHIP_G17P)
       supported_extensions.EXT_mesh_shader = hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE;
