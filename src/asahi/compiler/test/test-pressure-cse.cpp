@@ -152,3 +152,95 @@ TEST(PressureCSE, RandomizedValuesAndPressureInvariant)
       ralloc_free(mem);
    }
 }
+
+TEST(PressureCSE, ReplacementRangesStayWithinTheirBlock)
+{
+   for (unsigned gap : {0u, 31u, 4095u}) {
+      for (bool empty_middle : {false, true}) {
+         SCOPED_TRACE(gap);
+         SCOPED_TRACE(empty_middle);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_block *first =
+            list_first_entry(&b->shader->blocks, agx_block, link);
+         agx_index a = agx_mov(b, agx_uniform(8, AGX_SIZE_32));
+         agx_index c = agx_mov(b, agx_uniform(8, AGX_SIZE_32));
+         agx_instr *local_c = agx_unit_test(b, c);
+         b->shader->alloc += gap;
+         agx_index d = agx_mov(b, agx_uniform(10, AGX_SIZE_32));
+         agx_index e = agx_mov(b, agx_uniform(10, AGX_SIZE_32));
+         agx_instr *local_e = agx_unit_test(b, e);
+
+         agx_block *next = agx_test_block(b->shader);
+         first->successors[0] = next;
+         util_dynarray_append(&next->predecessors, first);
+         if (empty_middle) {
+            agx_block *last = agx_test_block(b->shader);
+            next->successors[0] = last;
+            util_dynarray_append(&last->predecessors, next);
+            next = last;
+         }
+         b->cursor = agx_after_block(next);
+         agx_instr *external_c = agx_unit_test(b, c);
+         agx_instr *external_e = agx_unit_test(b, e);
+
+         agx_opt_cse(b->shader);
+         EXPECT_TRUE(agx_is_equiv(local_c->src[0], a));
+         EXPECT_TRUE(agx_is_equiv(local_e->src[0], d));
+         EXPECT_TRUE(agx_is_equiv(external_c->src[0], c));
+         EXPECT_TRUE(agx_is_equiv(external_e->src[0], e));
+         ralloc_free(mem);
+      }
+   }
+}
+
+TEST(PressureCSE, ReplacementKeyZeroAndRepeatedEmptyBlocks)
+{
+   for (unsigned gap : {0u, 31u, 4095u}) {
+      for (bool pressure : {false, true}) {
+         SCOPED_TRACE(gap);
+         SCOPED_TRACE(pressure);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_block *last =
+            list_first_entry(&b->shader->blocks, agx_block, link);
+         agx_index c = agx_temp(b->shader, AGX_SIZE_32);
+         agx_index a = agx_mov(b, agx_uniform(8, AGX_SIZE_32));
+         agx_mov_to(b, c, agx_uniform(8, AGX_SIZE_32));
+         agx_unit_test(b, a);
+         agx_instr *local_c = agx_unit_test(b, c);
+         b->shader->alloc += gap;
+         agx_index d = agx_mov(b, agx_uniform(10, AGX_SIZE_32));
+         agx_index e = agx_mov(b, agx_uniform(10, AGX_SIZE_32));
+         agx_unit_test(b, d);
+         agx_instr *local_e = agx_unit_test(b, e);
+
+         for (unsigned n = 0; n < 3; ++n) {
+            agx_block *next = agx_test_block(b->shader);
+            last->successors[0] = next;
+            util_dynarray_append(&next->predecessors, last);
+            last = next;
+         }
+         b->cursor = agx_after_block(last);
+         agx_instr *external_c = pressure ? NULL : agx_unit_test(b, c);
+         agx_instr *external_e = pressure ? NULL : agx_unit_test(b, e);
+         agx_index f = agx_mov(b, agx_uniform(12, AGX_SIZE_32));
+         agx_index g = agx_mov(b, agx_uniform(12, AGX_SIZE_32));
+         agx_unit_test(b, f);
+         agx_instr *local_g = agx_unit_test(b, g);
+
+         if (pressure)
+            agx_opt_cse_pressure(b->shader);
+         else
+            agx_opt_cse(b->shader);
+         EXPECT_TRUE(agx_is_equiv(local_c->src[0], a));
+         EXPECT_TRUE(agx_is_equiv(local_e->src[0], d));
+         EXPECT_TRUE(agx_is_equiv(local_g->src[0], f));
+         if (!pressure) {
+            EXPECT_TRUE(agx_is_equiv(external_c->src[0], c));
+            EXPECT_TRUE(agx_is_equiv(external_e->src[0], e));
+         }
+         ralloc_free(mem);
+      }
+   }
+}

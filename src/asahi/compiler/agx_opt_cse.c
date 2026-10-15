@@ -123,7 +123,9 @@ static void
 agx_opt_cse_impl(agx_context *ctx, bool require_overlap)
 {
    struct set *instr_set = _mesa_set_create(NULL, hash_instr, instrs_equal);
-   agx_index *replacement = malloc(sizeof(agx_index) * ctx->alloc);
+   agx_index *replacement = calloc(ctx->alloc, sizeof(*replacement));
+   unsigned replacement_start = ctx->alloc;
+   unsigned replacement_end = 0;
    unsigned *last = NULL;
    if (require_overlap) {
       last = calloc(ctx->alloc, sizeof(*last));
@@ -135,7 +137,12 @@ agx_opt_cse_impl(agx_context *ctx, bool require_overlap)
    }
 
    agx_foreach_block(ctx, block) {
-      memset(replacement, 0, sizeof(agx_index) * ctx->alloc);
+      if (replacement_start < replacement_end) {
+         memset(replacement + replacement_start, 0,
+                sizeof(*replacement) * (replacement_end - replacement_start));
+      }
+      replacement_start = ctx->alloc;
+      replacement_end = 0;
       _mesa_set_clear(instr_set, NULL);
       if (require_overlap) {
          memset(last, 0, ctx->alloc * sizeof(*last));
@@ -185,8 +192,12 @@ agx_opt_cse_impl(agx_context *ctx, bool require_overlap)
                   last[a] = MAX2(last[a], last[b]);
                }
             }
-            agx_foreach_dest(instr, d)
-               replacement[instr->dest[d].value] = match->dest[d];
+            agx_foreach_dest(instr, d) {
+               const unsigned dest = instr->dest[d].value;
+               replacement[dest] = match->dest[d];
+               replacement_start = MIN2(replacement_start, dest);
+               replacement_end = MAX2(replacement_end, dest + 1);
+            }
          }
       }
    }
