@@ -250,6 +250,113 @@ TEST_F(nir_opt_algebraic_test, matched_variable_preserves_def_bits_and_swizzles)
    }
 }
 
+static std::vector<const nir_alu_instr *> initial_worklist_visits;
+
+static bool
+record_initial_worklist_visit(const nir_alu_instr *instr)
+{
+   initial_worklist_visits.push_back(instr);
+   return false;
+}
+
+TEST_F(nir_opt_algebraic_test, initial_worklist_order_and_flags)
+{
+   for (unsigned count : {0u, 1u, 7u, 8u, 9u, 15u, 16u, 17u,
+                          31u, 32u, 33u, 127u, 128u, 129u}) {
+      for (unsigned layout = 0; layout < 3; ++layout) {
+         SCOPED_TRACE(count);
+         SCOPED_TRACE(layout);
+         nir_shader_compiler_options options = {};
+         nir_builder current = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &options, "initial worklist order");
+         ralloc_steal(b->shader, current.shader);
+         nir_builder *build = &current;
+         auto append_alu = [&](unsigned amount) {
+            for (unsigned i = 0; i < amount; ++i)
+               nir_inot(build, nir_imm_int(build, i + 3));
+         };
+         nir_load_local_invocation_index(build);
+         if (layout == 0) {
+            append_alu(count);
+         } else if (layout == 1) {
+            append_alu(count / 3);
+            nir_if *branch = nir_push_if(build, nir_imm_true(build));
+            append_alu(count / 3);
+            nir_push_else(build, branch);
+            append_alu(count - 2 * (count / 3));
+            nir_pop_if(build, branch);
+         } else {
+            nir_loop *loop = nir_push_loop(build);
+            nir_loop_add_continue_construct(loop);
+            append_alu(count / 4);
+            nir_if *branch = nir_push_if(build, nir_imm_true(build));
+            append_alu(count / 4);
+            nir_jump(build, nir_jump_break);
+            nir_push_else(build, branch);
+            append_alu(count / 4);
+            nir_jump(build, nir_jump_continue);
+            nir_pop_if(build, branch);
+            nir_push_continue(build, loop);
+            append_alu(count - 3 * (count / 4));
+            nir_pop_loop(build, loop);
+         }
+         nir_validate_shader(current.shader, "before initial worklist");
+         std::vector<const nir_alu_instr *> expected;
+         nir_foreach_block_reverse(block, build->impl) {
+            nir_foreach_instr_reverse(instr, block) {
+               if (instr->type == nir_instr_type_alu) {
+                  ASSERT_EQ(nir_instr_as_alu(instr)->op, nir_op_inot);
+                  expected.push_back(nir_instr_as_alu(instr));
+               }
+            }
+         }
+         ASSERT_EQ(expected.size(), count);
+         std::vector<nir_instr *> all;
+         nir_foreach_block(block, build->impl) {
+            nir_foreach_instr(instr, block) {
+               instr->pass_flags = 0x5a;
+               all.push_back(instr);
+            }
+         }
+         const uint16_t transition[] = {2};
+         std::vector<per_op_table> operations(nir_num_search_ops);
+         for (per_op_table &op : operations) {
+            op.num_filtered_states = 1;
+            op.table = transition;
+         }
+         nir_search_value_union values[2] = {};
+         values[0].variable = {};
+         values[0].variable.value.type = nir_search_value_variable;
+         values[0].variable.cond_index = -1;
+         values[1].expression = {};
+         values[1].expression.value.type = nir_search_value_expression;
+         values[1].expression.opcode = nir_op_inot;
+         values[1].expression.swizzle = -1;
+         values[1].expression.comm_expr_idx = -1;
+         values[1].expression.cond_index = 0;
+         const struct transform transforms[] = {{1, 0, 0}, {0, 0, ~0u}};
+         const uint16_t offsets[] = {1, 1, 0};
+         const nir_search_expression_cond conditions[] = {
+            record_initial_worklist_visit,
+         };
+         nir_algebraic_table table = {};
+         table.transforms = transforms;
+         table.transform_offsets = offsets;
+         table.pass_op_table = operations.data();
+         table.values = values;
+         table.expression_cond = conditions;
+         const bool enabled[] = {true};
+         initial_worklist_visits.clear();
+         EXPECT_FALSE(nir_algebraic_impl(build->impl, enabled, &table));
+         EXPECT_EQ(initial_worklist_visits, expected);
+         for (nir_instr *instr : all)
+            EXPECT_EQ(instr->pass_flags, 0u);
+         nir_validate_shader(current.shader, "after initial worklist");
+         ralloc_free(current.shader);
+      }
+   }
+}
+
 TEST_F(nir_opt_algebraic_test, bounds_agx_unsigned_end_and_bound)
 {
    for (unsigned bits : {8u, 16u, 32u, 64u}) {

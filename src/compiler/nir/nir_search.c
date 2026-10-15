@@ -878,6 +878,9 @@ nir_algebraic_impl(nir_function_impl *impl,
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
          nir_algebraic_automaton(instr, &states, table->pass_op_table);
+         instr->pass_flags = 0;
+         if (instr->type == nir_instr_type_alu)
+            nir_instr_worklist_push_tail(&worklist, instr);
       }
    }
 
@@ -885,12 +888,13 @@ nir_algebraic_impl(nir_function_impl *impl,
     * first.  This will encourage us to match the biggest source patterns when
     * possible.
     */
-   nir_foreach_block_reverse(block, impl) {
-      nir_foreach_instr_reverse(instr, block) {
-         instr->pass_flags = 0;
-         if (instr->type == nir_instr_type_alu)
-            nir_instr_worklist_push_tail(&worklist, instr);
-      }
+   assert(worklist.instr_vec.tail == 0);
+   const unsigned initial_count = nir_instr_worklist_length(&worklist);
+   nir_instr **initial = worklist.instr_vec.data;
+   for (unsigned i = 0; i < initial_count / 2; ++i) {
+      nir_instr *tmp = initial[i];
+      initial[i] = initial[initial_count - 1 - i];
+      initial[initial_count - 1 - i] = tmp;
    }
 
    struct exec_list dead_instrs;
