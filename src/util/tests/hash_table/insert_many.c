@@ -58,11 +58,18 @@ main(int argc, char **argv)
    (void) argv;
 
    ht = _mesa_hash_table_create(NULL, key_value, uint32_t_key_equals);
+   assert(_mesa_hash_table_entry_capacity_bytes(0) ==
+          (uint64_t)ht->size * sizeof(*ht->table));
+   assert(_mesa_hash_table_entry_capacity_bytes(UINT32_MAX) == 0);
+   assert(_mesa_hash_table_entry_capacity_bytes(UINT64_MAX) == 0);
+   assert(_mesa_hash_table_entry_capacity_bytes(UINT64_C(1) << 31) > UINT32_MAX);
 
    for (i = 0; i < SIZE; i++) {
       keys[i] = i;
 
       _mesa_hash_table_insert(ht, keys + i, NULL);
+      assert(_mesa_hash_table_entry_capacity_bytes(i + 1) ==
+             (uint64_t)ht->size * sizeof(*ht->table));
    }
 
    for (i = 0; i < SIZE; i++) {

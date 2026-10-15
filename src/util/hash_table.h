@@ -76,6 +76,9 @@ _mesa_hash_table_create(void *mem_ctx,
                         bool (*key_equals_function)(const void *a,
                                                     const void *b));
 
+uint64_t
+_mesa_hash_table_entry_capacity_bytes(uint64_t entries);
+
 void
 _mesa_hash_table_init(struct hash_table *ht,
                       void *mem_ctx,

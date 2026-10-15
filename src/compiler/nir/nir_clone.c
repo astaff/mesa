@@ -46,6 +46,9 @@ typedef struct {
 
    /* maps orig ptr -> cloned ptr: */
    struct hash_table *remap_table;
+   bool dense_def_remap;
+   nir_def **defs;
+   unsigned num_defs;
 
    /* List of phi sources. */
    struct list_head phi_srcs;
@@ -61,6 +64,9 @@ init_clone_state(clone_state *state, struct hash_table *remap_table,
 {
    state->global_clone = global;
    state->allow_remap_fallback = allow_remap_fallback;
+   state->dense_def_remap = !remap_table && !allow_remap_fallback;
+   state->defs = NULL;
+   state->num_defs = 0;
 
    if (remap_table) {
       state->remap_table = remap_table;
@@ -112,6 +118,28 @@ static void *
 remap_local(clone_state *state, const void *ptr)
 {
    return _lookup_ptr(state, ptr, false);
+}
+
+static nir_def *
+remap_def(clone_state *state, const nir_def *def)
+{
+   if (state->defs && def && def->index < state->num_defs) {
+      nir_def *n = state->defs[def->index];
+      if (n)
+         return n;
+   }
+   return remap_local(state, def);
+}
+
+static void
+add_def_remap(clone_state *state, nir_def *ndef, const nir_def *def)
+{
+   if (state->defs && def->index < state->num_defs) {
+      assert(!state->defs[def->index]);
+      state->defs[def->index] = ndef;
+   } else if (likely(state->remap_table)) {
+      add_remap(state, ndef, def);
+   }
 }
 
 static void *
@@ -212,7 +240,7 @@ static void
 __clone_src(clone_state *state, void *ninstr_or_if,
             nir_src *nsrc, const nir_src *src)
 {
-   nsrc->ssa = remap_local(state, src->ssa);
+   nsrc->ssa = remap_def(state, src->ssa);
 }
 
 static void
@@ -220,8 +248,7 @@ __clone_def(clone_state *state, nir_instr *ninstr,
             nir_def *ndef, const nir_def *def)
 {
    nir_def_init(ninstr, ndef, def->num_components, def->bit_size);
-   if (likely(state->remap_table))
-      add_remap(state, ndef, def);
+   add_def_remap(state, ndef, def);
 }
 
 /* Returns a copy of the argument string that is owned by the new shader.
@@ -374,8 +401,7 @@ clone_load_const(clone_state *state, const nir_load_const_instr *lc)
 
    memcpy(&nlc->value, &lc->value, sizeof(*nlc->value) * lc->def.num_components);
 
-   if (likely(state->remap_table))
-      add_remap(state, &nlc->def, &lc->def);
+   add_def_remap(state, &nlc->def, &lc->def);
 
    return nlc;
 }
@@ -388,8 +414,7 @@ clone_ssa_undef(clone_state *state, const nir_undef_instr *sa)
                              sa->def.bit_size);
    clone_debug_info(state, &nsa->instr, &sa->instr);
 
-   if (likely(state->remap_table))
-      add_remap(state, &nsa->def, &sa->def);
+   add_def_remap(state, &nsa->def, &sa->def);
 
    return nsa;
 }
@@ -664,7 +689,7 @@ fixup_phi_srcs(clone_state *state)
       /* Remove from this list */
       list_del(&src->src.use_link);
 
-      src->src.ssa = remap_local(state, src->src.ssa);
+      src->src.ssa = remap_def(state, src->src.ssa);
       list_addtail(&src->src.use_link, &src->src.ssa->uses);
    }
    assert(list_is_empty(&state->phi_srcs));
@@ -702,12 +727,33 @@ nir_cf_list_clone(nir_cf_list *dst, nir_cf_list *src, nir_cf_node *parent,
       free_clone_state(&state);
 }
 
+static bool
+count_clone_def(nir_def *def, void *data)
+{
+   ++*(uint64_t *)data;
+   return true;
+}
+
 static nir_function_impl *
 clone_function_impl(clone_state *state, const nir_function_impl *fi)
 {
    nir_function_impl *nfi = nir_function_impl_create_bare(state->ns);
 
    state->impl = nfi;
+   assert(!state->defs);
+   if (state->dense_def_remap && fi->ssa_alloc) {
+      uint64_t num_defs = 0;
+      nir_foreach_block_unstructured(block, (nir_function_impl *)fi) {
+         nir_foreach_instr(instr, block)
+            nir_foreach_def(instr, count_clone_def, &num_defs);
+      }
+      uint64_t capacity_bytes = _mesa_hash_table_entry_capacity_bytes(num_defs);
+      if (num_defs && capacity_bytes &&
+          (uint64_t)fi->ssa_alloc * sizeof(*state->defs) <= capacity_bytes) {
+         state->num_defs = fi->ssa_alloc;
+         state->defs = calloc(fi->ssa_alloc, sizeof(*state->defs));
+      }
+   }
    if (fi->preamble)
       nfi->preamble = remap_global(state, fi->preamble);
 
@@ -718,6 +764,9 @@ clone_function_impl(clone_state *state, const nir_function_impl *fi)
    clone_cf_list(state, &nfi->body, &fi->body);
 
    fixup_phi_srcs(state);
+   free(state->defs);
+   state->defs = NULL;
+   state->num_defs = 0;
 
    /* All metadata is invalidated in the cloning process */
    nfi->valid_metadata = 0;

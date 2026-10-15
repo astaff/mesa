@@ -121,6 +121,16 @@ static const struct {
    ENTRY(2147483648ul, 2362232233ul, 2362232231ul )
 };
 
+uint64_t
+_mesa_hash_table_entry_capacity_bytes(uint64_t entries)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(hash_sizes); i++) {
+      if (entries <= hash_sizes[i].max_entries)
+         return (uint64_t)hash_sizes[i].size * sizeof(struct hash_entry);
+   }
+   return 0;
+}
+
 void
 _mesa_hash_table_init(struct hash_table *ht,
                       void *mem_ctx,
