@@ -2013,7 +2013,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
        * the M5 multi-target EOT numbers its PBEs and offset arguments by
        * stored target only. A partial EOT stores every attachment
        * (key->op), whatever its API store operation. */
-      if (store && !resolving && key->op[rt] == AGX_BG_EOT_NONE)
+      if (store && key->op[rt] == AGX_BG_EOT_NONE)
          continue;
       if (render->tilebuffer.spilled[rt]) continue;
       active[active_count++] = rt;
@@ -8363,7 +8363,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
              (unsigned)render->tilebuffer.sample_size_B *
                 render->tilebuffer.nr_samples * render->tilebuffer.tile_size <=
                 render->tilebuffer.max_bytes_per_tile &&
-             (!has_zs_attachment || (render->layer_count == 1 && plain_ms_zs)))) ||
+             (!has_zs_attachment || plain_ms_zs))) ||
           fragment_pass > AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH ||
           (!discard && (dyn->vp.depth_clip_negative_one_to_one ||
           dyn->ds.depth.bounds_test.enable ||
