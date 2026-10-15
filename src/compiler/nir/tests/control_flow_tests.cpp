@@ -22,6 +22,9 @@
  */
 
 #include "nir_test.h"
+#include <csignal>
+#include <cstdlib>
+#include <vector>
 
 class nir_cf_test : public nir_test {
 protected:
@@ -568,3 +571,178 @@ TEST_F(nir_loop_simplify_test, predicate_phis)
       }
    )"));
 }
+
+#ifndef NDEBUG
+static nir_if *
+validation_snapshot_diamond(nir_builder *b)
+{
+   nir_if *nif = nir_push_if(b, nir_imm_bool(b, true));
+   nir_imm_int(b, 1);
+   nir_push_else(b, nif);
+   nir_imm_int(b, 2);
+   nir_pop_if(b, nif);
+   nir_metadata_require(b->impl, nir_metadata_dominance);
+   return nif;
+}
+
+TEST_F(nir_cf_test, validator_rejects_stale_frontier_inline_and_heap)
+{
+   for (bool heap : {false, true}) {
+      SCOPED_TRACE(heap);
+      EXPECT_EXIT({
+         std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+         nir_if *nif = validation_snapshot_diamond(b);
+         nir_block *then_block = nir_if_first_then_block(nif);
+         nir_block *else_block = nir_if_first_else_block(nif);
+         if (then_block->dom_frontier.entries != 1 ||
+             then_block->dom_frontier.table != then_block->dom_frontier._initial_storage)
+            std::_Exit(91);
+         if (heap) {
+            _mesa_set_resize(&then_block->dom_frontier, 64);
+            if (then_block->dom_frontier.table == then_block->dom_frontier._initial_storage)
+               std::_Exit(91);
+         }
+         _mesa_set_clear(&then_block->dom_frontier, NULL);
+         _mesa_set_add(&then_block->dom_frontier, else_block);
+         nir_validate_shader(b->shader, "stale frontier snapshot test");
+         std::_Exit(0);
+      }, ::testing::ExitedWithCode(77), "dom_frontier");
+   }
+}
+
+TEST_F(nir_cf_test, validator_rejects_stale_children_inline_and_heap)
+{
+   for (bool heap : {false, true}) {
+      SCOPED_TRACE(heap);
+      EXPECT_EXIT({
+         std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+         validation_snapshot_diamond(b);
+         nir_block *entry = nir_start_block(b->impl);
+         if (entry->num_dom_children < 2 || entry->num_dom_children > 3 ||
+             entry->dom_children != entry->_dom_children_storage)
+            std::_Exit(91);
+         if (heap) {
+            nir_block **copy = ralloc_array(entry, nir_block *, entry->num_dom_children);
+            memcpy(copy, entry->dom_children, entry->num_dom_children * sizeof(*copy));
+            entry->dom_children = copy;
+         }
+         nir_block *tmp = entry->dom_children[0];
+         entry->dom_children[0] = entry->dom_children[1];
+         entry->dom_children[1] = tmp;
+         nir_validate_shader(b->shader, "stale child snapshot test");
+         std::_Exit(0);
+      }, ::testing::ExitedWithCode(77), "dom_children");
+   }
+}
+
+TEST_F(nir_cf_test, validator_preserves_invalidated_inline_metadata)
+{
+   nir_if *nif = validation_snapshot_diamond(b);
+   nir_block *entry = nir_start_block(b->impl);
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   ASSERT_GE(entry->num_dom_children, 2u);
+   ASSERT_LE(entry->num_dom_children, ARRAY_SIZE(entry->_dom_children_storage));
+   ASSERT_EQ(entry->dom_children, entry->_dom_children_storage);
+   nir_block *tmp = entry->dom_children[0];
+   entry->dom_children[0] = entry->dom_children[1];
+   entry->dom_children[1] = tmp;
+   std::vector<nir_block *> children(entry->dom_children,
+                                    entry->dom_children + entry->num_dom_children);
+   _mesa_set_clear(&then_block->dom_frontier, NULL);
+   _mesa_set_add(&then_block->dom_frontier, else_block);
+   nir_metadata saved = static_cast<nir_metadata>(b->impl->valid_metadata &
+                                                 ~nir_metadata_dominance);
+   b->impl->valid_metadata = saved;
+   nir_validate_shader(b->shader, "invalidated metadata preservation test");
+   EXPECT_EQ(b->impl->valid_metadata, saved);
+   ASSERT_EQ(entry->dom_children, entry->_dom_children_storage);
+   ASSERT_EQ(entry->num_dom_children, children.size());
+   for (unsigned i = 0; i < children.size(); ++i)
+      EXPECT_EQ(entry->dom_children[i], children[i]);
+   ASSERT_EQ(then_block->dom_frontier.table, then_block->dom_frontier._initial_storage);
+   EXPECT_EQ(then_block->dom_frontier.entries, 1u);
+   EXPECT_NE(_mesa_set_search(&then_block->dom_frontier, else_block), nullptr);
+}
+
+TEST_F(nir_cf_test, validator_rejects_stale_empty_frontier_cardinality)
+{
+   for (bool heap : {false, true}) {
+      SCOPED_TRACE(heap);
+      EXPECT_EXIT({
+         std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+         nir_if *nif = validation_snapshot_diamond(b);
+         nir_block *entry = nir_start_block(b->impl);
+         if (entry->dom_frontier.entries)
+            std::_Exit(91);
+         if (heap) {
+            _mesa_set_resize(&entry->dom_frontier, 64);
+            if (entry->dom_frontier.table == entry->dom_frontier._initial_storage)
+               std::_Exit(91);
+         }
+         _mesa_set_add(&entry->dom_frontier, nir_if_first_then_block(nif));
+         nir_validate_shader(b->shader, "stale empty frontier test");
+         std::_Exit(0);
+      }, ::testing::ExitedWithCode(77), "dom_frontier.entries");
+   }
+}
+
+TEST_F(nir_cf_test, validator_uses_collected_blocks_with_stale_indices)
+{
+   for (unsigned i = 0; i < 40; ++i)
+      validation_snapshot_diamond(b);
+   std::vector<nir_block *> blocks;
+   nir_foreach_block(block, b->impl)
+      blocks.push_back(block);
+   blocks.push_back(b->impl->end_block);
+   ASSERT_GT(blocks.size(), 19u);
+   for (nir_block *block : blocks)
+      block->index = UINT32_MAX;
+   b->impl->num_blocks = 1;
+   b->impl->valid_metadata = nir_metadata_none;
+   nir_validate_shader(b->shader, "untrusted block index test");
+   EXPECT_EQ(b->impl->valid_metadata, nir_metadata_none);
+   for (nir_block *block : blocks)
+      EXPECT_EQ(block->index, UINT32_MAX);
+}
+
+TEST_F(nir_cf_test, validator_preserves_invalidated_heap_metadata)
+{
+   nir_if *nif = validation_snapshot_diamond(b);
+   nir_block *entry = nir_start_block(b->impl);
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   ASSERT_GE(entry->num_dom_children, 2u);
+   nir_block **saved_pointer = ralloc_array(entry, nir_block *, entry->num_dom_children);
+   memcpy(saved_pointer, entry->dom_children,
+          entry->num_dom_children * sizeof(*saved_pointer));
+   entry->dom_children = saved_pointer;
+   nir_block *tmp = saved_pointer[0];
+   saved_pointer[0] = saved_pointer[1];
+   saved_pointer[1] = tmp;
+   std::vector<nir_block *> children(saved_pointer,
+                                    saved_pointer + entry->num_dom_children);
+   _mesa_set_resize(&then_block->dom_frontier, 64);
+   ASSERT_NE(then_block->dom_frontier.table, then_block->dom_frontier._initial_storage);
+   _mesa_set_clear(&then_block->dom_frontier, NULL);
+   _mesa_set_add(&then_block->dom_frontier, else_block);
+   set_entry *saved_table = then_block->dom_frontier.table;
+   unsigned saved_size = then_block->dom_frontier.size;
+   std::vector<set_entry> entries(saved_table, saved_table + saved_size);
+   nir_metadata saved = static_cast<nir_metadata>(b->impl->valid_metadata &
+                                                 ~nir_metadata_dominance);
+   b->impl->valid_metadata = saved;
+   nir_validate_shader(b->shader, "invalidated heap metadata preservation test");
+   EXPECT_EQ(b->impl->valid_metadata, saved);
+   ASSERT_EQ(entry->dom_children, saved_pointer);
+   ASSERT_EQ(entry->num_dom_children, children.size());
+   for (unsigned i = 0; i < children.size(); ++i)
+      EXPECT_EQ(entry->dom_children[i], children[i]);
+   ASSERT_EQ(then_block->dom_frontier.table, saved_table);
+   ASSERT_EQ(then_block->dom_frontier.size, saved_size);
+   for (unsigned i = 0; i < saved_size; ++i) {
+      EXPECT_EQ(saved_table[i].key, entries[i].key);
+      EXPECT_EQ(saved_table[i].hash, entries[i].hash);
+   }
+}
+#endif

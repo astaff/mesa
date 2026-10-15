@@ -1952,6 +1952,7 @@ typedef struct {
    uint32_t index;
    unsigned num_dom_children;
    struct nir_block **dom_children;
+   struct nir_block *dom_children_storage[ARRAY_SIZE(((nir_block *)0)->_dom_children_storage)];
    struct set dom_frontier;
    uint32_t dom_pre_index, dom_post_index;
 } block_dom_metadata;
@@ -1972,7 +1973,14 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
       md->dom_pre_index = block->dom_pre_index;
       md->dom_post_index = block->dom_post_index;
       md->dom_children = block->dom_children;
+      if (block->dom_children == block->_dom_children_storage) {
+         memcpy(md->dom_children_storage, block->_dom_children_storage,
+                sizeof(md->dom_children_storage));
+         md->dom_children = md->dom_children_storage;
+      }
       md->dom_frontier = block->dom_frontier;
+      if (block->dom_frontier.table == block->dom_frontier._initial_storage)
+         md->dom_frontier.table = md->dom_frontier._initial_storage;
       memset(&block->dom_frontier, 0, sizeof(struct set));
 
       block->dom_children = NULL;
@@ -1998,8 +2006,12 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
          validate_assert(state, block->dom_post_index == md->dom_post_index);
 
          if (block->num_dom_children == md->num_dom_children && block->num_dom_children) {
-            validate_assert(state, !memcmp(block->dom_children, md->dom_children,
-                                           block->num_dom_children * sizeof(md->dom_children[0])));
+            if (validate_assert(state, md->dom_children != NULL &&
+                                (md->dom_children != md->dom_children_storage ||
+                                 md->num_dom_children <= ARRAY_SIZE(md->dom_children_storage)))) {
+               validate_assert(state, !memcmp(block->dom_children, md->dom_children,
+                                              block->num_dom_children * sizeof(md->dom_children[0])));
+            }
          }
 
          validate_assert(state, block->dom_frontier.entries == md->dom_frontier.entries);
@@ -2028,7 +2040,14 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
       block->dom_pre_index = md->dom_pre_index;
       block->dom_post_index = md->dom_post_index;
       block->dom_children = md->dom_children;
+      if (md->dom_children == md->dom_children_storage) {
+         memcpy(block->_dom_children_storage, md->dom_children_storage,
+                sizeof(block->_dom_children_storage));
+         block->dom_children = block->_dom_children_storage;
+      }
       block->dom_frontier = md->dom_frontier;
+      if (md->dom_frontier.table == md->dom_frontier._initial_storage)
+         block->dom_frontier.table = block->dom_frontier._initial_storage;
    }
 
    ralloc_free(blocks);
