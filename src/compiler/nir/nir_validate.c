@@ -1949,6 +1949,7 @@ validate_instr_index(nir_function_impl *impl, validate_state *state)
 }
 
 typedef struct {
+   nir_block *block;
    uint32_t index;
    unsigned num_dom_children;
    struct nir_block **dom_children;
@@ -1963,11 +1964,14 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
    nir_metadata valid_metadata = impl->valid_metadata;
 
    /* Preserve dominance */
+   const unsigned num_blocks = state->blocks->entries;
    block_dom_metadata *blocks = ralloc_array(state->mem_ctx, block_dom_metadata,
-                                             state->blocks->size);
+                                             num_blocks);
+   unsigned block_index = 0;
    set_foreach(state->blocks, entry) {
       nir_block *block = (nir_block *)entry->key;
-      block_dom_metadata *md = &blocks[entry - state->blocks->table];
+      block_dom_metadata *md = &blocks[block_index++];
+      md->block = block;
       md->index = block->index;
       md->num_dom_children = block->num_dom_children;
       md->dom_pre_index = block->dom_pre_index;
@@ -1981,8 +1985,6 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
       md->dom_frontier = block->dom_frontier;
       if (block->dom_frontier.table == block->dom_frontier._initial_storage)
          md->dom_frontier.table = md->dom_frontier._initial_storage;
-      memset(&block->dom_frontier, 0, sizeof(struct set));
-
       block->dom_children = NULL;
       _mesa_pointer_set_init(&block->dom_frontier, block);
    }
@@ -1996,10 +1998,10 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
    assert(impl->valid_metadata == (valid_metadata | nir_metadata_block_index | nir_metadata_dominance));
 
    if (valid_metadata & nir_metadata_dominance) {
-      set_foreach(state->blocks, entry) {
-         nir_block *block = (nir_block *)entry->key;
-         block_dom_metadata *md = &blocks[entry - state->blocks->table];
-         state->block = (nir_block *)block;
+      for (unsigned i = 0; i < num_blocks; ++i) {
+         block_dom_metadata *md = &blocks[i];
+         nir_block *block = md->block;
+         state->block = block;
 
          validate_assert(state, block->num_dom_children == md->num_dom_children);
          validate_assert(state, block->dom_pre_index == md->dom_pre_index);
@@ -2015,9 +2017,11 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
          }
 
          validate_assert(state, block->dom_frontier.entries == md->dom_frontier.entries);
-         set_foreach(&block->dom_frontier, entry) {
-            validate_assert(state, _mesa_set_search_pre_hashed(&md->dom_frontier,
-                                                               entry->hash, entry->key));
+         if (block->dom_frontier.entries) {
+            set_foreach(&block->dom_frontier, entry) {
+               validate_assert(state, _mesa_set_search_pre_hashed(&md->dom_frontier,
+                                                                  entry->hash, entry->key));
+            }
          }
       }
       state->block = NULL;
@@ -2027,9 +2031,9 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
    validate_ssa_dominance(impl, state);
 
    /* Restore the old dominance metadata */
-   set_foreach(state->blocks, entry) {
-      nir_block *block = (nir_block *)entry->key;
-      block_dom_metadata *md = &blocks[entry - state->blocks->table];
+   for (unsigned i = 0; i < num_blocks; ++i) {
+      block_dom_metadata *md = &blocks[i];
+      nir_block *block = md->block;
 
       if (block->dom_children != block->_dom_children_storage)
          ralloc_free(block->dom_children);
