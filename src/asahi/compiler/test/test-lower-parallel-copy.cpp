@@ -324,3 +324,64 @@ TEST_F(LowerParallelCopy, LooksLikeASwap) {
    });
 }
 #endif
+
+TEST_F(LowerParallelCopy, EmptyCopies)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+
+   agx_emit_parallel_copies(actual, NULL, 0);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(LowerParallelCopy, MemoryOnlyAtFileEnd)
+{
+   struct agx_copy copies[] = {
+      {.dest = 2047, .dest_mem = true,
+       .src = agx_memory_register(2045, AGX_SIZE_16)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(2, AGX_SIZE_16),
+                 agx_memory_register(2045, AGX_SIZE_16));
+      agx_mov_to(b, agx_memory_register(2047, AGX_SIZE_16),
+                 agx_register(2, AGX_SIZE_16));
+   });
+}
+
+TEST_F(LowerParallelCopy, MemoryOnly64AtFileEnd)
+{
+   struct agx_copy copies[] = {
+      {.dest = 2044, .dest_mem = true,
+       .src = agx_memory_register(2040, AGX_SIZE_64)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(2040, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(2044, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(2042, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(2046, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+   });
+}
+
+TEST_F(LowerParallelCopy, IndependentClassesWithSameIndices)
+{
+   struct agx_copy copies[] = {
+      {.dest = 8, .dest_mem = true,
+       .src = agx_memory_register(10, AGX_SIZE_32)},
+      {.dest = 8, .src = agx_register(10, AGX_SIZE_32)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(8, AGX_SIZE_32),
+                 agx_register(10, AGX_SIZE_32));
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(10, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(8, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+   });
+}

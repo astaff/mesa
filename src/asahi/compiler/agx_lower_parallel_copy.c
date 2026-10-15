@@ -209,6 +209,11 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
       }
    }
 
+   if (num_copies2 == 0) {
+      free(copies2);
+      return;
+   }
+
    copies = copies2;
    num_copies = num_copies2;
 
@@ -225,9 +230,6 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
    }
 
    ctx->entry_count = num_copies;
-
-   memset(ctx->physreg_dest, 0, sizeof(ctx->physreg_dest));
-   memset(ctx->physreg_use_count, 0, sizeof(ctx->physreg_use_count));
 
    for (unsigned i = 0; i < ctx->entry_count; i++) {
       struct agx_copy *entry = &copies[i];
@@ -431,6 +433,9 @@ agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
    /* Emit copies fo reach register class separately because we don't have
     * register class awareness in the parallel copy lowering data structure.
     */
+   if (num_copies == 0)
+      return;
+
    agx_emit_parallel_copies_for_class(b, copies, num_copies, false);
    agx_emit_parallel_copies_for_class(b, copies, num_copies, true);
 }
