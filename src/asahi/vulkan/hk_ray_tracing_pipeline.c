@@ -284,14 +284,38 @@ struct hk_rt_shader_state {
    struct hk_ray_traversal_state traversal;
 };
 
+struct hk_rt_callable_context;
+struct hk_rt_callable_part {
+   nir_shader *nir;
+   struct hk_rt_callable_context *context;
+   unsigned pc, resume_base;
+};
+
+struct hk_rt_callable_context {
+   nir_variable *pc, *called;
+   struct util_dynarray parts;
+   struct hash_table *entries;
+};
+
+/* A callable return record precedes the callee's scratch frame. */
+#define HK_RT_CALLABLE_RETURN_SIZE 32
+
 struct hk_rt_compiler {
    struct hk_ray_tracing_pipeline *pipeline;
    VkPipelineCreateFlags2KHR flags;
    bool position_fetch;
+   bool native_agx;
+   nir_variable *native_query, *native_hit_kind;
+   bool callable_dispatch;
 
    struct hk_rt_shader_state state;
 
-   struct hash_table *functions;
+   struct hash_table **functions;
+   struct hash_table *function_depths;
+   struct hash_table *callable_parts;
+   struct hash_table *callable_functions;
+   struct hk_rt_callable_context **callable_contexts;
+   uint32_t max_depth;
 
    struct hk_rt_stack_sizes sizes;
 };
@@ -300,10 +324,12 @@ static uint32_t
 hk_rt_function_stack_size(struct hk_rt_compiler *compiler,
                           nir_function *function)
 {
-   hash_table_foreach (compiler->functions, entry) {
-      if (entry->data == function) {
-         const nir_shader *shader = entry->key;
-         return shader->scratch_size;
+   for (unsigned depth = 0; depth <= compiler->max_depth; ++depth) {
+      hash_table_foreach (compiler->functions[depth], entry) {
+         if (entry->data == function) {
+            const nir_shader *shader = entry->key;
+            return shader->scratch_size;
+         }
       }
    }
    return 0;
@@ -387,12 +413,20 @@ hk_ray_traversal_state_init(nir_function_impl *impl,
  */
 static void
 hk_call_ray_tracing_stage(nir_builder *b, struct hk_rt_compiler *compiler,
-                          nir_shader *stage)
+                          nir_shader *stage, bool trace_call)
 {
+   /* The backend has no recursive call instruction. Reuse each stage only
+    * within the same trace depth so the inliner sees an acyclic call graph.
+    * Callable and any-hit calls stay at the invoking trace depth. */
+   struct hash_entry *caller = _mesa_hash_table_search(
+      compiler->function_depths, b->impl->function);
+   unsigned depth = caller ? (uintptr_t)caller->data : 0;
+   depth += trace_call;
+   if (depth > compiler->max_depth)
+      return; /* Execution beyond the declared maximum depth is undefined. */
    nir_function *function;
-
    struct hash_entry *entry =
-      _mesa_hash_table_search(compiler->functions, stage);
+      _mesa_hash_table_search(compiler->functions[depth], stage);
    if (entry) {
       function = entry->data;
    } else {
@@ -426,12 +460,20 @@ hk_call_ray_tracing_stage(nir_builder *b, struct hk_rt_compiler *compiler,
       }
 
       function = nir_function_create(
-         b->shader, _mesa_shader_stage_to_string(stage->info.stage));
+         b->shader, ralloc_asprintf(b->shader, "%s.depth%u",
+            _mesa_shader_stage_to_string(stage->info.stage), depth));
       nir_function_set_impl(function, copy);
 
       ralloc_free(var_remap);
 
-      _mesa_hash_table_insert(compiler->functions, stage, function);
+      _mesa_hash_table_insert(compiler->functions[depth], stage, function);
+      _mesa_hash_table_insert(compiler->function_depths, function,
+                             (void *)(uintptr_t)depth);
+      struct hash_entry *part =
+         _mesa_hash_table_search(compiler->callable_parts, stage);
+      if (part)
+         _mesa_hash_table_insert(compiler->callable_functions, function,
+                                part->data);
    }
 
    nir_build_call(b, function, 0, NULL);
@@ -458,18 +500,74 @@ hk_call_ray_tracing_stage(nir_builder *b, struct hk_rt_compiler *compiler,
       break;
    case MESA_SHADER_CALLABLE:
       compiler->sizes.callable =
-         MAX2(compiler->sizes.callable, stage->scratch_size);
+         MAX2(compiler->sizes.callable,
+              stage->scratch_size + (compiler->callable_dispatch
+                 ? HK_RT_CALLABLE_RETURN_SIZE : 0));
       break;
    default:
       UNREACHABLE("Invalid ray tracing stage");
    }
 }
 
+/* Preserve invocation state across nested calls. SSA/DCE eliminates fields
+ * that the caller never reads after the return; no fixed spill frame is added. */
+struct hk_rt_saved_state {
+   nir_variable *vars[22];
+   nir_def *values[22];
+   unsigned count;
+};
+
+static struct hk_rt_saved_state
+hk_rt_save_state(nir_builder *b, struct hk_rt_shader_state *state)
+{
+   struct hk_rt_saved_state saved = {0};
+   nir_variable *vars[] = {
+      state->bvh_base,
+      state->flags,
+      state->cull_mask,
+      state->sbt_offset,
+      state->sbt_stride,
+      state->miss_index,
+      state->origin,
+      state->tmin,
+      state->dir,
+      state->tmax,
+      state->instance_addr,
+      state->primitive_id,
+      state->geometry_id_and_flags,
+      state->hit_kind,
+      state->sbt_index,
+      state->shader_record_ptr,
+      state->stack_ptr,
+      state->shader_call_data_offset,
+      state->accept,
+      state->terminate,
+      state->opaque,
+      state->primitive_addr,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(vars); ++i) {
+      if (!vars[i])
+         continue;
+      saved.vars[saved.count] = vars[i];
+      saved.values[saved.count++] = nir_load_var(b, vars[i]);
+   }
+   return saved;
+}
+
 static void
-hk_execute_callable(nir_builder *b, struct hk_rt_compiler *compiler,
+hk_rt_restore_state(nir_builder *b, const struct hk_rt_saved_state *saved)
+{
+   for (unsigned i = 0; i < saved->count; ++i)
+      nir_store_var(b, saved->vars[i], saved->values[i],
+                    BITFIELD_MASK(saved->values[i]->num_components));
+}
+
+static void
+hk_execute_callable_inline(nir_builder *b, struct hk_rt_compiler *compiler,
                     nir_intrinsic_instr *instr)
 {
    struct hk_rt_shader_state *state = &compiler->state;
+   struct hk_rt_saved_state saved = hk_rt_save_state(b, state);
 
    nir_def *sbt_index = instr->src[0].ssa;
    nir_def *payload = instr->src[1].ssa;
@@ -499,11 +597,173 @@ hk_execute_callable(nir_builder *b, struct hk_rt_compiler *compiler,
          continue;
 
       nir_push_if(b, nir_ieq_imm(b, callable_entry.value, group->handle.index));
-      hk_call_ray_tracing_stage(b, compiler, stage);
+      hk_call_ray_tracing_stage(b, compiler, stage, false);
       nir_pop_if(b, NULL);
    }
 
-   nir_store_var(b, state->stack_ptr, stack_ptr, 0x1);
+   hk_rt_restore_state(b, &saved);
+}
+
+static bool
+hk_callable_dispatch_needed(const struct hk_ray_tracing_pipeline *pipeline)
+{
+   for (unsigned i = 0; i < pipeline->stage_count; ++i) {
+      nir_shader *stage = pipeline->stages[i]->nir;
+      if (stage->info.stage != MESA_SHADER_CALLABLE)
+         continue;
+      nir_foreach_block(block, nir_shader_get_entrypoint(stage)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_execute_callable)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+/* Split callable stages at shader calls. The resulting functions are leaves
+ * of the C/NIR call graph; a per-invocation dispatcher selects their entry and
+ * resume parts. In particular, a dynamic SBT index must not make the inliner
+ * recurse through every callable (including itself). */
+static struct hk_rt_callable_context *
+hk_callable_context(nir_builder *b, struct hk_rt_compiler *compiler)
+{
+   struct hash_entry *caller = _mesa_hash_table_search(
+      compiler->function_depths, b->impl->function);
+   unsigned depth = caller ? (uintptr_t)caller->data : 0;
+   struct hk_rt_callable_context **slot = &compiler->callable_contexts[depth];
+   if (*slot)
+      return *slot;
+
+   struct hk_rt_callable_context *ctx =
+      rzalloc(b->shader, struct hk_rt_callable_context);
+   *slot = ctx;
+   ctx->pc = nir_variable_create(b->shader, nir_var_shader_temp,
+                                 glsl_uint_type(), "callable.pc");
+   ctx->called = nir_variable_create(b->shader, nir_var_shader_temp,
+                                     glsl_bool_type(), "callable.called");
+   util_dynarray_init(&ctx->parts, ctx);
+   ctx->entries = _mesa_pointer_hash_table_create(ctx);
+   const nir_lower_shader_calls_options options = {
+      .address_format = nir_address_format_32bit_offset,
+      .stack_alignment = 16,
+      .localized_loads = true,
+   };
+   for (unsigned i = 0; i < compiler->pipeline->stage_count; ++i) {
+      nir_shader *stage = compiler->pipeline->stages[i]->nir;
+      if (stage->info.stage != MESA_SHADER_CALLABLE ||
+          _mesa_hash_table_search(ctx->entries, stage))
+         continue;
+      nir_shader *entry = nir_shader_clone(ctx, stage);
+      nir_shader **resumes = NULL;
+      unsigned count = 0;
+      nir_lower_shader_calls(entry, &options, &resumes, &count, ctx);
+      unsigned first = util_dynarray_num_elements(&ctx->parts,
+                                                  struct hk_rt_callable_part *) + 1;
+      _mesa_hash_table_insert(ctx->entries, stage, (void *)(uintptr_t)first);
+      for (unsigned j = 0; j <= count; ++j) {
+         struct hk_rt_callable_part *part =
+            rzalloc(ctx, struct hk_rt_callable_part);
+         *part = (struct hk_rt_callable_part){
+            .nir = j ? resumes[j - 1] : entry,
+            .context = ctx, .pc = first + j, .resume_base = first + 1,
+         };
+         util_dynarray_append(&ctx->parts, part);
+         _mesa_hash_table_insert(compiler->callable_parts, part->nir, part);
+      }
+   }
+   return ctx;
+}
+
+static nir_def *
+hk_callable_pc(nir_builder *b, struct hk_rt_compiler *compiler,
+                struct hk_rt_callable_context *ctx, nir_def *handle)
+{
+   nir_def *pc = nir_imm_int(b, 0);
+   for (unsigned i = 0; i < compiler->pipeline->group_count; ++i) {
+      const struct hk_ray_tracing_group *g = compiler->pipeline->groups + i;
+      if (g->recursive_index == VK_SHADER_UNUSED_KHR)
+         continue;
+      nir_shader *stage = compiler->pipeline->stages[g->recursive_index]->nir;
+      struct hash_entry *entry = _mesa_hash_table_search(ctx->entries, stage);
+      if (entry)
+         pc = nir_bcsel(b, nir_ieq_imm(b, handle, g->handle.index),
+                        nir_imm_int(b, (uintptr_t)entry->data), pc);
+   }
+   return pc;
+}
+
+static void
+hk_callable_push(nir_builder *b, struct hk_rt_compiler *compiler,
+                  struct hk_rt_callable_context *ctx, nir_def *sbt_index,
+                  nir_def *payload, unsigned frame_size, unsigned resume_pc)
+{
+   struct hk_rt_shader_state *state = &compiler->state;
+   struct hk_sbt_entry entry =
+      hk_load_sbt_entry(b, sbt_index, HK_RT_CMD_CALLABLE_ADDRESS);
+   nir_def *sp = nir_load_var(b, state->stack_ptr);
+   unsigned delta = ALIGN_POT(frame_size, 16) + HK_RT_CALLABLE_RETURN_SIZE;
+   nir_def *next_sp = nir_iadd_imm(b, sp, delta);
+   nir_def *record = nir_iadd_imm(b, next_sp, -HK_RT_CALLABLE_RETURN_SIZE);
+   nir_store_scratch(b,
+      nir_vec4(b, nir_imm_int(b, resume_pc), sp,
+               nir_load_var(b, state->shader_call_data_offset), nir_imm_int(b, 0)),
+      record, .align_mul = 16, .write_mask = 15);
+   nir_store_scratch(b, nir_load_var(b, state->shader_record_ptr),
+      nir_iadd_imm(b, record, 16), .align_mul = 8, .write_mask = 1);
+   nir_store_var(b, state->stack_ptr, next_sp, 1);
+   nir_store_var(b, state->shader_call_data_offset,
+                 nir_iadd_imm(b, payload, -(int)delta), 1);
+   nir_store_var(b, state->shader_record_ptr, entry.shader_record_ptr, 1);
+   nir_store_var(b, ctx->pc, hk_callable_pc(b, compiler, ctx, entry.value), 1);
+   nir_store_var(b, ctx->called, nir_imm_true(b), 1);
+}
+
+static void
+hk_callable_pop(nir_builder *b, struct hk_rt_compiler *compiler,
+                 struct hk_rt_callable_context *ctx)
+{
+   struct hk_rt_shader_state *state = &compiler->state;
+   nir_def *record = nir_iadd_imm(b, nir_load_var(b, state->stack_ptr),
+                                 -HK_RT_CALLABLE_RETURN_SIZE);
+   nir_def *saved = nir_load_scratch(b, 4, 32, record, .align_mul = 16);
+   nir_def *shader_record = nir_load_scratch(b, 1, 64,
+      nir_iadd_imm(b, record, 16), .align_mul = 8);
+   nir_store_var(b, ctx->pc, nir_channel(b, saved, 0), 1);
+   nir_store_var(b, state->stack_ptr, nir_channel(b, saved, 1), 1);
+   nir_store_var(b, state->shader_call_data_offset, nir_channel(b, saved, 2), 1);
+   nir_store_var(b, state->shader_record_ptr, shader_record, 1);
+}
+
+static void
+hk_execute_callable(nir_builder *b, struct hk_rt_compiler *compiler,
+                    nir_intrinsic_instr *instr)
+{
+   if (!compiler->callable_dispatch) {
+      hk_execute_callable_inline(b, compiler, instr);
+      return;
+   }
+
+   struct hk_rt_saved_state saved = hk_rt_save_state(b, &compiler->state);
+   struct hk_rt_callable_context *ctx = hk_callable_context(b, compiler);
+   hk_callable_push(b, compiler, ctx, instr->src[0].ssa, instr->src[1].ssa,
+      hk_rt_function_stack_size(compiler, b->impl->function), 0);
+   nir_push_loop(b);
+   nir_def *pc = nir_load_var(b, ctx->pc);
+   nir_break_if(b, nir_ieq_imm(b, pc, 0));
+   nir_store_var(b, ctx->called, nir_imm_false(b), 1);
+   util_dynarray_foreach(&ctx->parts, struct hk_rt_callable_part *, part) {
+      nir_push_if(b, nir_ieq_imm(b, pc, (*part)->pc));
+      hk_call_ray_tracing_stage(b, compiler, (*part)->nir, false);
+      nir_pop_if(b, NULL);
+   }
+   nir_push_if(b, nir_inot(b, nir_load_var(b, ctx->called)));
+   hk_callable_pop(b, compiler, ctx);
+   nir_pop_if(b, NULL);
+   nir_pop_loop(b, NULL);
+   hk_rt_restore_state(b, &saved);
 }
 
 struct hk_lower_isec_state {
@@ -517,6 +777,15 @@ struct hk_lower_isec_state {
  * already been terminated; an any-hit shader in the same group then gets to
  * veto it, and ignoreIntersectionEXT rolls the state back.
  */
+static void
+hk_native_commit_report(nir_builder *b, struct hk_rt_compiler *compiler,
+                        nir_def *distance, nir_def *hit_kind)
+{
+   nir_def *q = &nir_build_deref_var(b, compiler->native_query)->def;
+   nir_rq_generate_intersection(b, q, distance);
+   nir_store_var(b, compiler->native_hit_kind, hit_kind, 1);
+}
+
 static bool
 hk_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
 {
@@ -558,7 +827,7 @@ hk_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
 
          nir_push_if(b, nir_inot(b, nir_load_var(b, state->opaque)));
          {
-            hk_call_ray_tracing_stage(b, compiler, isec_state->ahit);
+            hk_call_ray_tracing_stage(b, compiler, isec_state->ahit, false);
          }
          nir_pop_if(b, NULL);
 
@@ -566,6 +835,12 @@ hk_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
          nir_store_var(b, state->terminate,
                        nir_ior(b, terminate, prev_terminate), 0x1);
 
+         /* Commit before terminateRay returns from the intersection stage. */
+         if (compiler->native_agx) {
+            nir_push_if(b, nir_load_var(b, state->accept));
+            hk_native_commit_report(b, compiler, t, hit_kind);
+            nir_pop_if(b, NULL);
+         }
          nir_push_if(b, terminate);
          nir_jump(b, nir_jump_return);
          nir_pop_if(b, NULL);
@@ -573,6 +848,8 @@ hk_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
 
       nir_push_if(b, nir_load_var(b, state->accept));
       {
+         if (compiler->native_agx && !isec_state->ahit)
+            hk_native_commit_report(b, compiler, t, hit_kind);
          nir_store_var(b, commit, nir_imm_true(b), 0x1);
       }
       nir_push_else(b, NULL);
@@ -658,7 +935,7 @@ hk_handle_aabb_intersection(nir_builder *b,
       nir_shader *stage = compiler->pipeline->stages[group->isec_index]->nir;
 
       nir_push_if(b, nir_ieq_imm(b, isec_entry.value, group->handle.index));
-      hk_call_ray_tracing_stage(b, compiler, stage);
+      hk_call_ray_tracing_stage(b, compiler, stage, true);
       nir_pop_if(b, NULL);
 
       nir_shader *ahit_stage = NULL;
@@ -753,7 +1030,7 @@ hk_handle_triangle_intersection(nir_builder *b,
          nir_shader *stage = compiler->pipeline->stages[group->ahit_index]->nir;
 
          nir_push_if(b, nir_ieq_imm(b, ahit_entry.value, group->handle.index));
-         hk_call_ray_tracing_stage(b, compiler, stage);
+         hk_call_ray_tracing_stage(b, compiler, stage, true);
          nir_pop_if(b, NULL);
       }
    }
@@ -781,11 +1058,161 @@ hk_handle_triangle_intersection(nir_builder *b,
    nir_pop_if(b, NULL);
 }
 
+/* Candidate and committed state use the same native instance pointer table.
+ * Any-hit must see the candidate state before application acceptance. */
+static void
+hk_rt_native_load_hit_state(nir_builder *b, struct hk_rt_shader_state *state,
+                        nir_def *q, nir_def *as, bool committed)
+{
+   nir_def *instance_id = nir_rq_load(b, 1, 32, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_instance_id);
+   /* Native pointer table entries contain record-relative-offset +4. */
+   nir_def *table = nir_load_global(b, 1, 64, nir_iadd_imm(b, as, 128),
+                                    .align_mul = 8);
+   nir_def *entry = nir_load_global(b, 1, 64,
+      nir_iadd(b, nir_iadd(b, as, table), nir_u2u64(b, nir_ishl_imm(b, instance_id, 4))),
+      .align_mul = 8);
+   nir_def *instance = nir_iadd_imm(b, nir_iadd(b, as, entry), -4);
+   nir_store_var(b, state->instance_addr, instance, 1);
+   nir_def *primitive = nir_rq_load(b, 1, 32, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_primitive_index);
+   nir_store_var(b, state->primitive_id, primitive, 1);
+   nir_def *geometry = nir_rq_load(b, 1, 32, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_geometry_index);
+   nir_store_var(b, state->geometry_id_and_flags, geometry, 1);
+   nir_def *distance = nir_rq_load(b, 1, 32, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_t);
+   nir_store_var(b, state->tmax, distance, 1);
+   nir_def *type = nir_rq_load(b, 1, 32, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_type);
+   nir_push_if(b, nir_ieq_imm(b, type, committed ? 1 : 0));
+   nir_def *front = nir_rq_load(b, 1, 1, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_front_face);
+   nir_store_var(b, state->hit_kind,
+      nir_bcsel(b, front, nir_imm_int(b, 0xfe), nir_imm_int(b, 0xff)), 1);
+   nir_def *bary = nir_rq_load(b, 2, 32, q, .committed = committed,
+      .ray_query_value = nir_ray_query_value_intersection_barycentrics);
+   nir_store_scratch(b, bary, nir_load_var(b, state->stack_ptr),
+                     .align_mul = 8, .write_mask = 3);
+   nir_pop_if(b, NULL);
+   nir_def *otw = nir_iadd(b, instance,
+      nir_load_global(b, 1, 64, nir_iadd_imm(b, instance, 104), .align_mul = 8));
+   nir_def *sbt = nir_load_global(b, 1, 32, nir_iadd_imm(b, otw, 48), .align_mul = 4);
+   nir_store_var(b, state->traversal.sbt_offset_and_flags, sbt, 1);
+   nir_store_var(b, state->sbt_index,
+                 hk_hit_sbt_index(b, state, geometry), 1);
+}
+
+/* Native AS buffers use the captured Apple layout. Reuse the Vulkan query
+ * lowering for traversal; software hk_bvh traversal cannot interpret them. */
+static void
+hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
+                nir_def *as, nir_def *flags, nir_def *mask,
+                nir_def *origin, nir_def *tmin, nir_def *dir, nir_def *tmax)
+{
+   struct hk_rt_shader_state *state = &compiler->state;
+   /* Each generated traversal drains/terminates its native queue and copies
+    * the committed hit into state before invoking closest-hit or miss code.
+    * Those stages therefore reuse this context for their subsequent traces.
+    * Any application ray-query variables remain separate and retain the
+    * lowerer's multiple-live-query guard. */
+   if (!compiler->native_query) {
+      compiler->native_query = nir_variable_create(b->shader, nir_var_shader_temp,
+         glsl_uint64_t_type(), "rt.query");
+      compiler->native_query->data.ray_query = true;
+      compiler->native_hit_kind = nir_variable_create(b->shader,
+         nir_var_shader_temp, glsl_uint_type(), "rt.procedural_hit_kind");
+   }
+   nir_variable *query = compiler->native_query;
+   nir_def *q = &nir_build_deref_var(b, query)->def;
+   /* SkipClosestHitShader selects a pipeline stage after traversal; it
+    * does not change the native intersection query. */
+   nir_def *query_flags = nir_iand_imm(b, flags,
+      ~SpvRayFlagsSkipClosestHitShaderKHRMask);
+   if (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)
+      query_flags = nir_ior_imm(b, query_flags, SpvRayFlagsSkipAABBsKHRMask);
+   if (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR)
+      query_flags = nir_ior_imm(b, query_flags, SpvRayFlagsSkipTrianglesKHRMask);
+   nir_rq_initialize(b, q, as, query_flags, mask, origin, tmin, dir, tmax);
+   nir_push_loop(b);
+   nir_break_if(b, nir_inot(b, nir_rq_proceed(b, 1, q)));
+   {
+      nir_def *candidate_type = nir_rq_load(b, 1, 32, q, .committed = false,
+         .ray_query_value = nir_ray_query_value_intersection_type);
+      nir_def *best = nir_rq_load(b, 1, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_intersection_t);
+      hk_rt_native_load_hit_state(b, state, q, as, false);
+      nir_store_var(b, state->terminate,
+         nir_test_mask(b, flags, SpvRayFlagsTerminateOnFirstHitKHRMask), 1);
+      struct hk_sbt_entry hit_entry = hk_load_sbt_entry(
+         b, nir_load_var(b, state->sbt_index), HK_RT_CMD_HIT_ADDRESS);
+      nir_store_var(b, state->shader_record_ptr, hit_entry.shader_record_ptr, 1);
+      nir_push_if(b, nir_ieq_imm(b, candidate_type, 1));
+      {
+         nir_store_var(b, state->accept, nir_imm_false(b), 1);
+         nir_store_var(b, state->tmax, best, 1);
+         nir_store_var(b, state->opaque, nir_rq_load(b, 1, 1, q,
+            .committed = false,
+            .ray_query_value = nir_ray_query_value_intersection_candidate_aabb_opaque), 1);
+         for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
+            struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
+            if (group->isec_index == VK_SHADER_UNUSED_KHR)
+               continue;
+            nir_shader *stage = compiler->pipeline->stages[group->isec_index]->nir;
+            nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
+            hk_call_ray_tracing_stage(b, compiler, stage, true);
+            nir_pop_if(b, NULL);
+            struct hk_lower_isec_state isec_state = {
+               .compiler = compiler,
+               .ahit = group->ahit_index == VK_SHADER_UNUSED_KHR ? NULL :
+                  compiler->pipeline->stages[group->ahit_index]->nir,
+            };
+            nir_shader_intrinsics_pass(b->shader, hk_lower_isec_intrinsic,
+                                       nir_metadata_none, &isec_state);
+         }
+      }
+      nir_push_else(b, NULL);
+      {
+         nir_store_var(b, state->accept, nir_imm_true(b), 1);
+         for (uint32_t i = 0; i < compiler->pipeline->group_count; ++i) {
+            struct hk_ray_tracing_group *group = compiler->pipeline->groups + i;
+            if (group->ahit_index == VK_SHADER_UNUSED_KHR)
+               continue;
+            nir_shader *stage = compiler->pipeline->stages[group->ahit_index]->nir;
+            nir_push_if(b, nir_ieq_imm(b, hit_entry.value, group->handle.index));
+            hk_call_ray_tracing_stage(b, compiler, stage, true);
+            nir_pop_if(b, NULL);
+         }
+         nir_push_if(b, nir_load_var(b, state->accept));
+         nir_rq_confirm_intersection(b, q);
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+      nir_push_if(b, nir_iand(b, nir_load_var(b, state->accept),
+                              nir_load_var(b, state->terminate)));
+      nir_rq_terminate(b, q);
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_loop(b, NULL);
+   /* A miss after rejected candidates keeps the original ray maximum. */
+   nir_store_var(b, state->tmax, tmax, 1);
+   nir_def *type = nir_rq_load(b, 1, 32, q, .committed = true,
+                               .ray_query_value = nir_ray_query_value_intersection_type);
+   nir_store_var(b, state->traversal.hit, nir_ine_imm(b, type, 0), 1);
+   nir_push_if(b, nir_ine_imm(b, type, 0));
+   hk_rt_native_load_hit_state(b, state, q, as, true);
+   nir_push_if(b, nir_ieq_imm(b, type, 2));
+   nir_store_var(b, state->hit_kind, nir_load_var(b, compiler->native_hit_kind), 1);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+}
+
 static void
 hk_trace_ray(nir_builder *b, struct hk_rt_compiler *compiler,
              nir_intrinsic_instr *instr)
 {
    struct hk_rt_shader_state *state = &compiler->state;
+   struct hk_rt_saved_state saved = hk_rt_save_state(b, state);
 
    nir_def *accel_struct = instr->src[0].ssa;
    nir_def *flags = instr->src[1].ssa;
@@ -868,7 +1295,11 @@ hk_trace_ray(nir_builder *b, struct hk_rt_compiler *compiler,
    };
 
    nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
-   hk_build_ray_traversal(b, &args);
+   if (compiler->native_agx)
+      hk_trace_ray_native(b, compiler, accel_struct, flags, cull_mask,
+                      origin, tmin, dir, tmax);
+   else
+      hk_build_ray_traversal(b, &args);
    nir_pop_if(b, NULL);
 
    nir_push_if(b, nir_load_var(b, state->traversal.hit));
@@ -893,7 +1324,7 @@ hk_trace_ray(nir_builder *b, struct hk_rt_compiler *compiler,
             continue;
 
          nir_push_if(b, nir_ieq_imm(b, chit_entry.value, group->handle.index));
-         hk_call_ray_tracing_stage(b, compiler, stage);
+         hk_call_ray_tracing_stage(b, compiler, stage, true);
          nir_pop_if(b, NULL);
       }
 
@@ -917,13 +1348,31 @@ hk_trace_ray(nir_builder *b, struct hk_rt_compiler *compiler,
             continue;
 
          nir_push_if(b, nir_ieq_imm(b, miss_entry.value, group->handle.index));
-         hk_call_ray_tracing_stage(b, compiler, stage);
+         hk_call_ray_tracing_stage(b, compiler, stage, true);
          nir_pop_if(b, NULL);
       }
    }
    nir_pop_if(b, NULL);
 
-   nir_store_var(b, state->stack_ptr, stack_ptr, 0x1);
+   hk_rt_restore_state(b, &saved);
+}
+
+static void
+hk_rt_load_wto(nir_builder *b, const struct hk_rt_compiler *compiler,
+                nir_def *instance, nir_def *rows[3])
+{
+   if (!compiler->native_agx) {
+      hk_load_wto_matrix(b, instance, NULL, rows);
+      return;
+   }
+   nir_def *cols[4];
+   for (unsigned c = 0; c < 4; ++c)
+      cols[c] = nir_load_global(b, 3, 32,
+         nir_iadd_imm(b, instance, 16 + c*12), .align_mul = 4);
+   for (unsigned r = 0; r < 3; ++r)
+      rows[r] = nir_vec4(b, nir_channel(b, cols[0], r),
+         nir_channel(b, cols[1], r), nir_channel(b, cols[2], r),
+         nir_channel(b, cols[3], r));
 }
 
 static bool
@@ -954,6 +1403,29 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
    /* Ray tracing instructions */
    case nir_intrinsic_execute_callable:
       hk_execute_callable(b, compiler, intr);
+      break;
+   case nir_intrinsic_rt_execute_callable: {
+      struct hash_entry *entry = _mesa_hash_table_search(
+         compiler->callable_functions, b->impl->function);
+      assert(entry);
+      struct hk_rt_callable_part *part = entry->data;
+      hk_callable_push(b, compiler, part->context,
+         intr->src[0].ssa, intr->src[1].ssa, nir_intrinsic_stack_size(intr),
+         part->resume_base + nir_intrinsic_call_idx(intr));
+      break;
+   }
+   case nir_intrinsic_rt_trace_ray: {
+      struct hash_entry *entry = _mesa_hash_table_search(
+         compiler->callable_functions, b->impl->function);
+      assert(entry);
+      struct hk_rt_callable_part *part = entry->data;
+      hk_trace_ray(b, compiler, intr);
+      nir_store_var(b, part->context->pc,
+         nir_imm_int(b, part->resume_base + nir_intrinsic_call_idx(intr)), 1);
+      nir_store_var(b, part->context->called, nir_imm_true(b), 1);
+      break;
+   }
+   case nir_intrinsic_rt_resume:
       break;
    case nir_intrinsic_trace_ray:
       hk_trace_ray(b, compiler, intr);
@@ -999,8 +1471,9 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       nir_def *custom_instance_and_mask = nir_load_global(
          b, 1, 32,
          nir_iadd_imm(b, instance_node_addr,
-                      offsetof(struct hk_bvh_instance_node,
-                               custom_instance_and_mask)));
+                      compiler->native_agx ? 96 :
+                         offsetof(struct hk_bvh_instance_node,
+                                  custom_instance_and_mask)));
       def = nir_iand_imm(b, custom_instance_and_mask, 0xFFFFFF);
       break;
    }
@@ -1016,7 +1489,8 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       def = nir_load_global(
          b, 1, 32,
          nir_iadd_imm(b, instance_node_addr,
-                      offsetof(struct hk_bvh_instance_node, instance_id)));
+                      compiler->native_agx ? 100 :
+                         offsetof(struct hk_bvh_instance_node, instance_id)));
       break;
    }
    case nir_intrinsic_load_ray_flags:
@@ -1029,7 +1503,7 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
       const unsigned c = nir_intrinsic_column(intr);
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *wto_matrix[3];
-      hk_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
+      hk_rt_load_wto(b, compiler, instance_node_addr, wto_matrix);
 
       nir_def *vals[3];
       for (unsigned i = 0; i < 3; ++i)
@@ -1041,6 +1515,14 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_ray_object_to_world: {
       const unsigned c = nir_intrinsic_column(intr);
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
+      if (compiler->native_agx) {
+         nir_def *relative = nir_load_global(b, 1, 64,
+            nir_iadd_imm(b, instance_node_addr, 104), .align_mul = 8);
+         def = nir_load_global(b, 3, 32,
+            nir_iadd_imm(b, nir_iadd(b, instance_node_addr, relative), c*12),
+            .align_mul = 4);
+         break;
+      }
       nir_def *rows[3];
       for (unsigned r = 0; r < 3; ++r)
          rows[r] = nir_load_global(
@@ -1055,7 +1537,7 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_ray_object_origin: {
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *wto_matrix[3];
-      hk_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
+      hk_rt_load_wto(b, compiler, instance_node_addr, wto_matrix);
       def = hk_mul_vec3_mat(b, nir_load_var(b, state->origin), wto_matrix,
                             true);
       break;
@@ -1063,7 +1545,7 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_load_ray_object_direction: {
       nir_def *instance_node_addr = nir_load_var(b, state->instance_addr);
       nir_def *wto_matrix[3];
-      hk_load_wto_matrix(b, instance_node_addr, NULL, wto_matrix);
+      hk_rt_load_wto(b, compiler, instance_node_addr, wto_matrix);
       def = hk_mul_vec3_mat(b, nir_load_var(b, state->dir), wto_matrix, false);
       break;
    }
@@ -1333,7 +1815,11 @@ hk_compile_ray_tracing_stages(
       NIR_PASS(_, nir, nir_split_var_copies);
       NIR_PASS(_, nir, nir_lower_var_copies);
       NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+      NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
 
       assert(!nir->scratch_size);
       if (nir->info.stage == MESA_SHADER_ANY_HIT ||
@@ -1428,7 +1914,14 @@ hk_init_ray_tracing_groups(
        * process-boundary argument agx_emit_imadshl_agx() makes: refuse
        * loudly rather than take the process down. */
       const struct hk_ray_tracing_group *g = pipeline->groups + i;
-      const uint32_t own_stage_count = create_info->stageCount;
+      uint32_t own_stage_count = create_info->stageCount;
+      if (create_info->pLibraryInfo) {
+         for (uint32_t l = 0; l < create_info->pLibraryInfo->libraryCount; l++) {
+            VK_FROM_HANDLE(vk_pipeline, vk_lib,
+                           create_info->pLibraryInfo->pLibraries[l]);
+            own_stage_count += hk_pipeline_to_ray_tracing(vk_lib)->stage_count;
+         }
+      }
       if ((g->recursive_index != VK_SHADER_UNUSED_KHR &&
            g->recursive_index >= own_stage_count) ||
           (g->ahit_index != VK_SHADER_UNUSED_KHR &&
@@ -1444,8 +1937,25 @@ hk_init_ray_tracing_groups(
       /* Handles are unique per device, not per pipeline, so a handle an
        * application captured from a library keeps identifying the same group
        * after it is imported. */
-      pipeline->groups[i].handle.index =
-         p_atomic_inc_return(&dev->rt_group_handle_alloc);
+      if ((vk_rt_pipeline_create_flags(create_info) &
+           VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR) &&
+          group_info->pShaderGroupCaptureReplayHandle) {
+         uint32_t replay;
+         memcpy(&replay, group_info->pShaderGroupCaptureReplayHandle,
+                sizeof(replay));
+         pipeline->groups[i].handle.index = replay;
+         uint32_t current = p_atomic_read(&dev->rt_group_handle_alloc);
+         while (current < replay) {
+            uint32_t seen = p_atomic_cmpxchg(&dev->rt_group_handle_alloc,
+                                             current, replay);
+            if (seen == current)
+               break;
+            current = seen;
+         }
+      } else {
+         pipeline->groups[i].handle.index =
+            p_atomic_inc_return(&dev->rt_group_handle_alloc);
+      }
    }
 
    if (!create_info->pLibraryInfo)
@@ -1513,9 +2023,24 @@ hk_compile_ray_tracing_pipeline(
       .pipeline = pipeline,
       .flags = vk_rt_pipeline_create_flags(create_info),
       .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch,
+      .native_agx = dev->gen1_native_rq && dev->gen1_rq_instances,
+      .callable_dispatch = hk_callable_dispatch_needed(pipeline),
+      .max_depth = create_info->maxPipelineRayRecursionDepth,
    };
    hk_ray_tracing_state_init(b->shader, &compiler);
-   compiler.functions = _mesa_pointer_hash_table_create(NULL);
+   compiler.functions = rzalloc_array(b->shader, struct hash_table *,
+                                      compiler.max_depth + 1);
+   if (!compiler.functions) {
+      ralloc_free(b->shader);
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   for (unsigned depth = 0; depth <= compiler.max_depth; ++depth)
+      compiler.functions[depth] = _mesa_pointer_hash_table_create(b->shader);
+   compiler.function_depths = _mesa_pointer_hash_table_create(b->shader);
+   compiler.callable_parts = _mesa_pointer_hash_table_create(b->shader);
+   compiler.callable_functions = _mesa_pointer_hash_table_create(b->shader);
+   compiler.callable_contexts = rzalloc_array(b->shader,
+      struct hk_rt_callable_context *, compiler.max_depth + 1);
 
    /* A launch is dispatched in whole workgroups, so the trailing workgroup of
     * a width that is not a multiple of the workgroup size runs invocations the
@@ -1553,7 +2078,7 @@ hk_compile_ray_tracing_pipeline(
          continue;
 
       nir_push_if(b, nir_ieq_imm(b, raygen_entry.value, group->handle.index));
-      hk_call_ray_tracing_stage(b, &compiler, stage);
+      hk_call_ray_tracing_stage(b, &compiler, stage, false);
       nir_pop_if(b, NULL);
    }
 
@@ -1601,7 +2126,32 @@ hk_compile_ray_tracing_pipeline(
 
    hk_rt_optimize_nir(b->shader);
 
-   _mesa_hash_table_destroy(compiler.functions, NULL);
+   if (dev->dev.chip == AGX_CHIP_G17P) {
+      bool indirect = false;
+      nir_foreach_function_impl(impl, b->shader) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic == nir_intrinsic_load_scratch)
+                  indirect |= !nir_src_is_const(intr->src[0]);
+               else if (intr->intrinsic == nir_intrinsic_store_scratch)
+                  indirect |= !nir_src_is_const(intr->src[1]);
+            }
+         }
+      }
+      if (!indirect) {
+         NIR_PASS(_, b->shader, nir_lower_scratch_to_var);
+         hk_rt_optimize_nir(b->shader);
+      }
+   }
+
+   for (unsigned depth = 0; depth <= compiler.max_depth; ++depth)
+      _mesa_hash_table_destroy(compiler.functions[depth], NULL);
+   _mesa_hash_table_destroy(compiler.function_depths, NULL);
+   _mesa_hash_table_destroy(compiler.callable_parts, NULL);
+   _mesa_hash_table_destroy(compiler.callable_functions, NULL);
 
    /* hk_lower_nir() gates hk_nir_lower_ray_queries on `info.ray_queries > 0`
     * (`hk_shader.c:1783`), and info.ray_queries is only ever set by
@@ -1809,9 +2359,18 @@ hk_GetRayTracingCaptureReplayShaderGroupHandlesKHR(
    VkDevice _device, VkPipeline _pipeline, uint32_t firstGroup,
    uint32_t groupCount, size_t dataSize, void *pData)
 {
-   /* shaderGroupHandleCaptureReplaySize is zero and
-    * rayTracingPipelineShaderGroupHandleCaptureReplay is not advertised, so
-    * there is nothing an application may legally read here. */
+   VK_FROM_HANDLE(vk_pipeline, vk_pipeline, _pipeline);
+   struct hk_ray_tracing_pipeline *pipeline =
+      hk_pipeline_to_ray_tracing(vk_pipeline);
+   uint8_t *data = pData;
+
+   assert(dataSize >= (size_t)groupCount * sizeof(uint32_t));
+
+   for (uint32_t i = 0; i < groupCount; i++) {
+      const uint32_t index = pipeline->groups[firstGroup + i].handle.index;
+      memcpy(data + i * sizeof(uint32_t), &index, sizeof(index));
+   }
+
    return VK_SUCCESS;
 }
 
