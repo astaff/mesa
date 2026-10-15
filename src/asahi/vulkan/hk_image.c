@@ -884,8 +884,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    if (ycbcr_info &&
-       ((pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) ||
-        (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)))
+       (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){

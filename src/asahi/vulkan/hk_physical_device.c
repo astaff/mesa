@@ -884,13 +884,11 @@ hk_get_device_features(
        * a read-only shadow at +sparse_ro_offset, and a userspace sparse map
        * that the G17P texture descriptor points at in Sparse mode. The kernel
        * already accepts DRM_ASAHI_BIND_SINGLE_PAGE binds, and the G17P user VA
-       * window is split for the RO alias exactly as AGX2 is. Keep it off until
-       * the residency-query descriptor path is qualified on hardware; every
-       * piece below is chip-agnostic. */
-      const bool sparse = false;
+       * window is split for the RO alias exactly as AGX2 is. */
+      const bool sparse = true;
       features->shaderResourceResidency = sparse;
       features->sparseBinding = sparse;
-      features->sparseResidencyAliased = sparse;
+      features->sparseResidencyAliased = false;
       features->sparseResidencyImage2D = sparse;
       features->sparseResidencyBuffer = sparse;
       /* The common Honeykrisp lowering duplicates a draw per view, writes
@@ -1483,6 +1481,7 @@ hk_get_device_properties(const struct agx_device *dev,
        * fragment stages.  Keep subgroupQuadOperationsInAllStages false until
        * every other advertised graphics stage is independently witnessed. */
       properties->subgroupQuadOperationsInAllStages = false;
+      properties->sparseResidencyNonResidentStrict = false;
    }
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
