@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_queue.h"
+#include "hk_acceleration_structure.h"
 #include "hk_buffer.h"
 
 #include "agx_bg_eot.h"
@@ -991,8 +992,11 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
    /* The common queue submit path serializes submissions to this queue.
     * A logical queue, including one used only for host synchronization, does
     * not need a kernel scheduling context until it actually submits work. */
-   queue->drm.id = agx_create_command_queue(
-      &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1));
+   const uint64_t layouts[2] = {
+      dev->gen1_native_graphics_rq ? hk_gen1_ray_query_scs_layout(dev) : 0,
+      dev->gen1_native_fragment_rq ? hk_gen1_ray_query_scs_layout(dev) : 0};
+   queue->drm.id = agx_create_command_queue_with_render_scs(
+      &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
    if (queue->drm.id != UINT32_MAX)
       return VK_SUCCESS;
 
@@ -1186,6 +1190,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             asahi_append_compute_attachments(dev, &payload, cs);
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
             asahi_fill_cdm_command(dev, cs, &cmd.legacy);
+            if(cs->gen1_native_rq) {
+               header.size=sizeof(cmd);
+               cmd.scs_layout=hk_gen1_ray_query_scs_layout(dev);
+               cmd.intersection_pool=dev->gen1_rq_ift->va->addr;
+               cmd.intersection_pool_bytes=0x4000;
+               cmd.intersection_first=1;cmd.intersection_count=112;
+               cmd.intersection_default_program=UINT64_C(0x10010020000);
+               cmd.intersection_default_control=UINT64_C(0x16000000000);
+            }
             if (queue->sync.exact_prior) {
                header.size = sizeof(cmd);
                cmd.prior_vdm = cs->sync.prior[HK_SYNC_VDM];
@@ -1225,8 +1238,28 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                cmd.prior_vdm = cs->sync.prior[HK_SYNC_VDM];
                cmd.prior_cdm = cs->sync.prior[HK_SYNC_CDM];
             }
-            util_dynarray_append(&payload, header);
-            util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
+            if (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq) {
+               struct drm_asahi_cmd_render_with_ray_query extended = {.legacy = cmd};
+               for (unsigned stage = 0; stage < 2; ++stage) {
+                  if (!(stage ? cs->gen1_native_fragment_rq
+                              : cs->gen1_native_vertex_rq))
+                     continue;
+                  struct drm_asahi_render_ray_query_stage *rt = &extended.ray_query[stage];
+                  rt->scs_layout = hk_gen1_ray_query_scs_layout(dev);
+                  rt->intersection_pool = dev->gen1_rq_ift->va->addr;
+                  rt->intersection_pool_bytes = 0x4000;
+                  rt->intersection_first = 1;
+                  rt->intersection_count = 112;
+                  rt->intersection_default = UINT64_C(0x10010020000);
+                  rt->intersection_default_control = UINT64_C(0x16000000000);
+               }
+               header.size = sizeof(extended);
+               util_dynarray_append(&payload, header);
+               util_dynarray_append_array(&payload, uint8_t, &extended, header.size);
+            } else {
+               util_dynarray_append(&payload, header);
+               util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
+            }
             nr_vdm++;
          }
       }

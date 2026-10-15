@@ -4,6 +4,7 @@
 libagx_shader_files = files(
   'compression.cl',
   'copy.cl',
+  'as_properties.cl',
   'draws.cl',
   'geometry.cl',
   'query.cl',

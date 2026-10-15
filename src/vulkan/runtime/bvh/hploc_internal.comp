@@ -48,7 +48,11 @@ delta(uint32_t index)
       uint64_t right_key = packUint2x32(u32vec2(
          DEREF(INDEX(key64_id_pair, args.ids, right_index)).key_lo,
          DEREF(INDEX(key64_id_pair, args.ids, right_index)).key_hi));
-      return left_key != right_key ? (32 + uint32_t(findMSB(left_key ^ right_key))) : uint32_t(findMSB(left_index ^ right_index));
+      uint64_t difference = left_key ^ right_key;
+      uint32_t high = uint32_t(difference >> 32);
+      uint32_t bit = high != 0 ? 32 + uint32_t(findMSB(high))
+                               : uint32_t(findMSB(uint32_t(difference)));
+      return difference != 0 ? 32 + bit : uint32_t(findMSB(left_index ^ right_index));
    } else {
       uint32_t left_key = DEREF(INDEX(key32_id_pair, args.ids, left_index)).key;
       uint32_t right_key = DEREF(INDEX(key32_id_pair, args.ids, right_index)).key;
@@ -139,7 +143,9 @@ main(void)
       bool range_is_root = subgroupAny(range_size == active_leaf_count);
       uint64_t cluster_mask = packUint2x32(subgroupBallot(is_active && (range_is_root || range_size > cluster_threshold)).xy);
       while (cluster_mask != 0) {
-         uint32_t cluster_invoc = uint32_t(findLSB(cluster_mask));
+         uint32_t low = uint32_t(cluster_mask);
+         uint32_t cluster_invoc = low != 0 ? uint32_t(findLSB(low))
+            : 32 + uint32_t(findLSB(uint32_t(cluster_mask >> 32)));
          /* Clear the LSB. */
          cluster_mask &= cluster_mask - 1;
 

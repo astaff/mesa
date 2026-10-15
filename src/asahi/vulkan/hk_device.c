@@ -996,6 +996,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    return VK_SUCCESS;
 
 fail_meta:
+   hk_gen1_rq_finish(dev);
    hk_device_finish_meta(dev);
 fail_mem_cache:
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
@@ -1050,6 +1051,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    util_dynarray_fini(&dev->external_bos.list);
    u_rwlock_destroy(&dev->external_bos.lock);
 
+   hk_gen1_rq_finish(dev);
    hk_device_finish_meta(dev);
    hk_shader_binary_cache_finish(dev);
    hk_g17p_compute_program_cache_finish(dev);

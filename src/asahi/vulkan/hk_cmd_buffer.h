@@ -771,6 +771,9 @@ struct hk_cs {
     * samplers (especially for GL/DX11-era engines).
     */
    bool uses_sampler_heap;
+   bool gen1_native_rq;
+   bool gen1_native_fragment_rq;
+   bool gen1_native_vertex_rq;
 
    /* Scratch requirements */
    struct {
@@ -962,6 +965,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    }
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
+   a->gen1_native_rq |= b->gen1_native_rq;
    a->scratch.cs.main |= b->scratch.cs.main;
    a->scratch.cs.preamble |= b->scratch.cs.preamble;
 
@@ -1030,6 +1034,14 @@ struct hk_ioto_arena {
    uint64_t chunk_bytes;
 };
 
+struct hk_gen1_as_table_chunk {
+   struct list_head link;
+   struct agx_bo *tail;
+   struct agx_bo *bank;
+   struct agx_va *va;
+   uint32_t next, count;
+};
+
 struct hk_cmd_buffer {
    struct vk_command_buffer vk;
 
@@ -1060,6 +1072,7 @@ struct hk_cmd_buffer {
    /* Most recently addressed span. Recording often references the current
     * 4 KiB VDM chunk many times before moving to the next one. */
    struct hk_vdm_allocation *g17p_vdm_last_allocation;
+   struct list_head gen1_as_table_chunks;
 
    /* List of all recorded control streams */
    struct list_head control_streams;
@@ -1784,6 +1797,9 @@ void hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                              struct hk_shader *s, struct agx_grid grid,
                              struct agx_workgroup local_size);
 
+bool hk_gen1_upload_fragment_query_state(struct hk_cmd_buffer *cmd, bool vertex_stage,
+   struct agx3_ioto_uniform_range *range);
+
 void hk_g17p_prewarm_linked_compute_shader(struct hk_device *dev,
                                             struct hk_shader *s,
                                             struct hk_linked_shader *linked);
@@ -1827,6 +1843,11 @@ void hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd,
 void hk_cmd_dispatch_unaligned(VkCommandBuffer commandBuffer,
                                uint32_t invocations_x, uint32_t invocations_y,
                                uint32_t invocations_z);
+
+/* Driver-owned, resident indirect arguments addressed through their primary
+ * GPU VA. Sparse application buffers must use the public entrypoint. */
+void hk_cmd_dispatch_indirect_addr(VkCommandBuffer command_buffer,
+                                   VkDeviceAddress address);
 
 static inline void
 hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,

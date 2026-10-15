@@ -109,6 +109,27 @@ struct hk_device {
 
    /* Parameters for Mesa's common acceleration-structure builder. */
    struct vk_acceleration_structure_build_args accel_struct_args;
+   bool g17p_native_as;
+   bool gen1_native_rq;
+   bool gen1_native_fragment_rq;
+   bool gen1_native_graphics_rq;
+   bool gen1_rq_instances, gen1_rq_candidates, gen1_as_lock_ready;
+   simple_mtx_t gen1_as_lock;
+   struct util_dynarray gen1_ases;
+   struct agx_bo *gen1_as_metadata;
+   struct agx_bo *gen1_as_addresses;
+   struct agx_bo *gen1_as_query_bank;
+   bool gen1_rq_live_as_table;
+   bool gen1_as_chunk_cache_lock_ready;
+   simple_mtx_t gen1_as_chunk_cache_lock;
+   struct list_head gen1_as_free_chunks[2];
+   uint32_t gen1_as_free_chunk_count[2];
+   struct agx_bo *gen1_rq_code, *gen1_rq_ift;
+   struct agx_va *gen1_rq_code_alias;
+   uint64_t *gen1_rq_maps;
+   unsigned gen1_rq_bound_maps;
+   uint8_t *gen1_rq_user_image;
+   uint8_t gen1_rq_uniforms[320];
    struct agx_bg_eot_cache bg_eot;
    /* frg-codegen v4 BG/EOT device cache (hk_cmd_draw.c). */
    struct hk_g17p_bg_eot_dev_cache *g17p_bg_eot_dev_cache;

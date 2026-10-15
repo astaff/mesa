@@ -318,7 +318,8 @@ vk_acceleration_structure_build_state_init(struct vk_acceleration_structure_buil
 
    state->scratch.size = offset;
 
-   if (build_info->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR && args->has_update) {
+   if ((build_info->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
+        state->config.updateable) && args->has_update) {
       state->scratch.update_size = device->as_build_ops->get_update_scratch_size(vk_device_to_handle(device), state);
    } else {
       state->scratch.update_size = offset;
@@ -343,6 +344,7 @@ struct vk_bvh_build_pipeline_layout_key {
 struct vk_bvh_build_pipeline_key {
    enum vk_meta_object_key_type type;
    uint32_t flags;
+   uint32_t morton_phase_dispatch;
 };
 
 VkResult
@@ -379,6 +381,7 @@ vk_get_bvh_build_pipeline_spv(struct vk_device *device, struct vk_meta_device *m
    struct vk_bvh_build_pipeline_key key = {
       .type = type,
       .flags = flags,
+      .morton_phase_dispatch = args->morton_phase_dispatch,
    };
 
    VkPipeline pipeline_from_cache = vk_meta_lookup_pipeline(meta, &key, sizeof(key));
@@ -395,7 +398,7 @@ vk_get_bvh_build_pipeline_spv(struct vk_device *device, struct vk_meta_device *m
       .pCode = spv,
    };
 
-   VkSpecializationMapEntry spec_map[6] = {
+   VkSpecializationMapEntry spec_map[7] = {
       {
          .constantID = SUBGROUP_SIZE_ID,
          .offset = 0,
@@ -427,16 +430,22 @@ vk_get_bvh_build_pipeline_spv(struct vk_device *device, struct vk_meta_device *m
          .offset = sizeof(args->subgroup_size) + sizeof(args->bvh_bounds_offset) +
                    sizeof(flags) + sizeof(args->root_flags_offset) + sizeof(args->morton_sort_workgroup_size),
          .size = sizeof(args->morton_sort_kvs_per_thread),
+      },
+      {
+         .constantID = MORTON_PHASE_DISPATCH_ID,
+         .offset = 6 * sizeof(uint32_t),
+         .size = sizeof(uint32_t),
       }
    };
 
-   uint32_t spec_constants[6] = {
+   uint32_t spec_constants[7] = {
       args->subgroup_size,
       args->bvh_bounds_offset,
       flags,
       args->root_flags_offset,
       args->morton_sort_workgroup_size,
       args->morton_sort_kvs_per_thread,
+      args->morton_phase_dispatch,
    };
 
    VkSpecializationInfo spec_info = {
@@ -707,6 +716,19 @@ build_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
    return VK_SUCCESS;
 }
 
+VkResult
+vk_cmd_build_as_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
+                      struct vk_meta_device *meta,
+                      const struct vk_acceleration_structure_build_args *args,
+                      const struct vk_acceleration_structure_build_state *state)
+{
+   struct vk_acceleration_structure_build_state leaves = *state;
+   leaves.config.internal_type = VK_INTERNAL_BUILD_TYPE_LBVH;
+   leaves.leaf_node_count = 0;
+   return build_leaves(commandBuffer, device, meta, args, &leaves, 1,
+                       state->config.build_flags & VK_LEAF_BUILD_FLAGS);
+}
+
 static VkResult
 morton_generate(VkCommandBuffer commandBuffer, struct vk_device *device,
                 struct vk_meta_device *meta,
@@ -757,18 +779,27 @@ morton_generate(VkCommandBuffer commandBuffer, struct vk_device *device,
          continue;
 
       uint64_t scratch_addr = states[i].build_info->scratchData.deviceAddress;
-      const struct morton_sort_args consts = {
+      struct morton_sort_args consts = {
          .bvh = scratch_addr + states[i].scratch.ir_offset,
          .header = scratch_addr + states[i].scratch.header_offset,
          .ids_even = scratch_addr + states[i].scratch.sort_buffer_offset[0],
          .ids_odd = scratch_addr + states[i].scratch.sort_buffer_offset[1],
          .counts = scratch_addr + states[i].scratch.sort_internal_offset,
          .leaf_count = states[i].leaf_node_count,
+         .pass = UINT32_MAX,
       };
 
-      disp->CmdPushConstants(commandBuffer, layout,
-                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
-      disp->CmdDispatch(commandBuffer, states[i].morton_sort_dispatch_size, 1, 1);
+      const unsigned pass_count = args->morton_phase_dispatch
+         ? states[i].morton_sort_passes : 1;
+      for (unsigned pass = 0; pass < pass_count; ++pass) {
+         if (args->morton_phase_dispatch)
+            consts.pass = pass;
+         disp->CmdPushConstants(commandBuffer, layout,
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(consts), &consts);
+         disp->CmdDispatch(commandBuffer, states[i].morton_sort_dispatch_size, 1, 1);
+         if (pass + 1 < pass_count)
+            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+      }
 
       states[i].scratch_offset = states[i].scratch.sort_buffer_offset[states[i].morton_sort_passes & 0x1];
    }
@@ -1327,6 +1358,13 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
          return;
       }
 
+      if (args->emit_markers &&
+          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
+          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "leaves") == 0) {
+         free(states);
+         return;
+      }
+
       for (uint32_t i = 0; i < infoCount; ++i) {
          if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE) {
             device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.sort_internal_offset,
@@ -1342,6 +1380,13 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
       vk_bvh_build_barrier_transfer_to_compute(commandBuffer);
       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
 
+      if (args->emit_markers &&
+          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
+          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "fills") == 0) {
+         free(states);
+         return;
+      }
+
       result = vk_build_stage(morton_generate, commandBuffer, device, meta, args, states, infoCount, VK_MORTON_BUILD_FLAGS, false);
       if (result != VK_SUCCESS) {
          free(states);
@@ -1351,6 +1396,12 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
 
       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
 
+      if (args->emit_markers &&
+          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
+          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "morton") == 0) {
+         free(states);
+         return;
+      }
 
       if (batch_state.any_late_pair_compression) {
          vk_build_stage(pair_triangles, commandBuffer, device, meta, args, states, infoCount, VK_PAIR_TRIANGLES_BUILD_FLAGS, false);

@@ -4992,7 +4992,7 @@ hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    /* We implicitly scissor to the viewport. We need to do a min/max dance to
     * handle inverted viewports.
     */
-   for (uint32_t i = 0; i < dyn->vp.viewport_count; i++) {
+   for (uint32_t i = 0; i < api_viewports; i++) {
       const VkViewport *vp = &dyn->vp.viewports[i];
 
       minx[i] = MIN2(vp->x, vp->x + vp->width);

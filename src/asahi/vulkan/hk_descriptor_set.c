@@ -93,6 +93,12 @@ write_accel_struct_desc(struct hk_descriptor_set *set,
    VK_FROM_HANDLE(vk_acceleration_structure, accel_struct, _accel_struct);
    uint64_t addr =
       accel_struct ? vk_acceleration_structure_get_va(accel_struct) : 0;
+   if (accel_struct) {
+      struct hk_device *dev = container_of(accel_struct->base.device,
+                                             struct hk_device, vk);
+      if (dev->g17p_native_as)
+         addr = ALIGN_POT(addr, UINT64_C(16384));
+   }
 
    write_desc(set, binding, elem, &addr, sizeof(addr));
 }
@@ -838,6 +844,19 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
                write->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
          }
          break;
+
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+         const VkWriteDescriptorSetAccelerationStructureKHR *write_accel =
+            vk_find_struct_const(write->pNext,
+                                 WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR);
+         for (uint32_t j = 0; j < write->descriptorCount; j++) {
+            write_accel_struct_desc(&set,
+                                    write_accel->pAccelerationStructures[j],
+                                    write->dstBinding,
+                                    write->dstArrayElement + j);
+         }
+         break;
+      }
 
       default:
          break;

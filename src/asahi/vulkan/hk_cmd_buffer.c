@@ -175,6 +175,8 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
 
+   hk_cmd_pool_free_gen1_as_chunks(pool, &cmd->gen1_as_table_chunks);
+
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_MAIN, &cmd->uploader.main.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_USC, &cmd->uploader.usc.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_ROOT, &cmd->uploader.root.bos);
@@ -245,6 +247,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    list_inithead(&cmd->uploader.usc.bos);
    list_inithead(&cmd->uploader.root.bos);
    list_inithead(&cmd->vdm_allocations);
+   list_inithead(&cmd->gen1_as_table_chunks);
    list_inithead(&cmd->control_streams);
 
    *cmd_buffer_out = &cmd->vk;
@@ -1867,6 +1870,16 @@ hk_g17p_graphics_uniform_ranges(
    const uint64_t root_ptr = cmd->state.gfx.root;
    size_t count = 0;
    const unsigned root_uniform = s->info.agx3_root_uniform;
+   const unsigned texture_uniform_base = s->info.agx3_gen1_fragment_rq ? 168 : 0;
+   if (s->info.agx3_gen1_fragment_rq) {
+      if (linked->g17p_prolog_uses_root ||
+          agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) ||
+          hk_cmd_uses_blend_constant(cmd) ||
+          !hk_gen1_upload_fragment_query_state(
+             cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count]))
+         return hk_g17p_graphics_ranges_refused(range_count,count);
+      count++;
+   }
 
    const bool native_spills = s->info.stage == MESA_SHADER_FRAGMENT &&
       agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer);
@@ -1874,9 +1887,9 @@ hk_g17p_graphics_uniform_ranges(
    if (s->info.stage == MESA_SHADER_VERTEX) {
       const unsigned nr_attribs = DIV_ROUND_UP(
          BITSET_LAST_BIT(s->info.vs.attrib_components_read), 4);
-      const unsigned uniform_base = s->info.agx3_indexed_sampler_valid
+      const unsigned uniform_base = (s->info.agx3_indexed_sampler_valid
          ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
-         : 0;
+         : 0) + texture_uniform_base;
       if (nr_attribs > AGX_MAX_VBUFS)
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
@@ -2060,7 +2073,7 @@ hk_g17p_graphics_uniform_ranges(
 
       sources[count] = HK_G17P_RANGE_SOURCE_UPLOADED;
       ranges[count++] = (struct agx3_ioto_uniform_range){
-         .start_halfs = 0,
+         .start_halfs = texture_uniform_base,
          .size_halfs = 8,
          .address = pointers_va,
       };
@@ -2078,7 +2091,7 @@ hk_g17p_graphics_uniform_ranges(
       const uint64_t pointers_va = dev->rodata.indexed_heap_pointers;
       sources[count] = HK_G17P_RANGE_SOURCE_CONSTANT;
       ranges[count++] = (struct agx3_ioto_uniform_range){
-         .start_halfs = 0, .size_halfs = 8, .address = pointers_va,
+         .start_halfs = texture_uniform_base, .size_halfs = 8, .address = pointers_va,
       };
    }
 
@@ -2739,7 +2752,8 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          agfx->shaders[MESA_SHADER_VERTEX] ? hk_bound_hw_vs(agfx) : NULL;
       const uint8_t flags = hk_g17p_launch_flags(cmd, s);
       struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, stage, linked);
-      if (hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
+      if (!s->info.agx3_gen1_fragment_rq &&
+          hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
          const uint64_t published =
             hk_g17p_launch_replay(cmd, launch, linked, cached);
          if (published)

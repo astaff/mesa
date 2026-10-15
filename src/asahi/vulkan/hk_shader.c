@@ -8,6 +8,8 @@
  */
 #include "hk_shader.h"
 #include "hk_nir_sampler_bias.h"
+#include "hk_gen1_rt_indirect_contract.h"
+#include "asahi/compiler/agx_nir_gen1_ray_query.h"
 #include "util/u_debug.h"
 
 #include "hk_nir_ray_tracing.h"
@@ -35,6 +37,7 @@
 
 #include "agx_bo.h"
 #include "hk_cmd_buffer.h"
+#include "pipe/p_defines.h"
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -44,6 +47,7 @@
 #include "hk_sampler.h"
 #include "hk_shader.h"
 #include "hk_nir_sampler_bias.h"
+#include "asahi/compiler/agx_nir_gen1_ray_query.h"
 
 #include "nir_builder_opcodes.h"
 #include "nir_builtin_builder.h"
@@ -244,9 +248,75 @@ hk_fs_force_shader_depth_write(nir_shader *nir)
    nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DEPTH);
 }
 
+static bool
+hk_cf_list_has_ray_query(struct exec_list *cf_list)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_intrinsic_is_ray_query(nir_instr_as_intrinsic(instr)->intrinsic))
+               return true;
+         }
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (hk_cf_list_has_ray_query(&nif->then_list) ||
+             hk_cf_list_has_ray_query(&nif->else_list))
+            return true;
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (hk_cf_list_has_ray_query(&loop->body))
+            return true;
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return false;
+}
+
+static void
+hk_keep_ray_query_loops(struct exec_list *cf_list)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         hk_keep_ray_query_loops(&nif->then_list);
+         hk_keep_ray_query_loops(&nif->else_list);
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (hk_cf_list_has_ray_query(&loop->body))
+            loop->control = nir_loop_control_dont_unroll;
+         hk_keep_ray_query_loops(&loop->body);
+      }
+   }
+}
+
+static bool
+hk_nir_has_ray_query(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      if (hk_cf_list_has_ray_query(&impl->body))
+         return true;
+   }
+   return false;
+}
+
 void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
+   if ((nir->info.stage == MESA_SHADER_VERTEX ||
+        nir->info.stage == MESA_SHADER_TESS_EVAL) &&
+       debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_KEEP_LOOPS_DIAGNOSTIC", false)) {
+      nir_foreach_function_impl(impl, nir)
+         hk_keep_ray_query_loops(&impl->body);
+   }
+
    /* Must lower before io to temps */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_lower_terminate_to_demote);
@@ -345,7 +415,10 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
 {
    hk_preprocess_nir_internal(vk_pdev, nir);
    nir_lower_compute_system_values_options csv_options = {
-      .has_base_workgroup_id = true,
+      
+
+
+      .has_base_workgroup_id = nir->info.stage == MESA_SHADER_COMPUTE,
    };
    NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
 }
@@ -2019,7 +2092,34 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * memory is laid out, because the pass introduces shader temporaries that
     * nir_lower_vars_to_ssa still has to promote. */
    if (nir->info.ray_queries > 0) {
-      NIR_PASS(_, nir, hk_nir_lower_ray_queries);
+      if(dev->gen1_native_rq) {
+         NIR_PASS(_, nir, nir_opt_ray_queries);
+         NIR_PASS(_, nir, nir_opt_ray_query_ranges);
+         const struct agx_gen1_ray_query_layout layout={
+            .payload_uniform=dev->gen1_rq_candidates ? 118 : 124,.bvh_uniform=96,
+            .status_uniform=dev->gen1_rq_candidates ? 128 : dev->gen1_rq_instances ? 130 : 128,
+            .instance_traversal=dev->gen1_rq_instances,.candidates=dev->gen1_rq_candidates,
+            .as_table_first=dev->gen1_rq_instances ? HK_GEN1_AS_TABLE_AS_SLOTS : 1,
+            .launch_header = dev->gen1_rq_candidates ? 0x210000 : 0x110000,
+            .context_uniform=160,.as_table_uniform=164,
+            .fragment_shader=dev->gen1_native_fragment_rq,
+            .graphics_stage = dev->gen1_native_graphics_rq &&
+               ((nir->info.stage == MESA_SHADER_VERTEX &&
+                 !(next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                      VK_SHADER_STAGE_GEOMETRY_BIT))) ||
+                (nir->info.stage == MESA_SHADER_TESS_EVAL &&
+                 !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT))),
+            .compute_kernel = dev->gen1_native_graphics_rq,
+            .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
+               ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
+         };
+         if(!agx_nir_lower_gen1_ray_query(nir,&layout)) {
+            mesa_loge("Gen1 native ray query: unsupported shape or operation");
+            return;
+         }
+      } else {
+         NIR_PASS(_, nir, hk_nir_lower_ray_queries);
+      }
 
       /* The pass replaces every ray-query variable with ordinary temporaries
        * and lowers every rq_* intrinsic, so the source count is now stale.
@@ -2790,6 +2890,20 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 {
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
+   if ((sw_stage == MESA_SHADER_FRAGMENT && dev->gen1_native_fragment_rq) ||
+       (sw_stage != MESA_SHADER_FRAGMENT && sw_stage != MESA_SHADER_COMPUTE &&
+        dev->gen1_native_graphics_rq)) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic ==
+                      nir_intrinsic_intersect_ray_gen1_agx)
+                  shader->info.agx3_gen1_fragment_rq = true;
+            }
+         }
+      }
+   }
 
    /* The last VS/TES variant may pass xfb_info owned by this very NIR.
     * Resource lowering can replace and free that NIR below. Preserve its
@@ -3111,15 +3225,22 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                       ? AGX_G17P_TXF_ROOT_HALFS
                       : 0;
    const unsigned vertex_uniform_base =
-      sw_stage == MESA_SHADER_VERTEX &&
-      shader->info.agx3_indexed_sampler_valid
+      (sw_stage == MESA_SHADER_VERTEX &&
+       shader->info.agx3_indexed_sampler_valid
          ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
-         : 0;
+         : 0) +
+      (sw_stage == MESA_SHADER_VERTEX && shader->info.agx3_gen1_fragment_rq
+         ? 168 : 0);
    if (sw_stage == MESA_SHADER_FRAGMENT)
       root = AGX_ABI_FUNI_ROOT;
    else if (sw_stage == MESA_SHADER_VERTEX)
       root = vertex_uniform_base + AGX_ABI_VUNI_COUNT_VK(nr_vbos);
 
+   const unsigned texture_uniform_base =
+      ((sw_stage == MESA_SHADER_COMPUTE && dev->gen1_native_rq) ||
+       shader->info.agx3_gen1_fragment_rq) ? 168 : 0;
+   if (sw_stage != MESA_SHADER_VERTEX || !shader->info.agx3_gen1_fragment_rq)
+      root += texture_uniform_base;
    shader->info.set_count = set_count;
    shader->info.agx3_root_uniform = root;
 
@@ -3153,6 +3274,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    struct agx_shader_key backend_key = {
       .reserved_preamble = root + (4 * (1 + set_count)),
+      .g17p_texture_uniform_base = texture_uniform_base,
       .dev = agx_gather_device_key(&dev->dev),
       .no_stop = nir->info.stage == MESA_SHADER_FRAGMENT,
       .has_scratch = !nir->info.internal,
@@ -3947,7 +4069,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
                unsigned nr = DIV_ROUND_UP(
                   BITSET_LAST_BIT(shader->info.vs.attrib_components_read), 4);
-               agx_nir_lower_non_monolithic_uniforms(clone, nr);
+               agx_nir_lower_non_monolithic_uniforms_at(clone, nr,
+                  dev->gen1_native_graphics_rq && hk_nir_has_ray_query(clone) ? 168 : 0);
             }
          }
 
@@ -4026,6 +4149,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    *shader_out = obj;
    return VK_SUCCESS;
 }
+
 
 VkResult
 hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,

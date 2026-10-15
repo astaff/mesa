@@ -72,6 +72,8 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
       agx_chip_descriptor_generation(dev->chip),
       agx_chip_sampler_generation(dev->chip),
       agx_chip_sampler_heap_element_size(dev->chip),
+      hk_g17p_rt_enabled(dev->chip),
+      hk_g17p_rt_enabled(dev->chip),
    };
 
    _mesa_blake3_update(ctx, values, sizeof(values));
@@ -432,13 +434,14 @@ hk_get_device_features(
       .rayTraversalPrimitiveCulling = supported_extensions->KHR_ray_query ||
                                       supported_extensions->KHR_ray_tracing_pipeline,
 
-      /* VK_KHR_ray_tracing_pipeline.  Shader-group handle capture/replay is
-       * off because shaderGroupHandleCaptureReplaySize is zero: a handle is a
-       * device-unique index with nothing to replay.  The pipeline stack size
+      /* VK_KHR_ray_tracing_pipeline.  The pipeline stack size
        * is static scratch in the compiled megakernel, so the dynamic state
        * cannot change it and is not advertised either. */
       .rayTracingPipeline = supported_extensions->KHR_ray_tracing_pipeline,
-      .rayTracingPipelineShaderGroupHandleCaptureReplay = false,
+      .pipelineLibraryGroupHandles =
+         supported_extensions->EXT_pipeline_library_group_handles,
+      .rayTracingPipelineShaderGroupHandleCaptureReplay =
+         supported_extensions->KHR_ray_tracing_pipeline,
       .rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false,
       .rayTracingPipelineTraceRaysIndirect =
          supported_extensions->KHR_ray_tracing_pipeline,
@@ -1013,7 +1016,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH,
       .maxShaderGroupStride = 16384,
       .shaderGroupBaseAlignment = 64,
-      .shaderGroupHandleCaptureReplaySize = 0,
+      .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
       .maxRayDispatchInvocationCount = 1u << 30,
       .shaderGroupHandleAlignment = 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
@@ -1670,6 +1673,15 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_device_extension_table supported_extensions;
    hk_get_device_extensions(instance, &supported_extensions);
+   if (hk_g17p_rt_enabled(pdev->dev.chip)) {
+      supported_extensions.KHR_acceleration_structure = true;
+      supported_extensions.KHR_deferred_host_operations = true;
+      supported_extensions.KHR_ray_query = true;
+      supported_extensions.KHR_ray_tracing_pipeline = true;
+      supported_extensions.EXT_pipeline_library_group_handles = true;
+      supported_extensions.KHR_ray_tracing_maintenance1 = true;
+   }
+
 
    if (pdev->dev.chip == AGX_CHIP_G17P) {
       /* Advanced blending is hardware-qualified on A18 Pro for every

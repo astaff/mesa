@@ -431,6 +431,7 @@ TYPE(vk_prefix_scan_partition, 4);
 #define ROOT_FLAGS_OFFSET_ID 3
 #define MORTON_SORT_WORKGROUP_SIZE_ID 4
 #define MORTON_SORT_KVS_PER_THREAD_ID 5
+#define MORTON_PHASE_DISPATCH_ID 6
 
 #define VK_BUILD_FLAG_ALWAYS_ACTIVE (1 << 0)
 #define VK_BUILD_FLAG_PROPAGATE_CULL_FLAGS (1 << 1)
@@ -458,6 +459,7 @@ struct morton_sort_args {
    VOID_REF ids_odd;
    REF(morton_ready_count) counts;
    uint32_t leaf_count;
+   uint32_t pass;
 };
 
 #define LBVH_RIGHT_CHILD_BIT_SHIFT 29

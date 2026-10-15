@@ -198,7 +198,7 @@ bool hk_agx3_g17p_direct_color_resolve_supported(
    bool has_resolve_target, bool average_resolve, bool store_source);
 
 #define HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 6144u
-#define HK_AGX3_G17P_MAX_ROOT_SETS            8u
+#define HK_AGX3_G17P_MAX_ROOT_SETS            16u
 
 /* Resolve a packed precompiled-kernel argument block to the dword-granular
  * upload and uniform-range sizes required by G17P's Ioto loader. */

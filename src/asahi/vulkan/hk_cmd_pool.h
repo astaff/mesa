@@ -61,6 +61,15 @@ hk_g17p_cached_cmd_memory(const struct agx_device *dev)
    return dev->chip == AGX_CHIP_G17P && util_has_cache_ops();
 }
 
+struct hk_cmd_pool;
+struct hk_gen1_as_table_chunk;
+void hk_device_finish_gen1_as_chunks(struct hk_device *dev);
+VkResult hk_cmd_pool_alloc_gen1_as_chunk(struct hk_cmd_pool *pool,
+                                          uint32_t count,
+                                          struct hk_gen1_as_table_chunk **out);
+void hk_cmd_pool_free_gen1_as_chunks(struct hk_cmd_pool *pool,
+                                      struct list_head *chunks);
+
 void hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation);
 
 /* A VDM record's pointer is 40 bits and hardware reads bit 39 as the UAT
@@ -83,6 +92,8 @@ struct hk_cmd_pool {
    /** Recyclable hk_cmd_bo lists, kept separate by mapping and VA policy. */
    struct list_head free_bos[HK_CMD_BO_TYPE_COUNT];
    uint32_t num_free_bos[HK_CMD_BO_TYPE_COUNT];
+   struct list_head free_gen1_as_chunks[2];
+   uint32_t num_free_gen1_as_chunks[2];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_cmd_pool, vk.base, VkCommandPool,
