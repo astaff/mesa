@@ -55,6 +55,36 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
                  unsigned num_components, const uint8_t *swizzle,
                  struct match_state *state);
 static bool
+nir_algebraic_automaton_alu(nir_alu_instr *alu, struct util_dynarray *states,
+                           const struct per_op_table *tbl)
+{
+   const nir_op op = alu->op;
+   if (tbl->num_filtered_states == 0)
+      return false;
+
+   /* Calculate the index into the transition table. Note the index
+    * calculated must match the iteration order of Python's
+    * itertools.product(), which was used to emit the transition
+    * table.
+    */
+   unsigned index = 0;
+   for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
+      index *= tbl->num_filtered_states;
+      if (tbl->filter)
+         index += tbl->filter[*util_dynarray_element(states, uint16_t,
+                                                     alu->src[i].src.ssa->index)];
+   }
+
+   uint16_t *state = util_dynarray_element(states, uint16_t,
+                                           alu->def.index);
+   if (*state != tbl->table[index]) {
+      *state = tbl->table[index];
+      return true;
+   }
+   return false;
+}
+
+static bool
 nir_algebraic_automaton(nir_instr *instr, struct util_dynarray *states,
                         const struct per_op_table *pass_op_table);
 
@@ -765,32 +795,9 @@ nir_algebraic_automaton(nir_instr *instr, struct util_dynarray *states,
    switch (instr->type) {
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
-      nir_op op = alu->op;
-      uint16_t search_op = nir_search_op_for_nir_op(op);
-      const struct per_op_table *tbl = &pass_op_table[search_op];
-      if (tbl->num_filtered_states == 0)
-         return false;
-
-      /* Calculate the index into the transition table. Note the index
-       * calculated must match the iteration order of Python's
-       * itertools.product(), which was used to emit the transition
-       * table.
-       */
-      unsigned index = 0;
-      for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
-         index *= tbl->num_filtered_states;
-         if (tbl->filter)
-            index += tbl->filter[*util_dynarray_element(states, uint16_t,
-                                                        alu->src[i].src.ssa->index)];
-      }
-
-      uint16_t *state = util_dynarray_element(states, uint16_t,
-                                              alu->def.index);
-      if (*state != tbl->table[index]) {
-         *state = tbl->table[index];
-         return true;
-      }
-      return false;
+      uint16_t search_op = nir_search_op_for_nir_op(alu->op);
+      return nir_algebraic_automaton_alu(alu, states,
+                                        &pass_op_table[search_op]);
    }
 
    case nir_instr_type_load_const: {
@@ -877,10 +884,20 @@ nir_algebraic_impl(nir_function_impl *impl,
    /* Walk top-to-bottom setting up the automaton state. */
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
-         nir_algebraic_automaton(instr, &states, table->pass_op_table);
          instr->pass_flags = 0;
-         if (instr->type == nir_instr_type_alu)
+         if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            const uint16_t op = nir_search_op_for_nir_op(alu->op);
+            const struct per_op_table *tbl = &table->pass_op_table[op];
+            if (tbl->num_filtered_states == 0 &&
+                table->transforms[table->transform_offsets[0]].condition_offset ==
+                   ~0u)
+               continue;
+            nir_algebraic_automaton_alu(alu, &states, tbl);
             nir_instr_worklist_push_tail(&worklist, instr);
+         } else {
+            nir_algebraic_automaton(instr, &states, table->pass_op_table);
+         }
       }
    }
 

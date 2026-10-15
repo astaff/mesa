@@ -357,6 +357,196 @@ TEST_F(nir_opt_algebraic_test, initial_worklist_order_and_flags)
    }
 }
 
+static void
+filter_variable(nir_search_value_union &value, unsigned bits = 0)
+{
+   value.variable = {};
+   value.variable.value.type = nir_search_value_variable;
+   value.variable.value.bit_size = bits;
+   value.variable.cond_index = -1;
+   for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; ++i)
+      value.variable.swizzle[i] = i;
+}
+
+static void
+filter_expression(nir_search_value_union &value, uint16_t op, unsigned src,
+                  unsigned bits = 0, int condition = -1)
+{
+   value.expression = {};
+   value.expression.value.type = nir_search_value_expression;
+   value.expression.value.bit_size = bits;
+   value.expression.opcode = op;
+   value.expression.srcs[0] = src;
+   value.expression.swizzle = -1;
+   value.expression.comm_expr_idx = -1;
+   value.expression.cond_index = condition;
+}
+
+static nir_intrinsic_instr *
+filter_store(nir_builder *build, nir_def *value)
+{
+   nir_intrinsic_instr *store =
+      nir_intrinsic_instr_create(build->shader, nir_intrinsic_store_ssbo);
+   store->num_components = value->num_components;
+   store->src[0] = nir_src_for_ssa(value);
+   store->src[1] = nir_src_for_ssa(nir_imm_int(build, 0));
+   store->src[2] = nir_src_for_ssa(nir_imm_int(build, 0));
+   nir_intrinsic_set_write_mask(store, BITFIELD_MASK(value->num_components));
+   nir_intrinsic_set_align_mul(store, 1);
+   nir_builder_instr_insert(build, &store->instr);
+   return store;
+}
+
+TEST_F(nir_opt_algebraic_test, absent_opcodes_keep_state_zero_rules)
+{
+   for (bool supported : {false, true}) {
+      SCOPED_TRACE(supported);
+      b->cursor = nir_after_cf_list(&b->impl->body);
+      nir_def *input = nir_imm_int(b, 37);
+      nir_def *value = nir_inot(b, nir_inot(b, input));
+      nir_intrinsic_instr *store = filter_store(b, value);
+      nir_search_value_union values[3] = {};
+      filter_variable(values[0]);
+      filter_expression(values[1], nir_op_inot, 0);
+      filter_expression(values[2], nir_op_inot, 1);
+      const uint16_t transition[] = {0};
+      std::vector<per_op_table> operations(nir_num_search_ops);
+      if (supported) {
+         operations[nir_op_inot].num_filtered_states = 1;
+         operations[nir_op_inot].table = transition;
+      }
+      const struct transform transforms[] = {{2, 0, 0}, {0, 0, ~0u}};
+      const uint16_t offsets[] = {0, 1, 1};
+      nir_algebraic_table table = {};
+      table.transforms = transforms;
+      table.transform_offsets = offsets;
+      table.pass_op_table = operations.data();
+      table.values = values;
+      const bool enabled[] = {true};
+      ASSERT_TRUE(nir_algebraic_impl(b->impl, enabled, &table));
+      EXPECT_EQ(store->src[0].ssa, input);
+      nir_validate_shader(b->shader, "state zero rule retained");
+      nir_opt_constant_folding(b->shader);
+      EXPECT_EQ(nir_src_as_uint(store->src[0]), 37u);
+   }
+}
+
+static std::vector<unsigned> filter_eligible_visits;
+
+static bool
+record_filter_eligible(const nir_alu_instr *instr)
+{
+   filter_eligible_visits.push_back(instr->def.index);
+   return true;
+}
+
+TEST_F(nir_opt_algebraic_test, newly_eligible_users_remain_queued)
+{
+   nir_def *input = nir_load_local_invocation_index(b);
+   nir_def *opaque = nir_iadd(b, input, nir_imm_int(b, 1));
+   nir_def *single_not = nir_inot(b, opaque);
+   nir_def *inner_neg = nir_ineg(b, single_not);
+   nir_def *outer_neg = nir_ineg(b, inner_neg);
+   nir_def *parent = nir_inot(b, outer_neg);
+   nir_intrinsic_instr *store = filter_store(b, parent);
+   const unsigned neg_index = outer_neg->index;
+   const unsigned parent_index = parent->index;
+   nir_search_value_union values[5] = {};
+   filter_variable(values[0]);
+   filter_expression(values[1], nir_op_inot, 0);
+   filter_expression(values[2], nir_op_inot, 1, 0, 0);
+   filter_expression(values[3], nir_op_ineg, 0);
+   filter_expression(values[4], nir_op_ineg, 3, 0, 0);
+   const uint16_t not_filter[] = {0, 0, 1, 1, 0, 0};
+   const uint16_t neg_filter[] = {0, 0, 0, 0, 1, 1};
+   const uint16_t not_transition[] = {2, 3};
+   const uint16_t neg_transition[] = {4, 5};
+   std::vector<per_op_table> operations(nir_num_search_ops);
+   operations[nir_op_inot] = {not_filter, 2, not_transition};
+   operations[nir_op_ineg] = {neg_filter, 2, neg_transition};
+   const struct transform transforms[] = {
+      {0, 0, ~0u}, {2, 0, 0}, {0, 0, ~0u}, {4, 0, 0}, {0, 0, ~0u},
+   };
+   const uint16_t offsets[] = {0, 0, 0, 1, 0, 3};
+   const nir_search_expression_cond conditions[] = {record_filter_eligible};
+   nir_algebraic_table table = {};
+   table.transforms = transforms;
+   table.transform_offsets = offsets;
+   table.pass_op_table = operations.data();
+   table.values = values;
+   table.expression_cond = conditions;
+   const bool enabled[] = {true};
+   filter_eligible_visits.clear();
+   ASSERT_TRUE(nir_algebraic_impl(b->impl, enabled, &table));
+   EXPECT_EQ(store->src[0].ssa, opaque);
+   EXPECT_EQ(filter_eligible_visits,
+             (std::vector<unsigned>{neg_index, parent_index}));
+   nir_validate_shader(b->shader, "newly eligible user");
+   filter_eligible_visits.clear();
+   EXPECT_FALSE(nir_algebraic_impl(b->impl, enabled, &table));
+   EXPECT_TRUE(filter_eligible_visits.empty());
+}
+
+TEST_F(nir_opt_algebraic_test, filtered_opcodes_use_conversion_search_class)
+{
+   nir_def *input = nir_u2u16(b, nir_load_local_invocation_index(b));
+   nir_def *middle = nir_build_alu(b, nir_op_i2i32, input, nullptr, nullptr, nullptr);
+   nir_def *root = nir_build_alu(b, nir_op_i2i64, middle, nullptr, nullptr, nullptr);
+   nir_intrinsic_instr *store = filter_store(b, root);
+   nir_search_value_union values[4] = {};
+   filter_variable(values[0], 16);
+   filter_expression(values[1], nir_search_op_i2i, 0, 32);
+   filter_expression(values[2], nir_search_op_i2i, 1, 64);
+   filter_expression(values[3], nir_search_op_i2i, 0, 64);
+   const uint16_t transition[] = {2};
+   std::vector<per_op_table> operations(nir_num_search_ops);
+   operations[nir_search_op_i2i] = {nullptr, 1, transition};
+   const struct transform transforms[] = {{2, 3, 0}, {0, 0, ~0u}};
+   const uint16_t offsets[] = {1, 1, 0};
+   nir_algebraic_table table = {};
+   table.transforms = transforms;
+   table.transform_offsets = offsets;
+   table.pass_op_table = operations.data();
+   table.values = values;
+   const bool enabled[] = {true};
+   ASSERT_TRUE(nir_algebraic_impl(b->impl, enabled, &table));
+   nir_alu_instr *result = nir_src_as_alu(store->src[0]);
+   ASSERT_NE(result, nullptr);
+   EXPECT_EQ(result->op, nir_op_i2i64);
+   EXPECT_EQ(result->src[0].src.ssa, input);
+   EXPECT_EQ(result->def.bit_size, 64u);
+   nir_validate_shader(b->shader, "conversion search class");
+}
+
+TEST_F(nir_opt_algebraic_test, skipped_opcodes_have_flags_cleared)
+{
+   nir_def *input = nir_load_local_invocation_index(b);
+   nir_def *opaque = nir_iadd(b, input, nir_imm_int(b, 1));
+   nir_intrinsic_instr *store = filter_store(b, opaque);
+   std::vector<nir_instr *> visited;
+   nir_foreach_block(block, b->impl) {
+      nir_foreach_instr(instr, block) {
+         instr->pass_flags = 0x5a;
+         visited.push_back(instr);
+      }
+   }
+   std::vector<per_op_table> operations(nir_num_search_ops);
+   const struct transform transforms[] = {{0, 0, ~0u}};
+   const uint16_t offsets[] = {0, 0};
+   nir_search_value_union values[1] = {};
+   nir_algebraic_table table = {};
+   table.transforms = transforms;
+   table.transform_offsets = offsets;
+   table.pass_op_table = operations.data();
+   table.values = values;
+   const bool enabled[] = {true};
+   EXPECT_FALSE(nir_algebraic_impl(b->impl, enabled, &table));
+   EXPECT_EQ(store->src[0].ssa, opaque);
+   EXPECT_GT(visited.size(), 1u);
+   for (nir_instr *instr : visited)
+      EXPECT_EQ(instr->pass_flags, 0u);
+}
+
 TEST_F(nir_opt_algebraic_test, bounds_agx_unsigned_end_and_bound)
 {
    for (unsigned bits : {8u, 16u, 32u, 64u}) {
