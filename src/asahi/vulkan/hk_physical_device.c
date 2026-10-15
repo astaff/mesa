@@ -909,6 +909,7 @@ hk_get_device_features(
       features->shaderQuadControl = false;
       features->computeDerivativeGroupQuads = true;
       features->computeDerivativeGroupLinear = true;
+      features->textureCompressionASTC_HDR = true;
    }
 
    /* A multiview promise for a stage this device does not expose is
@@ -1786,6 +1787,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_compute_shader_derivatives = true;
       supported_extensions.EXT_shader_atomic_float = true;
       supported_extensions.EXT_shader_atomic_float2 = true;
+      supported_extensions.EXT_texture_compression_astc_hdr = true;
    }
 
    struct vk_features supported_features;
