@@ -100,6 +100,13 @@ check_native_minmax(void)
       uint64_t word;
       memcpy(&word, out.opaque, sizeof(word));
       assert(word == cases[i].word);
+
+      /* hk_nir_lower_descriptors' Gen10 compute LOD query reads the
+       * descriptor's copy of this word: bias is signed 5:6 at bits 43..53
+       * of the high half (bits 11..21), and max LOD is 4:6 at bits 10..19. */
+      const uint32_t high = (uint32_t)(word >> 32);
+      assert((int32_t)(high << 10) >> 21 == (int32_t)(cases[i].bias * 64));
+      assert(((uint32_t)word >> 10 & 0x3ff) == 14 * 64);
    }
 }
 
@@ -147,6 +154,14 @@ main(void)
    for (unsigned i = sizeof(expected_hal200); i < sizeof(g17p); ++i)
       assert(((const uint8_t *)&g17p)[i] == 0);
    assert(memcmp(&gen5, expected_gen5, sizeof(expected_gen5)) == 0);
+   {
+      /* The fields the Gen10 compute LOD query decodes from this word. */
+      const uint32_t lo = gen5.opaque[0], hi = gen5.opaque[1];
+      assert((lo & 0x3ff) == 64);                             /* min LOD 1 */
+      assert((lo >> 10 & 0x3ff) == 15 * 64);       /* max LOD 100 -> 15 */
+      assert((lo >> 27 & 3) == AGX_MIP_FILTER_LINEAR);
+      assert((int32_t)(hi << 10) >> 21 == -65);     /* bias -1.015625 */
+   }
 
    /* A disabled compare must retain the exact mature Gen4 bytes: compare
     * function bits were historically left at their header default. */
