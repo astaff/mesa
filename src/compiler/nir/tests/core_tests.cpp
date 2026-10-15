@@ -27,6 +27,7 @@ extern "C" {
 #include "nir_control_flow.h"
 }
 #include <vector>
+#include <algorithm>
 #include <string>
 
 namespace {
@@ -426,6 +427,138 @@ TEST_F(nir_core_test, clone_cf_list_preserves_external_sources_and_remap)
    nir_validate_shader(b->shader, "CF list clone fallback");
    nir_validate_ssa_dominance(b->shader, "CF list clone fallback");
    _mesa_hash_table_destroy(remap, nullptr);
+}
+
+TEST_F(nir_core_test, clone_local_declarations_preserve_mapping_context)
+{
+   struct local_case {
+      nir_function_impl *impl;
+      unsigned capacity;
+      std::vector<nir_variable *> variables;
+   };
+   std::vector<local_case> cases;
+   for (unsigned holes : {126u, 127u}) {
+      for (unsigned count : {0u, 12u, 13u, 16u, 64u}) {
+         std::string name = "mapped_locals_" + std::to_string(holes) + "_" +
+                            std::to_string(count);
+         nir_function *function = nir_function_create(b->shader, name.c_str());
+         nir_function_impl *impl = nir_function_impl_create(function);
+         nir_builder build = nir_builder_create(impl);
+         build.cursor = nir_after_block(nir_start_block(impl));
+         clone_sparse_sum(&build, holes, 47);
+         std::vector<nir_variable *> variables;
+         for (unsigned i = 0; i < count; ++i) {
+            std::string variable_name = "local_" + std::to_string(i);
+            variables.push_back(nir_local_variable_create(
+               impl, glsl_int_type(), variable_name.c_str()));
+         }
+         cases.push_back({impl, impl->ssa_alloc, variables});
+      }
+   }
+   nir_validate_shader(b->shader, "local-context clone source");
+   nir_shader *copy = nir_shader_clone(nullptr, b->shader);
+   nir_validate_shader(copy, "local-context clone result");
+   nir_validate_ssa_dominance(copy, "local-context clone result");
+   for (const local_case &source : cases) {
+      nir_function_impl *impl = clone_find_impl(copy, source.impl->function->name);
+      ASSERT_NE(impl, nullptr);
+      std::vector<nir_variable *> variables;
+      foreach_list_typed(nir_variable, var, node, &impl->locals)
+         variables.push_back(var);
+      ASSERT_EQ(variables.size(), source.variables.size());
+      for (unsigned i = 0; i < variables.size(); ++i) {
+         EXPECT_NE(variables[i], source.variables[i]);
+         EXPECT_EQ(variables[i]->type, source.variables[i]->type);
+         EXPECT_STREQ(variables[i]->name, source.variables[i]->name);
+         EXPECT_EQ(static_cast<unsigned>(variables[i]->data.mode),
+                   static_cast<unsigned>(nir_var_function_temp));
+      }
+      nir_alu_instr *sum = clone_find_sum(impl);
+      ASSERT_NE(sum, nullptr);
+      EXPECT_EQ(nir_src_as_uint(sum->src[0].src), 47u);
+      EXPECT_EQ(nir_src_as_uint(sum->src[1].src), 54u);
+      EXPECT_EQ(source.impl->ssa_alloc, source.capacity);
+   }
+   ralloc_free(copy);
+}
+
+TEST_F(nir_core_test, clone_body_blocks_preserve_edges_and_conditions)
+{
+   struct block_case {
+      nir_function_impl *impl;
+      unsigned capacity;
+      unsigned if_count;
+   };
+   std::vector<block_case> cases;
+   for (unsigned holes : {125u, 126u}) {
+      for (unsigned count : {0u, 3u, 4u, 8u, 9u, 10u, 32u}) {
+         std::string name = "mapped_blocks_" + std::to_string(holes) + "_" +
+                            std::to_string(count);
+         nir_function *function = nir_function_create(b->shader, name.c_str());
+         nir_function_impl *impl = nir_function_impl_create(function);
+         nir_builder build = nir_builder_create(impl);
+         build.cursor = nir_after_block(nir_start_block(impl));
+         clone_sparse_sum(&build, holes, 71);
+         nir_def *condition = nir_imm_bool(&build, true);
+         for (unsigned i = 0; i < count; ++i) {
+            nir_if *nif = nir_push_if(&build, condition);
+            nir_push_else(&build, nif);
+            nir_pop_if(&build, nif);
+         }
+         cases.push_back({impl, impl->ssa_alloc, count});
+      }
+   }
+   nir_validate_shader(b->shader, "block-context clone source");
+   nir_shader *copy = nir_shader_clone(nullptr, b->shader);
+   nir_validate_shader(copy, "block-context clone result");
+   nir_validate_ssa_dominance(copy, "block-context clone result");
+   for (const block_case &source : cases) {
+      nir_function_impl *impl = clone_find_impl(copy, source.impl->function->name);
+      ASSERT_NE(impl, nullptr);
+      std::vector<nir_block *> old_blocks, new_blocks;
+      nir_foreach_block(block, source.impl)
+         old_blocks.push_back(block);
+      nir_foreach_block(block, impl)
+         new_blocks.push_back(block);
+      ASSERT_EQ(old_blocks.size(), new_blocks.size());
+      EXPECT_EQ(old_blocks.size(), 1u + 3u * source.if_count);
+      unsigned conditions = 0;
+      nir_def *new_condition = nullptr;
+      for (unsigned i = 0; i < old_blocks.size(); ++i) {
+         for (unsigned edge = 0; edge < 2; ++edge) {
+            nir_block *successor = old_blocks[i]->successors[edge];
+            if (!successor) {
+               EXPECT_EQ(new_blocks[i]->successors[edge], nullptr);
+            } else if (successor == source.impl->end_block) {
+               EXPECT_EQ(new_blocks[i]->successors[edge], impl->end_block);
+            } else {
+               auto found = std::find(old_blocks.begin(), old_blocks.end(), successor);
+               ASSERT_NE(found, old_blocks.end());
+               EXPECT_EQ(new_blocks[i]->successors[edge],
+                         new_blocks[found - old_blocks.begin()]);
+            }
+         }
+         nir_cf_node *old_next = nir_cf_node_next(&old_blocks[i]->cf_node);
+         if (old_next && old_next->type == nir_cf_node_if) {
+            nir_cf_node *new_next = nir_cf_node_next(&new_blocks[i]->cf_node);
+            ASSERT_NE(new_next, nullptr);
+            ASSERT_EQ(static_cast<unsigned>(new_next->type),
+                      static_cast<unsigned>(nir_cf_node_if));
+            nir_if *old_if = nir_cf_node_as_if(old_next);
+            nir_if *new_if = nir_cf_node_as_if(new_next);
+            EXPECT_NE(new_if->condition.ssa, old_if->condition.ssa);
+            ASSERT_TRUE(nir_src_is_const(new_if->condition));
+            EXPECT_TRUE(nir_def_as_load_const(new_if->condition.ssa)->value[0].b);
+            if (!new_condition)
+               new_condition = new_if->condition.ssa;
+            EXPECT_EQ(new_if->condition.ssa, new_condition);
+            ++conditions;
+         }
+      }
+      EXPECT_EQ(conditions, source.if_count);
+      EXPECT_EQ(source.impl->ssa_alloc, source.capacity);
+   }
+   ralloc_free(copy);
 }
 
 }

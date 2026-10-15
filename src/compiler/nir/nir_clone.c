@@ -742,12 +742,14 @@ clone_function_impl(clone_state *state, const nir_function_impl *fi)
    state->impl = nfi;
    assert(!state->defs);
    if (state->dense_def_remap && fi->ssa_alloc) {
-      uint64_t num_defs = 0;
+      uint64_t num_defs = 0, num_blocks = 0;
       nir_foreach_block_unstructured(block, (nir_function_impl *)fi) {
+         num_blocks++;
          nir_foreach_instr(instr, block)
             nir_foreach_def(instr, count_clone_def, &num_defs);
       }
-      uint64_t capacity_bytes = _mesa_hash_table_entry_capacity_bytes(num_defs);
+      uint64_t capacity_bytes = _mesa_hash_table_entry_capacity_bytes(
+         num_defs + num_blocks + exec_list_length(&fi->locals));
       if (num_defs && capacity_bytes &&
           (uint64_t)fi->ssa_alloc * sizeof(*state->defs) <= capacity_bytes) {
          state->num_defs = fi->ssa_alloc;
