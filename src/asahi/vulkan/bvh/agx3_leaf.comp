@@ -28,6 +28,10 @@
 
 #include "hk_build_interface.h"
 
+#ifndef HK_AGX3_GEN1
+#define HK_AGX3_GEN1 0
+#endif
+
 layout(local_size_x = 8) in;
 #ifdef HK_AGX3_BATCH
 layout(push_constant) uniform CONSTS
@@ -233,7 +237,6 @@ main()
    args.status = entry.node_status;
    args.job_count = DEREF(entry.plan.state).job_count;
    args.reserved = entry.plan.reserved;
-   args.gen1 = 0;
    id = mapping.node;
 #endif
    if (id >= args.job_count)
@@ -247,7 +250,7 @@ main()
     * (class 5, one record per slot) is the ASAHI_M5_AABB_RECORD_STRIDE
     * diagnostic. Both decode in Apple's extractor; only hardware traversal
     * distinguishes them. */
-   uint aabb_stride = args.gen1 != 0 || args.reserved == 64u ? 64u : 48u;
+   uint aabb_stride = HK_AGX3_GEN1 != 0 || args.reserved == 64u ? 64u : 48u;
    if (count < 1u || count > 8 ||
        job.node_kind > HK_AGX3_NODE_AABBS) {
       if (lane == 0)
@@ -276,7 +279,7 @@ main()
             if (lower[lane][a] > upper[lane][a])
                atomicOr(bad, HK_AGX3_LEAF_RANGE);
          }
-         if (aabbs && args.gen1 == 0) {
+         if (aabbs && HK_AGX3_GEN1 == 0) {
             REF(vk_ir_aabb_node) box = REF(vk_ir_aabb_node)(
                OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
             /* The native record keeps the geometry id in the low 30 bits and
@@ -346,7 +349,7 @@ main()
           * single-AABB geometries passed). */
          root[0] =
             uint64_t((instances ? 0xe1u
-                      : aabbs ? (args.gen1 != 0 ? 0xa0u : ((aabb_stride == 64u ? 0xa0u : 0x80u) | 1u))
+                      : aabbs ? (HK_AGX3_GEN1 != 0 ? 0xa0u : ((aabb_stride == 64u ? 0xa0u : 0x80u) | 1u))
                       : 0xa0u) |
                      (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
          for (uint a = 0; a < 3; ++a)
@@ -402,7 +405,7 @@ main()
    if (instances && lane < count)
       encode_instance(job, lane);
    if (aabbs && lane < count) {
-      if (args.gen1 != 0)
+      if (HK_AGX3_GEN1 != 0)
          for (uint i = 0; i < 16; ++i)
             store32(children + uint64_t(lane) * 64ul + uint64_t(i) * 4ul, 0);
       /* 48-byte native bounding-box record at the selected record stride. */

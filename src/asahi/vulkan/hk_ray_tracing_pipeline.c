@@ -327,7 +327,6 @@ struct hk_rt_compiler {
    VkPipelineCreateFlags2KHR flags;
    bool position_fetch;
    bool native_agx;
-   nir_variable *native_query, *native_hit_kind;
    bool native_m5;
    /* M5 compiles one kernel per ray-generation group and shares a stage's
     * call site between the groups naming it. Other chips keep the single

@@ -4024,7 +4024,7 @@ TEST(NativeForms, M5MeshUVBNativeOperands)
    EXPECT_EQ(memcmp(bytes,primitive,8),0);
    ASSERT_TRUE(agx3_mesh_uvst(AGX_ISA_ENCODING_AGX3C,22,false,true,bytes,&length));
    EXPECT_EQ(memcmp(bytes,position,8),0);
-   EXPECT_FALSE(agx3_mesh_allocate_uvb(AGX_ISA_ENCODING_AGX3B,1,10,true,bytes,&length));
+   EXPECT_TRUE(agx3_mesh_allocate_uvb(AGX_ISA_ENCODING_AGX3B,1,10,true,bytes,&length));
    EXPECT_FALSE(agx3_mesh_uvst(AGX_ISA_ENCODING_AGX3C,1,false,true,bytes,&length));
    EXPECT_FALSE(agx3_mesh_uvst(AGX_ISA_ENCODING_AGX3C,254,false,true,bytes,&length));
 }
@@ -4065,7 +4065,7 @@ TEST(NativeForms, M5ObjectChildcountNativeLeaf)
    ASSERT_TRUE(agx3_mesh_object_childcount(AGX_ISA_ENCODING_AGX3C,bytes,&size));
    ASSERT_EQ(size,sizeof(native));
    EXPECT_EQ(memcmp(bytes,native,size),0);
-   EXPECT_FALSE(agx3_mesh_object_childcount(AGX_ISA_ENCODING_AGX3B,bytes,&size));
+   EXPECT_TRUE(agx3_mesh_object_childcount(AGX_ISA_ENCODING_AGX3B,bytes,&size));
 }
 
 TEST(NativeForms, M5ObjectChildcountSSACompiles)

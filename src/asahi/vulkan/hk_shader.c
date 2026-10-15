@@ -4887,7 +4887,7 @@ hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
 /* Parameter block addressed by the predicated object's uniform0 pointer.
  * The ordinary mesh-only object keeps its smaller native passthrough ABI. */
 static nir_shader *
-hk_build_predicated_mesh_object(void)
+hk_build_predicated_mesh_object(enum agx_chip chip)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_TASK, &agx_nir_options, "native predicated mesh object");
@@ -4926,7 +4926,10 @@ hk_build_predicated_mesh_object(void)
       nir_iadd(&b, grid, nir_u2u64(&b, nir_imul_imm(&b, lane, 4))), .align_mul = 4);
    nir_store_object_childcount_agx(&b, nir_bcsel(&b, nir_load_var(&b, enabled),
                                                value, nir_imm_int(&b, 0)));
-   agx_preprocess_nir_m5(b.shader);
+   if (agx_chip_g17_m5(chip))
+      agx_preprocess_nir_m5(b.shader);
+   else
+      agx_preprocess_nir_g17p(b.shader);
    return b.shader;
 }
 
@@ -4936,50 +4939,6 @@ hk_build_predicated_mesh_object(void)
 
 
 
-static nir_shader *
-hk_build_predicated_mesh_object(void)
-{
-   nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_TASK, &agx_nir_options, "native predicated mesh object");
-   b.shader->info.io_lowered = true;
-   b.shader->info.internal = true;
-   b.shader->info.workgroup_size[0] = 3;
-   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
-   nir_def *params = nir_load_preamble(&b, 1, 64, .base = 0);
-   nir_def *grid = nir_load_global_constant(&b, 1, 64, params, .align_mul = 8);
-   nir_def *count = nir_load_global_constant(&b, 1, 64,
-      nir_iadd_imm(&b, params, 8), .align_mul = 8);
-   nir_def *predicate = nir_load_global_constant(&b, 1, 64,
-      nir_iadd_imm(&b, params, 16), .align_mul = 8);
-   nir_variable *enabled = nir_local_variable_create(nir_shader_get_entrypoint(b.shader),
-                                                    glsl_bool_type(), "enabled");
-   nir_store_var(&b, enabled, nir_imm_true(&b), 1);
-   nir_push_if(&b, nir_ine_imm(&b, count, 0));
-   {
-      nir_def *limit = nir_load_global_constant(&b, 1, 32, count, .align_mul = 4);
-      nir_def *draw_id = nir_load_global_constant(&b, 1, 32,
-         nir_iadd_imm(&b, params, 24), .align_mul = 4);
-      nir_store_var(&b, enabled, nir_ult(&b, draw_id, limit), 1);
-   }
-   nir_pop_if(&b, NULL);
-   nir_push_if(&b, nir_ine_imm(&b, predicate, 0));
-   {
-      nir_def *value = nir_load_global_constant(&b, 1, 32, predicate, .align_mul = 4);
-      nir_def *invert = nir_load_global_constant(&b, 1, 32,
-         nir_iadd_imm(&b, params, 28), .align_mul = 4);
-      nir_def *pass = nir_ixor(&b, nir_ine_imm(&b, value, 0), nir_ine_imm(&b, invert, 0));
-      nir_store_var(&b, enabled, nir_iand(&b, pass, nir_load_var(&b, enabled)), 1);
-   }
-   nir_pop_if(&b, NULL);
-   nir_def *lane = nir_load_local_invocation_index(&b);
-   nir_def *value = nir_load_global_constant(&b, 1, 32,
-      nir_iadd(&b, grid, nir_u2u64(&b, nir_imul_imm(&b, lane, 4))), .align_mul = 4);
-   nir_store_object_childcount_agx(&b, nir_bcsel(&b, nir_load_var(&b, enabled),
-                                               value, nir_imm_int(&b, 0)));
-
-   agx_preprocess_nir_g17p(b.shader);
-   return b.shader;
-}
 
 static nir_def *
 hk_mesh_query_root(nir_builder *b, unsigned bit_size, unsigned offset)
@@ -5091,7 +5050,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    }
    if (dev->dev.chip == AGX_CHIP_G17P &&
        nir->info.stage == MESA_SHADER_FRAGMENT &&
-       !agx_nir_lower_m5_mesh_fragment(nir)) {
+       !agx_nir_lower_gen1_mesh_fragment(nir)) {
       ralloc_free(nir);
       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
    }
@@ -5263,11 +5222,13 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
       }
-      if (nir->info.mesh.primitive_type == MESA_PRIM_POINTS &&
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+          nir->info.mesh.primitive_type == MESA_PRIM_POINTS &&
           !(nir->info.outputs_written & VARYING_BIT_PSIZ))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_mesh_default_point_size, nir_metadata_control_flow, NULL);
-      if (nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES &&
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+          nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES &&
           !(nir->info.outputs_read & VARYING_BIT_PSIZ))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   kill_mesh_triangle_psiz_write,
@@ -5286,36 +5247,45 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       shader->info.mesh.vertex_outputs =
          nir->info.outputs_written & ~nir->info.per_primitive_outputs;
       shader->info.mesh.primitive_outputs =
-         nir->info.per_primitive_outputs & ~VARYING_BIT_PRIMITIVE_INDICES;
+         nir->info.per_primitive_outputs &
+         (agx_chip_g17_m5(dev->dev.chip) ? nir->info.outputs_written : ~UINT64_C(0)) &
+         ~VARYING_BIT_PRIMITIVE_INDICES;
       
 
 
 
 
       NIR_PASS(_, nir, nir_opt_constant_folding);
-      NIR_PASS(_, nir, hk_lower_mesh_queries);
+      if (dev->dev.chip == AGX_CHIP_G17P)
+         NIR_PASS(_, nir, hk_lower_mesh_queries);
       struct agx_m5_mesh_varyings varyings;
       if (agx_chip_g17_m5(dev->dev.chip)) {
          NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
          NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
       }
-      bool layout_ok = agx_m5_mesh_gather_varyings(nir, &varyings);
+      const bool m5_mesh = agx_chip_g17_m5(dev->dev.chip);
+      bool layout_ok = m5_mesh ? agx_m5_mesh_gather_varyings(nir, &varyings)
+                              : agx_gen1_mesh_gather_varyings(nir, &varyings);
 
       nir_builder layout = nir_builder_init_simple_shader(
          MESA_SHADER_VERTEX, &agx_nir_options, "native mesh raster interface");
       layout.shader->info.io_lowered = true;
+      if (m5_mesh) {
+         layout.shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
+         layout.shader->info.cull_distance_array_size = nir->info.cull_distance_array_size;
+      }
       layout.shader->info.outputs_written = VARYING_BIT_POS;
       nir_store_output(&layout, nir_undef(&layout, 4, 32),
          nir_imm_int(&layout, 0), .write_mask = 15,
          .io_semantics = {.location = VARYING_SLOT_POS, .num_slots = 1});
-      if (layout_ok && varyings.lv) {
+      if (layout_ok && !m5_mesh && varyings.lv) {
          layout.shader->info.outputs_written |= VARYING_BIT_LAYER;
          nir_store_output(&layout, nir_undef(&layout, 1, 32),
             nir_imm_int(&layout, 0), .write_mask = 1,
             .src_type = nir_type_uint32,
             .io_semantics = {.location = VARYING_SLOT_LAYER, .num_slots = 1});
       }
-      if (layout_ok && varyings.clip_count) {
+      if (layout_ok && !m5_mesh && varyings.clip_count) {
          layout.shader->info.clip_distance_array_size = varyings.clip_count;
          for (unsigned slot = VARYING_SLOT_CLIP_DIST0;
               slot <= VARYING_SLOT_CLIP_DIST1; ++slot) {
@@ -5329,14 +5299,14 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                .io_semantics = {.location = slot, .num_slots = 1});
          }
       }
-      if (layout_ok && varyings.components[VARYING_SLOT_PSIZ]) {
+      if (layout_ok && !m5_mesh && varyings.components[VARYING_SLOT_PSIZ]) {
          layout.shader->info.outputs_written |= VARYING_BIT_PSIZ;
          nir_store_output(&layout, nir_undef(&layout, 1, 32),
             nir_imm_int(&layout, 0), .write_mask = 1,
             .src_type = nir_type_float32,
             .io_semantics = {.location = VARYING_SLOT_PSIZ, .num_slots = 1});
       }
-      for (unsigned slot = VARYING_SLOT_VAR0; layout_ok && slot < 64; ++slot) {
+      for (unsigned slot = m5_mesh ? 0 : VARYING_SLOT_VAR0; layout_ok && slot < 64; ++slot) {
          const unsigned n = varyings.components[slot];
          if (!n)
             continue;
@@ -5378,17 +5348,20 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       layout_ok &= varyings.size == shader->info.uvs.size;
       layout_ok &= !varyings.clip_distance_count ||
          varyings.clip_distance_first == shader->info.uvs.group_offs[UVS_CLIP_DIST];
-      if (!layout_ok || !agx_nir_lower_m5_task_payload_probe(nir) ||
-          !agx_nir_lower_m5_mesh(nir, &varyings)) {
+      if (!layout_ok ||
+          !(m5_mesh ? agx_nir_lower_m5_task_payload_probe(nir)
+                    : agx_nir_lower_gen1_task_payload_probe(nir)) ||
+          !(m5_mesh ? agx_nir_lower_m5_mesh(nir, &varyings)
+                    : agx_nir_lower_gen1_mesh(nir, &varyings))) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "native mesh layout outside captured triangle contract");
       }
-   if (agx_chip_g17_m5(dev->dev.chip))
-      agx_preprocess_nir_m5(nir);
-   else
-      agx_preprocess_nir_g17p(nir);
+      if (agx_chip_g17_m5(dev->dev.chip))
+         agx_preprocess_nir_m5(nir);
+      else
+         agx_preprocess_nir_g17p(nir);
       result = hk_compile_nir(dev, pAllocator, nir, info->flags,
                              info->robustness, NULL, features, shader,
                              sw_stage, true, NULL, info->set_layout_count,
@@ -5402,7 +5375,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       
 
 
-      nir_shader *object_nir = hk_build_predicated_mesh_object();
+      nir_shader *object_nir = hk_build_predicated_mesh_object(dev->dev.chip);
       if (!object_nir) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -5451,7 +5424,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       struct hk_shader *predicated =
          &obj->variants[HK_MESH_VARIANT_PREDICATED_OBJECT];
-      nir_shader *object_nir = hk_build_predicated_mesh_object();
+      nir_shader *object_nir = hk_build_predicated_mesh_object(dev->dev.chip);
       if (!object_nir) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -5476,10 +5449,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "native task layout outside captured object contract");
       }
-   if (agx_chip_g17_m5(dev->dev.chip))
-      agx_preprocess_nir_m5(nir);
-   else
-      agx_preprocess_nir_g17p(nir);
+      if (agx_chip_g17_m5(dev->dev.chip))
+         agx_preprocess_nir_m5(nir);
+      else
+         agx_preprocess_nir_g17p(nir);
       result = hk_compile_nir(dev, pAllocator, nir, info->flags,
                              info->robustness, NULL, features, &obj->variants[0],
                              sw_stage, true, NULL, info->set_layout_count,
@@ -6087,8 +6060,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       }
       struct agx_m5_mesh_varyings mesh_varyings;
       if (mesh_nir && fs_nir &&
-          agx_m5_mesh_gather_varyings(mesh_nir, &mesh_varyings))
-         agx_nir_lower_m5_mesh_fragment_layout(fs_nir, &mesh_varyings);
+          agx_gen1_mesh_gather_varyings(mesh_nir, &mesh_varyings))
+         agx_nir_lower_gen1_mesh_fragment_layout(fs_nir, &mesh_varyings);
    }
 
    /* Only a complete pipeline known to have no fragment shader can fix an

@@ -84,7 +84,7 @@ agx_nir_m5_candidate_count(nir_builder *b, nir_def *driver, nir_def *lane)
     * query-once compiler witness uses 1600: its payload layout is 128 bytes
     * smaller before the candidate queue. Operand shape is the native +0x6ac
     * two-register selector-2 form. */
-   nir_def *control = nir_load_scs_indexed_agx(b, 1, driver, lane,
+   nir_def *control = nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
       .base = 1728, .component = 2);
    return nir_iand_imm(b, nir_ushr_imm(b, control, 21), 15);
 }
@@ -498,7 +498,7 @@ m5_trace_instance(nir_builder *b, nir_def *selector, nir_def *id,
       /* The queue is empty here (count == 0), so clearing the count bits is
        * a no-op; the active bit and completion words follow the runtime. */
       m5_candidate_request_batch(b, id, driver, lane, status_address,
-         nir_load_scs_indexed_agx(b, 1, driver, lane, .base = 1728,
+         nir_load_scs_indexed_agx(b, 1, 32, driver, lane, .base = 1728,
                                   .component = 2), NULL);
    } else {
       nir_def *resume_status = nir_ior_imm(b, nir_iand_imm(b, status, ~64u), 16);
@@ -524,11 +524,11 @@ m5_trace_instance(nir_builder *b, nir_def *selector, nir_def *id,
        * committed-result slots. This is not Vulkan candidate support. */
       *type_prim = nir_ior_imm(b, count, 0x40000000);
       *bary = first.barycentrics;
-      nir_def *final_status = nir_load_scs_indexed_agx(b, 2, driver, lane,
+      nir_def *final_status = nir_load_scs_indexed_agx(b, 2, 32, driver, lane,
          .base = 256, .component = 3);
       *instance = nir_vec4(b, zero, zero, nir_u2u32(b, pending),
                            first.distance);
-      *front_face = nir_load_scs_indexed_agx(b, 1, driver, lane,
+      *front_face = nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
          .base = 0, .component = 3);
       if (!m5_candidate_api() &&
           debug_get_bool_option("ASAHI_M5_RQ_METADATA_PROBE", false)) {
@@ -553,13 +553,13 @@ m5_trace_instance(nir_builder *b, nir_def *selector, nir_def *id,
       }
       return;
    }
-   nir_def *hit_words = nir_load_scs_indexed_agx(b, 2, driver, lane,
+   nir_def *hit_words = nir_load_scs_indexed_agx(b, 2, 32, driver, lane,
       .base = 256, .component = 3, .flags = 1);
    *type_prim = nir_channel(b, hit_words, 0);
    /* Fresh G17G triangle_front_facing witness selects1 when the signed
     * second hit word is negative: the native front-face bit is bit31. */
    *front_face = nir_channel(b, hit_words, 1);
-   *bary = nir_load_scs_indexed_agx(b, 2, driver, lane,
+   *bary = nir_load_scs_indexed_agx(b, 2, 32, driver, lane,
       .base = 512, .component = 3, .flags = 1);
 
    /* The captured runtime native-main.bin reads the committed instance
@@ -728,9 +728,9 @@ m5_model_capture(nir_builder *b, struct m5_rq_state *state,
    nir_def *lane = nir_iand_imm(b, id, 31);
    nir_def *driver = nir_iadd(b, nir_load_preamble(b, 1, 32, .base = 56),
       nir_imul_imm(b, nir_iand_imm(b, id, ~31u), m5_candidate_driver_stride()));
-   nir_def *control = nir_load_scs_indexed_agx(b, 1, driver, lane,
+   nir_def *control = nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
       .base = 1728, .component = 2);
-   nir_def *status = nir_load_scs_indexed_agx(b, 2, driver, lane,
+   nir_def *status = nir_load_scs_indexed_agx(b, 2, 32, driver, lane,
       .base = 256, .component = 3);
    nir_def *offset = nir_iadd(b, nir_imul_imm(b, id, 8 * 64 * 32),
       nir_iadd_imm(b, nir_imul_imm(b, event, 32),
@@ -849,9 +849,9 @@ m5_import_native_opaque(nir_builder *b, nir_def *id, nir_def *driver,
    /* Canonical native decoder byte-reencodes REGISTER_INDEXED selector3:
     * type256 scalar marker1; geom260 scalar marker0. */
    nir_def *hit = nir_vec2(b,
-      nir_load_scs_indexed_agx(b, 1, driver, lane,
+      nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
          .base = 256, .component = 3, .flags = 1),
-      nir_load_scs_indexed_agx(b, 1, driver, lane,
+      nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
          .base = 260, .component = 3));
    nir_def *type_prim = nir_channel(b, hit, 0);
    nir_def *distance = nir_load_scs_uniform_agx(b, 1, 32,
@@ -909,7 +909,7 @@ m5_import_native_opaque(nir_builder *b, nir_def *id, nir_def *driver,
       nir_store_global(b, nir_vec4(b, type_prim, nir_channel(b, hit, 1),
                                   distance, nir_u2u32(b, completion_status)),
          nir_iadd_imm(b, output, 4), .align_mul = 4, .write_mask = 15);
-      nir_def *control = nir_load_scs_indexed_agx(b, 1, driver, lane,
+      nir_def *control = nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
          .base = 1728, .component = 2);
       nir_store_global(b, nir_vec4(b, driver, id, lane, control),
          nir_iadd_imm(b, output, 20), .align_mul = 4, .write_mask = 15);
@@ -923,7 +923,7 @@ m5_import_native_opaque(nir_builder *b, nir_def *id, nir_def *driver,
    nir_push_if(b, agx_nir_m5_should_import_triangle(b, type_prim,
       nir_channel(b, nir_load_deref(b, result[2]), 3), distance, best,
       nir_load_deref(b, minimum)));
-   nir_def *bary = nir_load_scs_indexed_agx(b, 2, driver, lane,
+   nir_def *bary = nir_load_scs_indexed_agx(b, 2, 32, driver, lane,
       .base = 512, .component = 3, .flags = 1);
    nir_def *halves[3];
    for (unsigned i = 0; i < 3; ++i)
@@ -1026,7 +1026,7 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
       }
    }
    nir_def *index = nir_load_deref(b, cursor);
-   nir_def *control = nir_load_scs_indexed_agx(b, 1, driver, lane,
+   nir_def *control = nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
       .base = 1728, .component = 2);
    nir_def *count = nir_iand_imm(b, nir_ushr_imm(b, control, 21), 15);
    /* Private first-queue decode transport for the pinned standalone
@@ -1696,7 +1696,7 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
                nir_def *driver = nir_iadd(&b,
                   nir_load_preamble(&b, 1, 32, .base = 56),
                   nir_imul_imm(&b, nir_iand_imm(&b, saved_id, ~31u), m5_candidate_driver_stride()));
-               nir_def *control = nir_load_scs_indexed_agx(&b, 1, driver,
+               nir_def *control = nir_load_scs_indexed_agx(&b, 1, 32, driver,
                   nir_iand_imm(&b, saved_id, 31), .base = 1728, .component = 2);
                nir_def *resident_owner = nir_iand_imm(&b,
                   nir_ushr_imm(&b, control, 1), 0xfffff);

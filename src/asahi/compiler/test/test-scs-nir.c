@@ -38,7 +38,7 @@ static bool compile(unsigned mode, unsigned variant, unsigned width,
       nir_def *index = nir_iand_imm(&b,input,0);
       nir_store_scs_indexed_agx(&b,nir_vec(&b,v,variant),base,index,
                                 .base=offset,.component=4);
-      nir_def *loaded = nir_load_scs_indexed_agx(&b,variant,base,index,
+      nir_def *loaded = nir_load_scs_indexed_agx(&b,variant, 32,base,index,
                                                .base=offset,.component=4);
       nir_def *valid=nir_imm_true(&b);
       for(unsigned i=0;i<variant;i++)
@@ -47,7 +47,7 @@ static bool compile(unsigned mode, unsigned variant, unsigned width,
          for(unsigned i=0;i<variant;i++) v[i]=nir_iadd_imm(&b,v[i],33);
          nir_store_scs_indexed_agx(&b,nir_vec(&b,v,variant),base,index,
                                    .base=offset,.component=4);
-         nir_def *again=nir_load_scs_indexed_agx(&b,variant,base,index,
+         nir_def *again=nir_load_scs_indexed_agx(&b,variant, 32,base,index,
                                                .base=offset,.component=4);
          for(unsigned i=0;i<variant;i++)
             valid=nir_iand(&b,valid,nir_ieq(&b,nir_channel(&b,again,i),v[i]));
@@ -63,7 +63,7 @@ static bool compile(unsigned mode, unsigned variant, unsigned width,
    nir_def *out_addr = nir_iadd_imm(&b,nir_u2u64(&b,nir_ishl_imm(&b,id,2)),0x1000001dd00ull);
    nir_store_global(&b,result,out_addr,.align_mul=4,.write_mask=1);
    agx_preprocess_nir(b.shader);
-   struct agx_shader_key key={.dev={.chip=AGX_CHIP_G17S,.encoding=encoding},
+   struct agx_shader_key key={.dev={.chip=encoding == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P : AGX_CHIP_G17S,.encoding=encoding},
                               .no_preamble=true};
    struct agx_shader_part part={0};
    bool ok=agx_compile_shader_nir(b.shader,&key,&part);
@@ -84,8 +84,8 @@ static bool compile(unsigned mode, unsigned variant, unsigned width,
          }
          for(unsigned n=2;n<=AGX3_SCS_MAX_LENGTH && i+n<=part.info.main_offset+part.info.main_size;n+=2) {
             struct agx3_scs_desc d;
-            bool load=agx3_scs_decode_load(AGX_ISA_ENCODING_AGX3C,part.binary+i,n,&d);
-            bool store=!load && agx3_scs_decode_store(AGX_ISA_ENCODING_AGX3C,part.binary+i,n,&d);
+            bool load=agx3_scs_decode_load(encoding,part.binary+i,n,&d);
+            bool store=!load && agx3_scs_decode_store(encoding,part.binary+i,n,&d);
             if(!load && !store)continue;
             assert(d.byte_offset==offset);
             if(mode==1 || mode==3) {
@@ -139,7 +139,7 @@ int main(int argc,char **argv) {
    assert(compile(2,1,32,0,AGX_ISA_ENCODING_AGX3C,NULL));
    assert(compile(1,3,32,0,AGX_ISA_ENCODING_AGX3C,NULL));
    assert(!compile(1,4,32,32768,AGX_ISA_ENCODING_AGX3C,NULL));
-   assert(!compile(1,4,32,0,AGX_ISA_ENCODING_AGX3B,NULL));
+   assert(compile(1,4,32,0,AGX_ISA_ENCODING_AGX3B,NULL));
    assert(!compile(1,4,32,0,AGX_ISA_ENCODING_AGX2,NULL));
    glsl_type_singleton_decref();return 0;
 }

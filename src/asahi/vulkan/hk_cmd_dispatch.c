@@ -662,7 +662,7 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
 }
 
 static bool
-hk_g17p_compute_shader_supported(struct hk_shader *s,
+hk_g17p_compute_shader_supported(enum agx_chip chip, struct hk_shader *s,
                                  struct hk_linked_shader *linked, unsigned max_spill_B)
 {
    /* poly_nir_lower_gs preserves the API geometry stage on the main kernel,
@@ -676,7 +676,7 @@ hk_g17p_compute_shader_supported(struct hk_shader *s,
           ((!s->b.info.has_preamble && s->b.info.preamble_scratch_size == 0) ||
            /* Only an M5 compute compile forms a constant program
             * (hk_shader.c), and it carries its TPS frame in the launch. */
-           (agx_chip_g17_m5(dev->dev.chip) && s->info.stage == MESA_SHADER_COMPUTE &&
+           (agx_chip_g17_m5(chip) && s->info.stage == MESA_SHADER_COMPUTE &&
             s->b.info.agx3_preamble_staging_known &&
             s->b.info.preamble_scratch_size <= max_spill_B &&
             s->b.info.preamble_scratch_size >=
@@ -713,7 +713,7 @@ hk_g17p_compute_shader_supported(struct hk_shader *s,
  * the uniform file before launching the compute-stage binary. */
 static bool
 hk_g17p_compute_uniform_ranges(
-   struct hk_shader *s, uint64_t root_ptr, uint64_t texture_pointers,
+   enum agx_chip chip, struct hk_shader *s, uint64_t root_ptr, uint64_t texture_pointers,
    struct agx3_ioto_uniform_range ranges[3], size_t *range_count);
 
 static bool
@@ -725,13 +725,14 @@ hk_g17p_internal_graphics_uniform_ranges(
       ranges[HK_G17P_COMPUTE_MAX_RANGES],
    size_t *range_count)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    /* Uniform DMA is only enabled for hardware graphics stages;
     * this internal path cannot publish its span, so fail closed. */
    if (s->b.info.agx3_uniform_dma_count)
       return false;
 
    if (s->info.stage != MESA_SHADER_VERTEX)
-      return hk_g17p_compute_uniform_ranges(s, root_ptr, texture_pointers,
+      return hk_g17p_compute_uniform_ranges(dev->dev.chip, s, root_ptr, texture_pointers,
                                              ranges, range_count);
 
    if (!!texture_pointers != s->info.agx3_indexed_sampler_valid)
@@ -813,7 +814,7 @@ hk_g17p_internal_graphics_uniform_ranges(
 
 static bool
 hk_g17p_compute_uniform_ranges(
-   struct hk_shader *s, uint64_t root_ptr, uint64_t texture_pointers,
+   enum agx_chip chip, struct hk_shader *s, uint64_t root_ptr, uint64_t texture_pointers,
    struct agx3_ioto_uniform_range ranges[3], size_t *range_count)
 {
    if (!s || !ranges || !range_count ||
@@ -839,19 +840,16 @@ hk_g17p_compute_uniform_ranges(
    }
 
    const unsigned root_uniform = s->info.agx3_root_uniform ? s->info.agx3_root_uniform :
-                                 (agx_chip_g17_m5(dev->dev.chip) && (s->info.agx3_storage_image_valid ||
-                                  s->info.agx3_sampled_storage_valid ||
-                                  s->info.agx3_indexed_storage_valid))
-                                    ? AGX_G17P_STORAGE_ROOT_HALFS
-                                 : texture_pointers
-                                    ? AGX_G17P_TXF_ROOT_HALFS
-                                    : 0;
+      !agx_chip_g17_m5(chip) ? 0 :
+      (s->info.agx3_storage_image_valid || s->info.agx3_sampled_storage_valid ||
+       s->info.agx3_indexed_storage_valid) ? AGX_G17P_STORAGE_ROOT_HALFS :
+      texture_pointers ? AGX_G17P_TXF_ROOT_HALFS : 0;
    if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr, &ranges[0]))
       return false;
 
    size_t count = 1;
    if (texture_pointers) {
-      const unsigned texture_uniform = agx_chip_g17_m5(dev->dev.chip) &&
+      const unsigned texture_uniform = agx_chip_g17_m5(chip) &&
          (root_uniform == 164 || root_uniform == 176) ? root_uniform - 8 :
          root_uniform >= 168 ? 168 : 0;
       ranges[count++] = (struct agx3_ioto_uniform_range){
@@ -943,11 +941,12 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                               uint64_t *program_va_out,
                               struct hk_g17p_compute_program_ref *out)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    size_t range_count;
    const bool ranges_ok = internal_graphics
       ? hk_g17p_internal_graphics_uniform_ranges(
            cmd, s, linked, root_ptr, texture_pointers, ranges, &range_count)
-      : hk_g17p_compute_uniform_ranges(s, root_ptr, texture_pointers, ranges,
+      : hk_g17p_compute_uniform_ranges(dev->dev.chip, s, root_ptr, texture_pointers, ranges,
                                         &range_count);
    if (!ranges_ok) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1056,7 +1055,7 @@ hk_g17p_prewarm_linked_compute_program_kind(
    enum agx_ioto_g17p_compute_ldshdr_f1 kind)
 {
    if (!agx_native_graphics(&dev->dev) ||
-       !hk_g17p_compute_shader_supported(s, linked,
+       !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked,
                                          AGX3_G17P_MAX_COMPUTE_SPILL_B))
       return;
 
@@ -1085,7 +1084,7 @@ hk_g17p_prewarm_linked_compute_program_kind(
       ? hk_g17p_internal_graphics_uniform_ranges(
            cmd, s, linked, dummy_root, dummy_texture_pointers, ranges,
            &range_count)
-      : hk_g17p_compute_uniform_ranges(s, dummy_root,
+      : hk_g17p_compute_uniform_ranges(dev->dev.chip, s, dummy_root,
                                         dummy_texture_pointers, ranges,
                                         &range_count);
    struct agx3_g17p_compute_program_desc desc;
@@ -1146,7 +1145,7 @@ hk_g17p_indirect_launch_supported(struct hk_device *dev, struct agx_grid grid,
    struct hk_shader *helper =
       hk_g17p_indirect_helper(dev, grid, sparse_map_addr);
    if (grid.ptr == 0 || (grid.ptr & 3) != 0 ||
-       !hk_g17p_compute_shader_supported(helper,
+       !hk_g17p_compute_shader_supported(dev->dev.chip, helper,
                                          helper ? helper->only_linked : NULL,
                                          agx_chip_g17_m5(dev->dev.chip)
                                             ? AGX3_G17P_MAX_SPILL_B
@@ -1689,7 +1688,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       linked = cmd->state.gfx.linked[MESA_SHADER_VERTEX];
    if (!agx_chip_g17_m5(dev->dev.chip) || cs->type != HK_CS_CDM ||
        /* Static TPS addresses are 15-bit halfword offsets. */
-       !hk_g17p_compute_shader_supported(s, linked, 1u << 16) ||
+       !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, 1u << 16) ||
        ((s->b.info.scratch_size || linked->b.scratch_size) &&
         !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) ||
        (s->b.info.uses_ray_traversal && !dev->m5_native_rq) || s->info.agx3_txf_texture_valid ||
@@ -1730,7 +1729,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    size_t count = 0;
    const bool collected = internal
       ? hk_g17p_internal_graphics_uniform_ranges(cmd, s, linked, root, texture_pointers, ranges, &count)
-      : hk_g17p_compute_uniform_ranges(s, root, texture_pointers, ranges, &count);
+      : hk_g17p_compute_uniform_ranges(dev->dev.chip, s, root, texture_pointers, ranges, &count);
    reason = "uniform ranges";
    if (!collected)
       goto refused;
@@ -2066,7 +2065,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                  "G17P root range must cover every Honeykrisp set");
 
    if (!agx_native_graphics(&dev->dev) || cs->type != HK_CS_CDM ||
-       !hk_g17p_compute_shader_supported(s, linked,
+       !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked,
                                          AGX3_G17P_MAX_COMPUTE_SPILL_B)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;

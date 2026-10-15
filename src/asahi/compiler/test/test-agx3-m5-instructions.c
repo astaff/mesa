@@ -965,8 +965,9 @@ int main(void)
    if (!agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3C,
                                 AGX3_BARRIER_SCOPE_SUBGROUP_SHARED, &fence) ||
        fence.length != 0 ||
-       agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3B,
-                               AGX3_BARRIER_SCOPE_SUBGROUP_SHARED, &fence))
+       !agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3B,
+                                AGX3_BARRIER_SCOPE_SUBGROUP_SHARED, &fence) ||
+       fence.length != 0)
       return 1;
    puts("M5_SUBGROUP_SHARED_NO_RENDEZVOUS_PASS");
 

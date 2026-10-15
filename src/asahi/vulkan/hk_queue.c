@@ -1290,7 +1290,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                    cs->timestamp.end.handle || cs->timestamp.start.handle);
 
             asahi_append_compute_attachments(dev, &payload, cs);
-            if (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES) {
+            if (agx_chip_g17_m5(dev->dev.chip) &&
+                (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
                /* The header size is 16 bits; never let it truncate. */
                if (cs->compute_resources.size > UINT16_MAX) {
                   util_dynarray_fini(&payload);

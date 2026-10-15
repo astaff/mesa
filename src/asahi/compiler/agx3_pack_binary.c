@@ -924,12 +924,6 @@ agx3_map_sr(enum agx_isa_encoding enc, enum agx_sr sr, uint8_t *apple,
       SR(AGX_SR_THREAD_INDEX_IN_THREADGROUP, 13, AGX3_SR_W16);
       SR(AGX_SR_SCS_THREAD_INDEX, 59, AGX3_SR_W16);
       SR(AGX_SR_THREAD_INDEX_IN_SUBGROUP, 7, AGX3_SR_W16);
-   case AGX_SR_SCS_THREAD_INDEX:
-      if (enc != AGX_ISA_ENCODING_AGX3C)
-         return false;
-      *apple = 59;
-      *width = AGX3_SR_W16;
-      return true;
       SR(AGX_SR_SUBGROUP_INDEX_IN_THREADGROUP, 6, AGX3_SR_W16);
       SR(AGX_SR_THREAD_POSITION_IN_GRID_X, 23, AGX3_SR_W32);
       SR(AGX_SR_THREAD_POSITION_IN_GRID_Y, 24, AGX3_SR_W32);

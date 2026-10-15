@@ -50,7 +50,6 @@ struct hk_agx3_refit_args {
    uint32_t leaf_bound;
    uint32_t node_bound;
    uint32_t phase;
-   uint32_t gen1;
 };
 
 
@@ -100,7 +99,6 @@ struct hk_agx3_leaf_args {
    uint32_t job_count;
    /* Bounding-box record stride (48 default, 64 diagnostic). */
    uint32_t reserved;
-   uint32_t gen1;
 };
 
 #define HK_AGX3_LEAF_SUCCESS 0
@@ -145,7 +143,6 @@ struct hk_agx3_envelope_args {
    uint32_t node_bound;
    uint32_t keep_retained;
    uint32_t padding;
-   uint32_t gen1;
 };
 
 /* Scratch records for parallel binary-to-wide planning. Phases are separate
@@ -193,7 +190,6 @@ struct hk_agx3_plan_args {
    uint64_t retained_offset;
    uint32_t build_flags;
    uint32_t keep_retained;
-   uint32_t gen1;
 };
 
 /* Independent ASs share dispatches, not their writable records. The planner

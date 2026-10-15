@@ -316,10 +316,10 @@ static_assert(sizeof(struct hk_bvh_box_node) == 56, "node format");
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
 static_assert(sizeof(struct hk_agx3_leaf_args) == 24, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
-static_assert(sizeof(struct hk_agx3_envelope_args) == 24, "native envelope push ABI");
+static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 static_assert(sizeof(struct hk_agx3_plan_node) == 16, "native planner node ABI");
 static_assert(sizeof(struct hk_agx3_plan_state) == 32, "native planner state ABI");
-static_assert(sizeof(struct hk_agx3_plan_args) == 88, "native planner push ABI");
+static_assert(sizeof(struct hk_agx3_plan_args) == 112, "native planner push ABI");
 static_assert(sizeof(struct hk_bvh_box_node) == HK_BVH_NODE_PREFETCH_SIZE,
               "the traversal prefetches a whole box node before it knows the "
               "node type, so no node may be larger than one");
@@ -878,11 +878,11 @@ hk_cmd_encode_agx3_batch(VkCommandBuffer command_buffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   static_assert(sizeof(struct hk_agx3_plan_args) == 88, "native plan ABI");
-   static_assert(sizeof(struct hk_agx3_batch_job) == 120, "batch array stride");
+   static_assert(sizeof(struct hk_agx3_plan_args) == 112, "native plan ABI");
+   static_assert(sizeof(struct hk_agx3_batch_job) == 144, "batch array stride");
    static_assert(sizeof(struct hk_agx3_batch_args) == 32, "batch push ABI");
    static_assert(sizeof(struct hk_agx3_batch_map) == 8, "dense map stride");
-   static_assert(offsetof(struct hk_agx3_batch_job, first_job) == 108,
+   static_assert(offsetof(struct hk_agx3_batch_job, first_job) == 132,
                  "GPU-written dense offset ABI");
 
    const struct {
@@ -1104,8 +1104,8 @@ hk_build_leaves_batched(VkCommandBuffer commandBuffer, struct vk_device *device,
                         uint32_t build_count, uint32_t build_flags)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
-   static_assert(sizeof(struct hk_leaf_task) == 80, "leaf task shader ABI");
-   static_assert(offsetof(struct hk_leaf_task, first) == 72, "leaf task first ABI");
+   static_assert(sizeof(struct hk_leaf_task) == 88, "leaf task shader ABI");
+   static_assert(offsetof(struct hk_leaf_task, first) == 80, "leaf task first ABI");
    assert(args->subgroup_size == 32);
    uint64_t task_count = 0;
    for (unsigned i = 0; i < build_count; ++i) {

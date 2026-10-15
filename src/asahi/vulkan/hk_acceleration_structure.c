@@ -72,19 +72,19 @@ struct hk_vertex_table_args {
 };
 
 static const uint32_t agx3_node_spv[] = {
-#include "bvh/hk_agx3_leaf.spv.h"
+#include "bvh/hk_agx3_gen1_leaf.spv.h"
 };
 
 static const uint32_t agx3_envelope_spv[] = {
-#include "bvh/hk_agx3_envelope.spv.h"
+#include "bvh/hk_agx3_gen1_envelope.spv.h"
 };
 
 static const uint32_t agx3_plan_spv[] = {
-#include "bvh/hk_agx3_plan.spv.h"
+#include "bvh/hk_agx3_gen1_plan.spv.h"
 };
 
 static const uint32_t agx3_refit_spv[] = {
-#include "bvh/hk_agx3_refit.spv.h"
+#include "bvh/hk_agx3_gen1_refit.spv.h"
 };
 
 static void hk_flush_buffer_write_cp(VkCommandBuffer);
@@ -412,9 +412,9 @@ hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd)
 }
 
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
-static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
+static_assert(sizeof(struct hk_agx3_leaf_args) == 24, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
-static_assert(sizeof(struct hk_agx3_envelope_args) == 72, "native envelope push ABI");
+static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 
 static_assert(sizeof(struct hk_bvh_triangle_node) == 48, "node format");
 static_assert(sizeof(struct hk_bvh_aabb_node) == 32, "node format");
@@ -473,9 +473,6 @@ VkResult
 hk_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
                         const struct hk_agx3_leaf_args *args)
 {
-   struct hk_agx3_leaf_args gen1_args = *args;
-   gen1_args.gen1 = 1;
-   args = &gen1_args;
    VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
    struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
    if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
@@ -512,9 +509,6 @@ VkResult
 hk_cmd_finalize_agx3_as(VkCommandBuffer command_buffer,
                        const struct hk_agx3_envelope_args *args)
 {
-   struct hk_agx3_envelope_args gen1_args = *args;
-   gen1_args.gen1 = 1;
-   args = &gen1_args;
    VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
    struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
    if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
@@ -550,9 +544,6 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                         VkDeviceAddress node_status,
                         VkDeviceAddress envelope_status)
 {
-   struct hk_agx3_plan_args gen1_args = *args;
-   gen1_args.gen1 = 1;
-   args = &gen1_args;
    VK_FROM_HANDLE(hk_cmd_buffer, m5_dispatch_cmd, command_buffer);
    struct hk_device *m5_dispatch_dev = hk_cmd_buffer_device(m5_dispatch_cmd);
    if (agx_chip_g17_m5(m5_dispatch_dev->dev.chip))
@@ -1038,7 +1029,6 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       phase == 1 ? state->build_info->srcAccelerationStructure : state->build_info->dstAccelerationStructure);
    uint64_t scratch = state->build_info->scratchData.deviceAddress;
    struct hk_agx3_refit_args args = {
-      .gen1 = 1,
       .retained = hk_as_native_va(retained_as) + hk_agx3_retained_offset(state),
       .metadata = phase == 1 ? hk_gen1_as_metadata_addr(cmd, retained_as) : 0,
       .intermediate_bvh = scratch + state->scratch.ir_offset,

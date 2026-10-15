@@ -1974,7 +1974,6 @@ agx_get_sr_native_width_to(agx_builder *b, agx_index dst, enum agx_sr sr)
    case AGX_SR_MESH_PAYLOAD_HI:
    case AGX_SR_MESH_PRIMITIVE_STORAGE_HI:
    case AGX_SR_BACKGROUND_LAYER_ID:
-   case AGX_SR_SCS_THREAD_INDEX:
       narrow_agx3 = true;
       break;
    default:

@@ -14,6 +14,10 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 #extension GL_KHR_memory_scope_semantics : require
 #include "hk_build_interface.h"
+
+#ifndef HK_AGX3_GEN1
+#define HK_AGX3_GEN1 0
+#endif
 layout(local_size_x = 64) in;
 layout(push_constant) uniform CONSTS { hk_agx3_refit_args args; };
 struct refit_node { uint parent; uint arrivals; uint reserved[2]; };
@@ -32,14 +36,14 @@ void main()
    uint internal_bound = args.node_bound - args.leaf_bound;
    if (args.phase <= 1) {
       uint64_t retained_base = args.retained;
-      if (args.gen1 != 0 && args.phase == 1 && args.metadata != 0ul) {
+      if (HK_AGX3_GEN1 != 0 && args.phase == 1 && args.metadata != 0ul) {
          libagx_gen1_as_metadata live =
             DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
          retained_base = live.native_base + live.retained_offset;
       }
       /* Preserve the actual binary topology, not unused internal capacity.
        * Restore counts come from the retained GPU header after copy/rebase. */
-      uint internal_count = args.gen1 == 0 ? internal_bound : args.phase == 0 ? DEREF(args.header).ir_internal_node_count
+      uint internal_count = HK_AGX3_GEN1 == 0 ? internal_bound : args.phase == 0 ? DEREF(args.header).ir_internal_node_count
          : DEREF(REF(vk_ir_header)(retained_base)).ir_internal_node_count;
       uint words = header_words + internal_count * (SIZEOF(vk_ir_box_node) / 4);
       if (id < words) {

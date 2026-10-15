@@ -53,3 +53,18 @@ foreach s : [['agx3_plan.comp', 'hk_agx3_batch_plan'],
     output : s[1] + '.spv.h', command : command,
     depend_files : [vk_bvh_includes, hk_bvh_includes])
 endforeach
+
+foreach s : [['agx3_leaf.comp', 'hk_agx3_gen1_leaf'],
+             ['agx3_envelope.comp', 'hk_agx3_gen1_envelope'],
+             ['agx3_plan.comp', 'hk_agx3_gen1_plan'],
+             ['agx3_refit.comp', 'hk_agx3_gen1_refit']]
+  command = [prog_glslang, '-V', '-DHK_AGX3_GEN1=1',
+    '-I' + vk_bvh_include_dir, '-I' + hk_bvh_include_dir,
+    '-I' + dir_source_root + '/src/asahi/vulkan',
+    '--target-env', 'spirv1.5', '-x', '-o', '@OUTPUT@', '@INPUT@']
+  command += glslang_quiet
+  command += vk_glsl_shader_preamble
+  hk_bvh_spv += custom_target(s[1] + '.spv.h', input : s[0],
+    output : s[1] + '.spv.h', command : command,
+    depend_files : [vk_bvh_includes, hk_bvh_includes])
+endforeach

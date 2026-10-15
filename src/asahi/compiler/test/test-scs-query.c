@@ -303,7 +303,7 @@ scs_thread_identity(void)
  const uint8_t native[]={0xe4,0xea,0x10,0x46};uint8_t out[16],len=0;
  assert(agx3_sr_encode(AGX_ISA_ENCODING_AGX3C,&d,out,&len));
  assert(len==sizeof(native)&&!memcmp(out,native,len));
- assert(!agx3_sr_encode(AGX_ISA_ENCODING_AGX3B,&d,out,&len));
+ assert(agx3_sr_encode(AGX_ISA_ENCODING_AGX3B,&d,out,&len));
  puts("M5_NATIVE_SCS_THREAD_ID_BYTES_PASS");
 }
 
