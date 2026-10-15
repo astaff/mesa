@@ -2915,3 +2915,99 @@ TEST(NativeForms, RegisterValidationRejectsOutOfModelCopySpans)
 }
 
 #endif
+
+TEST(NativeForms, SchedulerSsaBookkeepingStaysWithinEachBlock)
+{
+   for (bool ilp : {false, true}) {
+      for (unsigned gap : {0u, 31u, 4095u}) {
+         for (unsigned empty_blocks : {0u, 2u}) {
+            SCOPED_TRACE(ilp);
+            SCOPED_TRACE(gap);
+            SCOPED_TRACE(empty_blocks);
+            void *mem = ralloc_context(NULL);
+            agx_shader_key key = {};
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+            key.dev.chip = AGX_CHIP_G17P;
+            agx_builder *b = agx_test_builder(mem);
+            b->shader->key = &key;
+            b->shader->stage = MESA_SHADER_COMPUTE;
+            b->shader->is_preamble = true;
+            agx_block *last =
+               list_first_entry(&b->shader->blocks, agx_block, link);
+            agx_index a = agx_mov_imm(b, 32, 3);
+            b->shader->alloc += gap;
+            agx_index c = agx_mov_imm(b, 32, 5);
+            agx_instr *observe_a = agx_unit_test(b, a);
+            agx_instr *observe_c = agx_unit_test(b, c);
+            auto next_block = [&]() {
+               agx_block *next = agx_test_block(b->shader);
+               last->successors[0] = next;
+               util_dynarray_append(&next->predecessors, last);
+               last = next;
+               b->cursor = agx_after_block(last);
+            };
+            for (unsigned n = 0; n < empty_blocks; ++n)
+               next_block();
+            next_block();
+            agx_index small = agx_mov_imm(b, 32, 7);
+            next_block();
+            agx_index sum = agx_iadd(b, a, c, 0);
+            sum = agx_iadd(b, sum, agx_mov_imm(b, 32, 11), 0);
+            sum = agx_iadd(b, sum, small, 0);
+            agx_instr *observe_sum = agx_unit_test(b, sum);
+            agx_index x = agx_mov_imm(b, 32, 13);
+            agx_index y = agx_mov_imm(b, 32, 17);
+            agx_instr *observe_other = agx_unit_test(b, agx_iadd(b, x, y, 0));
+
+            std::vector<std::vector<agx_instr *>> original;
+            agx_foreach_block(b->shader, block) {
+               original.emplace_back();
+               agx_foreach_instr_in_block(block, I)
+                  original.back().push_back(I);
+            }
+            if (ilp)
+               agx_ilp_schedule(b->shader);
+            else
+               agx_pressure_schedule(b->shader);
+
+            std::vector<uint64_t> values(b->shader->alloc, UINT64_MAX);
+            unsigned block_index = 0;
+            unsigned observations = 0;
+            agx_foreach_block(b->shader, block) {
+               unsigned count = 0;
+               agx_foreach_instr_in_block(block, I) {
+                  ++count;
+                  bool belonged = false;
+                  for (agx_instr *before : original[block_index])
+                     belonged |= before == I;
+                  ASSERT_TRUE(belonged);
+                  agx_foreach_ssa_src(I, src) {
+                     ASSERT_LT(I->src[src].value, values.size());
+                     ASSERT_NE(values[I->src[src].value], UINT64_MAX);
+                  }
+                  if (I->op == AGX_OPCODE_MOV_IMM) {
+                     values[I->dest[0].value] = I->imm;
+                  } else if (I->op == AGX_OPCODE_IADD) {
+                     values[I->dest[0].value] =
+                        uint32_t(values[I->src[0].value] +
+                                 values[I->src[1].value]);
+                  } else {
+                     ASSERT_EQ(I->op, AGX_OPCODE_UNIT_TEST);
+                     const unsigned expected = I == observe_a ? 3 :
+                        I == observe_c ? 5 : I == observe_sum ? 26 : 30;
+                     ASSERT_TRUE(I == observe_a || I == observe_c ||
+                                 I == observe_sum || I == observe_other);
+                     EXPECT_EQ(values[I->src[0].value], expected);
+                     ++observations;
+                  }
+               }
+               EXPECT_EQ(count, original[block_index].size());
+               ++block_index;
+            }
+            EXPECT_EQ(block_index, original.size());
+            EXPECT_EQ(observations, 4u);
+            ralloc_free(mem);
+         }
+      }
+   }
+}

@@ -120,16 +120,29 @@ add_uniform_dependencies(struct util_dynarray *nodes, void *memctx)
       AGX_NUM_UNIFORMS, add_fixed_dependency, nodes->data);
 }
 
+struct sched_dag_state {
+   struct sched_node **last_write;
+   unsigned start;
+   unsigned end;
+};
+
 static struct dag *
 create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniforms,
-           struct util_dynarray *all_nodes)
+           struct util_dynarray *all_nodes, struct sched_dag_state *state)
 {
    struct dag *dag = dag_create(ctx);
    struct util_dynarray nodes;
    util_dynarray_init(&nodes, memctx);
 
-   struct sched_node **last_write =
-      calloc(ctx->alloc, sizeof(struct sched_node *));
+   if (!state->last_write) {
+      state->last_write = calloc(ctx->alloc, sizeof(*state->last_write));
+   } else if (state->start < state->end) {
+      memset(state->last_write + state->start, 0,
+             (state->end - state->start) * sizeof(*state->last_write));
+   }
+   state->start = ctx->alloc;
+   state->end = 0;
+   struct sched_node **last_write = state->last_write;
    struct sched_node *coverage = NULL;
    struct sched_node *preload = NULL;
 
@@ -188,7 +201,10 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
 
       agx_foreach_ssa_dest(I, d) {
          assert(I->dest[d].value < ctx->alloc);
-         last_write[I->dest[d].value] = node;
+         const unsigned dest = I->dest[d].value;
+         last_write[dest] = node;
+         state->start = MIN2(state->start, dest);
+         state->end = MAX2(state->end, dest + 1);
       }
 
       /* Classify the instruction and add dependencies according to the class */
@@ -225,8 +241,6 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
       else
          add_dep(node, preload);
    }
-
-   free(last_write);
 
    if (native_uniforms && !add_uniform_dependencies(&nodes, memctx))
       return NULL;
@@ -376,6 +390,7 @@ agx_pressure_schedule(agx_context *ctx)
 {
    agx_compute_liveness(ctx);
    void *memctx = ralloc_context(ctx);
+   struct sched_dag_state dag_state = {0};
 
    bool native_uniforms = false;
    agx_foreach_instr_global(ctx, I) {
@@ -384,7 +399,8 @@ agx_pressure_schedule(agx_context *ctx)
 
    agx_foreach_block(ctx, block) {
       struct sched_ctx sctx = {
-         .dag = create_dag(ctx, block, memctx, native_uniforms, NULL),
+         .dag = create_dag(ctx, block, memctx, native_uniforms, NULL,
+                           &dag_state),
       };
       /* Preserve the original order if a complete dependency graph cannot be
        * built (invalid range or workspace allocation failure). */
@@ -401,6 +417,7 @@ agx_pressure_schedule(agx_context *ctx)
          I->src[s].kill = false;
    }
 
+   free(dag_state.last_write);
    ralloc_free(memctx);
 }
 
@@ -724,11 +741,13 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool native_uniforms, unsigned alu_latency,
                    unsigned load_latency, signed slack, signed cap,
                    bool place_exit_compare, bool order_edges_free,
-                   signed fwd_cap, unsigned hoist_samples)
+                   signed fwd_cap, unsigned hoist_samples,
+                   struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
    util_dynarray_init(&all, memctx);
-   struct dag *dag = create_dag(ctx, block, memctx, native_uniforms, &all);
+   struct dag *dag = create_dag(ctx, block, memctx, native_uniforms, &all,
+                                dag_state);
    if (!dag)
       return false;
 
@@ -1061,6 +1080,7 @@ agx_ilp_schedule(agx_context *ctx)
 
    agx_compute_liveness(ctx);
    void *memctx = ralloc_context(ctx);
+   struct sched_dag_state dag_state = {0};
 
    bool native_uniforms = false;
    agx_foreach_instr_global(ctx, I) {
@@ -1095,11 +1115,12 @@ agx_ilp_schedule(agx_context *ctx)
          continue;
       if (in_loop[block->index] && !ilp_block_has_memory(block)) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                            4 * alu_latency, AGX_ILP_SLACK, 0, true, false, 0, 0);
+                            4 * alu_latency, AGX_ILP_SLACK, 0, true, false, 0, 0,
+                            &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                            4 * alu_latency, 8, 0, true, false, 0, 0);
+                            4 * alu_latency, 8, 0, true, false, 0, 0, &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
                  ilp_block_samples(block) >= AGX_ILP_FS_MIN_SAMPLES) {
@@ -1111,7 +1132,7 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, AGX_ILP_FS_SAMPLE_SLACK, 0, false,
                             true, AGX_ILP_FS_SAMPLE_HALVES,
-                            AGX_ILP_FS_HOIST_SAMPLES);
+                            AGX_ILP_FS_HOIST_SAMPLES, &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
@@ -1124,7 +1145,7 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, AGX_ILP_SLACK,
                             AGX_ILP_CPROG_HALVES, false, true,
-                            AGX_ILP_CPROG_HALVES - 16, 0);
+                            AGX_ILP_CPROG_HALVES - 16, 0, &dag_state);
       }
    }
 
@@ -1133,5 +1154,6 @@ agx_ilp_schedule(agx_context *ctx)
          I->src[s].kill = false;
    }
 
+   free(dag_state.last_write);
    ralloc_free(memctx);
 }
