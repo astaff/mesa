@@ -12,8 +12,7 @@ agx_ppp_hal300_graphics_core_pack(
    if (!agx_chip_g17_m5(chip) || !fields || !out ||
        !fields->fragment_program || fields->cull_mode > 3 ||
        fields->clip_distance_words > 8 || fields->viewport_count > 16 ||
-       fields->fragment_pass > 3 || fields->flat_shading_vertex > 2 ||
-       fields->flat_shading_vertex)
+       fields->fragment_pass > 3 || fields->flat_shading_vertex > 2)
       return false;
 
    const uint64_t ti_spill_quads =

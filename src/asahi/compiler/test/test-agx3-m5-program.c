@@ -669,8 +669,31 @@ test_unused_vertex_outputs(void)
    return 0;
 }
 
+/* Native mesh draws select their provoking vertex in the PPP cull word's
+ * flat-shading field ((vertex + 1) << 7); vertex-stage draws keep 0 there
+ * and select it through the VDM vertex program template. */
+static int
+test_flat_shading_vertex(void)
+{
+   struct agx_ppp_hal300_graphics_fields fields = {
+      .fragment_program = 0x1000,
+      .line_width = 15,
+   };
+   struct agx_ppp_hal300_graphics_core state;
+   for (unsigned vertex = 0; vertex <= 2; ++vertex) {
+      fields.flat_shading_vertex = vertex;
+      CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G17S, &fields, &state));
+      uint32_t cull;
+      memcpy(&cull, state.bytes + state.offsets[7] + 4, 4);
+      CHECK(((cull >> 7) & 3) == vertex + 1);
+   }
+   fields.flat_shading_vertex = 3;
+   CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G17S, &fields, &state));
+   return 0;
+}
+
 int main(void) {
-   int r = test_unused_vertex_outputs() || test_load_completion_wait(AGX_CHIP_G17G) ||
+   int r = test_unused_vertex_outputs() || test_flat_shading_vertex() || test_load_completion_wait(AGX_CHIP_G17G) ||
            test_load_completion_wait(AGX_CHIP_G17S) ||
            test_multiround_uniforms(AGX_CHIP_G17G) ||
            test_multiround_uniforms(AGX_CHIP_G17S) ||

@@ -8450,6 +8450,13 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
                            VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
       }
       const struct agx_ppp_hal300_graphics_fields fields = {
+         /* A vertex-stage draw selects its provoking vertex through the VDM
+          * vertex program template (hk_agx3_publish_vertex_state). A
+          * native mesh draw has no such template; the PPP flat-shading
+          * vertex selects it (hardware: EDS last-vertex mesh draws pass
+          * with the PPP selector and fail with the VDM mesh-state word). */
+         .flat_shading_vertex =
+            gfx->shaders[MESA_SHADER_MESH] ? gfx->provoking : 0,
          .viewport_count = hk_effective_viewport_count(cmd),
          .general_varyings = general_varyings,
          .cf_register_count = cf->nr_cf,
@@ -9829,14 +9836,20 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       gfx->g17p_draw_id_host_valid = false;
    }
 
+   bool topology_changed = false;
    if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || gt_dirty || vgt_dirty || IS_SHADER_DIRTY(MESH)) {
       enum mesa_prim prim = native_mesh ? hw_vs->info.mesh.prim : hk_rast_prim(cmd);
+      const unsigned topology = translate_hw_primitive_topology(prim);
 
-      gfx->topology = translate_hw_primitive_topology(prim);
+      topology_changed = topology != gfx->topology && IS_SHADER_DIRTY(MESH);
+      gfx->topology = topology;
       gfx->object_type = translate_object_type(prim);
    }
 
-   if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || IS_DIRTY(RS_PROVOKING_VERTEX)) {
+   /* The selector depends on the topology, which binding or unbinding a
+    * mesh shader changes without dirtying the IA state. */
+   if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || IS_DIRTY(RS_PROVOKING_VERTEX) ||
+       topology_changed) {
       unsigned provoking = hk_provoking_selector(dyn, gfx->topology);
 
       if (provoking != gfx->provoking) {
