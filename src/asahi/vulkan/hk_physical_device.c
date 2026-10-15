@@ -263,6 +263,8 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_sampler_filter_minmax = false,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
+      .EXT_shader_atomic_float = false,
+      .EXT_shader_atomic_float2 = false,
       .EXT_shader_image_atomic_int64 = false,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_shader_module_identifier = true,
@@ -442,7 +444,8 @@ hk_get_device_features(
          supported_extensions->KHR_acceleration_structure,
       .accelerationStructureIndirectBuild =
          supported_extensions->KHR_acceleration_structure,
-      .accelerationStructureHostCommands = false,
+      .accelerationStructureHostCommands =
+         supported_extensions->KHR_acceleration_structure,
       .descriptorBindingAccelerationStructureUpdateAfterBind =
          supported_extensions->KHR_acceleration_structure,
       .rayQuery = supported_extensions->KHR_ray_query,
@@ -469,6 +472,10 @@ hk_get_device_features(
          supported_extensions->KHR_ray_tracing_position_fetch,
       .rayTracingPipelineTraceRaysIndirect2 =
          supported_extensions->KHR_ray_tracing_maintenance1,
+
+      /* VK_EXT_ray_tracing_invocation_reorder */
+      .rayTracingInvocationReorder =
+         supported_extensions->EXT_ray_tracing_invocation_reorder,
       .bufferDeviceAddressMultiDevice = false,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
@@ -745,6 +752,34 @@ hk_get_device_features(
       .robustImageAccess2 = true,
       .nullDescriptor = true,
 
+      /* VK_EXT_shader_atomic_float */
+      .shaderBufferFloat32Atomics = supported_extensions->EXT_shader_atomic_float,
+      .shaderBufferFloat32AtomicAdd = supported_extensions->EXT_shader_atomic_float,
+      .shaderBufferFloat64Atomics = false,
+      .shaderBufferFloat64AtomicAdd = false,
+      .shaderSharedFloat32Atomics = supported_extensions->EXT_shader_atomic_float,
+      .shaderSharedFloat32AtomicAdd = supported_extensions->EXT_shader_atomic_float,
+      .shaderSharedFloat64Atomics = false,
+      .shaderSharedFloat64AtomicAdd = false,
+      .shaderImageFloat32Atomics = supported_extensions->EXT_shader_atomic_float,
+      .shaderImageFloat32AtomicAdd = supported_extensions->EXT_shader_atomic_float,
+      .sparseImageFloat32Atomics = false,
+      .sparseImageFloat32AtomicAdd = false,
+
+      /* VK_EXT_shader_atomic_float2 */
+      .shaderBufferFloat16Atomics = false,
+      .shaderBufferFloat16AtomicAdd = false,
+      .shaderBufferFloat16AtomicMinMax = false,
+      .shaderBufferFloat32AtomicMinMax = supported_extensions->EXT_shader_atomic_float2,
+      .shaderBufferFloat64AtomicMinMax = false,
+      .shaderSharedFloat16Atomics = false,
+      .shaderSharedFloat16AtomicAdd = false,
+      .shaderSharedFloat16AtomicMinMax = false,
+      .shaderSharedFloat32AtomicMinMax = supported_extensions->EXT_shader_atomic_float2,
+      .shaderSharedFloat64AtomicMinMax = false,
+      .shaderImageFloat32AtomicMinMax = supported_extensions->EXT_shader_atomic_float2,
+      .sparseImageFloat32AtomicMinMax = false,
+
       /* VK_EXT_shader_image_atomic_int64 */
       .shaderImageInt64Atomics = false,
       .sparseImageInt64Atomics = false,
@@ -880,6 +915,7 @@ hk_get_device_features(
       features->shaderQuadControl = false;
       features->computeDerivativeGroupQuads = true;
       features->computeDerivativeGroupLinear = true;
+      features->textureCompressionASTC_HDR = true;
    }
 
    /* A multiview promise for a stage this device does not expose is
@@ -1046,6 +1082,9 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxRayDispatchInvocationCount = 1u << 30,
       .shaderGroupHandleAlignment = 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
+
+      .rayTracingInvocationReorderReorderingHint =
+         VK_RAY_TRACING_INVOCATION_REORDER_MODE_NONE_EXT,
 
       .maxPerStageDescriptorSamplers = HK_MAX_DESCRIPTORS,
       .maxPerStageDescriptorUniformBuffers = HK_MAX_DESCRIPTORS,
@@ -1741,6 +1780,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
          (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY) != 0;
       supported_extensions.KHR_ray_tracing_pipeline = true;
       supported_extensions.EXT_pipeline_library_group_handles = true;
+      supported_extensions.EXT_ray_tracing_invocation_reorder = true;
       supported_extensions.KHR_ray_tracing_maintenance1 = true;
       supported_extensions.KHR_ray_tracing_position_fetch = true;
    }
@@ -1755,6 +1795,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        * subgroup quad shuffle operations exposed above. */
       supported_extensions.KHR_shader_quad_control = false;
       supported_extensions.KHR_compute_shader_derivatives = true;
+      supported_extensions.EXT_shader_atomic_float = true;
+      supported_extensions.EXT_shader_atomic_float2 = true;
+      supported_extensions.EXT_texture_compression_astc_hdr = true;
    }
 
    struct vk_features supported_features;

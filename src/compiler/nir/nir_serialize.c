@@ -228,7 +228,8 @@ union packed_var {
       unsigned type_same_as_last : 1;
       unsigned interface_type_same_as_last : 1;
       unsigned ray_query : 1;
-      unsigned num_members : 16;
+      unsigned hit_object : 1;
+      unsigned num_members : 15;
    } u;
 };
 
@@ -292,6 +293,7 @@ write_variable(write_ctx *ctx, const nir_variable *var)
       flags.u.data_encoding = var_encode_full;
 
    flags.u.ray_query = var->data.ray_query;
+   flags.u.hit_object = var->data.hit_object;
 
    blob_write_uint32(ctx->blob, flags.u32);
 
@@ -389,6 +391,7 @@ read_variable(read_ctx *ctx)
    }
 
    var->data.ray_query = flags.u.ray_query;
+   var->data.hit_object = flags.u.hit_object;
 
    var->num_state_slots = flags.u.num_state_slots;
    if (var->num_state_slots != 0) {

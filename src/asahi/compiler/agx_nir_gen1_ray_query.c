@@ -62,6 +62,7 @@ gen1_rq_supported_load(const nir_intrinsic_instr *intr, bool instances, bool pos
       return true;
    case nir_ray_query_value_intersection_instance_id:
    case nir_ray_query_value_intersection_instance_custom_index:
+   case nir_ray_query_value_intersection_instance_address:
       return instances && nir_intrinsic_committed(intr);
    case nir_ray_query_value_intersection_type:
    case nir_ray_query_value_intersection_t:
@@ -534,8 +535,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
                                                nir_ball_fequal3(&b, hi, hi));
          if (stable_as_selector)
             valid_bounds = nir_iand(&b, valid_bounds,
-               nir_iand(&b, nir_ugt_imm(&b, selector, 0),
-                        nir_ult_imm(&b, selector, layout->as_table_first)));
+                                    nir_ine_imm(&b, selector, 0));
          nir_push_if(&b, valid_bounds);
          nir_def *base=nir_load_preamble(&b,1,64,.base=layout->payload_uniform);
          nir_def *id=nir_load_scs_thread_index_agx(&b);
@@ -756,6 +756,9 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          }
          case nir_ray_query_value_intersection_instance_id:
             value=nir_channel(&b,nir_load_deref(&b,result[2]),2);
+            break;
+         case nir_ray_query_value_intersection_instance_address:
+            value = nir_pack_64_2x32(&b, nir_channels(&b, nir_load_deref(&b, result[0]), 3));
             break;
          case nir_ray_query_value_intersection_instance_custom_index:
             value=nir_channel(&b,nir_load_deref(&b,result[2]),3);

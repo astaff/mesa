@@ -24,7 +24,7 @@ slot_count(enum agx_isa_encoding enc)
 static bool
 op_ok(enum agx3_atomic_op op)
 {
-   return op >= AGX3_ATOMIC_ADD && op <= AGX3_ATOMIC_XOR;
+   return op >= AGX3_ATOMIC_ADD && op <= AGX3_ATOMIC_FADD;
 }
 
 static bool
@@ -196,7 +196,7 @@ agx3_atomic_encode_local(enum agx_isa_encoding enc,
                          uint8_t out[AGX3_ATOMIC_MAX_LENGTH], uint8_t *len)
 {
    if (!encoding_ok(enc) || d == NULL || out == NULL || len == NULL ||
-       !op_ok(d->op) || d->value > 191 ||
+       !op_ok(d->op) || d->op == AGX3_ATOMIC_FADD || d->value > 191 ||
        (d->wait_mask & ~((1u << slot_count(enc)) - 1u)))
       return false;
 

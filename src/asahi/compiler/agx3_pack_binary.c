@@ -3449,6 +3449,7 @@ agx3_map_atomic_op(enum agx_atomic_opc in, enum agx3_atomic_op *out)
       OP(AND);
       OP(OR);
       OP(XOR);
+      OP(FADD);
 #undef OP
    }
 
@@ -3474,6 +3475,8 @@ agx3_translate_device_atomic(const agx_instr *I,
       return false;
 
    d->exec_masked = exec_masked;
+   if (d->op == AGX3_ATOMIC_FADD && enc != AGX_ISA_ENCODING_AGX3B)
+      return false;
 
    const unsigned value_channels =
       d->op == AGX3_ATOMIC_CMPXCHG ? 2 : 1;

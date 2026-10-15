@@ -351,6 +351,8 @@ lower_rq_load(nir_builder *b, nir_def *index, nir_intrinsic_instr *instr,
                                                                       custom_instance_and_mask))),
                           0xFFFFFF);
    }
+   case nir_ray_query_value_intersection_instance_address:
+      return rq_load_var(b, index, intersection->instance_addr);
    case nir_ray_query_value_intersection_instance_id: {
       nir_def *instance_node_addr = rq_load_var(b, index, intersection->instance_addr);
       return nir_load_global(

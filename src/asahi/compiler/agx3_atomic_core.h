@@ -8,9 +8,11 @@
  * Apple's G15G/G16G/G17S compiler output.  AGX3b device atomics are in-place;
  * AGX3c device atomics split value and return registers.  Threadgroup atomics
  * split them on both encodings.  G17P additionally grounds no-result
- * threadgroup atomics with immediate and register byte addresses.  No 64-bit
- * encoding has been witnessed, so the interface deliberately has no width
- * selector.
+ * threadgroup atomics with immediate and register byte addresses.  The float
+ * add selector was established on A18 Pro hardware for device memory.  The
+ * one witnessed 64-bit form (Apple's G17P atomic_max on atomic_ulong, the
+ * f90=3 min/max family) returns a changed flag rather than the old value on
+ * hardware and is not encoded here, so the interface has no width selector.
  */
 
 #pragma once
@@ -37,6 +39,7 @@ enum agx3_atomic_op {
    AGX3_ATOMIC_AND = 8,
    AGX3_ATOMIC_OR = 9,
    AGX3_ATOMIC_XOR = 10,
+   AGX3_ATOMIC_FADD = 11,
 };
 
 enum agx3_atomic_base_kind {
