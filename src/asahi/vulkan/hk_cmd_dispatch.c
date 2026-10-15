@@ -1739,7 +1739,11 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       goto refused;
    if (s->b.info.uses_ray_traversal) {
       reason = "native query dispatch shape";
+      /* Internal query kernels use the compute query ABI. A software vertex
+       * variant keeps the vertex ABI (hk_g17p_internal_graphics_uniform_ranges)
+       * and therefore stays refused. */
       if (internal && s->info.stage != MESA_SHADER_TESS_CTRL &&
+          s->info.stage != MESA_SHADER_TESS_EVAL &&
           s->info.stage != MESA_SHADER_GEOMETRY)
          goto refused;
       /* Keep the shader's captured payload profile, but derive every allocation

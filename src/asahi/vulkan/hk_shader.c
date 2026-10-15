@@ -3330,6 +3330,12 @@ hk_nir_uses_root(const nir_shader *nir)
    return false;
 }
 
+struct hk_g17p_vertex_preamble_shift {
+   unsigned base;
+   /* Preamble loads below this half are fixed ABI state, not VBO uniforms. */
+   unsigned first;
+};
+
 static bool
 hk_g17p_shift_vertex_preamble(UNUSED nir_builder *b,
                               nir_intrinsic_instr *intr, void *data)
@@ -3337,9 +3343,10 @@ hk_g17p_shift_vertex_preamble(UNUSED nir_builder *b,
    if (intr->intrinsic != nir_intrinsic_load_preamble)
       return false;
 
-   const unsigned base = *(const unsigned *)data;
+   const struct hk_g17p_vertex_preamble_shift *shift = data;
+   const unsigned base = shift->base;
    const unsigned old = nir_intrinsic_base(intr);
-   if (old > UINT16_MAX - base)
+   if (old < shift->first || old > UINT16_MAX - base)
       return false;
 
    nir_intrinsic_set_base(intr, old + base);
@@ -3963,8 +3970,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    if ((sw_stage == MESA_SHADER_FRAGMENT && dev->gen1_native_fragment_rq) ||
        (sw_stage != MESA_SHADER_FRAGMENT && sw_stage != MESA_SHADER_COMPUTE &&
         dev->gen1_native_graphics_rq) ||
+       /* The hardware evaluation variant becomes a vertex shader in
+        * poly_nir_lower_tes() below, after this scan. */
        (dev->m5_native_rq && (nir->info.stage == MESA_SHADER_VERTEX ||
-                               nir->info.stage == MESA_SHADER_FRAGMENT))) {
+                               nir->info.stage == MESA_SHADER_FRAGMENT ||
+                               (sw_stage == MESA_SHADER_TESS_EVAL && hw)))) {
       nir_foreach_function_impl(impl, nir) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
@@ -4011,10 +4021,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
           * 0..7. The monolithic VBO lowering may already have materialized
           * vertex ABI preamble loads, so move those as one unit before root
           * and descriptor-set lowering allocates the following ranges. */
-         const unsigned base = AGX_ABI_G17P_TEXTURE_POINTER_HALFS;
+         const struct hk_g17p_vertex_preamble_shift shift = {
+            .base = AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
+         };
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_g17p_shift_vertex_preamble,
-                  nir_metadata_control_flow, (void *)&base);
+                  nir_metadata_control_flow, (void *)&shift);
       }
    } else if (agx_native_graphics(&dev->dev) &&
               (nir->info.stage == MESA_SHADER_GEOMETRY ||
@@ -4152,11 +4164,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       shader->info.agx3_indexed_sampler_valid = true;
       if (nir->info.stage == MESA_SHADER_VERTEX) {
          /* Both native AGX3 shader ABIs reserve halves 0..7 for the texture
-          * and sampler heaps. Move already-lowered VBO uniforms together. */
-         const unsigned base = AGX_ABI_G17P_TEXTURE_POINTER_HALFS;
+          * and sampler heaps. Move already-lowered VBO uniforms together.
+          * A native query owns halves 0..167 and its heaps start at 168, so
+          * only the vertex ABI above the query state moves. */
+         const struct hk_g17p_vertex_preamble_shift shift = {
+            .base = AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
+            .first = shader->info.agx3_gen1_fragment_rq ? 168 : 0,
+         };
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_g17p_shift_vertex_preamble,
-                  nir_metadata_control_flow, (void *)&base);
+                  nir_metadata_control_flow, (void *)&shift);
       }
    }
 

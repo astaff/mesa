@@ -451,6 +451,7 @@ int main(int argc,char **argv)
  batch_completion_latch(2);
  standard_ray_query(1, false, MESA_SHADER_COMPUTE);
  standard_ray_query(1, false, MESA_SHADER_TESS_CTRL);
+ standard_ray_query(1, false, MESA_SHADER_TESS_EVAL);
  standard_ray_query(1, false, MESA_SHADER_VERTEX);
  standard_ray_query(1, false, MESA_SHADER_FRAGMENT);
  standard_ray_query(2, false, MESA_SHADER_COMPUTE);
