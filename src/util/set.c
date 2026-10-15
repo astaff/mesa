@@ -472,32 +472,46 @@ set_search_or_add(struct set *ht, uint32_t hash, const void *key, bool *found)
 
    uint32_t size = ht->size;
    uint32_t start_address = util_fast_urem32(hash, size, ht->size_magic);
+   uint32_t hash_address = start_address;
+   struct set_entry *entry = ht->table + hash_address;
+
+   if (entry_is_free(entry)) {
+      available_entry = entry;
+      goto insert;
+   }
+   if (entry_is_deleted(entry)) {
+      available_entry = entry;
+   } else if (entry->hash == hash && ht->key_equals_function(key, entry->key)) {
+      if (found)
+         *found = true;
+      return entry;
+   }
+
    uint32_t double_hash = util_fast_urem32(hash, ht->rehash,
                                            ht->rehash_magic) + 1;
-   uint32_t hash_address = start_address;
-   do {
-      struct set_entry *entry = ht->table + hash_address;
+   while (true) {
+      hash_address = hash_address + double_hash;
+      if (hash_address >= size)
+         hash_address -= size;
+      if (hash_address == start_address)
+         break;
 
+      entry = ht->table + hash_address;
       if (!entry_is_present(entry)) {
-         /* Stash the first available entry we find */
          if (available_entry == NULL)
             available_entry = entry;
          if (entry_is_free(entry))
             break;
       }
-
-      if (!entry_is_deleted(entry) &&
-          entry->hash == hash &&
+      if (!entry_is_deleted(entry) && entry->hash == hash &&
           ht->key_equals_function(key, entry->key)) {
          if (found)
             *found = true;
          return entry;
       }
+   }
 
-      hash_address = hash_address + double_hash;
-      if (hash_address >= size)
-         hash_address -= size;
-   } while (hash_address != start_address);
+insert:;
 
    if (available_entry) {
       /* There is no matching entry, create it. */

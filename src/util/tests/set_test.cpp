@@ -171,3 +171,90 @@ TEST(set, search_or_add)
 
    _mesa_set_destroy(s, NULL);
 }
+
+struct set_probe_key {
+   uint32_t value;
+   uint32_t hash;
+};
+
+static uint32_t
+set_probe_hash(const void *p)
+{
+   return static_cast<const set_probe_key *>(p)->hash;
+}
+
+static bool
+set_probe_equal(const void *a, const void *b)
+{
+   return static_cast<const set_probe_key *>(a)->value ==
+          static_cast<const set_probe_key *>(b)->value;
+}
+
+TEST(set, search_or_add_collision_churn)
+{
+   constexpr unsigned count = 257;
+   for (unsigned policy = 0; policy < 3; ++policy) {
+      for (bool prehashed : {false, true}) {
+         SCOPED_TRACE(policy);
+         SCOPED_TRACE(prehashed);
+         set_probe_key keys[count], duplicates[count];
+         const set_probe_key *model[count] = {};
+         for (unsigned i = 0; i < count; ++i) {
+            uint32_t hash = policy == 0 ? 0 : policy == 1 ? i % 7 :
+                            i == 1 ? UINT32_MAX : i * 2654435761u;
+            keys[i] = duplicates[i] = {i, hash};
+         }
+         struct set s;
+         _mesa_set_init(&s, nullptr, set_probe_hash, set_probe_equal);
+         for (unsigned phase = 0; phase < 4; ++phase) {
+            SCOPED_TRACE(phase);
+            for (unsigned i = 0; i < count; ++i) {
+               bool found = true;
+               set_entry *entry = prehashed ?
+                  _mesa_set_search_or_add_pre_hashed(&s, keys[i].hash,
+                                                    &keys[i], &found) :
+                  _mesa_set_search_or_add(&s, &keys[i], &found);
+               ASSERT_NE(entry, nullptr);
+               EXPECT_FALSE(found);
+               EXPECT_EQ(entry->key, &keys[i]);
+               model[i] = &keys[i];
+            }
+            EXPECT_EQ(s.entries, count);
+            for (unsigned i = 0; i < count; i += 3) {
+               _mesa_set_remove_key(&s, &duplicates[i]);
+               model[i] = nullptr;
+            }
+            for (unsigned i = count; i-- > 0;) {
+               SCOPED_TRACE(i);
+               bool found = !model[i];
+               set_entry *entry = prehashed ?
+                  _mesa_set_search_or_add_pre_hashed(&s, duplicates[i].hash,
+                                                    &duplicates[i], &found) :
+                  _mesa_set_search_or_add(&s, &duplicates[i], &found);
+               ASSERT_NE(entry, nullptr);
+               EXPECT_EQ(found, model[i] != nullptr);
+               if (!model[i])
+                  model[i] = &duplicates[i];
+               EXPECT_EQ(entry->key, model[i]);
+               EXPECT_EQ(_mesa_set_search_or_add(&s, &keys[i], nullptr)->key,
+                         model[i]);
+            }
+            EXPECT_EQ(s.entries, count);
+            _mesa_set_resize(&s, count * (phase + 2));
+            for (unsigned i = 0; i < count; ++i) {
+               set_entry *entry = _mesa_set_search(&s, &keys[i]);
+               ASSERT_NE(entry, nullptr);
+               EXPECT_EQ(entry->key, model[i]);
+            }
+            _mesa_set_clear(&s, nullptr);
+            EXPECT_EQ(s.entries, 0u);
+            EXPECT_EQ(s.deleted_entries, 0u);
+            for (unsigned i = 0; i < count; ++i) {
+               EXPECT_EQ(_mesa_set_search(&s, &keys[i]), nullptr);
+               model[i] = nullptr;
+            }
+         }
+         _mesa_set_fini(&s, nullptr);
+      }
+   }
+}
