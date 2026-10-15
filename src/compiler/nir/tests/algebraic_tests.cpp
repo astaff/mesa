@@ -793,6 +793,161 @@ TEST_F(nir_opt_algebraic_test, fixed_output_root_preserves_input_components)
    }
 }
 
+
+static nir_def *
+binding_input(nir_builder *build, unsigned components, const char *name)
+{
+   nir_variable *variable = nir_local_variable_create(
+      build->impl, glsl_vector_type(GLSL_TYPE_UINT, components), name);
+   return nir_load_var(build, variable);
+}
+
+TEST_F(nir_opt_algebraic_test, repeated_binding_keeps_first_active_swizzle)
+{
+   for (unsigned components : {1u, 2u, 4u, 8u, 16u}) {
+      for (bool same : {false, true}) {
+         SCOPED_TRACE(components);
+         SCOPED_TRACE(same);
+         nir_shader_compiler_options options = {};
+         nir_builder current = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &options, "repeated variable swizzle");
+         ralloc_steal(b->shader, current.shader);
+         nir_def *input = binding_input(&current, 16, "input");
+         nir_alu_instr *add = nir_alu_instr_create(current.shader, nir_op_iadd);
+         nir_def_init(&add->instr, &add->def, components, 32);
+         for (unsigned src = 0; src < 2; ++src) {
+            add->src[src].src = nir_src_for_ssa(input);
+            for (unsigned i = 0; i < components; ++i)
+               add->src[src].swizzle[i] = (i + 3 + (src && !same)) % 16;
+         }
+         nir_builder_instr_insert(&current, &add->instr);
+         nir_intrinsic_instr *store = filter_store(&current, &add->def);
+         nir_search_value_union values[2] = {};
+         filter_variable(values[0]);
+         filter_expression(values[1], nir_op_iadd, 0);
+         values[1].expression.srcs[1] = 0;
+         const uint16_t transition[] = {2};
+         std::vector<per_op_table> operations(nir_num_search_ops);
+         operations[nir_op_iadd] = {nullptr, 1, transition};
+         const struct transform transforms[] = {
+            {0, 0, ~0u}, {1, 0, 0}, {0, 0, ~0u},
+         };
+         const uint16_t offsets[] = {0, 0, 1};
+         nir_algebraic_table table = {};
+         table.transforms = transforms;
+         table.transform_offsets = offsets;
+         table.pass_op_table = operations.data();
+         table.values = values;
+         const bool enabled[] = {true};
+         EXPECT_EQ(nir_algebraic_impl(current.impl, enabled, &table), same);
+         if (same) {
+            nir_alu_instr *result = nir_src_as_alu(store->src[0]);
+            ASSERT_NE(result, nullptr);
+            EXPECT_EQ(result->op, nir_op_mov);
+            EXPECT_EQ(result->src[0].src.ssa, input);
+            for (unsigned i = 0; i < components; ++i)
+               EXPECT_EQ(result->src[0].swizzle[i], (i + 3) % 16);
+         } else {
+            EXPECT_EQ(store->src[0].ssa, &add->def);
+         }
+         nir_validate_shader(current.shader, "repeated variable swizzle");
+      }
+   }
+}
+
+static std::vector<unsigned> binding_condition_visits;
+
+static bool
+binding_accepts_flipped_source(const nir_search_state *, const nir_alu_instr *,
+                               unsigned src, unsigned, const uint8_t *)
+{
+   binding_condition_visits.push_back(src);
+   return src == 1;
+}
+
+TEST_F(nir_opt_algebraic_test, conditioned_and_direct_bindings_keep_direction_state)
+{
+   nir_def *lhs = binding_input(b, 4, "lhs");
+   nir_def *rhs = binding_input(b, 4, "rhs");
+   nir_def *root = nir_iadd(b, lhs, rhs);
+   nir_intrinsic_instr *store = filter_store(b, root);
+   nir_search_value_union values[3] = {};
+   filter_variable(values[0]);
+   values[0].variable.cond_index = 0;
+   filter_variable(values[1]);
+   values[1].variable.variable = 1;
+   values[1].variable.swizzle[0] = NIR_MAX_VEC_COMPONENTS - 1;
+   filter_expression(values[2], nir_op_iadd, 0);
+   values[2].expression.srcs[1] = 1;
+   values[2].expression.comm_exprs = 1;
+   values[2].expression.comm_expr_mask = 1;
+   const uint16_t transition[] = {2};
+   std::vector<per_op_table> operations(nir_num_search_ops);
+   operations[nir_op_iadd] = {nullptr, 1, transition};
+   const struct transform transforms[] = {
+      {0, 0, ~0u}, {2, 1, 0}, {0, 0, ~0u},
+   };
+   const uint16_t offsets[] = {0, 0, 1};
+   const nir_search_variable_cond conditions[] = {binding_accepts_flipped_source};
+   nir_algebraic_table table = {};
+   table.transforms = transforms;
+   table.transform_offsets = offsets;
+   table.pass_op_table = operations.data();
+   table.values = values;
+   table.variable_cond = conditions;
+   const bool enabled[] = {true};
+   binding_condition_visits.clear();
+   ASSERT_TRUE(nir_algebraic_impl(b->impl, enabled, &table));
+   EXPECT_EQ(binding_condition_visits, (std::vector<unsigned>{0, 1}));
+   EXPECT_EQ(store->src[0].ssa, lhs);
+   nir_validate_shader(b->shader, "conditioned and direct bindings");
+}
+
+TEST_F(nir_opt_algebraic_test, rejected_constant_binding_does_not_commit_state)
+{
+   for (unsigned components : {1u, 4u, 16u}) {
+      SCOPED_TRACE(components);
+      nir_shader_compiler_options options = {};
+      nir_builder current = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &options, "rejected constant binding");
+      ralloc_steal(b->shader, current.shader);
+      nir_def *lhs = binding_input(&current, components, "lhs");
+      nir_def *rhs = binding_input(&current, components, "rhs");
+      nir_def *root = nir_iadd(&current, lhs, rhs);
+      nir_intrinsic_instr *store = filter_store(&current, root);
+      nir_search_value_union values[5] = {};
+      filter_variable(values[0]);
+      values[0].variable.is_constant = true;
+      filter_variable(values[1]);
+      filter_variable(values[2]);
+      values[2].variable.variable = 1;
+      filter_expression(values[3], nir_op_iadd, 0);
+      values[3].expression.srcs[1] = 2;
+      values[3].expression.comm_exprs = 1;
+      values[3].expression.comm_expr_mask = 1;
+      filter_expression(values[4], nir_op_iadd, 1);
+      values[4].expression.srcs[1] = 2;
+      values[4].expression.comm_exprs = 1;
+      values[4].expression.comm_expr_mask = 1;
+      const uint16_t transition[] = {2};
+      std::vector<per_op_table> operations(nir_num_search_ops);
+      operations[nir_op_iadd] = {nullptr, 1, transition};
+      const struct transform transforms[] = {
+         {0, 0, ~0u}, {3, 1, 0}, {4, 1, 0}, {0, 0, ~0u},
+      };
+      const uint16_t offsets[] = {0, 0, 1};
+      nir_algebraic_table table = {};
+      table.transforms = transforms;
+      table.transform_offsets = offsets;
+      table.pass_op_table = operations.data();
+      table.values = values;
+      const bool enabled[] = {true};
+      ASSERT_TRUE(nir_algebraic_impl(current.impl, enabled, &table));
+      EXPECT_EQ(store->src[0].ssa, lhs);
+      nir_validate_shader(current.shader, "rejected constant binding");
+   }
+}
+
 TEST_F(nir_opt_algebraic_test, bounds_agx_unsigned_end_and_bound)
 {
    for (unsigned bits : {8u, 16u, 32u, 64u}) {

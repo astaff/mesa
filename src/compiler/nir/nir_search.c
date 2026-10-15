@@ -236,7 +236,8 @@ match_value(const nir_algebraic_table *table,
             unsigned num_components, const uint8_t *swizzle,
             struct match_state *state)
 {
-   uint8_t new_swizzle[NIR_MAX_VEC_COMPONENTS];
+   uint8_t swizzle_storage[NIR_MAX_VEC_COMPONENTS];
+   uint8_t *new_swizzle = swizzle_storage;
 
    /* If the source is an explicitly sized source, then we need to reset
     * both the number of components and the swizzle.
@@ -246,13 +247,23 @@ match_value(const nir_algebraic_table *table,
       swizzle = identity_swizzle;
    }
 
-   for (unsigned i = 0; i < num_components; ++i)
-      new_swizzle[i] = instr->src[src].swizzle[swizzle[i]];
-
    /* If the value has a specific bit size and it doesn't match, bail */
    if (value->bit_size > 0 &&
        nir_src_bit_size(instr->src[src].src) != value->bit_size)
       return false;
+
+   if (value->type == nir_search_value_variable) {
+      const nir_search_variable *var = nir_search_value_as_variable(value);
+      assert(var->variable < NIR_SEARCH_MAX_VARIABLES);
+      if (var->cond_index == -1 &&
+          !(state->variables_seen & (1 << var->variable))) {
+         new_swizzle = state->variables[var->variable].swizzle;
+         memset(new_swizzle, 0, NIR_MAX_VEC_COMPONENTS);
+      }
+   }
+
+   for (unsigned i = 0; i < num_components; ++i)
+      new_swizzle[i] = instr->src[src].swizzle[swizzle[i]];
 
    switch (value->type) {
    case nir_search_value_expression:
@@ -285,8 +296,10 @@ match_value(const nir_algebraic_table *table,
          struct match_variable *dst = &state->variables[var->variable];
          dst->def = instr->src[src].src.ssa;
 
-         memcpy(dst->swizzle, new_swizzle, num_components);
-         memset(dst->swizzle + num_components, 0, NIR_MAX_VEC_COMPONENTS - num_components);
+         if (new_swizzle != dst->swizzle) {
+            memcpy(dst->swizzle, new_swizzle, num_components);
+            memset(dst->swizzle + num_components, 0, NIR_MAX_VEC_COMPONENTS - num_components);
+         }
 
          return true;
       }
