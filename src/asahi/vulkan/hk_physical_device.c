@@ -1482,6 +1482,7 @@ hk_get_device_properties(const struct agx_device *dev,
        * fragment stages.  Keep subgroupQuadOperationsInAllStages false until
        * every other advertised graphics stage is independently witnessed. */
       properties->subgroupQuadOperationsInAllStages = false;
+      properties->sparseResidencyNonResidentStrict = false;
    }
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
