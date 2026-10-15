@@ -1364,8 +1364,10 @@ bool
 agx_nir_lower_m5_ray_query(nir_shader *shader,
                            const struct agx_m5_ray_query_layout *layout)
 {
-   if (!layout || shader->info.stage != MESA_SHADER_COMPUTE ||
-       shader->info.workgroup_size_variable ||
+   const bool kernel = layout && layout->compute_kernel &&
+      shader->info.stage == MESA_SHADER_TESS_CTRL;
+   if (!layout || (!kernel && shader->info.stage != MESA_SHADER_COMPUTE) ||
+       (!kernel && shader->info.workgroup_size_variable) ||
        layout->payload_uniform > 508 ||
        (layout->payload_uniform & 1) || layout->bvh_uniform > 508 ||
        (layout->bvh_uniform & 1) || layout->status_uniform > 510 ||

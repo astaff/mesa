@@ -75,6 +75,7 @@ struct agx_m5_ray_query_layout {
    unsigned context_uniform;
    unsigned as_table_uniform;
    bool instance_traversal;
+   bool compute_kernel;
 };
 
 /* Lower standard NIR rq_* operations for opaque triangle queries and arrays.

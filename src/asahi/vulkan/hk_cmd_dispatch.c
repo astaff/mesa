@@ -1739,7 +1739,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       goto refused;
    if (s->b.info.uses_ray_traversal) {
       reason = "native query dispatch shape";
-      if (internal)
+      if (internal && s->info.stage != MESA_SHADER_TESS_CTRL)
          goto refused;
       /* Keep the shader's captured payload profile, but derive every allocation
        * and parameter offset from the native ScsLayoutGen2 equations. In

@@ -2788,6 +2788,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             .context_uniform = dev->m5_rq_instances ? 160 : 148,
             .as_table_uniform = dev->m5_rq_instances ? 164 : 152,
             .instance_traversal = dev->m5_rq_instances,
+            .compute_kernel = true,
          };
          if (!agx_nir_lower_m5_ray_query(nir, &layout)) {
             mesa_loge("M5 native ray query: unsupported query shape or operation");
@@ -4318,11 +4319,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          : 0) +
       (sw_stage == MESA_SHADER_VERTEX && shader->info.agx3_gen1_fragment_rq
          ? 168 : 0);
-   /* A device exposing ray queries does not make every compute shader a
-    * ray-query shader. Keep the reserved native query prefix only where
-    * there are live queries; ordinary compute uses the compact root ABI. */
+   /* TCS kernels retain their API stage through lowering. Reserve the native
+    * query prefix for them as well as compute, and only for live queries. */
    const bool m5_native_query_abi =
-      sw_stage == MESA_SHADER_COMPUTE && dev->m5_native_rq &&
+      (nir->info.stage == MESA_SHADER_COMPUTE ||
+       sw_stage == MESA_SHADER_TESS_CTRL) && dev->m5_native_rq &&
       (!debug_get_bool_option("ASAHI_M5_SHADER_LOCAL_RQ_ABI", true) ||
        hk_m5_needs_query_abi(nir));
    if (m5_native_query_abi)
