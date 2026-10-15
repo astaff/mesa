@@ -227,7 +227,8 @@ agx3_tex_encode_fetch(enum agx_isa_encoding enc,
    if ((!immediate_operands || d->sparse) && enc != AGX_ISA_ENCODING_AGX3B)
       return false;
    const int ep = enc == AGX_ISA_ENCODING_AGX3B
-                     ? (immediate_operands && !d->sparse ? 3 : 4)
+                     ? (immediate_operands && !d->sparse &&
+                        !d->heap_uniform_base ? 3 : 4)
                      : 0;
    if (!agx3_bind_compose(enc, "smp", ep, base, nb, ov, n, out, len)) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
@@ -837,7 +838,7 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
 
    /* f120 deposits instruction bit 142, past the 112-bit ep3 form, so a
     * sparse sample takes ep4 even when both descriptors are immediate. */
-   const int ep = (immediate && !d->sparse) ? 3 : 4;
+   const int ep = (immediate && !d->sparse && !d->heap_uniform_base) ? 3 : 4;
    if (!agx3_bind_compose(enc, "smp", ep, base, nb, ov, n, out, len)) {
       memset(out, 0, AGX3_TEX_MAX_LENGTH);
       *len = 0;
