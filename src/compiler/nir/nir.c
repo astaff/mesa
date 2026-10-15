@@ -1976,21 +1976,22 @@ nir_block_cf_tree_next(nir_block *block)
    if (!parent || parent->type == nir_cf_node_function)
       return NULL;
 
-   /* Is this the last block of a cf_node? Return the following block */
-   if (block == nir_cf_node_cf_tree_last(parent))
-      return nir_cf_node_as_block(nir_cf_node_next(parent));
-
    switch (parent->type) {
    case nir_cf_node_if: {
-      /* We are at the end of the if. Go to the beginning of the else */
       nir_if *if_stmt = nir_cf_node_as_if(parent);
+      if (block->cf_node.node.next == &if_stmt->else_list.tail_sentinel)
+         return nir_cf_node_as_block(nir_cf_node_next(parent));
+      /* We are at the end of the if. Go to the beginning of the else */
       assert(block == nir_if_last_then_block(if_stmt));
       return nir_if_first_else_block(if_stmt);
    }
 
    case nir_cf_node_loop: {
-      /* We are at the end of the body and there is a continue construct */
       nir_loop *loop = nir_cf_node_as_loop(parent);
+      if (!nir_loop_has_continue_construct(loop) ||
+          block->cf_node.node.next == &loop->continue_list.tail_sentinel)
+         return nir_cf_node_as_block(nir_cf_node_next(parent));
+      /* We are at the end of the body and there is a continue construct */
       assert(block == nir_loop_last_block(loop) &&
              nir_loop_has_continue_construct(loop));
       return nir_loop_first_continue_block(loop);

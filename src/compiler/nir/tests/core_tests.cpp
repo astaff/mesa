@@ -561,4 +561,101 @@ TEST_F(nir_core_test, clone_body_blocks_preserve_edges_and_conditions)
    ralloc_free(copy);
 }
 
+static void
+collect_cf_tree_blocks(struct exec_list *list, std::vector<nir_block *> &blocks)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         blocks.push_back(nir_cf_node_as_block(node));
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         collect_cf_tree_blocks(&nif->then_list, blocks);
+         collect_cf_tree_blocks(&nif->else_list, blocks);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         collect_cf_tree_blocks(&loop->body, blocks);
+         collect_cf_tree_blocks(&loop->continue_list, blocks);
+         break;
+      }
+      default:
+         ADD_FAILURE();
+         break;
+      }
+   }
+}
+
+static void
+build_cf_tree_case(nir_builder *build, unsigned depth, unsigned style)
+{
+   if (!depth)
+      return;
+
+   nir_if *nif = nir_push_if(build, nir_imm_true(build));
+   build_cf_tree_case(build, depth - 1, style);
+   nir_push_else(build, nif);
+   if (style & 1)
+      build_cf_tree_case(build, depth - 1, style);
+   nir_pop_if(build, nif);
+
+   if (style & 2) {
+      nir_loop *loop = nir_push_loop(build);
+      if (style & 4)
+         nir_loop_add_continue_construct(loop);
+      build_cf_tree_case(build, depth - 1, style);
+      nir_if *exit = nir_push_if(build, nir_imm_true(build));
+      nir_jump(build, nir_jump_break);
+      nir_push_else(build, exit);
+      if (style & 4)
+         nir_jump(build, nir_jump_continue);
+      nir_pop_if(build, exit);
+      if (style & 4) {
+         nir_push_continue(build, loop);
+         build_cf_tree_case(build, depth - 1, style & 1);
+      }
+      nir_pop_loop(build, loop);
+   }
+}
+
+TEST_F(nir_core_test, cf_tree_next_matches_recursive_lists)
+{
+   EXPECT_EQ(nir_block_cf_tree_next(nullptr), nullptr);
+   for (unsigned depth = 0; depth <= 3; ++depth) {
+      for (unsigned style : {0u, 1u, 2u, 3u, 6u, 7u}) {
+         SCOPED_TRACE(depth);
+         SCOPED_TRACE(style);
+         nir_shader_compiler_options options = {};
+         nir_builder current = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &options, "cf tree traversal");
+         ralloc_steal(b->shader, current.shader);
+         nir_imm_int(&current, 42);
+         build_cf_tree_case(&current, depth, style);
+         nir_validate_shader(current.shader, "before cf tree traversal");
+
+         auto check = [&](struct exec_list *list) {
+            std::vector<nir_block *> expected;
+            collect_cf_tree_blocks(list, expected);
+            ASSERT_FALSE(expected.empty());
+            for (unsigned i = 0; i < expected.size(); ++i) {
+               SCOPED_TRACE(i);
+               EXPECT_EQ(nir_block_cf_tree_next(expected[i]),
+                         i + 1 < expected.size() ? expected[i + 1] : nullptr);
+            }
+         };
+         check(&current.impl->body);
+         nir_cf_list extracted;
+         nir_cursor gap = nir_cf_extract(
+            &extracted, nir_before_cf_list(&current.impl->body),
+            nir_after_cf_list(&current.impl->body));
+         check(&extracted.list);
+         nir_cf_reinsert(&extracted, gap);
+         nir_validate_shader(current.shader, "after cf tree reinsertion");
+         check(&current.impl->body);
+      }
+   }
+}
+
 }
