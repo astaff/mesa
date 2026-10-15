@@ -7,6 +7,55 @@
 #include <stdlib.h>
 #include <string.h>
 
+bool
+agx_nir_m5_canonicalize_empty_mesh(nir_shader *s)
+{
+   if (s->info.stage != MESA_SHADER_MESH ||
+       (s->info.mesh.primitive_type != MESA_PRIM_POINTS &&
+        s->info.mesh.primitive_type != MESA_PRIM_LINES) ||
+       s->info.outputs_written || s->info.outputs_read)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(s);
+   nir_intrinsic_instr *count = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_set_vertex_and_primitive_count:
+            if (count || nir_intrinsic_stream_id(intr))
+               return false;
+            for (unsigned i = 0; i < 2; ++i) {
+               if (!nir_src_is_const(intr->src[i]) ||
+                   nir_src_as_uint(intr->src[i]) != 0)
+                  return false;
+            }
+            count = intr;
+            break;
+         case nir_intrinsic_store_output:
+         case nir_intrinsic_store_per_vertex_output:
+         case nir_intrinsic_store_per_primitive_output:
+            return false;
+         default:
+            break;
+         }
+      }
+   }
+   if (!count)
+      return false;
+
+   nir_metadata_require(impl, nir_metadata_dominance);
+   if (!nir_block_dominates(count->instr.block, nir_impl_last_block(impl)))
+      return false;
+
+   /* No geometry reaches rasterization. Keep the shader's memory work and
+    * use the existing native triangle launch for the proven-empty output. */
+   s->info.mesh.primitive_type = MESA_PRIM_TRIANGLES;
+   return true;
+}
+
 struct mesh_layout {
    unsigned output_base, primitive_count, vertex_count, position;
    unsigned plane_stride, planes, bytes;

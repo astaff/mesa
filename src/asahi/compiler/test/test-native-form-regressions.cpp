@@ -4974,3 +4974,67 @@ TEST(NativeForms, M5MultisampleTileDataRemainsLiveUntilLastStore)
       ralloc_free(mem);
    }
 }
+
+TEST(NativeForms, M5EmptyMeshTopology)
+{
+   for (auto primitive : {MESA_PRIM_POINTS, MESA_PRIM_LINES}) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+         &agx_nir_options, "empty mesh with memory work");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.shader->info.mesh.primitive_type = primitive;
+      b.shader->info.mesh.max_vertices_out = 1;
+      b.shader->info.mesh.max_primitives_out = 1;
+      b.shader->info.io_lowered = true;
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      nir_store_global(&b, lane, nir_iadd(&b, nir_imm_int64(&b, 0x2000000),
+                       nir_u2u64(&b, nir_imul_imm(&b, lane, 4))),
+                       .write_mask=1, .align_mul=4);
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0),
+         nir_imm_int(&b, 0), nir_undef(&b, 1, 32));
+      ASSERT_TRUE(agx_nir_m5_canonicalize_empty_mesh(b.shader));
+      EXPECT_EQ(b.shader->info.mesh.primitive_type, MESA_PRIM_TRIANGLES);
+      ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
+      agx_preprocess_nir(b.shader);
+      agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17S;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.no_preamble = true;
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx_last_compile_refusal();
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, M5EmptyMeshRejectsOutput)
+{
+   for (unsigned nonzero = 0; nonzero < 3; ++nonzero) {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+         &agx_nir_options, "nonempty mesh");
+      b.shader->info.mesh.primitive_type = MESA_PRIM_POINTS;
+      if (nonzero == 2)
+         b.shader->info.outputs_written = VARYING_BIT_POS;
+      nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, nonzero == 0),
+         nir_imm_int(&b, nonzero == 1), nir_undef(&b, 1, 32));
+      EXPECT_FALSE(agx_nir_m5_canonicalize_empty_mesh(b.shader));
+      EXPECT_EQ(b.shader->info.mesh.primitive_type, MESA_PRIM_POINTS);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, M5EmptyMeshRejectsConditionalCount)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_MESH,
+      &agx_nir_options, "conditional mesh count");
+   b.shader->info.mesh.primitive_type = MESA_PRIM_POINTS;
+   EXPECT_FALSE(agx_nir_m5_canonicalize_empty_mesh(b.shader));
+   nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0),
+      nir_imm_int(&b, 0), nir_undef(&b, 1, 32));
+   nir_pop_if(&b, NULL);
+   EXPECT_FALSE(agx_nir_m5_canonicalize_empty_mesh(b.shader));
+   EXPECT_EQ(b.shader->info.mesh.primitive_type, MESA_PRIM_POINTS);
+   ralloc_free(b.shader);
+}

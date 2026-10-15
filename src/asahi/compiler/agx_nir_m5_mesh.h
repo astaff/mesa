@@ -12,6 +12,7 @@ extern "C" {
 
 
 
+bool agx_nir_m5_canonicalize_empty_mesh(nir_shader *shader);
 bool agx_nir_lower_m5_mesh_triangle_probe(nir_shader *shader);
 
 
