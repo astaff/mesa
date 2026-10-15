@@ -31,6 +31,11 @@
 /* This should be the same as nir_search_max_comm_ops in nir_algebraic.py. */
 #define NIR_SEARCH_MAX_COMM_OPS 8
 
+struct match_variable {
+   nir_def *def;
+   uint8_t swizzle[NIR_MAX_VEC_COMPONENTS];
+};
+
 struct match_state {
    unsigned fp_math_ctrl;
    uint8_t comm_op_direction;
@@ -41,7 +46,7 @@ struct match_state {
    const struct per_op_table *pass_op_table;
    const nir_algebraic_table *table;
 
-   nir_alu_src variables[NIR_SEARCH_MAX_VARIABLES];
+   struct match_variable variables[NIR_SEARCH_MAX_VARIABLES];
    const nir_search_state *state;
 };
 
@@ -241,14 +246,14 @@ match_value(const nir_algebraic_table *table,
          return false;
 
       if (state->variables_seen & (1 << var->variable)) {
-         if (state->variables[var->variable].src.ssa != instr->src[src].src.ssa)
+         if (state->variables[var->variable].def != instr->src[src].src.ssa)
             return false;
 
          return !memcmp(state->variables[var->variable].swizzle, new_swizzle, num_components);
       } else {
          state->variables_seen |= (1 << var->variable);
-         nir_alu_src *dst = &state->variables[var->variable];
-         dst->src = instr->src[src].src;
+         struct match_variable *dst = &state->variables[var->variable];
+         dst->def = instr->src[src].src.ssa;
 
          memcpy(dst->swizzle, new_swizzle, num_components);
          memset(dst->swizzle + num_components, 0, NIR_MAX_VEC_COMPONENTS - num_components);
@@ -391,7 +396,7 @@ replace_bitsize(const nir_search_value *value, unsigned search_bitsize,
    if (value->bit_size > 0)
       return value->bit_size;
    if (value->bit_size < 0)
-      return nir_src_bit_size(state->variables[-value->bit_size - 1].src);
+      return state->variables[-value->bit_size - 1].def->bit_size;
    return search_bitsize;
 }
 
@@ -473,8 +478,8 @@ construct_value(nir_builder *build,
       const nir_search_variable *var = nir_search_value_as_variable(value);
       assert(state->variables_seen & (1 << var->variable));
 
-      nir_alu_src val = { NIR_SRC_INIT };
-      nir_alu_src_copy(&val, &state->variables[var->variable]);
+      nir_alu_src val;
+      val.src = nir_src_for_ssa(state->variables[var->variable].def);
       assert(!var->is_constant);
 
       for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)

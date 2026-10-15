@@ -24,6 +24,10 @@
 
 #include "nir_test.h"
 #include "nir_constant_expressions.h"
+extern "C" {
+#include "nir_search.h"
+}
+#include <vector>
 
 namespace {
 
@@ -120,6 +124,131 @@ protected:
       nir_opt_mqsad(b->shader);
    }
 };
+
+static std::vector<unsigned> unary_match_condition_calls;
+
+static bool
+record_unary_match_condition(const nir_alu_instr *instr)
+{
+   unary_match_condition_calls.push_back(instr->def.index);
+   return true;
+}
+
+TEST_F(nir_opt_algebraic_test, matched_variable_preserves_def_bits_and_swizzles)
+{
+   for (unsigned bits : {8u, 16u, 32u, 64u}) {
+      for (unsigned components : {1u, 2u, 4u, 8u, 16u}) {
+         for (unsigned depth : {2u, 4u, 8u}) {
+            SCOPED_TRACE(bits);
+            SCOPED_TRACE(components);
+            SCOPED_TRACE(depth);
+            b->cursor = nir_after_cf_list(&b->impl->body);
+            nir_load_const_instr *input =
+               nir_load_const_instr_create(b->shader, components, bits);
+            for (unsigned c = 0; c < components; ++c)
+               input->value[c] = nir_const_value_for_uint(17 + c, bits);
+            nir_builder_instr_insert(b, &input->instr);
+            nir_def *value = &input->def;
+            std::vector<unsigned> indices;
+            std::vector<std::vector<unsigned>> swizzles;
+            for (unsigned level = 0; level < depth; ++level) {
+               value = nir_inot(b, value);
+               nir_alu_instr *alu = nir_def_as_alu(value);
+               indices.push_back(value->index);
+               swizzles.emplace_back();
+               for (unsigned c = 0; c < components; ++c) {
+                  unsigned swizzle =
+                     (components - 1 - c + level) % components;
+                  alu->src[0].swizzle[c] = swizzle;
+                  swizzles.back().push_back(swizzle);
+               }
+            }
+            nir_intrinsic_instr *store =
+               nir_intrinsic_instr_create(b->shader, nir_intrinsic_store_ssbo);
+            store->num_components = components;
+            store->src[0] = nir_src_for_ssa(value);
+            store->src[1] = nir_src_for_ssa(nir_imm_int(b, 0));
+            store->src[2] = nir_src_for_ssa(nir_imm_int(b, 0));
+            nir_intrinsic_set_write_mask(store, BITFIELD_MASK(components));
+            nir_intrinsic_set_align_mul(store, 1);
+            nir_builder_instr_insert(b, &store->instr);
+
+            const unsigned variable = NIR_SEARCH_MAX_VARIABLES - 1;
+            std::vector<nir_search_value_union> values(depth + 3);
+            values[0].variable = {};
+            values[0].variable.value.type = nir_search_value_variable;
+            values[0].variable.variable = variable;
+            values[0].variable.cond_index = -1;
+            for (unsigned c = 0; c < NIR_MAX_VEC_COMPONENTS; ++c)
+               values[0].variable.swizzle[c] = c;
+            for (unsigned level = 1; level <= depth; ++level) {
+               nir_search_expression &expr = values[level].expression;
+               expr = {};
+               expr.value.type = nir_search_value_expression;
+               expr.opcode = nir_op_inot;
+               expr.swizzle = -1;
+               expr.comm_expr_idx = -1;
+               expr.cond_index = 0;
+               expr.srcs[0] = level - 1;
+            }
+            nir_search_constant &zero = values[depth + 1].constant;
+            zero = {};
+            zero.data.i = 0;
+            zero.value.type = nir_search_value_constant;
+            zero.value.bit_size = -int(variable) - 1;
+            zero.type = nir_type_int;
+            nir_search_expression &replacement = values[depth + 2].expression;
+            replacement = {};
+            replacement.value.type = nir_search_value_expression;
+            replacement.value.bit_size = -int(variable) - 1;
+            replacement.opcode = nir_op_iadd;
+            replacement.swizzle = -1;
+            replacement.comm_expr_idx = -1;
+            replacement.cond_index = -1;
+            replacement.srcs[0] = 0;
+            replacement.srcs[1] = depth + 1;
+            const uint16_t transition[] = {2};
+            std::vector<per_op_table> operations(nir_num_search_ops);
+            for (per_op_table &op : operations) {
+               op.num_filtered_states = 1;
+               op.table = transition;
+            }
+            const struct transform transforms[] = {
+               {static_cast<uint16_t>(depth), static_cast<uint16_t>(depth + 2), 0}, {0, 0, ~0u},
+            };
+            const uint16_t offsets[] = {1, 1, 0};
+            const nir_search_expression_cond conditions[] = {
+               record_unary_match_condition,
+            };
+            nir_algebraic_table table = {};
+            table.transforms = transforms;
+            table.transform_offsets = offsets;
+            table.pass_op_table = operations.data();
+            table.values = values.data();
+            table.expression_cond = conditions;
+            const bool enabled[] = {true};
+            unary_match_condition_calls.clear();
+            ASSERT_TRUE(nir_algebraic_impl(b->impl, enabled, &table));
+            ASSERT_GE(unary_match_condition_calls.size(), depth);
+            for (unsigned level = 0; level < depth; ++level)
+               EXPECT_EQ(unary_match_condition_calls[level],
+                         indices[depth - 1 - level]);
+            ASSERT_EQ(nir_src_bit_size(store->src[0]), bits);
+            ASSERT_EQ(nir_src_num_components(store->src[0]), components);
+            nir_validate_shader(b->shader, "matched variable representation");
+            nir_opt_constant_folding(b->shader);
+            ASSERT_TRUE(nir_src_is_const(store->src[0]));
+            for (unsigned c = 0; c < components; ++c) {
+               unsigned input_component = c;
+               for (unsigned level = depth; level-- > 0;)
+                  input_component = swizzles[level][input_component];
+               EXPECT_EQ(nir_src_comp_as_uint(store->src[0], c),
+                         17u + input_component);
+            }
+         }
+      }
+   }
+}
 
 TEST_F(nir_opt_algebraic_test, bounds_agx_unsigned_end_and_bound)
 {
