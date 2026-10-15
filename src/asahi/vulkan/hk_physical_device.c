@@ -443,7 +443,8 @@ hk_get_device_features(
          supported_extensions->KHR_acceleration_structure,
       .accelerationStructureIndirectBuild =
          supported_extensions->KHR_acceleration_structure,
-      .accelerationStructureHostCommands = false,
+      .accelerationStructureHostCommands =
+         supported_extensions->KHR_acceleration_structure,
       .descriptorBindingAccelerationStructureUpdateAfterBind =
          supported_extensions->KHR_acceleration_structure,
       .rayQuery = supported_extensions->KHR_ray_query,
@@ -470,6 +471,10 @@ hk_get_device_features(
          supported_extensions->KHR_ray_tracing_position_fetch,
       .rayTracingPipelineTraceRaysIndirect2 =
          supported_extensions->KHR_ray_tracing_maintenance1,
+
+      /* VK_EXT_ray_tracing_invocation_reorder */
+      .rayTracingInvocationReorder =
+         supported_extensions->EXT_ray_tracing_invocation_reorder,
       .bufferDeviceAddressMultiDevice = false,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
@@ -1076,6 +1081,9 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxRayDispatchInvocationCount = 1u << 30,
       .shaderGroupHandleAlignment = 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
+
+      .rayTracingInvocationReorderReorderingHint =
+         VK_RAY_TRACING_INVOCATION_REORDER_MODE_NONE_EXT,
 
       .maxPerStageDescriptorSamplers = HK_MAX_DESCRIPTORS,
       .maxPerStageDescriptorUniformBuffers = HK_MAX_DESCRIPTORS,
@@ -1771,6 +1779,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
          (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY) != 0;
       supported_extensions.KHR_ray_tracing_pipeline = true;
       supported_extensions.EXT_pipeline_library_group_handles = true;
+      supported_extensions.EXT_ray_tracing_invocation_reorder = true;
       supported_extensions.KHR_ray_tracing_maintenance1 = true;
       supported_extensions.KHR_ray_tracing_position_fetch = true;
    }

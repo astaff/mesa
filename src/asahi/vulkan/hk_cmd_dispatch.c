@@ -1344,7 +1344,6 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           * six-u32 geometry block. Admit only RT's32x1x1 profile and the
           * validated Gen1 resident window under an explicit diagnostic. */
          valid = valid &&
-            debug_get_bool_option("ASAHI_G17P_RT_INDIRECT_DIAGNOSTIC", false) &&
             dev->gen1_rq_instances && dev->gen1_rq_candidates &&
             grid.mode == AGX_CDM_MODE_INDIRECT_GLOBAL &&
             local_size.x == 32 && local_size.y == 1 && local_size.z == 1 &&
@@ -1359,11 +1358,6 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             setup->info.workgroup_size[2] == 1 && setup->info.nr_preamble_gprs == 0 &&
             setup->info.preamble_size == 0 && setup->info.local_size == 0 &&
             setup->info.agx3_tps_size == 0 && setup->info.printf_uniform == 0;
-         if (valid)
-            mesa_logi("Gen1 indirect RT diagnostic: resident=%u warp_stride=%u state=%u "
-                      "kernel_pages=%u as_table=%u; GPU geometry helper enabled",
-                      contract.physical_slots, contract.query_stride, contract.state_bytes,
-                      contract.kernel_scs_pages, contract.as_table_bytes);
       } else {
          valid = valid && grid.count[0] && grid.count[1] && grid.count[2];
       }

@@ -1211,6 +1211,10 @@ hk_trace_ray_native(nir_builder *b, struct hk_rt_compiler *compiler,
    nir_pop_if(b, NULL);
 }
 
+static void hk_rt_dispatch_hit_or_miss(nir_builder *, struct hk_rt_compiler *,
+                                       nir_def *, nir_def *);
+static nir_variable *hk_deref_base_var(nir_deref_instr *);
+
 static void
 hk_trace_ray(nir_builder *b, struct hk_rt_compiler *compiler,
              nir_intrinsic_instr *instr)
@@ -1306,6 +1310,36 @@ hk_trace_ray(nir_builder *b, struct hk_rt_compiler *compiler,
       hk_build_ray_traversal(b, &args);
    nir_pop_if(b, NULL);
 
+   hk_rt_dispatch_hit_or_miss(b, compiler, flags, miss_index);
+
+   hk_rt_restore_state(b, &saved);
+}
+
+static void
+hk_rt_load_wto(nir_builder *b, const struct hk_rt_compiler *compiler,
+                nir_def *instance, nir_def *rows[3])
+{
+   if (!compiler->native_agx) {
+      hk_load_wto_matrix(b, instance, NULL, rows);
+      return;
+   }
+   nir_def *cols[4];
+   for (unsigned c = 0; c < 4; ++c)
+      cols[c] = nir_load_global(b, 3, 32,
+         nir_iadd_imm(b, instance, 16 + c*12), .align_mul = 4);
+   for (unsigned r = 0; r < 3; ++r)
+      rows[r] = nir_vec4(b, nir_channel(b, cols[0], r),
+         nir_channel(b, cols[1], r), nir_channel(b, cols[2], r),
+         nir_channel(b, cols[3], r));
+}
+
+
+static void
+hk_rt_dispatch_hit_or_miss(nir_builder *b, struct hk_rt_compiler *compiler,
+                           nir_def *flags, nir_def *miss_index)
+{
+   struct hk_rt_shader_state *state = &compiler->state;
+
    nir_push_if(b, nir_load_var(b, state->traversal.hit));
    {
       nir_def *skip_chit =
@@ -1357,26 +1391,498 @@ hk_trace_ray(nir_builder *b, struct hk_rt_compiler *compiler,
       }
    }
    nir_pop_if(b, NULL);
+}
+
+enum hk_hit_object_field {
+   HK_HOBJ_KIND,
+   HK_HOBJ_FLAGS,
+   HK_HOBJ_CULL_MASK,
+   HK_HOBJ_SBT_OFFSET,
+   HK_HOBJ_SBT_STRIDE,
+   HK_HOBJ_SBT_INDEX,
+   HK_HOBJ_ORIGIN,
+   HK_HOBJ_TMIN,
+   HK_HOBJ_DIR,
+   HK_HOBJ_TMAX,
+   HK_HOBJ_INSTANCE_ADDR,
+   HK_HOBJ_PRIMITIVE_ID,
+   HK_HOBJ_GEOMETRY_ID_AND_FLAGS,
+   HK_HOBJ_HIT_KIND,
+   HK_HOBJ_BVH_BASE,
+   HK_HOBJ_PRIMITIVE_ADDR,
+   HK_HOBJ_ATTRIBUTES,
+   HK_HOBJ_FIELDS,
+};
+
+#define HK_HOBJ_EMPTY 0
+#define HK_HOBJ_MISS  1
+#define HK_HOBJ_HIT   2
+#define HK_HOBJ_ATTRIBUTE_WORDS (HK_RAY_HIT_ATTRIBS_SIZE / 4)
+
+static const struct glsl_type *
+hk_hit_object_type(void)
+{
+   const struct glsl_struct_field fields[HK_HOBJ_FIELDS] = {
+      [HK_HOBJ_KIND] = {.type = glsl_uint_type(), .name = "kind"},
+      [HK_HOBJ_FLAGS] = {.type = glsl_uint_type(), .name = "flags"},
+      [HK_HOBJ_CULL_MASK] = {.type = glsl_uint_type(), .name = "cull_mask"},
+      [HK_HOBJ_SBT_OFFSET] = {.type = glsl_uint_type(), .name = "sbt_offset"},
+      [HK_HOBJ_SBT_STRIDE] = {.type = glsl_uint_type(), .name = "sbt_stride"},
+      [HK_HOBJ_SBT_INDEX] = {.type = glsl_uint_type(), .name = "sbt_index"},
+      [HK_HOBJ_ORIGIN] = {.type = glsl_vec_type(3), .name = "origin"},
+      [HK_HOBJ_TMIN] = {.type = glsl_float_type(), .name = "tmin"},
+      [HK_HOBJ_DIR] = {.type = glsl_vec_type(3), .name = "dir"},
+      [HK_HOBJ_TMAX] = {.type = glsl_float_type(), .name = "tmax"},
+      [HK_HOBJ_INSTANCE_ADDR] = {.type = glsl_uint64_t_type(), .name = "instance_addr"},
+      [HK_HOBJ_PRIMITIVE_ID] = {.type = glsl_uint_type(), .name = "primitive_id"},
+      [HK_HOBJ_GEOMETRY_ID_AND_FLAGS] = {.type = glsl_uint_type(), .name = "geometry_id_and_flags"},
+      [HK_HOBJ_HIT_KIND] = {.type = glsl_uint_type(), .name = "hit_kind"},
+      [HK_HOBJ_BVH_BASE] = {.type = glsl_uint64_t_type(), .name = "bvh_base"},
+      [HK_HOBJ_PRIMITIVE_ADDR] = {.type = glsl_uint64_t_type(), .name = "primitive_addr"},
+      [HK_HOBJ_ATTRIBUTES] = {.type = glsl_array_type(glsl_uint_type(), HK_HOBJ_ATTRIBUTE_WORDS, 0),
+                              .name = "attributes"},
+   };
+   return glsl_struct_type(fields, HK_HOBJ_FIELDS, "hk_hit_object", false);
+}
+
+static void
+hk_retype_hit_objects(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool any = false;
+   nir_foreach_variable_in_shader(var, nir) {
+      if (var->data.hit_object) {
+         var->type = glsl_type_wrap_in_arrays(hk_hit_object_type(), var->type);
+         any = true;
+      }
+   }
+   nir_foreach_function_temp_variable(var, impl) {
+      if (var->data.hit_object) {
+         var->type = glsl_type_wrap_in_arrays(hk_hit_object_type(), var->type);
+         any = true;
+      }
+   }
+   if (!any)
+      return;
+   nir_foreach_block (block, impl) {
+      nir_foreach_instr (instr, block) {
+         if (instr->type != nir_instr_type_deref)
+            continue;
+         nir_deref_instr *deref = nir_instr_as_deref(instr);
+         nir_variable *var = hk_deref_base_var(deref);
+         if (!var || !var->data.hit_object)
+            continue;
+         if (deref->deref_type == nir_deref_type_var)
+            deref->type = var->type;
+         else if (deref->deref_type == nir_deref_type_array)
+            deref->type = glsl_get_array_element(nir_deref_instr_parent(deref)->type);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_all);
+}
+
+static nir_deref_instr *
+hk_hobj_field(nir_builder *b, nir_deref_instr *hobj, enum hk_hit_object_field field)
+{
+   return nir_build_deref_struct(b, hobj, field);
+}
+
+static nir_def *
+hk_hobj_load(nir_builder *b, nir_deref_instr *hobj, enum hk_hit_object_field field)
+{
+   return nir_load_deref(b, hk_hobj_field(b, hobj, field));
+}
+
+static void
+hk_hobj_store(nir_builder *b, nir_deref_instr *hobj, enum hk_hit_object_field field,
+              nir_def *value)
+{
+   nir_store_deref(b, hk_hobj_field(b, hobj, field), value,
+                   BITFIELD_MASK(value->num_components));
+}
+
+static nir_deref_instr *
+hk_hobj_attribute(nir_builder *b, nir_deref_instr *hobj, unsigned word)
+{
+   return nir_build_deref_array_imm(b, hk_hobj_field(b, hobj, HK_HOBJ_ATTRIBUTES), word);
+}
+
+static void
+hk_hobj_clear(nir_builder *b, nir_deref_instr *hobj, unsigned kind)
+{
+   hk_hobj_store(b, hobj, HK_HOBJ_KIND, nir_imm_int(b, kind));
+   hk_hobj_store(b, hobj, HK_HOBJ_CULL_MASK, nir_imm_int(b, 0xFF));
+   hk_hobj_store(b, hobj, HK_HOBJ_SBT_OFFSET, nir_imm_int(b, 0));
+   hk_hobj_store(b, hobj, HK_HOBJ_SBT_STRIDE, nir_imm_int(b, 0));
+   hk_hobj_store(b, hobj, HK_HOBJ_INSTANCE_ADDR, nir_imm_int64(b, 0));
+   hk_hobj_store(b, hobj, HK_HOBJ_PRIMITIVE_ID, nir_imm_int(b, 0));
+   hk_hobj_store(b, hobj, HK_HOBJ_GEOMETRY_ID_AND_FLAGS, nir_imm_int(b, 0));
+   hk_hobj_store(b, hobj, HK_HOBJ_HIT_KIND, nir_imm_int(b, 0));
+   hk_hobj_store(b, hobj, HK_HOBJ_BVH_BASE, nir_imm_int64(b, 0));
+   hk_hobj_store(b, hobj, HK_HOBJ_PRIMITIVE_ADDR, nir_imm_int64(b, 0));
+}
+
+static void
+hk_hobj_push_frame(nir_builder *b, struct hk_rt_compiler *compiler,
+                   nir_def *payload)
+{
+   struct hk_rt_shader_state *state = &compiler->state;
+   const uint32_t stack_size =
+      hk_rt_function_stack_size(compiler, b->impl->function);
+   nir_def *stack_ptr = nir_load_var(b, state->stack_ptr);
+   nir_store_var(b, state->stack_ptr, nir_iadd_imm(b, stack_ptr, stack_size), 0x1);
+   nir_store_var(b, state->shader_call_data_offset,
+                 nir_iadd_imm(b, payload, -(int32_t)stack_size), 0x1);
+}
+
+static void
+hk_hit_object_trace(nir_builder *b, struct hk_rt_compiler *compiler,
+                    nir_intrinsic_instr *intr)
+{
+   struct hk_rt_shader_state *state = &compiler->state;
+   nir_deref_instr *hobj = nir_src_as_deref(intr->src[0]);
+   struct hk_rt_saved_state saved = hk_rt_save_state(b, state);
+
+   nir_def *accel_struct = intr->src[1].ssa;
+   nir_def *flags = intr->src[2].ssa;
+   nir_def *cull_mask = intr->src[3].ssa;
+   nir_def *sbt_offset = nir_iand_imm(b, nir_channel(b, intr->src[4].ssa, 0), 0xF);
+   nir_def *sbt_stride = nir_iand_imm(b, nir_channel(b, intr->src[4].ssa, 1), 0xF);
+   nir_def *miss_index = nir_iand_imm(b, intr->src[5].ssa, 0xFFFF);
+   nir_def *origin = intr->src[6].ssa;
+   nir_def *tmin = intr->src[7].ssa;
+   nir_def *dir = intr->src[8].ssa;
+   nir_def *tmax = intr->src[9].ssa;
+   nir_def *payload = intr->src[10].ssa;
+
+   hk_hobj_push_frame(b, compiler, payload);
+   hk_ray_traversal_state_init(b->impl, &state->traversal);
+
+   nir_store_var(b, state->bvh_base, accel_struct, 0x1);
+   nir_store_var(b, state->flags, flags, 0x1);
+   nir_store_var(b, state->cull_mask, cull_mask, 0x1);
+   nir_store_var(b, state->sbt_offset, sbt_offset, 0x1);
+   nir_store_var(b, state->sbt_stride, sbt_stride, 0x1);
+   nir_store_var(b, state->miss_index, miss_index, 0x1);
+   nir_store_var(b, state->origin, origin, 0x7);
+   nir_store_var(b, state->tmin, tmin, 0x1);
+   nir_store_var(b, state->dir, dir, 0x7);
+   nir_store_var(b, state->tmax, tmax, 0x1);
+
+   nir_store_var(b, state->traversal.bvh_base, accel_struct, 0x1);
+   nir_store_var(b, state->traversal.origin, origin, 0x7);
+   nir_store_var(b, state->traversal.dir, dir, 0x7);
+   nir_store_var(b, state->traversal.inv_dir, nir_frcp(b, dir), 0x7);
+   nir_store_var(b, state->traversal.current_node,
+                 nir_imm_int(b, HK_BVH_ROOT_NODE), 0x1);
+   nir_store_var(b, state->traversal.stack_base, nir_imm_int(b, -1), 0x1);
+   nir_store_var(b, state->traversal.stack_ptr, nir_imm_int(b, 0), 0x1);
+   nir_store_var(b, state->traversal.hit, nir_imm_false(b), 0x1);
+
+   struct hk_ray_traversal_vars vars = {
+      .tmax = nir_build_deref_var(b, state->tmax),
+      .origin = nir_build_deref_var(b, state->traversal.origin),
+      .dir = nir_build_deref_var(b, state->traversal.dir),
+      .inv_dir = nir_build_deref_var(b, state->traversal.inv_dir),
+      .bvh_base = nir_build_deref_var(b, state->traversal.bvh_base),
+      .current_node = nir_build_deref_var(b, state->traversal.current_node),
+      .stack_base = nir_build_deref_var(b, state->traversal.stack_base),
+      .stack_ptr = nir_build_deref_var(b, state->traversal.stack_ptr),
+      .stack = nir_build_deref_var(b, state->traversal.stack),
+      .instance_addr = nir_build_deref_var(b, state->traversal.instance_addr),
+      .sbt_offset_and_flags =
+         nir_build_deref_var(b, state->traversal.sbt_offset_and_flags),
+   };
+   struct hk_ray_traversal_args args = {
+      .root_bvh_base = accel_struct,
+      .flags = flags,
+      .cull_mask = nir_ishl_imm(b, cull_mask, 24),
+      .origin = origin,
+      .tmin = tmin,
+      .dir = dir,
+      .vars = vars,
+      .aabb_cb =
+         (compiler->flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)
+            ? NULL
+            : hk_handle_aabb_intersection,
+      .triangle_cb =
+         (compiler->flags &
+          VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR)
+            ? NULL
+            : hk_handle_triangle_intersection,
+      .data = compiler,
+   };
+
+   nir_push_if(b, nir_ine_imm(b, accel_struct, 0));
+   if (compiler->native_agx)
+      hk_trace_ray_native(b, compiler, accel_struct, flags, cull_mask,
+                          origin, tmin, dir, tmax);
+   else
+      hk_build_ray_traversal(b, &args);
+   nir_pop_if(b, NULL);
+
+   nir_def *hit = nir_load_var(b, state->traversal.hit);
+   hk_hobj_store(b, hobj, HK_HOBJ_KIND,
+                 nir_bcsel(b, hit, nir_imm_int(b, HK_HOBJ_HIT), nir_imm_int(b, HK_HOBJ_MISS)));
+   hk_hobj_store(b, hobj, HK_HOBJ_FLAGS, flags);
+   hk_hobj_store(b, hobj, HK_HOBJ_CULL_MASK, cull_mask);
+   hk_hobj_store(b, hobj, HK_HOBJ_SBT_OFFSET, sbt_offset);
+   hk_hobj_store(b, hobj, HK_HOBJ_SBT_STRIDE, sbt_stride);
+   hk_hobj_store(b, hobj, HK_HOBJ_SBT_INDEX,
+                 nir_bcsel(b, hit, nir_load_var(b, state->sbt_index), miss_index));
+   hk_hobj_store(b, hobj, HK_HOBJ_ORIGIN, origin);
+   hk_hobj_store(b, hobj, HK_HOBJ_TMIN, tmin);
+   hk_hobj_store(b, hobj, HK_HOBJ_DIR, dir);
+   hk_hobj_store(b, hobj, HK_HOBJ_TMAX, nir_load_var(b, state->tmax));
+   hk_hobj_store(b, hobj, HK_HOBJ_INSTANCE_ADDR, nir_load_var(b, state->instance_addr));
+   hk_hobj_store(b, hobj, HK_HOBJ_PRIMITIVE_ID, nir_load_var(b, state->primitive_id));
+   hk_hobj_store(b, hobj, HK_HOBJ_GEOMETRY_ID_AND_FLAGS,
+                 nir_load_var(b, state->geometry_id_and_flags));
+   hk_hobj_store(b, hobj, HK_HOBJ_HIT_KIND, nir_load_var(b, state->hit_kind));
+   hk_hobj_store(b, hobj, HK_HOBJ_BVH_BASE, accel_struct);
+   hk_hobj_store(b, hobj, HK_HOBJ_PRIMITIVE_ADDR, state->primitive_addr ?
+                 nir_load_var(b, state->primitive_addr) : nir_imm_int64(b, 0));
+   nir_def *frame = nir_load_var(b, state->stack_ptr);
+   for (unsigned i = 0; i < HK_HOBJ_ATTRIBUTE_WORDS; ++i) {
+      nir_def *word = nir_load_scratch(b, 1, 32, nir_iadd_imm(b, frame, 4 * i),
+                                       .align_mul = 4);
+      nir_store_deref(b, hk_hobj_attribute(b, hobj, i), word, 0x1);
+   }
+   if (compiler->native_agx) {
+      nir_def *q = &nir_build_deref_var(b, compiler->native_query)->def;
+      nir_def *type = nir_rq_load(b, 1, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_intersection_type);
+      nir_push_if(b, nir_iand(b, hit, nir_ieq_imm(b, type, 1)));
+      nir_def *bary = nir_rq_load(b, 2, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_intersection_barycentrics);
+      for (unsigned i = 0; i < 2; ++i)
+         nir_store_deref(b, hk_hobj_attribute(b, hobj, i),
+                         nir_channel(b, bary, i), 0x1);
+      nir_pop_if(b, NULL);
+   }
 
    hk_rt_restore_state(b, &saved);
 }
 
 static void
-hk_rt_load_wto(nir_builder *b, const struct hk_rt_compiler *compiler,
-                nir_def *instance, nir_def *rows[3])
+hk_hit_object_execute(nir_builder *b, struct hk_rt_compiler *compiler,
+                      nir_intrinsic_instr *intr)
 {
-   if (!compiler->native_agx) {
-      hk_load_wto_matrix(b, instance, NULL, rows);
-      return;
+   struct hk_rt_shader_state *state = &compiler->state;
+   nir_deref_instr *hobj = nir_src_as_deref(intr->src[0]);
+   nir_def *payload = intr->src[1].ssa;
+   struct hk_rt_saved_state saved = hk_rt_save_state(b, state);
+
+   hk_ray_traversal_state_init(b->impl, &state->traversal);
+   nir_def *kind = hk_hobj_load(b, hobj, HK_HOBJ_KIND);
+   nir_push_if(b, nir_ine_imm(b, kind, HK_HOBJ_EMPTY));
+   {
+      hk_hobj_push_frame(b, compiler, payload);
+      nir_def *flags = hk_hobj_load(b, hobj, HK_HOBJ_FLAGS);
+      nir_def *sbt_index = hk_hobj_load(b, hobj, HK_HOBJ_SBT_INDEX);
+      nir_store_var(b, state->bvh_base, hk_hobj_load(b, hobj, HK_HOBJ_BVH_BASE), 0x1);
+      nir_store_var(b, state->flags, flags, 0x1);
+      nir_store_var(b, state->cull_mask, hk_hobj_load(b, hobj, HK_HOBJ_CULL_MASK), 0x1);
+      nir_store_var(b, state->sbt_offset, hk_hobj_load(b, hobj, HK_HOBJ_SBT_OFFSET), 0x1);
+      nir_store_var(b, state->sbt_stride, hk_hobj_load(b, hobj, HK_HOBJ_SBT_STRIDE), 0x1);
+      nir_store_var(b, state->miss_index, sbt_index, 0x1);
+      nir_store_var(b, state->origin, hk_hobj_load(b, hobj, HK_HOBJ_ORIGIN), 0x7);
+      nir_store_var(b, state->tmin, hk_hobj_load(b, hobj, HK_HOBJ_TMIN), 0x1);
+      nir_store_var(b, state->dir, hk_hobj_load(b, hobj, HK_HOBJ_DIR), 0x7);
+      nir_store_var(b, state->tmax, hk_hobj_load(b, hobj, HK_HOBJ_TMAX), 0x1);
+      nir_store_var(b, state->instance_addr,
+                    hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR), 0x1);
+      nir_store_var(b, state->primitive_id,
+                    hk_hobj_load(b, hobj, HK_HOBJ_PRIMITIVE_ID), 0x1);
+      nir_store_var(b, state->geometry_id_and_flags,
+                    hk_hobj_load(b, hobj, HK_HOBJ_GEOMETRY_ID_AND_FLAGS), 0x1);
+      nir_store_var(b, state->hit_kind, hk_hobj_load(b, hobj, HK_HOBJ_HIT_KIND), 0x1);
+      nir_store_var(b, state->sbt_index, sbt_index, 0x1);
+      if (state->primitive_addr)
+         nir_store_var(b, state->primitive_addr,
+                       hk_hobj_load(b, hobj, HK_HOBJ_PRIMITIVE_ADDR), 0x1);
+      nir_store_var(b, state->traversal.hit, nir_ieq_imm(b, kind, HK_HOBJ_HIT), 0x1);
+      nir_def *frame = nir_load_var(b, state->stack_ptr);
+      for (unsigned i = 0; i < HK_HOBJ_ATTRIBUTE_WORDS; ++i) {
+         nir_store_scratch(b, nir_load_deref(b, hk_hobj_attribute(b, hobj, i)),
+                           nir_iadd_imm(b, frame, 4 * i), .align_mul = 4,
+                           .write_mask = 0x1);
+      }
+      hk_rt_dispatch_hit_or_miss(b, compiler, flags, sbt_index);
    }
-   nir_def *cols[4];
-   for (unsigned c = 0; c < 4; ++c)
-      cols[c] = nir_load_global(b, 3, 32,
-         nir_iadd_imm(b, instance, 16 + c*12), .align_mul = 4);
-   for (unsigned r = 0; r < 3; ++r)
-      rows[r] = nir_vec4(b, nir_channel(b, cols[0], r),
-         nir_channel(b, cols[1], r), nir_channel(b, cols[2], r),
-         nir_channel(b, cols[3], r));
+   nir_pop_if(b, NULL);
+
+   hk_rt_restore_state(b, &saved);
+}
+
+static void
+hk_hit_object_record_miss(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   nir_deref_instr *hobj = nir_src_as_deref(intr->src[0]);
+   hk_hobj_clear(b, hobj, HK_HOBJ_MISS);
+   hk_hobj_store(b, hobj, HK_HOBJ_FLAGS, intr->src[1].ssa);
+   hk_hobj_store(b, hobj, HK_HOBJ_SBT_INDEX, nir_iand_imm(b, intr->src[2].ssa, 0xFFFF));
+   hk_hobj_store(b, hobj, HK_HOBJ_ORIGIN, intr->src[3].ssa);
+   hk_hobj_store(b, hobj, HK_HOBJ_TMIN, intr->src[4].ssa);
+   hk_hobj_store(b, hobj, HK_HOBJ_DIR, intr->src[5].ssa);
+   hk_hobj_store(b, hobj, HK_HOBJ_TMAX, intr->src[6].ssa);
+}
+
+static void
+hk_hit_object_record_from_query(nir_builder *b, struct hk_rt_compiler *compiler,
+                                nir_intrinsic_instr *intr)
+{
+   nir_deref_instr *hobj = nir_src_as_deref(intr->src[0]);
+   nir_def *q = intr->src[1].ssa;
+   nir_def *sbt_index = intr->src[2].ssa;
+   nir_def *hit_kind = intr->src[3].ssa;
+   const bool attributes = !nir_src_is_undef(intr->src[4]);
+
+   nir_def *type = nir_rq_load(b, 1, 32, q, .committed = true,
+                               .ray_query_value = nir_ray_query_value_intersection_type);
+   nir_push_if(b, nir_ine_imm(b, type, 0));
+   {
+      hk_hobj_clear(b, hobj, HK_HOBJ_HIT);
+      hk_hobj_store(b, hobj, HK_HOBJ_FLAGS, nir_rq_load(b, 1, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_flags));
+      hk_hobj_store(b, hobj, HK_HOBJ_SBT_INDEX, sbt_index);
+      hk_hobj_store(b, hobj, HK_HOBJ_ORIGIN, nir_rq_load(b, 3, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_world_ray_origin));
+      hk_hobj_store(b, hobj, HK_HOBJ_TMIN, nir_rq_load(b, 1, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_tmin));
+      hk_hobj_store(b, hobj, HK_HOBJ_DIR, nir_rq_load(b, 3, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_world_ray_direction));
+      hk_hobj_store(b, hobj, HK_HOBJ_TMAX, nir_rq_load(b, 1, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_intersection_t));
+      nir_def *instance = nir_rq_load(b, 1, 64, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_intersection_instance_address);
+      nir_def *primitive = nir_rq_load(b, 1, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_intersection_primitive_index);
+      nir_def *geometry = nir_rq_load(b, 1, 32, q, .committed = true,
+         .ray_query_value = nir_ray_query_value_intersection_geometry_index);
+      hk_hobj_store(b, hobj, HK_HOBJ_INSTANCE_ADDR, instance);
+      hk_hobj_store(b, hobj, HK_HOBJ_PRIMITIVE_ID, primitive);
+      hk_hobj_store(b, hobj, HK_HOBJ_GEOMETRY_ID_AND_FLAGS, geometry);
+      hk_hobj_store(b, hobj, HK_HOBJ_HIT_KIND, hit_kind);
+      if (compiler->native_agx)
+         hk_hobj_store(b, hobj, HK_HOBJ_PRIMITIVE_ADDR,
+            agx_nir_gen1_vertex_position_address(b, instance, geometry, primitive));
+      if (attributes) {
+         nir_def *words = intr->src[4].ssa;
+         for (unsigned i = 0; i < words->num_components; ++i)
+            nir_store_deref(b, hk_hobj_attribute(b, hobj, i),
+                            nir_channel(b, words, i), 0x1);
+      } else {
+         nir_def *bary = nir_rq_load(b, 2, 32, q, .committed = true,
+            .ray_query_value = nir_ray_query_value_intersection_barycentrics);
+         for (unsigned i = 0; i < 2; ++i)
+            nir_store_deref(b, hk_hobj_attribute(b, hobj, i),
+                            nir_channel(b, bary, i), 0x1);
+      }
+   }
+   nir_push_else(b, NULL);
+   {
+      hk_hobj_clear(b, hobj, HK_HOBJ_EMPTY);
+   }
+   nir_pop_if(b, NULL);
+}
+
+static nir_def *
+hk_hit_object_record_ptr(nir_builder *b, nir_deref_instr *hobj)
+{
+   nir_def *kind = hk_hobj_load(b, hobj, HK_HOBJ_KIND);
+   nir_def *sbt_index = hk_hobj_load(b, hobj, HK_HOBJ_SBT_INDEX);
+   struct hk_sbt_entry hit = hk_load_sbt_entry(b, sbt_index, HK_RT_CMD_HIT_ADDRESS);
+   struct hk_sbt_entry miss = hk_load_sbt_entry(b, sbt_index, HK_RT_CMD_MISS_ADDRESS);
+   return nir_bcsel(b, nir_ieq_imm(b, kind, HK_HOBJ_HIT),
+                    hit.shader_record_ptr, miss.shader_record_ptr);
+}
+
+static nir_def *
+hk_hit_object_load(nir_builder *b, struct hk_rt_compiler *compiler,
+                   nir_intrinsic_instr *intr)
+{
+   nir_deref_instr *hobj = nir_src_as_deref(intr->src[0]);
+   const unsigned column = nir_intrinsic_column(intr);
+   switch (nir_intrinsic_hit_object_value(intr)) {
+   case nir_hit_object_value_kind:
+      return hk_hobj_load(b, hobj, HK_HOBJ_KIND);
+   case nir_hit_object_value_ray_flags:
+      return hk_hobj_load(b, hobj, HK_HOBJ_FLAGS);
+   case nir_hit_object_value_sbt_record_index:
+      return hk_hobj_load(b, hobj, HK_HOBJ_SBT_INDEX);
+   case nir_hit_object_value_world_ray_origin:
+      return hk_hobj_load(b, hobj, HK_HOBJ_ORIGIN);
+   case nir_hit_object_value_tmin:
+      return hk_hobj_load(b, hobj, HK_HOBJ_TMIN);
+   case nir_hit_object_value_world_ray_direction:
+      return hk_hobj_load(b, hobj, HK_HOBJ_DIR);
+   case nir_hit_object_value_tmax:
+      return hk_hobj_load(b, hobj, HK_HOBJ_TMAX);
+   case nir_hit_object_value_primitive_index:
+      return hk_hobj_load(b, hobj, HK_HOBJ_PRIMITIVE_ID);
+   case nir_hit_object_value_geometry_index:
+      return nir_iand_imm(b, hk_hobj_load(b, hobj, HK_HOBJ_GEOMETRY_ID_AND_FLAGS),
+                          0xFFFFFFF);
+   case nir_hit_object_value_instance_id: {
+      nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
+      return nir_load_global(b, 1, 32, nir_iadd_imm(b, instance,
+         compiler->native_agx ? 100 : offsetof(struct hk_bvh_instance_node, instance_id)));
+   }
+   case nir_hit_object_value_instance_custom_index: {
+      nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
+      nir_def *custom = nir_load_global(b, 1, 32, nir_iadd_imm(b, instance,
+         compiler->native_agx ? 96 :
+            offsetof(struct hk_bvh_instance_node, custom_instance_and_mask)));
+      return nir_iand_imm(b, custom, 0xFFFFFF);
+   }
+   case nir_hit_object_value_hit_kind:
+      return hk_hobj_load(b, hobj, HK_HOBJ_HIT_KIND);
+   case nir_hit_object_value_object_ray_origin:
+   case nir_hit_object_value_object_ray_direction: {
+      const bool is_origin =
+         nir_intrinsic_hit_object_value(intr) == nir_hit_object_value_object_ray_origin;
+      nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
+      nir_def *wto[3];
+      hk_rt_load_wto(b, compiler, instance, wto);
+      return hk_mul_vec3_mat(b, hk_hobj_load(b, hobj, is_origin ? HK_HOBJ_ORIGIN : HK_HOBJ_DIR),
+                             wto, is_origin);
+   }
+   case nir_hit_object_value_world_to_object: {
+      nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
+      nir_def *wto[3];
+      hk_rt_load_wto(b, compiler, instance, wto);
+      nir_def *vals[3];
+      for (unsigned i = 0; i < 3; ++i)
+         vals[i] = nir_channel(b, wto[i], column);
+      return nir_vec(b, vals, 3);
+   }
+   case nir_hit_object_value_object_to_world: {
+      nir_def *instance = hk_hobj_load(b, hobj, HK_HOBJ_INSTANCE_ADDR);
+      if (compiler->native_agx) {
+         nir_def *relative = nir_load_global(b, 1, 64,
+            nir_iadd_imm(b, instance, 104), .align_mul = 8);
+         return nir_load_global(b, 3, 32,
+            nir_iadd_imm(b, nir_iadd(b, instance, relative), column * 12),
+            .align_mul = 4);
+      }
+      nir_def *rows[3];
+      for (unsigned r = 0; r < 3; ++r)
+         rows[r] = nir_load_global(b, 4, 32,
+            nir_iadd_imm(b, instance,
+                         offsetof(struct hk_bvh_instance_node, otw_matrix) + r * 16));
+      return nir_vec3(b, nir_channel(b, rows[0], column),
+                      nir_channel(b, rows[1], column),
+                      nir_channel(b, rows[2], column));
+   }
+   case nir_hit_object_value_shader_record_buffer_handle:
+      return nir_unpack_64_2x32(b, hk_hit_object_record_ptr(b, hobj));
+   case nir_hit_object_value_triangle_vertex_positions:
+      return hk_load_vertex_position(b, hk_hobj_load(b, hobj, HK_HOBJ_PRIMITIVE_ADDR),
+                                     column);
+   default:
+      UNREACHABLE("invalid hit object value");
+   }
 }
 
 static bool
@@ -1434,6 +1940,36 @@ hk_lower_ray_tracing_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_trace_ray:
       hk_trace_ray(b, compiler, intr);
       break;
+   case nir_intrinsic_hit_object_trace_ray:
+      hk_hit_object_trace(b, compiler, intr);
+      break;
+   case nir_intrinsic_hit_object_execute_shader:
+      hk_hit_object_execute(b, compiler, intr);
+      break;
+   case nir_intrinsic_hit_object_record_miss:
+      hk_hit_object_record_miss(b, intr);
+      break;
+   case nir_intrinsic_hit_object_record_empty:
+      hk_hobj_clear(b, nir_src_as_deref(intr->src[0]), HK_HOBJ_EMPTY);
+      break;
+   case nir_intrinsic_hit_object_record_from_query:
+      hk_hit_object_record_from_query(b, compiler, intr);
+      break;
+   case nir_intrinsic_hit_object_set_sbt_record_index:
+      hk_hobj_store(b, nir_src_as_deref(intr->src[0]), HK_HOBJ_SBT_INDEX,
+                    intr->src[1].ssa);
+      break;
+   case nir_intrinsic_hit_object_load:
+      def = hk_hit_object_load(b, compiler, intr);
+      break;
+   case nir_intrinsic_hit_object_load_attributes: {
+      nir_deref_instr *hobj = nir_src_as_deref(intr->src[0]);
+      nir_def *words[HK_HOBJ_ATTRIBUTE_WORDS];
+      for (unsigned i = 0; i < intr->def.num_components; ++i)
+         words[i] = nir_load_deref(b, hk_hobj_attribute(b, hobj, i));
+      def = nir_vec(b, words, intr->def.num_components);
+      break;
+   }
    case nir_intrinsic_ignore_ray_intersection:
       nir_store_var(b, state->accept, nir_imm_false(b), 0x1);
       nir_push_if(b, nir_imm_true(b));
@@ -1741,7 +2277,7 @@ hk_park_ray_query_vars(nir_shader *nir, bool park)
    bool any = false;
 
    foreach_list_typed_safe (nir_variable, var, node, src) {
-      if (!var->data.ray_query)
+      if (!var->data.ray_query && !var->data.hit_object)
          continue;
 
       exec_node_remove(&var->node);
@@ -1760,7 +2296,7 @@ hk_park_ray_query_vars(nir_shader *nir, bool park)
 
          nir_deref_instr *deref = nir_instr_as_deref(instr);
          nir_variable *var = hk_deref_base_var(deref);
-         if (var && var->data.ray_query)
+         if (var && (var->data.ray_query || var->data.hit_object))
             deref->modes = to;
       }
    }
@@ -1861,6 +2397,7 @@ hk_compile_ray_tracing_stages(
                nir_address_format_64bit_global);
 
       hk_park_ray_query_vars(nir, false);
+      hk_retype_hit_objects(nir);
 
       NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                hk_move_ray_tracing_intrinsic, nir_metadata_control_flow, NULL);
