@@ -534,8 +534,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
                                                nir_ball_fequal3(&b, hi, hi));
          if (stable_as_selector)
             valid_bounds = nir_iand(&b, valid_bounds,
-               nir_iand(&b, nir_ugt_imm(&b, selector, 0),
-                        nir_ult_imm(&b, selector, layout->as_table_first)));
+                                    nir_ine_imm(&b, selector, 0));
          nir_push_if(&b, valid_bounds);
          nir_def *base=nir_load_preamble(&b,1,64,.base=layout->payload_uniform);
          nir_def *id=nir_load_scs_thread_index_agx(&b);

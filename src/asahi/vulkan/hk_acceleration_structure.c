@@ -22,6 +22,7 @@
 #include "asahi/compiler/agx3_rt_gen1_clique.h"
 #include "asahi/compiler/agx3_rt_gen1_runtime_tables.h"
 #include "util/u_dl.h"
+#include "util/cache_ops.h"
 #include "hk_agx3_as_layout.h"
 #include "util/hash_table.h"
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
@@ -89,16 +90,95 @@ static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_bu
 static void hk_agx3_refit_phase(VkCommandBuffer,
    const struct vk_acceleration_structure_build_state *, unsigned);
 
-/* Native instance records and the AS header name entries in the same table.
- * Per-lane replacement of those entries aliases child IDs with root IDs. */
+#define HK_GEN1_AS_ID_LIMIT (1u << 20)
+#define HK_GEN1_SPARSE_PAGE_BYTES 0x4000u
+
+static uint32_t
+hk_gen1_as_index_to_id(uint32_t index)
+{
+   const uint32_t id = index + 1;
+   return id < HK_GEN1_AS_TABLE_AS_SLOTS ? id : id + HK_GEN1_RQ_PHYSICAL_SLOTS;
+}
+
+static bool
+hk_gen1_sparse_init(struct hk_device *dev, struct hk_gen1_sparse_table *t,
+                    uint32_t entry_bytes, uint64_t fixed_va,
+                    enum agx_bo_flags bo_flags, uint32_t bind_flags,
+                    const char *label)
+{
+   *t = (struct hk_gen1_sparse_table){
+      .entry_bytes = entry_bytes, .bo_flags = bo_flags,
+      .bind_flags = bind_flags, .label = label,
+   };
+   util_dynarray_init(&t->pages, NULL);
+   t->va = agx_va_alloc(&dev->dev, (uint64_t)HK_GEN1_AS_ID_LIMIT * entry_bytes,
+                        HK_GEN1_SPARSE_PAGE_BYTES,
+                        fixed_va ? AGX_VA_USC | AGX_VA_FIXED : 0, fixed_va);
+   return t->va != NULL;
+}
+
+static void
+hk_gen1_sparse_finish(struct hk_device *dev, struct hk_gen1_sparse_table *t)
+{
+   unsigned i = 0;
+   util_dynarray_foreach(&t->pages, struct agx_bo *, bo) {
+      if (t->va)
+         agx_bo_bind(&dev->dev, NULL,
+                     t->va->addr + (uint64_t)i * HK_GEN1_SPARSE_PAGE_BYTES,
+                     HK_GEN1_SPARSE_PAGE_BYTES, 0, DRM_ASAHI_BIND_UNBIND);
+      agx_bo_unreference(&dev->dev, *bo);
+      ++i;
+   }
+   util_dynarray_fini(&t->pages);
+   if (t->va)
+      agx_va_free(&dev->dev, t->va, false);
+   t->va = NULL;
+}
+
+static void *
+hk_gen1_sparse_entry(struct hk_device *dev, struct hk_gen1_sparse_table *t,
+                     uint32_t id)
+{
+   if (!t->va || id >= HK_GEN1_AS_ID_LIMIT)
+      return NULL;
+   const uint32_t per_page = HK_GEN1_SPARSE_PAGE_BYTES / t->entry_bytes;
+   const uint32_t page = id / per_page;
+   while (util_dynarray_num_elements(&t->pages, struct agx_bo *) <= page) {
+      const unsigned next = util_dynarray_num_elements(&t->pages, struct agx_bo *);
+      struct agx_bo *bo = agx_bo_create(&dev->dev, HK_GEN1_SPARSE_PAGE_BYTES,
+                                      HK_GEN1_SPARSE_PAGE_BYTES, t->bo_flags,
+                                      t->label);
+      if (!bo)
+         return NULL;
+      memset(agx_bo_map(bo), 0, HK_GEN1_SPARSE_PAGE_BYTES);
+      util_post_flush_fence();
+      struct agx_bo **slot = util_dynarray_grow(&t->pages, struct agx_bo *, 1);
+      if (!slot) {
+         agx_bo_unreference(&dev->dev, bo);
+         return NULL;
+      }
+      if (agx_bo_bind(&dev->dev, bo,
+                      t->va->addr + (uint64_t)next * HK_GEN1_SPARSE_PAGE_BYTES,
+                      HK_GEN1_SPARSE_PAGE_BYTES, 0, t->bind_flags)) {
+         util_dynarray_pop(&t->pages, struct agx_bo *);
+         agx_bo_unreference(&dev->dev, bo);
+         return NULL;
+      }
+      *slot = bo;
+   }
+   struct agx_bo *bo = *util_dynarray_element(&t->pages, struct agx_bo *, page);
+   return (uint8_t *)agx_bo_map(bo) + (uint64_t)(id % per_page) * t->entry_bytes;
+}
+
 static uint32_t
 hk_gen1_as_id(struct hk_device *dev, struct vk_acceleration_structure *as)
 {
-   uint32_t result = 0, i = 1;
+   uint32_t result = 0;
    simple_mtx_lock(&dev->gen1_as_lock);
-   util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-      if (*p == as) { result = i; break; }
-      ++i;
+   if (dev->gen1_as_ids) {
+      struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_as_ids, as);
+      if (entry)
+         result = (uint32_t)(uintptr_t)entry->data;
    }
    simple_mtx_unlock(&dev->gen1_as_lock);
    return result;
@@ -108,12 +188,17 @@ static uint64_t
 hk_gen1_as_metadata_addr_for_id(struct hk_cmd_buffer *cmd, uint32_t id)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!dev->gen1_as_metadata || !id || id >= LIBAGX_GEN1_AS_METADATA_SLOTS) {
+   void *entry = NULL;
+   if (dev->gen1_as_lock_ready && id) {
+      simple_mtx_lock(&dev->gen1_as_lock);
+      entry = hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, id);
+      simple_mtx_unlock(&dev->gen1_as_lock);
+   }
+   if (!entry) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return 0;
    }
-   hk_cmd_buffer_retain_bo(cmd, dev->gen1_as_metadata);
-   return dev->gen1_as_metadata->va->addr +
+   return dev->gen1_as_metadata_pages.va->addr +
           (uint64_t)id * LIBAGX_GEN1_AS_METADATA_STRIDE;
 }
 
@@ -128,11 +213,16 @@ hk_gen1_as_metadata_addr(struct hk_cmd_buffer *cmd,
 static void
 hk_gen1_as_publish_address(struct hk_device *dev, uint32_t id, uint64_t address)
 {
-   __atomic_store_n((uint64_t *)agx_bo_map(dev->gen1_as_addresses) + id,
-                    address, __ATOMIC_RELEASE);
-   if (dev->gen1_as_query_bank)
+   uint64_t *slot = hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, id);
+   uint64_t *table = hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages, id);
+   if (slot)
+      __atomic_store_n(slot, address, __ATOMIC_RELEASE);
+   if (table)
+      __atomic_store_n(table, address, __ATOMIC_RELEASE);
+   if (dev->gen1_as_query_bank && id < HK_GEN1_AS_TABLE_AS_SLOTS)
       __atomic_store_n((uint64_t *)agx_bo_map(dev->gen1_as_query_bank) + 2 * id,
                        address, __ATOMIC_RELEASE);
+   util_post_flush_fence();
 }
 
 static uint64_t
@@ -151,11 +241,12 @@ hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
    if (!dev->g17p_native_as || !buffer->device_address)
       return;
    simple_mtx_lock(&dev->gen1_as_lock);
-   uint32_t id = 1;
+   uint32_t index = 0;
    util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
       if (*p && (*p)->buffer == buffer)
-         hk_gen1_as_publish_address(dev, id, hk_gen1_as_bound_va(*p));
-      ++id;
+         hk_gen1_as_publish_address(dev, hk_gen1_as_index_to_id(index),
+                                    hk_gen1_as_bound_va(*p));
+      ++index;
    }
    simple_mtx_unlock(&dev->gen1_as_lock);
 }
@@ -183,21 +274,36 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
       return vk_error(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS);
    }
    bool inserted = false;
-   uint32_t id = 1;
+   uint32_t index = 0;
    simple_mtx_lock(&dev->gen1_as_lock);
-   util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-      if (!*p) { *p = as; inserted = true; break; }
-      ++id;
+   if (dev->gen1_rq_live_as_table) {
+      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
+         if (!*p) { *p = as; inserted = true; break; }
+         ++index;
+      }
    }
-   if (!inserted && util_dynarray_num_elements(&dev->gen1_ases,
-                                  struct vk_acceleration_structure *) < 2047) {
+   if (!inserted)
+      index = util_dynarray_num_elements(&dev->gen1_ases,
+                                        struct vk_acceleration_structure *);
+   const uint32_t id = hk_gen1_as_index_to_id(index);
+   const bool live_limit = dev->gen1_rq_live_as_table &&
+                           id >= HK_GEN1_AS_TABLE_AS_SLOTS;
+   if (!inserted && !live_limit && id < HK_GEN1_AS_ID_LIMIT &&
+       hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, id) &&
+       hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages, id) &&
+       hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, id)) {
       struct vk_acceleration_structure **p =
          util_dynarray_grow(&dev->gen1_ases, struct vk_acceleration_structure *, 1);
       if (p) { *p = as; inserted = true; }
    }
-   if (inserted) {
-      hk_gen1_as_publish_address(dev, id, hk_gen1_as_bound_va(as));
+   if (inserted && dev->gen1_as_ids &&
+       !_mesa_hash_table_insert(dev->gen1_as_ids, as, (void *)(uintptr_t)id)) {
+      *util_dynarray_element(&dev->gen1_ases, struct vk_acceleration_structure *,
+                             index) = NULL;
+      inserted = false;
    }
+   if (inserted)
+      hk_gen1_as_publish_address(dev, id, hk_gen1_as_bound_va(as));
    simple_mtx_unlock(&dev->gen1_as_lock);
    if (!inserted) {
       vk_common_DestroyAccelerationStructureKHR(device, *out, alloc);
@@ -222,14 +328,15 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
             _mesa_hash_table_remove(dev->gen1_vertex_tables, entry);
          }
       }
-      uint32_t id = 1;
-      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-         if (*p == as) {
-            hk_gen1_as_publish_address(dev, id, 0);
-            *p = NULL;
-            break;
+      struct hash_entry *entry = dev->gen1_as_ids
+         ? _mesa_hash_table_search(dev->gen1_as_ids, as) : NULL;
+      if (entry) {
+         const uint32_t id = (uint32_t)(uintptr_t)entry->data;
+         util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
+            if (*p == as) { *p = NULL; break; }
          }
-         ++id;
+         hk_gen1_as_publish_address(dev, id, 0);
+         _mesa_hash_table_remove(dev->gen1_as_ids, entry);
       }
       simple_mtx_unlock(&dev->gen1_as_lock);
    }
@@ -266,23 +373,7 @@ hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (dev->gen1_rq_live_as_table)
       return hk_gen1_upload_live_as_table(cmd);
-   simple_mtx_lock(&dev->gen1_as_lock);
-   unsigned count = util_dynarray_num_elements(&dev->gen1_ases,
-                                              struct vk_acceleration_structure *);
-   assert(count < 2048);
-   struct agx_ptr table = hk_pool_alloc(cmd, HK_GEN1_AS_TABLE_BYTES, 16);
-   if (table.cpu) {
-      memset(table.cpu, 0, HK_GEN1_AS_TABLE_BYTES);
-      uint64_t *words = table.cpu;
-      unsigned i = 1;
-      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-         if (*p)
-            words[2*i] = hk_gen1_as_bound_va(*p);
-         ++i;
-      }
-   }
-   simple_mtx_unlock(&dev->gen1_as_lock);
-   return table.cpu ? table.gpu : 0;
+   return dev->gen1_as_table_pages.va ? dev->gen1_as_table_pages.va->addr : 0;
 }
 
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
@@ -679,7 +770,13 @@ hk_vertex_table_publish(VkCommandBuffer commandBuffer, struct hk_device *dev,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    const uint32_t id = hk_gen1_as_id(dev, as);
-   if (!id || id * 16 >= AGX_GEN1_VERTEX_DIRECTORY_BYTES) {
+   void *directory_entry = NULL;
+   if (id) {
+      simple_mtx_lock(&dev->gen1_as_lock);
+      directory_entry = hk_gen1_sparse_entry(dev, &dev->gen1_vertex_directory_pages, id);
+      simple_mtx_unlock(&dev->gen1_as_lock);
+   }
+   if (!directory_entry) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -1104,16 +1201,9 @@ hk_gen1_rq_finish(struct hk_device *dev)
    dev->gen1_rq_code_alias=NULL;dev->gen1_rq_bound_maps=0;
    dev->gen1_native_rq=false;
    hk_device_finish_gen1_as_chunks(dev);
-   if (dev->gen1_vertex_directory) {
-      agx_bo_bind(&dev->dev, NULL, AGX_GEN1_VERTEX_DIRECTORY_VA,
-                  AGX_GEN1_VERTEX_DIRECTORY_BYTES, 0, DRM_ASAHI_BIND_UNBIND);
-      agx_bo_unreference(&dev->dev, dev->gen1_vertex_directory);
-      dev->gen1_vertex_directory = NULL;
-   }
-   if (dev->gen1_vertex_directory_va) {
-      agx_va_free(&dev->dev, dev->gen1_vertex_directory_va, false);
-      dev->gen1_vertex_directory_va = NULL;
-   }
+   dev->gen1_vertex_directory = NULL;
+   dev->gen1_vertex_directory_va = NULL;
+   hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
    if (dev->gen1_vertex_tables) {
       hash_table_foreach(dev->gen1_vertex_tables, entry)
          free(entry->data);
@@ -1122,12 +1212,17 @@ hk_gen1_rq_finish(struct hk_device *dev)
    }
    if (dev->gen1_as_lock_ready) {
       util_dynarray_fini(&dev->gen1_ases);
+      if (dev->gen1_as_ids) {
+         _mesa_hash_table_destroy(dev->gen1_as_ids, NULL);
+         dev->gen1_as_ids = NULL;
+      }
+      hk_gen1_sparse_finish(dev, &dev->gen1_as_table_pages);
+      hk_gen1_sparse_finish(dev, &dev->gen1_as_metadata_pages);
+      hk_gen1_sparse_finish(dev, &dev->gen1_as_address_pages);
       simple_mtx_destroy(&dev->gen1_as_lock);
       dev->gen1_as_lock_ready=false;
    }
-   agx_bo_unreference(&dev->dev, dev->gen1_as_metadata);
    dev->gen1_as_metadata = NULL;
-   agx_bo_unreference(&dev->dev, dev->gen1_as_addresses);
    dev->gen1_as_addresses = NULL;
    agx_bo_unreference(&dev->dev, dev->gen1_as_query_bank);
    dev->gen1_as_query_bank = NULL;
@@ -1479,24 +1574,21 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
       util_dynarray_init(&dev->gen1_ases, NULL);
       dev->gen1_as_lock_ready=true;
       dev->gen1_vertex_tables = _mesa_pointer_hash_table_create(NULL);
-      dev->gen1_vertex_directory_va = agx_va_alloc(&dev->dev, AGX_GEN1_VERTEX_DIRECTORY_BYTES,
-         0x4000, AGX_VA_USC | AGX_VA_FIXED, AGX_GEN1_VERTEX_DIRECTORY_VA);
-      dev->gen1_vertex_directory = agx_bo_create(&dev->dev, AGX_GEN1_VERTEX_DIRECTORY_BYTES,
-         0x4000, AGX_BO_WRITEBACK, "Gen1 vertex table directory");
-      if (!dev->gen1_vertex_directory_va || !dev->gen1_vertex_directory ||
-          agx_bo_bind(&dev->dev, dev->gen1_vertex_directory, AGX_GEN1_VERTEX_DIRECTORY_VA,
-                      AGX_GEN1_VERTEX_DIRECTORY_BYTES, 0,
-                      DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
-         mesa_loge("Gen1 vertex table directory unavailable (va=%p bo=%p)",
-                   (void *)dev->gen1_vertex_directory_va, (void *)dev->gen1_vertex_directory);
-         if (dev->gen1_vertex_directory)
-            agx_bo_unreference(&dev->dev, dev->gen1_vertex_directory);
-         if (dev->gen1_vertex_directory_va)
-            agx_va_free(&dev->dev, dev->gen1_vertex_directory_va, false);
+      dev->gen1_as_ids = _mesa_pointer_hash_table_create(NULL);
+      if (hk_gen1_sparse_init(dev, &dev->gen1_vertex_directory_pages, 16,
+                              AGX_GEN1_VERTEX_DIRECTORY_VA, 0,
+                              DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE,
+                              "Gen1 vertex table directory") &&
+          hk_gen1_sparse_entry(dev, &dev->gen1_vertex_directory_pages,
+                               HK_GEN1_AS_TABLE_ENTRIES - 1)) {
+         dev->gen1_vertex_directory = *util_dynarray_element(
+            &dev->gen1_vertex_directory_pages.pages, struct agx_bo *, 0);
+         dev->gen1_vertex_directory_va = dev->gen1_vertex_directory_pages.va;
+      } else {
+         mesa_loge("Gen1 vertex table directory unavailable");
+         hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
          dev->gen1_vertex_directory = NULL;
          dev->gen1_vertex_directory_va = NULL;
-      } else {
-         memset(agx_bo_map(dev->gen1_vertex_directory), 0, AGX_GEN1_VERTEX_DIRECTORY_BYTES);
       }
       if (dev->gen1_rq_live_as_table) {
          simple_mtx_init(&dev->gen1_as_chunk_cache_lock, mtx_plain);
@@ -1507,23 +1599,35 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
          dev->gen1_as_chunk_cache_lock_ready = true;
       }
       /* GPU-only live metadata: builds/copies initialize all64 bytes. */
-      dev->gen1_as_metadata = agx_bo_create(&dev->dev,
-         LIBAGX_GEN1_AS_METADATA_SLOTS * LIBAGX_GEN1_AS_METADATA_STRIDE,
-         16384, AGX_BO_WRITEBACK, "Gen1 AS live metadata");
-      dev->gen1_as_addresses = agx_bo_create(&dev->dev,
-         LIBAGX_GEN1_AS_METADATA_SLOTS * sizeof(uint64_t), 16384,
-         AGX_BO_WRITEBACK, "Gen1 AS creation addresses");
+      const bool tables_ok =
+         hk_gen1_sparse_init(dev, &dev->gen1_as_metadata_pages,
+                             LIBAGX_GEN1_AS_METADATA_STRIDE, 0, 0,
+                             DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE,
+                             "Gen1 AS live metadata") &&
+         hk_gen1_sparse_init(dev, &dev->gen1_as_address_pages, sizeof(uint64_t),
+                             0, 0, DRM_ASAHI_BIND_READ,
+                             "Gen1 AS creation addresses") &&
+         hk_gen1_sparse_init(dev, &dev->gen1_as_table_pages,
+                             HK_GEN1_AS_TABLE_ENTRY_BYTES, 0, 0,
+                             DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE,
+                             "Gen1 AS table") &&
+         hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, 0) &&
+         hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, 0) &&
+         hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages,
+                              HK_GEN1_AS_TABLE_ENTRIES - 1);
       if (dev->gen1_rq_live_as_table)
          dev->gen1_as_query_bank = agx_bo_create(&dev->dev,
             HK_GEN1_AS_TABLE_AS_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES, 16384,
             0, "Gen1 live AS query bank");
-      if (!dev->gen1_as_metadata || !dev->gen1_as_addresses ||
+      if (!tables_ok || !dev->gen1_as_ids ||
           (dev->gen1_rq_live_as_table && !dev->gen1_as_query_bank)) {
          hk_gen1_rq_finish(dev);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
-      memset(agx_bo_map(dev->gen1_as_addresses), 0,
-             LIBAGX_GEN1_AS_METADATA_SLOTS * sizeof(uint64_t));
+      dev->gen1_as_metadata = *util_dynarray_element(
+         &dev->gen1_as_metadata_pages.pages, struct agx_bo *, 0);
+      dev->gen1_as_addresses = *util_dynarray_element(
+         &dev->gen1_as_address_pages.pages, struct agx_bo *, 0);
       if (dev->gen1_as_query_bank)
          memset(agx_bo_map(dev->gen1_as_query_bank), 0,
                 HK_GEN1_AS_TABLE_AS_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES);
@@ -1920,13 +2024,13 @@ hk_gen1_as_address_map(struct hk_cmd_buffer *cmd, uint32_t *count)
    *count = 0;
    if (map.cpu) {
       struct libagx_gen1_as_address *entries = map.cpu;
-      uint32_t id = 1;
+      uint32_t index = 0;
       util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, as) {
          uint64_t address = *as ? hk_gen1_as_bound_va(*as) : 0;
          if (address) entries[(*count)++] = (struct libagx_gen1_as_address) {
-            .address = address, .resource_id = id,
+            .address = address, .resource_id = hk_gen1_as_index_to_id(index),
          };
-         ++id;
+         ++index;
       }
       qsort(entries, *count, sizeof(*entries), hk_gen1_as_address_compare);
    }
@@ -1984,11 +2088,14 @@ hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
    uint32_t invocations = DIV_ROUND_UP(dst->size - padding, 16);
    libagx_gen1_as_deserialize(cmd, agx_1d(invocations), AGX_BARRIER_ALL,
       hk_as_native_va(dst), info->src.deviceAddress, metadata, uuid, dst->size - padding, id);
-   hk_cmd_buffer_retain_bo(cmd, dev->gen1_as_addresses);
+   simple_mtx_lock(&dev->gen1_as_lock);
+   const uint32_t id_bound = hk_gen1_as_index_to_id(
+      util_dynarray_num_elements(&dev->gen1_ases, struct vk_acceleration_structure *));
+   simple_mtx_unlock(&dev->gen1_as_lock);
    libagx_gen1_as_deserialize_references(cmd,
       agx_1d((dst->size - padding) / 128), AGX_BARRIER_ALL,
       hk_as_native_va(dst), info->src.deviceAddress, map, map_count,
-      dev->gen1_as_addresses->va->addr, uuid, dst->size - padding);
+      dev->gen1_as_address_pages.va->addr, id_bound, uuid, dst->size - padding);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
