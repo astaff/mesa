@@ -859,7 +859,8 @@ static bool
 lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
                         const struct lower_descriptors_ctx *ctx)
 {
-   if (tex->op != nir_texop_lod || ctx->descriptor_generation != 9 ||
+   if (tex->op != nir_texop_lod ||
+       (ctx->descriptor_generation != 9 && ctx->descriptor_generation != 10) ||
        b->shader->info.stage != MESA_SHADER_COMPUTE ||
        b->shader->info.derivative_group == DERIVATIVE_GROUP_NONE ||
        agx_nir_compute_implicit_lod_diagnostic())
@@ -892,21 +893,35 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
       hk_sampled_image_descriptor_layout(ctx->descriptor_generation);
    const uint64_t plane_offset_B = plane * native.stride;
 
-   nir_def *index = load_resource_deref_desc(
-      b, 1, 16, sampler, plane_offset_B + native.sampler_index, ctx);
-   nir_def *api_bias = load_resource_deref_desc(
-      b, 1, 32, sampler,
-      plane_offset_B + native.sampler +
-         offsetof(struct hk_sampled_image_descriptor_sw, g17p.lod_bias),
-      ctx);
-   nir_def *heap = load_root(
-      b, 1, 64, nir_imm_int(b, hk_root_descriptor_offset(sampler_heap_address)),
-      8);
-   nir_def *addr = nir_iadd(
-      b, heap,
-      nir_imul_imm(b, nir_u2u64(b, index),
-                   agx_chip_sampler_heap_element_size(AGX_CHIP_G17P)));
-   nir_def *word = load_speculatable(b, 1, 32, addr, 8);
+   nir_def *word, *api_bias;
+   if (ctx->descriptor_generation == 9) {
+      nir_def *index = load_resource_deref_desc(
+         b, 1, 16, sampler, plane_offset_B + native.sampler_index, ctx);
+      api_bias = load_resource_deref_desc(
+         b, 1, 32, sampler,
+         plane_offset_B + native.sampler +
+            offsetof(struct hk_sampled_image_descriptor_sw, g17p.lod_bias),
+         ctx);
+      nir_def *heap = load_root(
+         b, 1, 64,
+         nir_imm_int(b, hk_root_descriptor_offset(sampler_heap_address)), 8);
+      nir_def *addr = nir_iadd(
+         b, heap,
+         nir_imul_imm(b, nir_u2u64(b, index),
+                      agx_chip_sampler_heap_element_size(AGX_CHIP_G17P)));
+      word = load_speculatable(b, 1, 32, addr, 8);
+   } else {
+      /* A Gen10 descriptor carries its plane's Gen5 sampler word itself
+       * (hk_rc_sampler::key, the heap entry's packed state), with the API
+       * bias in the word's signed 5:6 LOD bias field at bits 43..53 --
+       * the bias Gen5 hardware applies when sampling with this sampler. */
+      nir_def *packed = load_resource_deref_desc(
+         b, 2, 32, sampler, plane_offset_B + native.sampler, ctx);
+      word = nir_channel(b, packed, 0);
+      nir_def *bias_fixed =
+         nir_ishr_imm(b, nir_ishl_imm(b, nir_channel(b, packed, 1), 10), 21);
+      api_bias = nir_fmul_imm(b, nir_i2f32(b, bias_fixed), 1.0 / 64.0);
+   }
    nir_def *min_lod =
       nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, word, 0x3ff)), 1.0 / 64.0);
    nir_def *max_lod = nir_fmul_imm(
