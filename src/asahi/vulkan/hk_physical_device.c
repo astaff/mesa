@@ -440,7 +440,8 @@ hk_get_device_features(
       .accelerationStructureCaptureReplay = false,
       .accelerationStructureIndirectBuild = false,
       .accelerationStructureHostCommands = false,
-      .descriptorBindingAccelerationStructureUpdateAfterBind = false,
+      .descriptorBindingAccelerationStructureUpdateAfterBind =
+         supported_extensions->KHR_acceleration_structure,
       .rayQuery = supported_extensions->KHR_ray_query,
       .rayTraversalPrimitiveCulling = supported_extensions->KHR_ray_query ||
                                       supported_extensions->KHR_ray_tracing_pipeline,
