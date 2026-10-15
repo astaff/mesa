@@ -856,6 +856,7 @@ TEST(NativeForms, TransientTextureResultPreservesEarlierAsyncWriteSpan)
       ralloc_free(mem);
    }
 }
+#include <algorithm>
 
 TEST(NativeForms, M5Matrix8MetalCompilerWitnesses)
 {
@@ -4918,6 +4919,58 @@ TEST(NativeForms, M5QuadHelpersKeepFragmentEntryUnmarked)
                      0, 1, false, AGX3_VARY_CENTER, helpers == 0, expected, &len));
       ASSERT_GE(binary.size, len);
       EXPECT_EQ(memcmp(binary.data, expected, len), 0);
+      ralloc_free(mem);
+   }
+}
+
+
+TEST(NativeForms, M5MultisampleTileDataRemainsLiveUntilLastStore)
+{
+   for (unsigned targets : {1u, 4u}) {
+      SCOPED_TRACE(targets);
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+      key.secondary = true;
+      key.no_preamble = true;
+      key.fs.nr_samples = 4;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->agx3_mrt_tile_ops_ordered = true;
+      for (unsigned rt = 0; rt < targets; ++rt)
+         BITSET_SET(key.g17p_tile_partitions, 4 * rt);
+      agx_wait_pix(b, 12);
+      std::vector<std::vector<uint8_t>> expected;
+      for (unsigned sample = 0; sample < 4; ++sample) {
+         for (unsigned target = targets; target-- > 0;) {
+            const bool last = sample == 3 && target == 0;
+            agx_index data = agx_register(0, AGX_SIZE_16);
+            data.channels_m1 = 1;
+            data.discard = last;
+            const agx_index coverage = agx_register(16 + sample, AGX_SIZE_16);
+            agx_st_tile(b, data, coverage, agx_null(), AGX_FORMAT_U8NORM,
+                        15, target * 4, false, target);
+            uint8_t bytes[AGX3_TILE_MAX_LENGTH], length;
+            ASSERT_TRUE(agx3_tile_store_f13(AGX_ISA_ENCODING_AGX3C, 0,
+               AGX3_TILE_W8, 15, target * 4,
+               agx3_tile_sample_reg(16 + sample, false), 0, last,
+               bytes, &length));
+            expected.emplace_back(bytes, bytes + length);
+         }
+      }
+      agx_stop(b);
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+      const uint8_t *start = (const uint8_t *)binary.data;
+      const uint8_t *end = start + binary.size;
+      for (const auto &bytes : expected) {
+         auto found = std::search(start, end, bytes.begin(), bytes.end());
+         ASSERT_NE(found, end);
+         start = found + bytes.size();
+      }
       ralloc_free(mem);
    }
 }

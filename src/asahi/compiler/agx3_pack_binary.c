@@ -11124,8 +11124,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                       /* Native per-sample exports use halves
                        * 0..31 even for one/two targets. */
                       true,
-                      enc == AGX_ISA_ENCODING_AGX3C ||
-                         (ctx->key->g17p_emrt && !load &&
+                      (enc == AGX_ISA_ENCODING_AGX3C && !load &&
+                       (I->src[0].kill || I->src[0].discard)) ||
+                         (enc != AGX_ISA_ENCODING_AGX3C &&
+                          ctx->key->g17p_emrt && !load &&
                           I->src[0].value >= 16)) ||
                    (!load && last &&
                     (!agx3_pixel_release(
@@ -11227,13 +11229,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                     false, g17p_lone_pair, &ctx->agx3_colour_link, initial_size))
                   AGX3_REFUSE(I);
             }
-            /* C's native eight-sample sample_id fragment retains a payload
-             * across its first store (f13=0), then marks each unique payload
-             * at last use (f13=1). Keep all previously qualified C store
-             * profiles unchanged; B's raw32 stores retain their own policy. */
+            /* Native C multisample stores retain a reused payload with
+             * f13=0 and release it only at its last use. B's raw32 stores
+             * retain their own policy. */
             const bool store_f13 = enc == AGX_ISA_ENCODING_AGX3C &&
                ((!g17p_multi_background &&
-                 (!g17p_sample_colour_stores || ctx->key->fs.nr_samples != 8)) ||
+                 (!g17p_sample_colour_stores || ctx->key->fs.nr_samples <= 1)) ||
                 I->src[0].kill || I->src[0].discard);
             if (!agx3_emit_tile(emission, enc, I, slot, wait, first, last,
                                 g17p_multi_background ||
