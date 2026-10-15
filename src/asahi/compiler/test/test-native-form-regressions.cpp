@@ -5038,3 +5038,24 @@ TEST(NativeForms, M5EmptyMeshRejectsConditionalCount)
    EXPECT_EQ(b.shader->info.mesh.primitive_type, MESA_PRIM_POINTS);
    ralloc_free(b.shader);
 }
+
+TEST(NativeForms, M5MeshActiveSubgroupIndexReachesPacker)
+{
+   for (unsigned half : {0u, 1u, 14u, 63u, 254u}) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_MESH;
+      agx_get_sr_coverage_to(b, agx_register(half, AGX_SIZE_16),
+                             AGX_SR_ACTIVE_THREAD_INDEX_IN_SUBGROUP);
+      agx_stop(b);
+      util_dynarray bytes;
+      util_dynarray_init(&bytes, mem);
+      EXPECT_TRUE(agx3_pack_binary(b->shader, &bytes));
+      EXPECT_GT(bytes.size, 4u);
+      ralloc_free(mem);
+   }
+}
