@@ -447,8 +447,10 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    unsigned m5_stores = 0;
    for (unsigned rt = 0; rt < ARRAY_SIZE(key->op); ++rt)
       m5_stores += key->op[rt] == AGX_EOT_STORE;
+   const bool m5_layered_pair = agx_chip_g17_m5(cache->dev->chip) &&
+      key->tib.layered && key->m5_store_and_resolve;
    if (agx_chip_g17_m5(cache->dev->chip) && m5_stores &&
-       (m5_stores > 1 || key->op[0] != AGX_EOT_STORE)) {
+       (m5_stores > 1 || key->op[0] != AGX_EOT_STORE || m5_layered_pair)) {
       if (agx_tilebuffer_spills(&key->tib))
          return NULL;
       uint8_t selectors[8];
@@ -465,8 +467,16 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
       }
       uint8_t text[AGX3_M5_MRT_EOT_MAX_LENGTH];
       size_t size;
-      if (!agx3_m5_mrt_eot_generate_layered(m5_stores, selectors,
-             key->multisample_store, key->tib.layered, text, sizeof(text), &size))
+      if (m5_layered_pair) {
+         if (m5_stores != 1 || !key->multisample_store)
+            return NULL;
+         selectors[1] = selectors[0];
+         m5_stores = 2;
+      }
+      const unsigned sample_mask = m5_layered_pair ? 1 :
+         key->multisample_store ? (1u << m5_stores) - 1 : 0;
+      if (!agx3_m5_mrt_eot_generate_sample_mask(m5_stores, selectors,
+             sample_mask, key->tib.layered, text, sizeof(text), &size))
          return NULL;
       const struct agx_shader_part bin = {
          .binary = text,

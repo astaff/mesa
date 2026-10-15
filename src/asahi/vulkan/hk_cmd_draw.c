@@ -2407,7 +2407,9 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          descriptor_count * sizeof(*descriptor), 32);
       if (!pbe)
          return (struct hk_bg_eot){0};
-      const uint64_t arguments[] = {pbe, 0, pbe + sizeof(*descriptor)};
+      const uint64_t arguments[] = {
+         pbe, 0, key->tib.layered ? 0 : pbe + sizeof(*descriptor),
+      };
       uint64_t table = hk_pool_upload(cmd, arguments,
          (key->m5_store_and_resolve ? 3 : 2) * sizeof(uint64_t), 16);
       if (!table)

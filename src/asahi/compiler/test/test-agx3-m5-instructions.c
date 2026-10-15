@@ -1763,6 +1763,46 @@ int main(void)
       }
    }
 
+   for (unsigned ms = 0; ms < 2; ++ms) {
+      const enum pipe_format formats[] = {
+         PIPE_FORMAT_R10G10B10A2_UNORM, PIPE_FORMAT_B10G10R10A2_UNORM,
+      };
+      for (unsigned f = 0; f < ARRAY_SIZE(formats); ++f) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "M5 layered RGB10 EOT");
+         nir_def *xy = nir_trim_vector(
+            &b, nir_load_global_invocation_id(&b, 32), 2);
+         nir_def *coords = nir_vec3(&b, nir_channel(&b, xy, 0),
+            nir_channel(&b, xy, 1), nir_u2u32(&b, nir_load_layer_id(&b)));
+         nir_image_store_block_agx(&b, nir_imm_intN_t(&b, 0, 16),
+            nir_imm_int(&b, 0), coords, .format=PIPE_FORMAT_R10G10B10A2_UNORM,
+            .image_dim=GLSL_SAMPLER_DIM_2D, .image_array=true,
+            .explicit_coord=true);
+         agx_preprocess_nir(b.shader);
+         struct agx_shader_key key = {
+            .dev.chip=AGX_CHIP_G17S, .dev.encoding=AGX_ISA_ENCODING_AGX3C,
+            .no_preamble=true, .m5_rt0_eot=true,
+            .g17p_rt0_eot_multisample=ms,
+         };
+         agx_g17p_configure_rt0_eot_key(formats[f], &key);
+         struct agx_shader_part part = {0};
+         uint8_t generated[AGX3_M5_MRT_EOT_MAX_LENGTH];
+         size_t length = 0;
+         const uint8_t selector = 0x75;
+         bool generated_ok = agx3_m5_mrt_eot_generate_layered(
+            1, &selector, ms, true, generated, sizeof(generated), &length);
+         bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
+         bool match = generated_ok && compiled &&
+            part.info.binary_size == length &&
+            memcmp(part.binary, generated, length) == 0;
+         printf("M5_LAYERED_RGB10_%u_MS_%u_%s\n", f, ms,
+                match ? "PASS" : "FAIL");
+         ok &= match;
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+
    /* A narrow zero-extended low word vanishes from this funnel shift.
     * These local-ID address calculations formerly failed after narrowing. */
    for (unsigned shift = 16; shift <= 31; shift++) {

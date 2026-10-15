@@ -122,11 +122,12 @@ m5_mrt_layer(uint8_t *bytes, size_t *size)
 }
 
 bool
-agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors,
-                                 bool multisample, bool layered, uint8_t *output,
+agx3_m5_mrt_eot_generate_sample_mask(unsigned targets, const uint8_t *selectors,
+                                 unsigned multisample_mask, bool layered, uint8_t *output,
                                  size_t capacity, size_t *written)
 {
-   if (!output || !written || !selectors || targets < 1 || targets > 8)
+   if (!output || !written || !selectors || targets < 1 || targets > 8 ||
+       (multisample_mask & ~((1u << targets) - 1)))
       return false;
    for (unsigned rt = 0; rt < targets; ++rt) {
       /* Reuse the RT0 store classes: F16/I16 f29=1, raw32 f29=2,
@@ -147,7 +148,7 @@ agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors,
          return false;
    }
    for (unsigned rt = 0; rt < first; ++rt) {
-      if (!m5_mrt_store(bytes, &size, rt, selectors[rt], multisample, layered))
+      if (!m5_mrt_store(bytes, &size, rt, selectors[rt], (multisample_mask & (1u << rt)) != 0, layered))
          return false;
    }
    for (unsigned rt = first; rt < targets; ++rt) {
@@ -155,7 +156,7 @@ agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors,
          return false;
    }
    for (unsigned rt = first; rt < targets; ++rt) {
-      if (!m5_mrt_store(bytes, &size, rt, selectors[rt], multisample, layered))
+      if (!m5_mrt_store(bytes, &size, rt, selectors[rt], (multisample_mask & (1u << rt)) != 0, layered))
          return false;
    }
    const uint8_t stop[] = {0x0e, 0, 0, 0};
@@ -168,6 +169,17 @@ agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors,
    memcpy(output, bytes, size);
    *written = size;
    return true;
+}
+
+bool
+agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors,
+                                 bool multisample, bool layered, uint8_t *output,
+                                 size_t capacity, size_t *written)
+{
+   if (targets < 1 || targets > 8)
+      return false;
+   return agx3_m5_mrt_eot_generate_sample_mask(targets, selectors,
+      multisample ? (1u << targets) - 1 : 0, layered, output, capacity, written);
 }
 
 bool

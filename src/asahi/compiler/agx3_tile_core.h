@@ -28,6 +28,9 @@ extern "C" {
 #define AGX3_M5_MRT_EOT_MAX_LENGTH 400u
 uint16_t agx3_m5_mrt_eot_nr_gprs(unsigned targets);
 uint16_t agx3_m5_mrt_eot_staging_halfs(unsigned targets);
+bool agx3_m5_mrt_eot_generate_sample_mask(unsigned targets, const uint8_t *selectors,
+                                      unsigned multisample_mask, bool layered,
+                                      uint8_t *output, size_t capacity, size_t *written);
 bool agx3_m5_mrt_eot_generate_layered(unsigned targets, const uint8_t *selectors,
                                       bool multisample, bool layered,
                                       uint8_t *output, size_t capacity,

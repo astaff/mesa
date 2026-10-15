@@ -6593,7 +6593,7 @@ agx3_g17p_layered_eot_kind(const agx_context *ctx, enum agx_isa_encoding enc)
         store_format != AGX_FORMAT_I8 && store_format != AGX_FORMAT_U16NORM &&
         store_format != AGX_FORMAT_S16NORM && store_format != AGX_FORMAT_F16 &&
         store_format != AGX_FORMAT_S8NORM && store_format != AGX_FORMAT_I16 &&
-        store_format != AGX_FORMAT_I32))
+        store_format != AGX_FORMAT_I32 && store_format != AGX_FORMAT_RGB10A2))
       return AGX3_G17P_RT0_EOT_NONE;
 
    return agx3_g17p_rt0_eot_store_kind(ctx->key, store_format);
@@ -10768,7 +10768,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                  I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                  I->src[1].type == AGX_INDEX_IMMEDIATE)) &&
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
-               (I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
+               (m5_banked_3d || I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
                 ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
                   I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
                  (I->src[1].type == AGX_INDEX_IMMEDIATE ||
