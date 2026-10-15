@@ -2949,6 +2949,17 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                &sysvals_to_varyings);
    }
 
+   /* Tess levels are compact float arrays: nir_lower_io turns an indirect
+    * element index into an IO offset counted in components, while poly's
+    * TCS/TES buffer addressing counts IO offsets in slots. A control shader
+    * writing gl_TessLevelOuter[gl_InvocationID] therefore stored levels 1/2
+    * into other slots, left them zero and culled every patch. Make the
+    * levels vectors so indexed accesses become per-component accesses. */
+   if (agx_chip_g17_m5(dev->dev.chip) &&
+       (nir->info.stage == MESA_SHADER_TESS_CTRL ||
+        nir->info.stage == MESA_SHADER_TESS_EVAL))
+      NIR_PASS(_, nir, nir_lower_tess_level_array_vars_to_vec);
+
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             glsl_type_size,
             nir_lower_io_lower_64bit_to_32 |
