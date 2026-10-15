@@ -56,7 +56,8 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
 
       if (p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
           (p_format == PIPE_FORMAT_R32_FLOAT &&
-           pdev->dev.chip == AGX_CHIP_G17P))
+           (pdev->dev.chip == AGX_CHIP_G17P ||
+            agx_chip_g17_m5(pdev->dev.chip))))
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
    }
 

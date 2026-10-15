@@ -229,7 +229,8 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* Our image atomic lowering doesn't bother to handle linear */
    if ((p_format == PIPE_FORMAT_R32_UINT || p_format == PIPE_FORMAT_R32_SINT ||
         (p_format == PIPE_FORMAT_R32_FLOAT &&
-         pdev->dev.chip == AGX_CHIP_G17P)) &&
+         (pdev->dev.chip == AGX_CHIP_G17P ||
+          agx_chip_g17_m5(pdev->dev.chip)))) &&
        tiling == VK_IMAGE_TILING_OPTIMAL) {
 
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
