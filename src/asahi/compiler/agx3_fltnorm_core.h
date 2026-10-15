@@ -238,6 +238,11 @@ struct agx3_colour_link_info {
     * straight_line admits a derivative-consumer entry gate in this part;
     * branch_free says no branch crosses any byte of the part, so the
     * linker may remove this part's entry gate. */
+   bool rt_query_write_acquired;
+   uint8_t rt_query_wait_count;
+   bool rt_query_wait_unsupported;
+   uint16_t rt_query_wait_mask;
+   uint32_t rt_query_wait_offset;
    bool entry_emitted;
    bool straight_line;
    bool branch_free;

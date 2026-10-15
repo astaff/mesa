@@ -31,7 +31,7 @@
  * and eight leaf boxes.
  *
  * This header intentionally depends only on the C standard library so it can
- * be shared by Vulkan and Gallium.
+ * be shared by Vulkan, Gallium and the native D3D12 frontend.
  */
 
 #ifndef AGX_RT_BVH_H
@@ -66,6 +66,9 @@ struct agx_rt_bvh_gen5_header {
 };
 
 struct agx_rt_bvh_gen1_hw_triangle_leaf {
+   /* Historical API name: this is the full-precision geometry record read by
+    * the native CPU extractor, not a QuantizedTriangleBlock. The native
+    * layout reserves separate traversal blocks before these records. */
    /* Four-lane structure-of-arrays vertex payload: X, Y, then Z.  An
     * unpaired triangle duplicates its third vertex in lane three. */
    float coordinate[3][4];
@@ -326,7 +329,7 @@ agx_rt_bvh_gen1_leaf_slot_capacity(
 }
 
 /* Each Gen1 child lane has a four-bit low part and a two-bit high part.  Zero
- * in the high part encodes four, so the decoded end lies in 1..18. */
+ * in the high part encodes four, so the decoded end lies in 1..19. */
 static inline uint32_t
 agx_rt_bvh_gen1_leaf_lane_end(
    const struct agx_rt_bvh_gen1_header *header, unsigned lane)
@@ -468,7 +471,7 @@ agx_rt_bvh_bitcast_f32_to_u32(float value)
 /*
  * Floating-point helpers done with bit arithmetic rather than <math.h>, so
  * this header keeps its promise to depend only on the freestanding C library
- * and stays linkable from Vulkan and Gallium without
+ * and stays linkable from Vulkan, Gallium and the D3D12 frontend without
  * dragging in libm.  Both rounding helpers are restricted to the
  * non-negative, in-range domain the quantiser actually uses.
  */
@@ -576,11 +579,15 @@ agx_rt_bvh_gen1_quantize_child_bounds(
    if (!frame || !minimum || !maximum || !bounds)
       return false;
 
+   struct agx_rt_bvh_gen1_quantized_bounds result;
+
    for (unsigned axis = 0; axis < 3; ++axis) {
       const float step = agx_rt_bvh_gen1_axis_step(frame->exponent[axis]);
 
       if (!agx_rt_bvh_is_finite(minimum[axis]) ||
-          !agx_rt_bvh_is_finite(maximum[axis]))
+          !agx_rt_bvh_is_finite(maximum[axis]) ||
+          !agx_rt_bvh_is_finite(frame->origin[axis]) ||
+          frame->exponent[axis] == 255)
          return false;
       if (!(minimum[axis] <= maximum[axis]))
          return false;
@@ -594,8 +601,8 @@ agx_rt_bvh_gen1_quantize_child_bounds(
              maximum[axis] != frame->origin[axis])
             return false;
 
-         bounds->component[axis] = 0;
-         bounds->component[3 + axis] = 0;
+         result.component[axis] = 0;
+         result.component[3 + axis] = 0;
          continue;
       }
 
@@ -604,13 +611,28 @@ agx_rt_bvh_gen1_quantize_child_bounds(
       const float high =
          agx_rt_bvh_ceil_nonneg((maximum[axis] - frame->origin[axis]) / step);
 
-      if (low < 0.0f || high > 127.0f)
+      if (!agx_rt_bvh_is_finite(low) || !agx_rt_bvh_is_finite(high) ||
+          low < 0.0f || high > 127.0f)
          return false;
 
-      bounds->component[axis] = (uint32_t)low;
-      bounds->component[3 + axis] = (uint32_t)high;
+      uint32_t qmin = (uint32_t)low, qmax = (uint32_t)high;
+      /* Division may round an off-grid coordinate onto an integer. Check
+       * the actual reconstructed float before accepting either boundary. */
+      while (frame->origin[axis] + (float)qmin * step > minimum[axis]) {
+         if (!qmin)
+            return false;
+         --qmin;
+      }
+      while (frame->origin[axis] + (float)qmax * step < maximum[axis]) {
+         if (qmax == 127)
+            return false;
+         ++qmax;
+      }
+      result.component[axis] = qmin;
+      result.component[3 + axis] = qmax;
    }
 
+   *bounds = result;
    return true;
 }
 
@@ -900,6 +922,503 @@ agx_rt_bvh_gen5_offset_child_leaves_bytes(
    }
 
    return agx_rt_bvh_gen5_offset_lhb_bytes(header) + (int64_t)extra;
+}
+
+/* Bounded native-format node and leaf construction. */
+static inline bool
+agx_rt_bvh_gen1_hw_triangle_leaf_pack(
+   void *packed, size_t available,
+   const struct agx_rt_bvh_gen1_hw_triangle_leaf *leaf)
+{
+   if (!packed || !leaf || available < AGX_RT_BVH_GEN1_HW_TRIANGLE_LEAF_SIZE)
+      return false;
+
+   uint8_t bytes[AGX_RT_BVH_GEN1_HW_TRIANGLE_LEAF_SIZE];
+   agx_store_le32(bytes, AGX_RT_BVH_GEN1_HW_TRIANGLE_LEAF_MARKER);
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      for (unsigned lane = 0; lane < 4; ++lane) {
+         uint32_t bits;
+         memcpy(&bits, &leaf->coordinate[axis][lane], sizeof(bits));
+         agx_store_le32(bytes + 4 + 4 * (axis * 4 + lane), bits);
+      }
+   }
+   agx_store_le32(bytes + 52, leaf->geometry_word);
+   agx_store_le32(bytes + 56, leaf->primitive_word[0]);
+   agx_store_le32(bytes + 60, leaf->primitive_word[1]);
+   memcpy(packed, bytes, sizeof(bytes));
+   return true;
+}
+
+static inline bool
+agx_rt_bvh_gen1_hw_aabb_leaf_pack(
+   void *packed, size_t available,
+   const struct agx_rt_bvh_gen1_hw_aabb_leaf *leaf)
+{
+   if (!packed || !leaf || available < AGX_RT_BVH_GEN1_HW_AABB_LEAF_SIZE ||
+       (leaf->header & 0xffu) != AGX_RT_BVH_GEN1_HW_AABB_LEAF_MARKER)
+      return false;
+
+   uint8_t bytes[AGX_RT_BVH_GEN1_HW_AABB_LEAF_SIZE];
+   agx_store_le32(bytes, leaf->header);
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      uint32_t bits;
+      memcpy(&bits, &leaf->minimum[axis], sizeof(bits));
+      agx_store_le32(bytes + 4 + axis * 4, bits);
+      memcpy(&bits, &leaf->maximum[axis], sizeof(bits));
+      agx_store_le32(bytes + 16 + axis * 4, bits);
+   }
+   agx_store_le64(bytes + 28, leaf->packed_ids_and_flags);
+   agx_store_le32(bytes + 36, leaf->word36);
+   agx_store_le64(bytes + 40, leaf->primitive_data_relative_word);
+   memcpy(packed, bytes, sizeof(bytes));
+   return true;
+}
+
+static inline bool
+agx_rt_bvh_gen1_header_pack(
+   void *packed, size_t available,
+   const struct agx_rt_bvh_gen1_header *header)
+{
+   if (!packed || !header || available < AGX_RT_BVH_GEN1_HEADER_SIZE)
+      return false;
+
+   uint8_t bytes[AGX_RT_BVH_GEN1_HEADER_SIZE];
+   for (unsigned i = 0; i < 8; ++i)
+      agx_store_le64(bytes + i * 8, header->words[i]);
+   memcpy(packed, bytes, sizeof(bytes));
+   return true;
+}
+
+static inline bool
+agx_rt_bvh_gen1_header_set_child_layout(
+   struct agx_rt_bvh_gen1_header *header, unsigned inner_count,
+   unsigned leaf_boxes, uint32_t child_space_slot, unsigned leaf_type,
+   unsigned leaf_slot_capacity, bool indexed_leaf_counts)
+{
+   if (!header || inner_count > 8 || leaf_boxes > 8 ||
+       inner_count + leaf_boxes == 0 || inner_count + leaf_boxes > 8 ||
+       leaf_type > 31 || leaf_slot_capacity > 15 ||
+       (leaf_boxes && !leaf_slot_capacity && !indexed_leaf_counts))
+      return false;
+
+   const uint32_t control = inner_count == 8 ? 0 :
+                            leaf_boxes == 8 ? 0x3f :
+                            (leaf_boxes << 3) | inner_count;
+   header->words[0] = (header->words[0] & ~UINT64_C(0x1f)) |
+                      (leaf_slot_capacity << 1) | indexed_leaf_counts;
+   header->words[5] = (header->words[5] & ~UINT64_C(0xffff)) |
+                      (child_space_slot >> 16);
+   header->words[6] = (header->words[6] & ~UINT64_C(0xffff)) |
+                      (child_space_slot & 0xffffu);
+   header->words[7] = (header->words[7] & ~UINT64_C(0x1f3f)) |
+                      (leaf_type << 8) | control;
+   return true;
+}
+
+static inline bool
+agx_rt_bvh_gen1_header_set_leaf_lane_end(
+   struct agx_rt_bvh_gen1_header *header, unsigned lane, unsigned end)
+{
+   if (!header || lane >= 8 || !end || end > 19)
+      return false;
+
+   const unsigned low = end <= 16 ? end - 1 : 15;
+   const unsigned high = (end - low) & 3u;
+   header->words[lane] = (header->words[lane] & ~UINT64_C(0x3f0000)) |
+                         ((uint64_t)low << 16) | ((uint64_t)high << 20);
+   return true;
+}
+
+static inline unsigned
+agx_rt_bvh_ceil_pow2_exponent(float value)
+{
+   const uint32_t bits = agx_rt_bvh_bitcast_f32_to_u32(value);
+   const uint32_t exponent = (bits >> 23) & 0xffu;
+
+   if (exponent == 0)
+      return 0; /* subnormal: below the representable step range */
+
+   /* An exact power of two is already the answer; anything else needs the
+    * next one up. */
+   return (bits & UINT32_C(0x7fffff)) ? exponent + 1u : exponent;
+}
+
+static inline bool
+agx_rt_bvh_gen1_quantization_frame_pack(
+   struct agx_rt_bvh_gen1_header *header,
+   const struct agx_rt_bvh_gen1_quantization_frame *frame)
+{
+   if (!header || !frame)
+      return false;
+
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      const uint32_t bits = agx_rt_bvh_bitcast_f32_to_u32(frame->origin[axis]);
+
+      /* The decoder drops the low sixteen mantissa bits, so only a value that
+       * is already exactly representable may be written here.  Fitting the
+       * frame is what rounds; this only deposits. */
+      if ((bits & 0xffffu) || !agx_rt_bvh_is_finite(frame->origin[axis]) ||
+          frame->exponent[axis] == 255)
+         return false;
+   }
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      const uint32_t bits = agx_rt_bvh_bitcast_f32_to_u32(frame->origin[axis]);
+      header->words[1 + axis] = (header->words[1 + axis] & ~UINT64_C(0xffff)) |
+                                (uint64_t)(bits >> 16);
+   }
+
+   header->words[0] = (header->words[0] & ~(UINT64_C(0xff) << 8)) |
+                      ((uint64_t)frame->exponent[0] << 8);
+   header->words[4] = (header->words[4] & ~UINT64_C(0xffff)) |
+                      ((uint64_t)frame->exponent[1] << 8) |
+                      (uint64_t)frame->exponent[2];
+   return true;
+}
+
+static inline bool
+agx_rt_bvh_gen1_node_bounds(const struct agx_rt_bvh_gen1_header *header,
+                            float minimum[3], float maximum[3])
+{
+   struct agx_rt_bvh_gen1_quantization_frame frame;
+
+   if (!minimum || !maximum)
+      return false;
+   if (!agx_rt_bvh_gen1_quantization_frame_unpack(header, &frame))
+      return false;
+
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      const float step = agx_rt_bvh_gen1_axis_step(frame.exponent[axis]);
+
+      minimum[axis] = frame.origin[axis];
+      maximum[axis] = frame.origin[axis] + 128.0f * step;
+   }
+
+   return true;
+}
+
+static inline float
+agx_rt_bvh_gen1_origin_round_down(float value)
+{
+   const uint32_t bits = agx_rt_bvh_bitcast_f32_to_u32(value);
+   uint32_t half = bits >> 16;
+
+   if ((bits & UINT32_C(0x80000000)) && (bits & 0xffffu))
+      ++half;
+
+   return agx_rt_bvh_bitcast_u32_to_f32(half << 16);
+}
+
+static inline bool
+agx_rt_bvh_gen1_quantization_frame_fit(
+   const float minimum[3], const float maximum[3],
+   struct agx_rt_bvh_gen1_quantization_frame *frame)
+{
+   if (!minimum || !maximum || !frame)
+      return false;
+
+   struct agx_rt_bvh_gen1_quantization_frame result = {0};
+
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      if (!agx_rt_bvh_is_finite(minimum[axis]) ||
+          !agx_rt_bvh_is_finite(maximum[axis]))
+         return false;
+      if (!(minimum[axis] <= maximum[axis]))
+         return false;
+
+      const float origin = agx_rt_bvh_gen1_origin_round_down(minimum[axis]);
+
+      if (!agx_rt_bvh_is_finite(origin) || origin > minimum[axis])
+         return false;
+
+      const float extent = maximum[axis] - origin;
+      unsigned exponent;
+
+      if (extent <= 0.0f) {
+         /* A degenerate axis: step +0.0 puts both corners on the origin. */
+         result.origin[axis] = origin;
+         result.exponent[axis] = 0;
+         continue;
+      }
+
+      /* Smallest power of two at least extent / 127. */
+      exponent = agx_rt_bvh_ceil_pow2_exponent(extent / 127.0f);
+
+      if (exponent < 1)
+         exponent = 1;
+      else if (exponent > 254)
+         return false;
+
+      /* Verify rather than trust the exponent arithmetic: bump the step until
+       * the maximum corner actually quantises inside the grid.  This settles
+       * the boundary cases frexpf alone does not. */
+      for (;;) {
+         const float step = agx_rt_bvh_gen1_axis_step((uint8_t)exponent);
+
+         if (step > 0.0f &&
+             agx_rt_bvh_ceil_nonneg((maximum[axis] - origin) / step) <= 127.0f)
+            break;
+
+         if (++exponent > 254)
+            return false;
+      }
+
+      result.origin[axis] = origin;
+      result.exponent[axis] = (uint8_t)exponent;
+   }
+
+   *frame = result;
+   return true;
+}
+
+static inline bool
+agx_rt_bvh_gen1_header_set_quantized_child_bounds(
+   struct agx_rt_bvh_gen1_header *header, unsigned child,
+   const struct agx_rt_bvh_gen1_quantized_bounds *bounds)
+{
+   static const unsigned shift[6] = {57, 50, 43, 36, 29, 22};
+
+   if (!header || !bounds || child >= 8)
+      return false;
+
+   uint64_t word = header->words[child] & ((UINT64_C(1) << 22) - 1);
+
+   for (unsigned i = 0; i < 6; ++i) {
+      if (bounds->component[i] > 0x7fu)
+         return false;
+
+      word |= (uint64_t)(bounds->component[i] & 0x7fu) << shift[i];
+   }
+
+   header->words[child] = word;
+   return true;
+}
+
+static inline bool
+agx_rt_bvh_gen1_header_encode_child_bounds(
+   struct agx_rt_bvh_gen1_header *header, unsigned child,
+   const float minimum[3], const float maximum[3])
+{
+   struct agx_rt_bvh_gen1_quantization_frame frame;
+   struct agx_rt_bvh_gen1_quantized_bounds bounds;
+
+   if (!agx_rt_bvh_gen1_quantization_frame_unpack(header, &frame))
+      return false;
+   if (!agx_rt_bvh_gen1_quantize_child_bounds(&frame, minimum, maximum,
+                                              &bounds))
+      return false;
+
+   return agx_rt_bvh_gen1_header_set_quantized_child_bounds(header, child,
+                                                            &bounds);
+}
+
+/* Gen3 QTB encoding type 0, three-vertex block. This packs already quantized
+ * coordinates in the native-tested 0..126 range; frame selection, primitive IDs and the other encoding types
+ * are separate operations. Native encodeVertex places vertex 0 at bit 107,
+ * then vertices 1 and 2 at bits 86 and 65. Within each vertex Z is lowest.
+ * Preserve the frame/header and every other bit in the caller's block.
+ */
+static inline bool
+agx_rt_qtb_gen3_type0_pack_vertex(void *packed, size_t available,
+                                 unsigned vertex, const uint32_t xyz[3])
+{
+   if (!packed || !xyz || available < 16 || vertex >= 3 ||
+       xyz[0] > 126 || xyz[1] > 126 || xyz[2] > 126)
+      return false;
+
+   uint8_t *bytes = packed;
+   const unsigned first = 107 - 21 * vertex;
+   const uint32_t value = (xyz[0] << 14) | (xyz[1] << 7) | xyz[2];
+   for (unsigned bit = 0; bit < 21; ++bit) {
+      const unsigned dst = first + bit;
+      const uint8_t mask = 1u << (dst % 8);
+      bytes[dst / 8] = (bytes[dst / 8] & ~mask) |
+                       (((value >> bit) & 1u) ? mask : 0);
+   }
+   return true;
+}
+
+/* Type-2 QTB coordinates are 10-bit unsigned fixed point with one
+ * fractional bit. All nine fields and the split exponent header were checked
+ * against 64 native TriFast builder outputs, including non-planar triangles.
+ * Vertex zero has four extra preceding bits. */
+static inline bool
+agx_rt_qtb_gen3_type2_pack_vertex_fp1(void *packed, size_t available,
+                                    unsigned vertex, const uint32_t xyz[3])
+{
+   if (!packed || !xyz || available < 32 || vertex >= 3 ||
+       xyz[0] > 1023 || xyz[1] > 1023 || xyz[2] > 1023)
+      return false;
+
+   static const unsigned first_bit[3] = {196, 162, 132};
+   const uint32_t value = (xyz[0] << 20) | (xyz[1] << 10) | xyz[2];
+   uint8_t *bytes = packed;
+   for (unsigned bit = 0; bit < 30; ++bit) {
+      const unsigned dst = first_bit[vertex] + bit;
+      const uint8_t mask = 1u << (dst % 8);
+      bytes[dst / 8] = (bytes[dst / 8] & ~mask) |
+                       (((value >> bit) & 1u) ? mask : 0);
+   }
+   return true;
+}
+
+/* Compatibility entry point for integral quantized coordinates. */
+static inline bool
+agx_rt_qtb_gen3_type2_pack_vertex(void *packed, size_t available,
+                                 unsigned vertex, const uint32_t xyz[3])
+{
+   if (!xyz || xyz[0] > 511 || xyz[1] > 511 || xyz[2] > 511)
+      return false;
+   const uint32_t fp1[3] = {xyz[0] << 1, xyz[1] << 1, xyz[2] << 1};
+   return agx_rt_qtb_gen3_type2_pack_vertex_fp1(packed, available, vertex, fp1);
+}
+
+/* Unindexed, one-triangle native TriFast type-2 block. Exponents are ordered
+ * XYZ at the API boundary; the wire order is Z at byte 1, X/Y at bytes 8/9.
+ * Coordinates are fixed point with one fractional bit. */
+static inline bool
+agx_rt_qtb_gen3_type2_single_triangle_fp1(
+   void *packed, size_t available, const uint16_t origin[3],
+   const uint8_t exponent[3], const uint32_t xyz[3][3])
+{
+   if (!packed || !origin || !exponent || !xyz || available < 64)
+      return false;
+
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      if ((origin[axis] & 0x7f80) == 0x7f80 || exponent[axis] == 255)
+         return false;
+      for (unsigned vertex = 0; vertex < 3; ++vertex) {
+         if (xyz[vertex][axis] > 1023)
+            return false;
+      }
+   }
+
+   uint8_t result[64] = {2};
+   result[1] = exponent[2];
+   result[8] = exponent[0];
+   result[9] = exponent[1];
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      result[2 + 2 * axis] = origin[axis];
+      result[3 + 2 * axis] = origin[axis] >> 8;
+   }
+   for (unsigned vertex = 0; vertex < 3; ++vertex)
+      agx_rt_qtb_gen3_type2_pack_vertex_fp1(result, sizeof(result), vertex,
+                                            xyz[vertex]);
+
+   memcpy(packed, result, sizeof(result));
+   return true;
+}
+
+static inline bool
+agx_rt_qtb_gen3_type2_single_triangle(
+   void *packed, size_t available, const uint16_t origin[3],
+   const uint8_t exponent[3], const uint32_t xyz[3][3])
+{
+   if (!xyz || !exponent)
+      return false;
+   uint32_t fp1[3][3];
+   uint8_t native_exponent[3];
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      /* Earlier integral callers used zero for a degenerate axis. */
+      native_exponent[axis] = exponent[axis] ? exponent[axis] : 1;
+      for (unsigned vertex = 0; vertex < 3; ++vertex) {
+         if (xyz[vertex][axis] > 511)
+            return false;
+         fp1[vertex][axis] = xyz[vertex][axis] << 1;
+      }
+   }
+   return agx_rt_qtb_gen3_type2_single_triangle_fp1(
+      packed, available, origin, native_exponent, fp1);
+}
+
+/* Fit and encode the single-triangle block observed from the native builder.
+ * This does not construct a BVH root or qualify traversal. Reject nonfinite
+ * inputs, origins and overflowed extents before touching the destination. */
+static inline bool
+agx_rt_qtb_gen3_type2_from_triangle(void *packed, size_t available,
+                                   const float vertices[3][3])
+{
+   if (!packed || !vertices || available < 64)
+      return false;
+   uint16_t origin[3];
+   uint8_t exponent[3];
+   uint32_t quantized[3][3];
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      float minimum = vertices[0][axis], maximum = minimum;
+      for (unsigned vertex = 0; vertex < 3; ++vertex) {
+         const float value = vertices[vertex][axis];
+         if (!agx_rt_bvh_is_finite(value))
+            return false;
+         if (value < minimum) minimum = value;
+         if (value > maximum) maximum = value;
+      }
+      const float base = agx_rt_bvh_gen1_origin_round_down(minimum);
+      const float extent = maximum - base;
+      if (!agx_rt_bvh_is_finite(base) || !agx_rt_bvh_is_finite(extent))
+         return false;
+      origin[axis] = agx_rt_bvh_bitcast_f32_to_u32(base) >> 16;
+      const unsigned e = (agx_rt_bvh_bitcast_f32_to_u32(extent) >> 23) & 0xff;
+      exponent[axis] = e > 8 ? e - 7 : 1;
+      /* Double arithmetic retains the fractional bit without overflowing the
+       * reciprocal for very small float exponents. */
+      const double scale = 4.0 / agx_rt_bvh_gen1_axis_step(exponent[axis]);
+      for (unsigned vertex = 0; vertex < 3; ++vertex) {
+         const double q = ((double)vertices[vertex][axis] - base) * scale;
+         quantized[vertex][axis] = q <= 0.0 ? 0 : q >= 1023.0 ? 1023 : (uint32_t)q;
+      }
+   }
+   return agx_rt_qtb_gen3_type2_single_triangle_fp1(
+      packed, available, origin, exponent, quantized);
+}
+
+/* Unindexed Gen3 type-6 block, up to four unpaired triangles. The native
+ * two/eight-triangle captures use four 24-bit XYZ slots per triangle, in
+ * vertex order 2, 2, 1, 0. Each component is eight bits, unlike type 2's
+ * ten-bit fixed-point coordinates. This is only the traversal payload;
+ * explicit primitive IDs live in the associated full-precision records. */
+static inline bool
+agx_rt_qtb_gen3_type6_from_triangles(void *packed, size_t available,
+                                  const float (*vertices)[3][3], unsigned count)
+{
+   if (!packed || !vertices || available < 64 || !count || count > 4)
+      return false;
+
+   float origin[3];
+   uint8_t result[64] = {6};
+   uint8_t exponent[3];
+   for (unsigned axis = 0; axis < 3; ++axis) {
+      float minimum = vertices[0][0][axis], maximum = minimum;
+      for (unsigned t = 0; t < count; ++t)
+         for (unsigned v = 0; v < 3; ++v) {
+            float x = vertices[t][v][axis];
+            if (!agx_rt_bvh_is_finite(x))
+               return false;
+            if (x < minimum) minimum = x;
+            if (x > maximum) maximum = x;
+         }
+      origin[axis] = agx_rt_bvh_gen1_origin_round_down(minimum);
+      float extent = maximum - origin[axis];
+      if (!agx_rt_bvh_is_finite(origin[axis]) || !agx_rt_bvh_is_finite(extent))
+         return false;
+      unsigned e = (agx_rt_bvh_bitcast_f32_to_u32(extent) >> 23) & 0xff;
+      exponent[axis] = e > 8 ? e - 7 : 1;
+      uint16_t bf16 = agx_rt_bvh_bitcast_f32_to_u32(origin[axis]) >> 16;
+      result[2 + axis * 2] = bf16;
+      result[3 + axis * 2] = bf16 >> 8;
+   }
+   result[1] = exponent[2];
+   result[8] = exponent[0];
+   result[9] = exponent[1];
+   static const unsigned order[4] = {2, 2, 1, 0};
+   for (unsigned t = 0; t < count; ++t)
+      for (unsigned slot = 0; slot < 4; ++slot)
+         for (unsigned axis = 0; axis < 3; ++axis) {
+            double q = ((double)vertices[t][order[slot]][axis] - origin[axis]) /
+                       agx_rt_bvh_gen1_axis_step(exponent[axis]);
+            result[16 + t * 12 + slot * 3 + 2 - axis] =
+               q <= 0 ? 0 : q >= 255 ? 255 : (uint8_t)q;
+         }
+   memcpy(packed, result, sizeof(result));
+   return true;
 }
 
 #ifdef __cplusplus

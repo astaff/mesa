@@ -421,6 +421,24 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       } else {
          memcpy(linked_map + offset, part_code, sz);
       }
+      if (i == 2 && main && main->info.agx3_colour_link.rt_query_write_acquired) {
+         const struct agx3_colour_link_info *link = &part->info.agx3_colour_link;
+         if (link->rt_query_wait_count != 1 || link->rt_query_wait_unsupported)
+            goto invalid_start_marker;
+         uint32_t at = link->rt_query_wait_offset;
+         if (drop_entry[i] && at > link->entry_offset) at -= AGX3_PIXEL_MAX_LENGTH;
+         uint8_t before[AGX3_PIXEL_MAX_LENGTH], after[AGX3_PIXEL_MAX_LENGTH];
+         uint8_t before_len, after_len;
+         if (at > sz || sz - at < AGX3_PIXEL_MAX_LENGTH ||
+             !agx3_pixel_wait(AGX_ISA_ENCODING_AGX3B, 12, link->rt_query_wait_mask,
+                             before, &before_len) ||
+             !agx3_pixel_wait(AGX_ISA_ENCODING_AGX3B, 8, link->rt_query_wait_mask,
+                             after, &after_len) || before_len != after_len ||
+             before_len != AGX3_PIXEL_MAX_LENGTH ||
+             memcmp(linked_map + offset + at, before, before_len))
+            goto invalid_start_marker;
+         memcpy(linked_map + offset + at, after, after_len);
+      }
       if (dev->chip == AGX_CHIP_G17P && fragment &&
           !agx3_fltnorm_relocate_start(linked_map + offset, sz,
                                        part->info.agx3_fltnorm_start, offset))

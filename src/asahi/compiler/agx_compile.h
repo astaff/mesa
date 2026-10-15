@@ -435,6 +435,8 @@ struct agx_shader_key {
    /* Number of reserved preamble slots at the start */
    unsigned reserved_preamble;
 
+   uint16_t g17p_texture_uniform_base;
+
    /* Whether scratch memory is available in the given shader stage */
    bool has_scratch;
 

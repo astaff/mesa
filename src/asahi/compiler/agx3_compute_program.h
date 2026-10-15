@@ -14,6 +14,7 @@
 /* Largest thread-private spill frame a G17P program publishes, in bytes.
  * applegpu_g17p holding 60 live uint4 temporaries publishes 1584. */
 #define AGX3_G17P_MAX_SPILL_B 4096u
+#define AGX3_G17P_MAX_COMPUTE_SPILL_B 8192u
 
 struct agx3_g17p_compute_program_desc {
    uint64_t program_va;

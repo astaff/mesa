@@ -36,6 +36,8 @@
 #include "agx3_resource_ir.h"
 #include "agx3_pixel_core.h"
 #include "agx3_scs_core.h"
+#include "agx3_rt_gen1_traversal.h"
+#include "agx3_rt_core.h"
 #include "agx3_select_core.h"
 #include "agx3_slot_core.h"
 #include "agx3_sr_core.h"
@@ -53,6 +55,7 @@
 #include "agx_compiler.h"
 #include "agx_debug.h"
 #include "util/half_float.h"
+#include "util/u_debug.h"
 
 #include <limits.h>
 #include <math.h>
@@ -804,6 +807,8 @@ agx3_is_async(const agx_instr *I)
           agx_is_texture_publication(I) ||
           I->op == AGX_OPCODE_SCS_LOAD_AGX3 ||
           I->op == AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3 ||
+          I->op == AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3 ||
+          I->op == AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3 ||
           I->op == AGX_OPCODE_LOAD_CPROG_AGX3 ||
           I->op == AGX_OPCODE_STACK_LOAD ||
           I->op == AGX_OPCODE_STACK_STORE;
@@ -1316,7 +1321,8 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
                         struct agx3_staging_banks *banks,
                         uint16_t outstanding,
                         uint16_t *staged_end, bool pixel_entry,
-                        uint32_t *pixel_entry_offset)
+                        uint32_t *pixel_entry_offset,
+                        uint16_t heap_uniform_base)
 {
    const bool immediate = I->nr_srcs == 6 &&
       I->src[3].type == AGX_INDEX_IMMEDIATE;
@@ -1585,6 +1591,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       return false;
 
    const struct agx3_tex_fetch_desc d = {
+      .heap_uniform_base = heap_uniform_base,
       .dest = I->dest[0].value,
       .coord = stage_coordinates ? staging_coord : I->src[0].value,
       .width = I->dest[0].size == AGX_SIZE_32 ? AGX3_TEX_W32 : AGX3_TEX_W16,
@@ -1647,7 +1654,8 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
                               uint16_t wait_mask,
                               struct agx3_staging_banks *banks,
                               uint16_t bank_floor, uint16_t *outstanding,
-                              uint8_t *write_slot)
+                              uint8_t *write_slot,
+                              uint16_t heap_uniform_base)
 {
    const bool normalized = I->format == AGX_FORMAT_U8NORM ||
                            I->format == AGX_FORMAT_RGB10A2;
@@ -1829,10 +1837,12 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
       struct agx3_image_write_desc resolved = d;
       resolved.image_value = 0;
       encoded = agx3_tex_encode_image_write_2d(
-         enc, &resolved, 8, 1, imgwci, &imgwci_len);
+         enc, &resolved, heap_uniform_base + 8, 1, imgwci, &imgwci_len);
    } else {
-      encoded = agx3_tex_encode_image_write_rgba8_2d(
-         enc, &d, imgwci, &imgwci_len);
+      const uint16_t base = heap_uniform_base + (d.image_value == 1 ? 4 : 0);
+      const uint8_t staging_slot = d.image_value == 0 ? 1 : 2;
+      encoded = agx3_tex_encode_image_write_2d(
+         enc, &d, base, staging_slot, imgwci, &imgwci_len);
    }
    if (!encoded || !agx3_append(&staged, imgwci, imgwci_len) ||
        !agx3_append(emission, staged.data, staged.size)) {
@@ -1873,7 +1883,8 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
                          uint8_t native_coord_slot,
                          const uint16_t cem_scratch[3], bool vertex_stage,
                          bool compute_stage, uint16_t array_scratch,
-                         uint16_t bank_base, bool publication_last)
+                         uint16_t bank_base, bool publication_last,
+                         uint16_t heap_uniform_base)
 {
    const bool published = agx_texture_resource(I) != 0;
    const bool explicit_lod = I->lod_mode == AGX_LOD_MODE_LOD_MIN;
@@ -2499,6 +2510,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    }
 
    const struct agx3_tex_sample_desc d = {
+      .heap_uniform_base = heap_uniform_base,
       .dest = I->dest[0].value,
       .coord = coord,
       .width = I->dest[0].size == AGX_SIZE_32 ? AGX3_TEX_W32 : AGX3_TEX_W16,
@@ -2980,7 +2992,7 @@ static uint32_t agx3_g17p_colour_writeout(uint32_t writeout, unsigned pair);
 static bool
 agx3_emit_pixel(struct util_dynarray *emission, enum agx_isa_encoding enc,
                 const agx_instr *I, uint16_t wait_mask, bool last,
-                unsigned colour_pair)
+                unsigned colour_pair, struct agx3_colour_link_info *link, size_t initial_size)
 {
    if (I->nr_dests != 0 || I->nr_srcs != 0 ||
        (last && I->op != AGX_OPCODE_SIGNAL_PIX))
@@ -2988,8 +3000,19 @@ agx3_emit_pixel(struct util_dynarray *emission, enum agx_isa_encoding enc,
 
    uint8_t bytes[AGX3_PIXEL_MAX_LENGTH];
    uint8_t len = 0;
-   const uint32_t writeout =
-      agx3_g17p_colour_writeout(I->writeout, colour_pair);
+   uint32_t writeout = agx3_g17p_colour_writeout(I->writeout, colour_pair);
+   if (I->op == AGX_OPCODE_WAIT_PIX && (writeout & 4) && link) {
+      if (link->rt_query_write_acquired) {
+         if (writeout != 12) return false;
+         writeout = 8;
+      } else if (writeout == 12 && link->rt_query_wait_count == 0) {
+         link->rt_query_wait_count = 1;
+         link->rt_query_wait_offset = emission->size - initial_size;
+         link->rt_query_wait_mask = wait_mask;
+      } else {
+         link->rt_query_wait_unsupported = true;
+      }
+   }
    const bool ok =
       I->op == AGX_OPCODE_WAIT_PIX
          ? agx3_pixel_wait(enc, writeout, wait_mask, bytes, &len)
@@ -3042,15 +3065,16 @@ agx3_scs_plain_index(agx_index index)
 }
 
 static bool
-agx3_translate_scs(const agx_instr *I, bool is_store, bool indexed,
+agx3_translate_scs(enum agx_isa_encoding enc, const agx_instr *I, bool is_store, bool indexed,
+                   bool register_indexed, bool register_base,
                    uint8_t slot, uint16_t wait_mask,
                    struct agx3_scs_desc *d)
 {
    memset(d, 0, sizeof(*d));
    const int width = agx3_fmt_to_width(I->format);
    const int64_t byte_offset = (int64_t)I->imm;
-   const unsigned expected_srcs = indexed ? (is_store ? 3 : 2)
-                                          : (is_store ? 1 : 0);
+   const unsigned expected_srcs = register_base ? (is_store ? 2 : 1) :
+                                   indexed ? (is_store ? 3 : 2) : (is_store ? 1 : 0);
    if (width < 0 || byte_offset < INT16_MIN || byte_offset > INT16_MAX ||
        I->nr_dests != (is_store ? 0 : 1) ||
        I->nr_srcs != expected_srcs ||
@@ -3058,13 +3082,21 @@ agx3_translate_scs(const agx_instr *I, bool is_store, bool indexed,
         (I->scs_zero_extend || I->scs_c_load_marker)))
       return false;
 
-   const agx_index data = is_store ? I->src[0] : I->dest[0];
+   agx_index data = is_store ? I->src[0] : I->dest[0];
+   /* Post-RA register-cache hints are not SCS operand modifiers. Its
+    * witnessed final-use bit is carried separately in the SCS descriptor. */
+   const bool data_kill = enc == AGX_ISA_ENCODING_AGX3C &&
+                          is_store && (data.kill || data.discard);
+   data.kill = data.cache = data.discard = false;
+   agx_index scalar_data = data;
+   scalar_data.channels_m1 = 0;
    const enum agx_size expected =
-      width == AGX3_MEM_W32 ? AGX_SIZE_32 : AGX_SIZE_16;
-   if (!agx3_src_is_register(data) || !agx3_scs_plain_index(data) ||
-       data.size != expected || agx_channels(data) != 1 ||
+      (width == AGX3_MEM_W32 || I->scs_zero_extend) ? AGX_SIZE_32 : AGX_SIZE_16;
+   if (!agx3_src_is_register(data) || !agx3_scs_plain_index(scalar_data) ||
+       data.size != expected || I->mask > 15 ||
+       agx_channels(data) != util_last_bit(I->mask ? I->mask : 1) ||
        (data.value & (agx_size_align_16(expected) - 1)) ||
-       data.value + agx_size_align_16(expected) > 256)
+       data.value + agx_size_align_16(expected) * agx_channels(data) > 256)
       return false;
 
    *d = (struct agx3_scs_desc){
@@ -3074,18 +3106,56 @@ agx3_translate_scs(const agx_instr *I, bool is_store, bool indexed,
       .address_kind = indexed ? AGX3_SCS_ADDRESS_UNIFORM_INDEXED
                               : AGX3_SCS_ADDRESS_DIRECT,
       .slot = is_store ? 0 : slot,
-      .wait_mask = wait_mask,
+      .wait_mask = wait_mask | (I->scs_rt_wait ? 32 : 0),
+      .value_kill = data_kill,
+      .component_mask = I->mask ? I->mask : 1,
    };
 
+   if (register_indexed || register_base) {
+      agx_index base = I->src[is_store ? 1 : 0];
+      agx_index index = register_base ? agx_register(0, AGX_SIZE_32) :
+                                       I->src[is_store ? 2 : 1];
+      const bool base_kill = enc == AGX_ISA_ENCODING_AGX3C &&
+                             (base.kill || base.discard);
+      const bool index_kill = enc == AGX_ISA_ENCODING_AGX3C &&
+                              (index.kill || index.discard);
+      base.kill = base.cache = base.discard = false;
+      index.kill = index.cache = index.discard = false;
+      if (!agx3_src_is_register(base) || base.size != AGX_SIZE_32 ||
+          !agx3_scs_plain_index(base) || (base.value & 1) || base.value > 254 ||
+          !agx3_src_is_register(index) || index.size != AGX_SIZE_32 ||
+          !agx3_scs_plain_index(index) || (index.value & 1) || index.value > 254)
+         return false;
+      d->address_kind = register_base ? AGX3_SCS_ADDRESS_REGISTER_BASE :
+                                        AGX3_SCS_ADDRESS_REGISTER_INDEXED;
+      d->base_register = base.value;
+      d->index = index.value;
+      d->has_address_selector = true;
+      d->address_selector = I->scs_address_selector;
+      d->base_kill = base_kill;
+      d->index_kill = !register_base && index_kill;
+      d->value_kill = data_kill;
+      d->c_status_load = enc == AGX_ISA_ENCODING_AGX3C &&
+                         !is_store && I->scs_c_status_load;
+      d->b_status_load = enc == AGX_ISA_ENCODING_AGX3B &&
+                         !is_store && I->scs_c_status_load;
+      d->c_load_marker = !is_store && I->scs_c_load_marker;
+      return true;
+   }
+
    if (indexed) {
-      const agx_index base = I->src[is_store ? 1 : 0];
-      const agx_index index = I->src[is_store ? 2 : 1];
+      agx_index base = I->src[is_store ? 1 : 0];
+      agx_index index = I->src[is_store ? 2 : 1];
+      const bool index_kill = enc == AGX_ISA_ENCODING_AGX3C &&
+                              (index.kill || index.discard);
+      base.kill = base.cache = base.discard = false;
+      index.kill = index.cache = index.discard = false;
 
       /* The pseudo itself preserves the address-space provenance.  Require
        * the physical operands to preserve it too: a scalar 64-bit uniform
        * base and a scalar aligned 32-bit GPR index.  In particular, no
-       * register base, vector, source modifier, or inferred last-use bit is
-       * silently encoded into fields whose semantics are not yet grounded.
+       * register base or arithmetic source modifier is silently encoded.
+       * Component masks and final index use have independent native witnesses.
        */
       if (base.type != AGX_INDEX_UNIFORM || base.size != AGX_SIZE_64 ||
           !agx3_scs_plain_index(base) || base.value >= 512 ||
@@ -3096,6 +3166,9 @@ agx3_translate_scs(const agx_instr *I, bool is_store, bool indexed,
 
       d->uniform_base = base.value;
       d->index = index.value;
+      d->index_kill = index_kill;
+      d->has_address_selector = true;
+      d->address_selector = I->scs_address_selector;
       d->zero_extend = !is_store && I->scs_zero_extend;
       d->c_load_marker = !is_store && I->scs_c_load_marker;
    }
@@ -3196,7 +3269,8 @@ agx3_translate_mem(const agx_instr *I, bool is_store, uint8_t slot,
        * index operand cannot decode as "operand absent") made no difference
        * on hardware. */
       d->idx_kill = index.kill;
-      d->idx_signed = false;
+      /* M5 C45: NIR abs requests zero extension; plain indices are signed. */
+      d->idx_signed = !index.abs;
 
       /*
        * A REGISTER index is scaled by the shift alone, not by the access
@@ -3396,8 +3470,11 @@ agx3_translate_device_atomic(const agx_instr *I,
    }
 
    const agx_index index = I->src[2];
-   if (index.memory || index.abs || index.neg || index.kill ||
-       (index.cache && index.discard) || agx_channels(index) != 1)
+   /* Immediate inlining uses abs to mark the wider 16-bit literal field,
+    * including atomic element indices. It is not an address modifier. */
+   if (index.memory || (index.abs && index.type != AGX_INDEX_IMMEDIATE) ||
+       index.neg || index.kill || (index.cache && index.discard) ||
+       agx_channels(index) != 1)
       return false;
 
    if (index.type == AGX_INDEX_IMMEDIATE) {
@@ -4455,7 +4532,7 @@ agx3_emit_scoped_barrier(struct util_dynarray *emission,
 {
    if (I->op != AGX_OPCODE_SCOPED_BARRIER_AGX3 ||
        I->nr_dests != 0 || I->nr_srcs != 0 ||
-       I->imm > AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT)
+       I->imm > AGX3_BARRIER_SCOPE_SUBGROUP_SHARED)
       return false;
 
    struct agx3_encoded_scoped_barrier encoded;
@@ -7994,6 +8071,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    unsigned device_loads_left = 0;
    bool has_coverage_write = false;
    bool has_memory_write = false;
+   bool has_ray_traversal = false;
    /* The last pixel release of a program-ending fragment part, when no
     * colour store, coverage update, acquisition or branch follows it. */
    const agx_instr *g17p_final_release = NULL;
@@ -8080,6 +8158,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              scan_I->op == AGX_OPCODE_DEVICE_STORE ||
              scan_I->op == AGX_OPCODE_IMAGE_WRITE)
             has_memory_write = true;
+         if (scan_I->op == AGX_OPCODE_INTERSECT_RAY_GEN1 ||
+             scan_I->op == AGX_OPCODE_CONTINUE_RAY_GEN1)
+            has_ray_traversal = true;
          if (scan_I->op == AGX_OPCODE_DEVICE_LOAD)
             device_loads_left++;
          if (scan_I->op == AGX_OPCODE_IMAGE_WRITE)
@@ -8360,6 +8441,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
           entry_I->op == AGX_OPCODE_ZS_EMIT_AGX3)
          ctx->agx3_colour_link.straight_line = false;
    }
+   const bool fragment_ray_query = has_ray_traversal &&
+      enc == AGX_ISA_ENCODING_AGX3B && ctx->stage == MESA_SHADER_FRAGMENT;
+   if (fragment_ray_query && (ctx->key->fs.nr_samples > 1 ||
+       (ctx->agx3_colour_link.colour_classes & ~1u)))
+      goto fail;
+   bool ray_query_acquired = false;
    unsigned g17p_link_packs_seen = 0;
    unsigned g17p_mrt_stores_seen = 0;
    bool g17p_mrt_acquired = false;
@@ -8867,7 +8954,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                               : 0;
    const uint16_t image_write_bank_floor =
       MAX2(fixed_staging_floor, ALIGN_POT(zs_staging_halfs, 8));
-   if ((has_coverage_write || (has_memory_write && !ctx->key->secondary)) &&
+   if ((has_coverage_write ||
+        ((has_memory_write || has_ray_traversal) && !ctx->key->secondary)) &&
        enc == AGX_ISA_ENCODING_AGX3B &&
        ctx->stage == MESA_SHADER_FRAGMENT &&
        !ctx->key->fs.ignore_tib_dependencies) {
@@ -8952,6 +9040,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             I->op == AGX_OPCODE_POP_EXEC && after_loop_backedge;
          if (loop_pop)
             block->loop_exit_offset = emission->size;
+         if (fragment_ray_query && !ray_query_acquired && agx3_is_cf_op(I)) {
+            uint8_t pixel[AGX3_PIXEL_MAX_LENGTH], pixel_len;
+            const bool ok = g17p_colourless_fragment
+               ? agx3_pixel_atomic_acquire(enc, pixel, &pixel_len)
+               : agx3_pixel_wait(enc, 4, 0, pixel, &pixel_len);
+            if (!ok || !agx3_append(emission, pixel, pixel_len)) AGX3_REFUSE(I);
+            ray_query_acquired = true;
+            ctx->agx3_colour_link.rt_query_write_acquired = !g17p_colourless_fragment;
+         }
          const off_t cf_start = emission->size;
          off_t cf_compare_end = -1;
          const int cf = agx3_try_control_flow(
@@ -9460,7 +9557,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                                            : NULL,
                                          outstanding_here, &staged_end,
                                          open_pixel_fetch,
-                                         &ctx->agx3_colour_link.entry_offset))
+                                         &ctx->agx3_colour_link.entry_offset,
+                                         ctx->key->g17p_texture_uniform_base))
                AGX3_REFUSE(I);
             if (open_pixel_fetch) {
                ctx->agx3_colour_link.entry_emitted = true;
@@ -9484,7 +9582,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             if (!agx3_emit_storage_image_write(emission, enc, I, wait,
                                                &staging_banks,
                                                image_write_bank_floor,
-                                               &outstanding, &write_slot))
+                                               &outstanding, &write_slot,
+                                               ctx->key->g17p_texture_uniform_base))
                AGX3_REFUSE(I);
             image_write_slots &= outstanding;
             image_write_slots |= 1u << (write_slot - 1);
@@ -9746,7 +9845,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                           ctx->stage == MESA_SHADER_COMPUTE,
                                           ms_array_scratch, bank_base,
                                           published && resource_last_use[
-                                             published_resource] == instr_index))
+                                             published_resource] == instr_index,
+                                          ctx->key->g17p_texture_uniform_base))
                AGX3_REFUSE(I);
             if (open_pixel) {
                ctx->agx3_colour_link.entry_emitted = true;
@@ -9868,7 +9968,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                g17p_colour_open = true;
             }
             if (!agx3_emit_pixel(emission, enc, I, wait,
-                                 I == g17p_final_release, g17p_lone_pair))
+                                 I == g17p_final_release, g17p_lone_pair, &ctx->agx3_colour_link, initial_size))
                AGX3_REFUSE(I);
             continue;
          }
@@ -10018,8 +10118,21 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   (I->src[0].kill || I->src[0].discard);
                /* A multisample store keeps its own coverage dependency. */
                const bool store_waits = !acquire_class || g17p_mrt.multisample;
+               uint32_t query_acquire = acquire;
+               if (acquire_class && shared && (acquire & 4)) {
+                  if (ctx->agx3_colour_link.rt_query_write_acquired) {
+                     if (acquire != 12) AGX3_REFUSE(I);
+                     query_acquire = 8;
+                  } else if (acquire == 12 && ctx->agx3_colour_link.rt_query_wait_count == 0) {
+                     ctx->agx3_colour_link.rt_query_wait_count = 1;
+                     ctx->agx3_colour_link.rt_query_wait_offset = emission->size - initial_size;
+                     ctx->agx3_colour_link.rt_query_wait_mask = store_waits ? 0 : wait;
+                  } else {
+                     ctx->agx3_colour_link.rt_query_wait_unsupported = true;
+                  }
+               }
                if ((acquire_class &&
-                    (!agx3_pixel_wait(enc, acquire, store_waits ? 0 : wait,
+                    (!agx3_pixel_wait(enc, query_acquire, store_waits ? 0 : wait,
                                       bytes, &len) ||
                      !agx3_append(emission, bytes, len))) ||
                    !agx3_emit_tile(emission, enc, I, slot,
@@ -10045,7 +10158,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   g17p_colour_open = true;
                }
                if (!agx3_emit_pixel(emission, enc, g17p_deferred_write, 0,
-                                    false, g17p_lone_pair))
+                                    false, g17p_lone_pair, &ctx->agx3_colour_link, initial_size))
                   AGX3_REFUSE(I);
             }
             /* Apple's per-sample RGBA32 fragments store from halves 24 and
@@ -10225,7 +10338,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                AGX3_REFUSE(I);
             if (g17p_deferred_zs_wait && !interleaved_zs &&
                 !agx3_emit_pixel(emission, enc, g17p_deferred_zs_wait, 0, false,
-                                 0))
+                                 0, &ctx->agx3_colour_link, initial_size))
                AGX3_REFUSE(I);
             g17p_deferred_zs_wait = NULL;
 
@@ -10326,7 +10439,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                       bytes, &len) ||
                 !agx3_append(emission, bytes, len) ||
                 !agx3_emit_pixel(emission, enc, g17p_deferred_zs_wait, 0,
-                                 false, 0))
+                                 false, 0, &ctx->agx3_colour_link, initial_size))
                AGX3_REFUSE(I);
             const struct agx3_zs_desc d = {
                .value = 0, .value_kill = true, .slot = 1, .wait_mask = 1,
@@ -10546,20 +10659,155 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
 
+         if (I->op == AGX_OPCODE_INTERSECT_RAY_GEN1 ||
+             I->op == AGX_OPCODE_CONTINUE_RAY_GEN1) {
+            uint8_t bytes[16], len;
+            if (enc != AGX_ISA_ENCODING_AGX3B || I->nr_dests || slot)
+               AGX3_REFUSE(I);
+            if (wait && !agx3_retire_slots_noop(emission, enc, wait))
+               AGX3_REFUSE(I);
+            if (I->op == AGX_OPCODE_INTERSECT_RAY_GEN1) {
+               agx_index bvh=I->src[0], request=I->src[1];
+               bvh.kill=bvh.cache=bvh.discard=false;
+               request.kill=request.cache=request.discard=false;
+               if (I->nr_srcs != 4 || bvh.size != AGX_SIZE_64 ||
+                   request.size != AGX_SIZE_64 ||
+                   !agx3_scs_plain_index(bvh) || !agx3_scs_plain_index(request))
+                  AGX3_REFUSE(I);
+               const struct agx3_rt_gen1_intersect_desc d = {
+                  .bvh=bvh.value, .request=request.value,
+                  .bvh_uniform=bvh.type==AGX_INDEX_UNIFORM,
+                  .request_uniform=request.type==AGX_INDEX_UNIFORM,
+                  .context_uniform=I->imm,
+               };
+               if (!agx3_rt_gen1_encode_intersect(enc,&d,bytes,&len))
+                  AGX3_REFUSE(I);
+               for (unsigned j=0;j<2;j++) {
+                  agx_index word=I->src[2+j];
+                  uint8_t copy[AGX3_STAGE_MAX_LENGTH], n;
+                  if (!agx3_src_is_register(word) || word.size!=AGX_SIZE_32 ||
+                      word.memory || word.abs || word.neg || (word.value&1) ||
+                      !agx3_rt_gen1_encode_launch_word(j,word.value,copy,&n) ||
+                      !agx3_append(emission,copy,n))
+                     AGX3_REFUSE(I);
+               }
+               ctx->agx3_staging_halfs=MAX2(ctx->agx3_staging_halfs,4);
+            } else {
+               if (I->nr_srcs != 1) AGX3_REFUSE(I);
+               agx_index id = I->src[0];
+               uint8_t resume[32], resume_len;
+               if (!agx3_src_is_register(id) || id.size != AGX_SIZE_32 ||
+                   id.memory || id.abs || id.neg || (id.value & 1) ||
+                   !(I->imm == 0 ?
+                     agx3_rt_gen1_encode_resume(enc, id.value, resume, &resume_len) :
+                     I->imm == 1 && agx3_rt_gen1_encode_refill(enc, id.value, resume, &resume_len)) ||
+                   !agx3_append(emission, resume, resume_len))
+                  AGX3_REFUSE(I);
+               ctx->agx3_staging_halfs = MAX2(ctx->agx3_staging_halfs, 6);
+               continue;
+            }
+            uint8_t fence[AGX3_RT_CORE_MAX_LENGTH], fence_len;
+            if (!agx3_rt_traversal_barrier(enc,
+                  I->op == AGX_OPCODE_INTERSECT_RAY_GEN1 ? AGX3_RT_BARRIER_ENTRY
+                                                       : AGX3_RT_BARRIER_IN_LOOP,
+                  fence, &fence_len) || !agx3_append(emission,fence,fence_len))
+               AGX3_REFUSE(I);
+            if (fragment_ray_query && !ray_query_acquired) {
+               uint8_t pixel[AGX3_PIXEL_MAX_LENGTH], pixel_len;
+               const bool ok = g17p_colourless_fragment
+                  ? agx3_pixel_atomic_acquire(enc, pixel, &pixel_len)
+                  : agx3_pixel_wait(enc, 4, 0, pixel, &pixel_len);
+               if (!ok || !agx3_append(emission, pixel, pixel_len)) AGX3_REFUSE(I);
+               ray_query_acquired = true;
+               ctx->agx3_colour_link.rt_query_write_acquired = !g17p_colourless_fragment;
+            }
+            if (!agx3_append(emission,bytes,len)) AGX3_REFUSE(I);
+            continue;
+         }
+
+         if (I->op == AGX_OPCODE_ALLOCATE_UVB_M5 ||
+             I->op == AGX_OPCODE_STORE_UVB_M5) {
+            uint8_t bytes[8], length;
+            bool encoded;
+            if (I->nr_dests || slot || (enc != AGX_ISA_ENCODING_AGX3C &&
+                                      enc != AGX_ISA_ENCODING_AGX3B))
+               AGX3_REFUSE(I);
+            if (I->op == AGX_OPCODE_ALLOCATE_UVB_M5) {
+               if (I->nr_srcs != 2 ||
+                   !agx3_src_is_register(I->src[0]) ||
+                   !agx3_src_is_register(I->src[1]) ||
+                   I->src[0].size != AGX_SIZE_16 ||
+                   I->src[1].size != AGX_SIZE_16 ||
+                   agx_channels(I->src[0]) != 1 ||
+                   agx_channels(I->src[1]) != 1 ||
+                   I->src[0].memory || I->src[1].memory ||
+                   I->src[0].abs || I->src[1].abs ||
+                   I->src[0].neg || I->src[1].neg)
+                  AGX3_REFUSE(I);
+               encoded = agx3_mesh_allocate_uvb(enc, I->src[0].value,
+                                                I->src[1].value, I->src[0].kill || I->src[0].discard,
+                                                bytes, &length);
+            } else {
+               if (I->nr_srcs != 1 || I->imm > 1 ||
+                   !agx3_src_is_register(I->src[0]) ||
+                   I->src[0].size != AGX_SIZE_32 ||
+                   agx_channels(I->src[0]) != 2 ||
+                   I->src[0].memory || I->src[0].abs || I->src[0].neg)
+                  AGX3_REFUSE(I);
+               encoded = agx3_mesh_uvst(enc, I->src[0].value, I->imm,
+                                         I->src[0].kill || I->src[0].discard,
+                                         bytes, &length);
+            }
+            if (!encoded || (wait && !agx3_retire_slots_noop(emission, enc, wait)) ||
+                !agx3_append(emission, bytes, length))
+               AGX3_REFUSE(I);
+            continue;
+         }
+
+         if (I->op == AGX_OPCODE_STORE_OBJECT_CHILDCOUNT_M5) {
+            uint8_t bytes[AGX3_STAGE_MAX_LENGTH], length;
+            if ((enc != AGX_ISA_ENCODING_AGX3C && enc != AGX_ISA_ENCODING_AGX3B) ||
+                I->nr_dests || I->nr_srcs != 1 ||
+                !agx3_vary_reg32(I->src[0]))
+               AGX3_REFUSE(I);
+            const uint16_t stage_wait = wait | (outstanding & 1u);
+            if (!agx3_stage_copy_source(enc, 0, I->src[0].value,
+                 I->src[0].kill || I->src[0].discard, 1, stage_wait, bytes, &length) ||
+                !agx3_append(emission, bytes, length) ||
+                !agx3_mesh_object_childcount(enc, bytes, &length) ||
+                !agx3_append(emission, bytes, length))
+               AGX3_REFUSE(I);
+            ctx->agx3_staging_halfs = MAX2(ctx->agx3_staging_halfs, 2);
+            outstanding &= (uint16_t)~(stage_wait | 1u);
+            continue;
+         }
          if (I->op == AGX_OPCODE_SCS_LOAD_AGX3 ||
              I->op == AGX_OPCODE_SCS_STORE_AGX3 ||
              I->op == AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3 ||
-             I->op == AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3) {
+             I->op == AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3 ||
+             I->op == AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3 ||
+             I->op == AGX_OPCODE_SCS_STORE_REGISTER_INDEXED_AGX3 ||
+             I->op == AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3 ||
+             I->op == AGX_OPCODE_SCS_STORE_REGISTER_BASE_AGX3) {
             const bool is_store = I->op == AGX_OPCODE_SCS_STORE_AGX3 ||
                                   I->op ==
-                                     AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3;
-            const bool indexed =
+                                     AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3 ||
+                                  I->op == AGX_OPCODE_SCS_STORE_REGISTER_INDEXED_AGX3 ||
+                                  I->op == AGX_OPCODE_SCS_STORE_REGISTER_BASE_AGX3;
+            const bool register_indexed =
+               I->op == AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3 ||
+               I->op == AGX_OPCODE_SCS_STORE_REGISTER_INDEXED_AGX3;
+            const bool register_base =
+               I->op == AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3 ||
+               I->op == AGX_OPCODE_SCS_STORE_REGISTER_BASE_AGX3;
+            const bool indexed = register_base || register_indexed ||
                I->op == AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3 ||
                I->op == AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3;
             struct agx3_scs_desc d;
             uint8_t bytes[AGX3_SCS_MAX_LENGTH];
             uint8_t len = 0;
-            if (!agx3_translate_scs(I, is_store, indexed, slot, wait, &d))
+            if (!agx3_translate_scs(enc, I, is_store, indexed, register_indexed,
+                                    register_base, slot, wait, &d))
                AGX3_REFUSE(I);
             const bool ok =
                is_store ? agx3_scs_encode_store(enc, &d, bytes, &len)
@@ -10991,7 +11239,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * outstanding interpolation/coefficient dependency. Retire it
              * through the already-grounded scoreboard no-op, then preserve
              * the byte-exact zero-wait gradient encoding. */
-            if ((fop == AGX3_FUNOP_DFDX || fop == AGX3_FUNOP_DFDY) &&
+            if ((fop == AGX3_FUNOP_SINC || fop == AGX3_FUNOP_DFDX ||
+                 fop == AGX3_FUNOP_DFDY) &&
                 funop_wait) {
                if (!agx3_retire_result_wait(emission, enc, I, funop_wait))
                   AGX3_REFUSE(I);
@@ -14925,6 +15174,23 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    if (ctx->key->no_stop && !ctx->is_preamble && outstanding != 0 &&
        !agx3_retire_slots_noop(emission, enc, outstanding))
       goto fail;
+
+   if (ctx->key->dev.chip == AGX_CHIP_G17P &&
+       enc == AGX_ISA_ENCODING_AGX3B &&
+       ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble &&
+       !ctx->key->secondary && !ctx->key->fs.ignore_tib_dependencies &&
+       ctx->nir && !ctx->nir->info.outputs_written && count == 0 &&
+       debug_get_bool_option("ASAHI_G17P_EMPTY_FS_PIXEL_DIAGNOSTIC", false)) {
+      uint8_t bytes[AGX3_PIXEL_MAX_LENGTH], len;
+      if (!agx3_pixel_colour_entry(enc, bytes, &len) ||
+          !agx3_append(emission, bytes, len))
+         goto fail;
+      ctx->agx3_colour_link.entry_emitted = true;
+      ctx->agx3_colour_link.entry_offset = emission->size - len - initial_size;
+      if (!agx3_pixel_release(enc, 0, true, 0, bytes, &len) ||
+          !agx3_append(emission, bytes, len))
+         goto fail;
+   }
 
    if (!ctx->key->no_stop || ctx->is_preamble) {
       const struct agx3_sel_instr end = {.op = AGX3_SEL_OP_END};

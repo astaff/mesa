@@ -214,14 +214,21 @@ lower_non_monolithic_uniforms(nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 bool
-agx_nir_lower_non_monolithic_uniforms(nir_shader *nir, unsigned nr)
+agx_nir_lower_non_monolithic_uniforms_at(nir_shader *nir, unsigned nr,
+                                         unsigned uniform_base)
 {
-   struct agx_vs_prolog_key layout = {0};
+   struct agx_vs_prolog_key layout = {.uniform_base = uniform_base};
    if (nr)
       BITSET_SET_COUNT(layout.component_mask, 0, nr * 4);
 
    return nir_shader_intrinsics_pass(nir, lower_non_monolithic_uniforms,
                                      nir_metadata_control_flow, &layout);
+}
+
+bool
+agx_nir_lower_non_monolithic_uniforms(nir_shader *nir, unsigned nr)
+{
+   return agx_nir_lower_non_monolithic_uniforms_at(nir, nr, 0);
 }
 
 static bool

@@ -77,6 +77,7 @@ enum agx3_tex_level_kind {
 };
 
 struct agx3_tex_fetch_desc {
+   uint16_t heap_uniform_base;
    uint16_t dest;       /* half-register index */
    uint16_t coord;      /* four-half aligned pair of f32 coordinates */
    enum agx3_tex_width width;
@@ -186,6 +187,7 @@ enum agx3_tex_gather {
 };
 
 struct agx3_tex_sample_desc {
+   uint16_t heap_uniform_base;
    uint16_t dest;       /* half-register index */
    uint16_t coord;      /* four-half aligned pair of f32 coordinates */
    enum agx3_tex_width width;

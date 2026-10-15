@@ -972,6 +972,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_raw_vertex_id:
    case nir_intrinsic_load_local_invocation_id:
    case nir_intrinsic_load_local_invocation_index:
+   case nir_intrinsic_load_scs_thread_index_agx:
    case nir_intrinsic_load_global_invocation_id:
    case nir_intrinsic_load_global_invocation_index:
    case nir_intrinsic_load_subgroup_invocation:
@@ -982,6 +983,10 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_subgroup_lt_mask:
    case nir_intrinsic_load_helper_invocation:
    case nir_intrinsic_is_helper_invocation:
+   case nir_intrinsic_load_scs_agx:
+   case nir_intrinsic_load_scs_indexed_agx:
+   case nir_intrinsic_load_scs_uniform_agx:
+   case nir_intrinsic_load_scs_base_agx:
    case nir_intrinsic_load_scratch:
    case nir_intrinsic_load_scratch_nv:
    case nir_intrinsic_load_scratch_intel:

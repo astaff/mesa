@@ -6,6 +6,7 @@
 #include "agx_compiler.h"
 #include "agx_debug.h"
 #include "agx3_uniform_integer_instr.h"
+#include "util/u_debug.h"
 
 /*
  * Not all instructions can take uniforms. Memory instructions can take
@@ -86,6 +87,14 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
       assert(!high && "texture heap always low");
       return !high && src_index == 0;
 
+   case AGX_OPCODE_INTERSECT_RAY_GEN1:
+      return encoding == AGX_ISA_ENCODING_AGX3B && src_index < 2 &&
+             !high && !(value & 1) && value <= 508 && size == AGX_SIZE_64;
+   case AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3:
+   case AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3:
+      return encoding != AGX_ISA_ENCODING_AGX2 && !high &&
+             src_index == (op == AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3 ? 0 : 1) &&
+             size == AGX_SIZE_64 && !(value & 1) && value < 512;
    case AGX_OPCODE_DEVICE_LOAD:
       return src_index == 0 && memory_base;
    case AGX_OPCODE_DEVICE_STORE:
@@ -495,7 +504,8 @@ agx_lower_uniform_sources(agx_context *ctx)
               I->src[1].type == AGX_INDEX_IMMEDIATE);
          if (I->src[s].type == AGX_INDEX_UNIFORM && !select_uniform_flag &&
              !select_uniform_comparand && !select_uniform_alternative &&
-             (s == first_uniform || copy_minmax || copy_float_uniforms || copy_float_modifier ||
+             (s == first_uniform ||
+              copy_minmax || copy_float_uniforms || copy_float_modifier ||
               copy_compare_uniform || copy_tex ||
               !(native_integer || uniform_imm_compare ||
                 (s < 4 && keep_isel_uniform[s]) ||

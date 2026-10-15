@@ -109,7 +109,9 @@ SPARSE = immediate("sparse", "bool")
 QUERY_LOD = immediate("query_lod", "bool")
 COHERENT = immediate("coherent", "bool")
 SCS_ZERO_EXTEND = immediate("scs_zero_extend", "bool")
+SCS_C_STATUS_LOAD = immediate("scs_c_status_load", "bool")
 SCS_C_LOAD_MARKER = immediate("scs_c_load_marker", "bool")
+SCS_ADDRESS_SELECTOR = immediate("scs_address_selector", "uint8_t")
 SCOREBOARD = immediate("scoreboard")
 ICOND = immediate("icond", "enum agx_icond")
 FCOND = immediate("fcond", "enum agx_fcond")
@@ -153,6 +155,7 @@ SR = enum("sr", {
    147: 'helper_arg_h',
    # G17P builtin background reload: native half-register layer input.
    195: 'background_layer_id',
+   234: 'scs_thread_index',
    # AGX3 hardware-vertex inputs. Apple emits these as explicit 32-bit rld
    # instructions instead of the AGX2 preloaded-input ABI.
    216: 'instance_id',
@@ -459,6 +462,14 @@ op("persp_rcp_agx3", None, srcs = 1, imms = [IMM], is_float = True)
 op("iterproj", (0x21, 8, _), srcs = 3, imms = [CHANNELS, INTERPOLATION])
 
 op("ldcf", (0xA1, 8, _), srcs = 1, imms = [CHANNELS])
+op("allocate_uvb_m5", _, dests=0, srcs=2, can_eliminate=False,
+   can_reorder=False, schedule_class="store", agx3_mnemonic="allocate_uvb")
+op("store_uvb_m5", _, dests=0, srcs=1, imms=[IMM], can_eliminate=False,
+   can_reorder=False, schedule_class="store", agx3_mnemonic="uvst")
+
+op("store_object_childcount_m5", _, dests=0, srcs=1, can_eliminate=False,
+   can_reorder=False, schedule_class="store", agx3_mnemonic="uvsw")
+
 op("st_vary", None, dests = 0, srcs = 2, can_eliminate = False)
 op("st_vary_mul_agx3", None, dests = 0, srcs = 3, can_eliminate = False)
 op("st_vary_fma_agx3", None, dests = 0, srcs = 4, can_eliminate = False)
@@ -507,22 +518,41 @@ op("scoped_barrier_agx3", _, dests = 0, srcs = 0, imms = [IMM],
 # Direct-absolute scalar coverage-stack access. These internal pseudos are the
 # bounded landing point for future ray-query lowering; no generic address-space
 # operation is silently reinterpreted as SCS.
-op("scs_load_agx3", _, dests = 1, srcs = 0, imms = [IMM, FORMAT],
-   schedule_class = "load", agx3_mnemonic = "ldscs")
-op("scs_store_agx3", _, dests = 0, srcs = 1, imms = [IMM, FORMAT],
-   can_eliminate = False, schedule_class = "store", agx3_mnemonic = "stscs")
+op("scs_load_agx3", _, dests = 1, srcs = 0, imms = [IMM, FORMAT, MASK],
+   can_reorder = False, schedule_class = "load", agx3_mnemonic = "ldscs")
+op("scs_store_agx3", _, dests = 0, srcs = 1, imms = [IMM, FORMAT, MASK],
+   can_eliminate = False, can_reorder = False, schedule_class = "store", agx3_mnemonic = "stscs")
 
-# Uniform-base plus scalar-GPR-index SCS access.  The source order keeps the
-# address provenance explicit instead of recovering it from generic pointer
-# arithmetic after the fact: load(base, index), store(value, base, index).
-# The backend derives the hardware scale from FORMAT and refuses every other
-# address form.
 op("scs_load_uniform_indexed_agx3", _, dests = 1, srcs = 2,
-   imms = [IMM, FORMAT, SCS_ZERO_EXTEND, SCS_C_LOAD_MARKER],
-   schedule_class = "load", agx3_mnemonic = "ldscs")
+   imms = [IMM, FORMAT, MASK, SCS_ADDRESS_SELECTOR, SCS_ZERO_EXTEND, SCS_C_LOAD_MARKER],
+   can_reorder = False, schedule_class = "load", agx3_mnemonic = "ldscs")
 op("scs_store_uniform_indexed_agx3", _, dests = 0, srcs = 3,
-   imms = [IMM, FORMAT], can_eliminate = False, schedule_class = "store",
+   imms = [IMM, FORMAT, MASK, SCS_ADDRESS_SELECTOR], can_eliminate = False, can_reorder = False, schedule_class = "store",
    agx3_mnemonic = "stscs")
+
+op("scs_load_register_indexed_agx3", _, dests = 1, srcs = 2,
+   imms = [IMM, FORMAT, MASK, SCS_ADDRESS_SELECTOR, SCS_C_LOAD_MARKER],
+   can_reorder = False, schedule_class = "load", agx3_mnemonic = "ldscs")
+op("scs_store_register_indexed_agx3", _, dests = 0, srcs = 3,
+   imms = [IMM, FORMAT, MASK, SCS_ADDRESS_SELECTOR],
+   can_eliminate = False, can_reorder = False, schedule_class = "store", agx3_mnemonic = "stscs")
+
+op("scs_load_register_base_agx3", _, dests = 1, srcs = 1,
+   imms = [IMM, FORMAT, MASK, SCS_ADDRESS_SELECTOR, SCS_C_LOAD_MARKER,
+           SCS_C_STATUS_LOAD],
+   can_reorder = False, schedule_class = "load", agx3_mnemonic = "ldscs")
+op("scs_store_register_base_agx3", _, dests = 0, srcs = 2,
+   imms = [IMM, FORMAT, MASK, SCS_ADDRESS_SELECTOR],
+   can_eliminate = False, can_reorder = False, schedule_class = "store",
+   agx3_mnemonic = "stscs")
+
+
+op("intersect_ray_gen1", _, dests=0, srcs=4, imms=[IMM],
+   can_eliminate=False, can_reorder=False, schedule_class="barrier",
+   agx3_mnemonic="intersect_ray")
+op("continue_ray_gen1", _, dests=0, srcs=1, imms=[IMM],
+   can_eliminate=False, can_reorder=False, schedule_class="barrier",
+   agx3_mnemonic="continue_ray")
 
 def memory_barrier(name, a, b, c):
     op(name, (0xF5 | (a << 10) | (b << 8) | (c << 12), 2, _), dests = 0, srcs = 0,

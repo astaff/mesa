@@ -90,7 +90,10 @@ agx3_g17p_native_compute_launch_pack(
     * as a low VA>>6 word followed by 0x40000000 | VA[47:40].  Word 1 still
     * carries the upper pointer bits and must be derived from the VA, not
     * hard-coded -- see the note on the store below. */
-   agx3_cmdstream_store_le32(packed, program->launch_template.word0);
+   uint32_t word0 = program->launch_template.word0;
+   if (global_size[1] < 2 && global_size[2] < 2)
+      word0 &= UINT32_C(0xfff1ffff);
+   agx3_cmdstream_store_le32(packed, word0);
    /* Word 1 bits 22..31 carry program_va[47:38]; the hardware reconstructs
     * pipeline = ((word1 >> 22) << 38) | (word@+8 << 6). */
    agx3_cmdstream_store_le32(
