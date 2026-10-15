@@ -97,3 +97,12 @@ bool agx_nir_m5_split_ray_query_arrays(nir_shader *shader);
 
 bool agx_nir_lower_m5_ray_query(nir_shader *shader,
                                 const struct agx_m5_ray_query_layout *layout);
+
+/* Remove an already lowered native query whose results cannot reach any
+ * remaining memory, output or vertex-emission side effect. Geometry-shader
+ * lowering clones the query into kernels from which it strips the API
+ * stores; the query there is dead work. Native query operations are removed
+ * only when every one of them is provably dead; otherwise only the
+ * value-preserving phi/copy cleanup the analysis needs is applied. Returns
+ * progress. */
+bool agx_nir_m5_remove_dead_ray_queries(nir_shader *shader);

@@ -2820,8 +2820,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             .instance_traversal = dev->m5_rq_instances,
             .compute_kernel = true,
          };
-         if (!agx_nir_lower_m5_ray_query(nir, &layout)) {
-            mesa_loge("M5 native ray query: unsupported query shape or operation");
+         /* Geometry queries are lowered here and then cloned into the poly
+          * kernels and the raster vertex program. Hardware runs of those
+          * draws have requested GPU recovery and the cause is not isolated,
+          * so they stay refused unless explicitly requested for diagnosis. */
+         const bool refused_stage = nir->info.stage == MESA_SHADER_GEOMETRY &&
+            !debug_get_bool_option("ASAHI_M5_GS_RAY_QUERY_DIAGNOSTIC", false);
+         if (refused_stage || !agx_nir_lower_m5_ray_query(nir, &layout)) {
+            mesa_loge(refused_stage
+               ? "M5 native ray query: geometry stage is diagnostic-only"
+               : "M5 native ray query: unsupported query shape or operation");
             if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
                nir_print_shader(nir, stderr);
             return;
@@ -5556,6 +5564,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "Gen1 native GS ray query lowering failed");
+      }
+
+      /* The main kernel has the API stores stripped; a native query whose
+       * results only fed them is dead there and runs in the raster vertex
+       * program instead. The count kernel keeps the API stores, so its query
+       * is removed only if it is dead there too. */
+      if (dev->m5_native_rq) {
+         NIR_PASS(_, nir, agx_nir_m5_remove_dead_ray_queries);
+         if (count)
+            NIR_PASS(_, count, agx_nir_m5_remove_dead_ray_queries);
       }
 
       agx_preprocess_nir(count);

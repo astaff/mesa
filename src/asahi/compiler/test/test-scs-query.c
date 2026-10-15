@@ -310,6 +310,115 @@ standard_ray_query(unsigned count, bool array, mesa_shader_stage stage)
    printf("M5_STANDARD_RAY_QUERY_PASS count=%u array=%u stage=%u\n", count, array, stage);
 }
 
+static unsigned
+native_query_ops(nir_shader *shader)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_enter_query_agx:
+            case nir_intrinsic_intersect_ray_agx:
+            case nir_intrinsic_continue_ray_agx:
+            case nir_intrinsic_load_scs_indexed_agx:
+            case nir_intrinsic_store_scs_indexed_agx:
+            case nir_intrinsic_load_scs_uniform_agx:
+            case nir_intrinsic_store_scs_uniform_agx:
+            case nir_intrinsic_load_scs_base_agx:
+            case nir_intrinsic_store_scs_base_agx:
+            case nir_intrinsic_load_scs_register_agx:
+            case nir_intrinsic_store_scs_agx:
+               n++;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return n;
+}
+
+/* Geometry lowering clones a lowered query into kernels whose API stores it
+ * strips. Such a query is removed; one whose result is stored is kept. */
+static void
+dead_ray_query(bool live)
+{
+   const char *value = getenv("ASAHI_M5_RQ_CANDIDATE_API");
+   char *saved = value ? strdup(value) : NULL;
+   setenv("ASAHI_M5_RQ_CANDIDATE_API", "1", 1);
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_GEOMETRY, &agx_nir_options, "M5 dead ray query");
+   b.shader->info.workgroup_size[0] = 64;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.ray_queries = 1;
+   nir_variable *query =
+      nir_local_variable_create(b.impl, glsl_uint64_t_type(), "query");
+   query->data.ray_query = true;
+   nir_def *rq = &nir_build_deref_var(&b, query)->def;
+   /* A live ID-dependent value before the query, as poly's index write. */
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_rq_initialize(&b, rq, nir_imm_int64(&b, 0x10002000000ull),
+                     nir_imm_int(&b, 1), nir_imm_int(&b, 255),
+                     nir_imm_vec3(&b, 0, 0, -1), nir_imm_float(&b, 0),
+                     nir_imm_vec3(&b, 0, 0, 1), nir_imm_float(&b, 10));
+   nir_push_loop(&b);
+   nir_break_if(&b, nir_inot(&b, nir_rq_proceed(&b, 1, rq)));
+   nir_pop_loop(&b, NULL);
+   nir_def *type = nir_rq_load(&b, 1, 32, rq,
+      .ray_query_value = nir_ray_query_value_intersection_type, .committed = true);
+   nir_intrinsic_instr *result = nir_store_global(&b, type,
+      nir_imm_int64(&b, 0x10003010000ull), .align_mul = 4, .write_mask = 1);
+   nir_store_global(&b, id, nir_imm_int64(&b, 0x10003020000ull),
+                    .align_mul = 4, .write_mask = 1);
+   const struct agx_m5_ray_query_layout layout = {
+      .payload_uniform = 134, .bvh_uniform = 100, .status_uniform = 134,
+      .launch_header = 0x10000000, .context_uniform = 160,
+      .as_table_uniform = 164, .instance_traversal = true,
+      .compute_kernel = true,
+   };
+   assert(agx_nir_lower_m5_ray_query(b.shader, &layout));
+   assert(native_query_ops(b.shader));
+   if (!live)
+      nir_instr_remove(&result->instr);
+   const unsigned before = native_query_ops(b.shader);
+   const bool progress = agx_nir_m5_remove_dead_ray_queries(b.shader);
+   assert(progress || live);
+   assert(live ? native_query_ops(b.shader) == before
+               : !native_query_ops(b.shader));
+   unsigned stores = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         stores += instr->type == nir_instr_type_intrinsic &&
+            nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_global;
+      }
+   }
+   assert(stores == (live ? 2 : 1));
+   b.shader->info.stage = MESA_SHADER_COMPUTE;
+   agx_preprocess_nir(b.shader);
+   struct agx_shader_key key = {
+      .dev = {.chip = AGX_CHIP_G17S, .encoding = AGX_ISA_ENCODING_AGX3C},
+      .no_preamble = true,
+   };
+   struct agx_shader_part part = {0};
+   bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
+   if (!compiled) fprintf(stderr, "Dead query compile refusal: %s\n", agx_last_compile_refusal());
+   assert(compiled);
+   assert(part.info.uses_ray_traversal == live && part.info.main_size);
+   free(part.binary);
+   ralloc_free(b.shader);
+   if (saved) {
+      setenv("ASAHI_M5_RQ_CANDIDATE_API", saved, 1);
+      free(saved);
+   } else {
+      unsetenv("ASAHI_M5_RQ_CANDIDATE_API");
+   }
+   printf("M5_DEAD_RAY_QUERY_PASS live=%u\n", live);
+}
+
 /* Native instance completion is a byte read, not a word read and shift. */
 static void
 instance_completion_byte(void)
@@ -451,7 +560,10 @@ int main(int argc,char **argv)
  batch_completion_latch(2);
  standard_ray_query(1, false, MESA_SHADER_COMPUTE);
  standard_ray_query(1, false, MESA_SHADER_TESS_CTRL);
+ dead_ray_query(false);
+ dead_ray_query(true);
  standard_ray_query(1, false, MESA_SHADER_TESS_EVAL);
+ standard_ray_query(1, false, MESA_SHADER_GEOMETRY);
  standard_ray_query(1, false, MESA_SHADER_VERTEX);
  standard_ray_query(1, false, MESA_SHADER_FRAGMENT);
  standard_ray_query(2, false, MESA_SHADER_COMPUTE);

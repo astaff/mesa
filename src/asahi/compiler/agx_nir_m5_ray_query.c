@@ -1367,6 +1367,7 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
    const bool kernel = layout && layout->compute_kernel &&
       (shader->info.stage == MESA_SHADER_TESS_CTRL ||
        shader->info.stage == MESA_SHADER_TESS_EVAL ||
+       shader->info.stage == MESA_SHADER_GEOMETRY ||
        shader->info.stage == MESA_SHADER_VERTEX ||
        shader->info.stage == MESA_SHADER_FRAGMENT);
    if (!layout || (!kernel && shader->info.stage != MESA_SHADER_COMPUTE) ||
@@ -2000,4 +2001,260 @@ unsupported:
    util_dynarray_fini(&ops);
    util_dynarray_fini(&queries);
    return false;
+}
+
+/* Native query operations only touch the invocation's SCS stack and the
+ * per-query state they own; they have no observer other than other query
+ * operations. */
+static bool
+m5_rq_native_query_op(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_enter_query_agx:
+   case nir_intrinsic_intersect_ray_agx:
+   case nir_intrinsic_continue_ray_agx:
+   case nir_intrinsic_load_scs_agx:
+   case nir_intrinsic_store_scs_agx:
+   case nir_intrinsic_load_scs_indexed_agx:
+   case nir_intrinsic_store_scs_indexed_agx:
+   case nir_intrinsic_load_scs_uniform_agx:
+   case nir_intrinsic_store_scs_uniform_agx:
+   case nir_intrinsic_load_scs_base_agx:
+   case nir_intrinsic_store_scs_base_agx:
+   case nir_intrinsic_load_scs_register_agx:
+   case nir_intrinsic_load_scs_thread_index_agx:
+      return true;
+   default:
+      return false;
+   }
+}
+
+struct m5_rq_taint {
+   struct set *loops;
+   bool progress;
+   bool external;
+};
+
+static bool
+m5_rq_src_clean(nir_src *src, void *data)
+{
+   return !nir_def_instr(src->ssa)->pass_flags;
+}
+
+static void
+m5_rq_taint_instr(nir_instr *instr, struct m5_rq_taint *t)
+{
+   if (!instr->pass_flags) {
+      instr->pass_flags = 1;
+      t->progress = true;
+   }
+}
+
+/* Mark everything data- or control-dependent on a native query operation.
+ * region is true inside control flow selected by such a value. Sets *jump
+ * when a break/continue of the innermost enclosing loop is so selected. */
+static void
+m5_rq_taint_list(struct exec_list *list, bool region, bool *jump,
+                 struct m5_rq_taint *t)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+            if (region || m5_rq_native_query_op(instr) ||
+                !nir_foreach_src(instr, m5_rq_src_clean, NULL))
+               m5_rq_taint_instr(instr, t);
+            if (instr->pass_flags && instr->type == nir_instr_type_jump) {
+               nir_jump_type type = nir_instr_as_jump(instr)->type;
+               if (type == nir_jump_break || type == nir_jump_continue)
+                  *jump = true;
+               else
+                  t->external = true;
+            }
+         }
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         const bool selected = region ||
+            nir_def_instr(nif->condition.ssa)->pass_flags;
+         m5_rq_taint_list(&nif->then_list, selected, jump, t);
+         m5_rq_taint_list(&nif->else_list, selected, jump, t);
+         if (selected) {
+            nir_block *after = nir_cf_node_as_block(nir_cf_node_next(node));
+            nir_foreach_phi(phi, after)
+               m5_rq_taint_instr(&phi->instr, t);
+         }
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         bool own_jump = false;
+         const bool selected = region || _mesa_set_search(t->loops, loop);
+         m5_rq_taint_list(&loop->body, selected, &own_jump, t);
+         if (nir_loop_has_continue_construct(loop))
+            m5_rq_taint_list(&loop->continue_list, selected, &own_jump, t);
+         if (!selected && own_jump) {
+            /* The trip count depends on the query: every value produced in
+             * the loop does too. */
+            _mesa_set_add(t->loops, loop);
+            t->progress = true;
+         }
+         break;
+      }
+      default:
+         t->external = true;
+         break;
+      }
+   }
+}
+
+static void
+m5_rq_collect_ifs(struct exec_list *list, struct set *ifs)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (nir_def_instr(nif->condition.ssa)->pass_flags)
+            _mesa_set_add(ifs, nif);
+         m5_rq_collect_ifs(&nif->then_list, ifs);
+         m5_rq_collect_ifs(&nif->else_list, ifs);
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         m5_rq_collect_ifs(&loop->body, ifs);
+         if (nir_loop_has_continue_construct(loop))
+            m5_rq_collect_ifs(&loop->continue_list, ifs);
+      }
+   }
+}
+
+/* Remove the outermost selected control flow. Selected instructions outside
+ * it were removed already; the selected phis after it are gone too. */
+static void
+m5_rq_remove_selected_cf(struct exec_list *list, struct set *ifs,
+                         struct set *loops)
+{
+   foreach_list_typed_safe(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (_mesa_set_search(ifs, nif)) {
+            nir_cf_node_remove(node);
+         } else {
+            m5_rq_remove_selected_cf(&nif->then_list, ifs, loops);
+            m5_rq_remove_selected_cf(&nif->else_list, ifs, loops);
+         }
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (_mesa_set_search(loops, loop)) {
+            nir_cf_node_remove(node);
+         } else {
+            m5_rq_remove_selected_cf(&loop->body, ifs, loops);
+            if (nir_loop_has_continue_construct(loop))
+               m5_rq_remove_selected_cf(&loop->continue_list, ifs, loops);
+         }
+      }
+   }
+}
+
+bool
+agx_nir_m5_remove_dead_ray_queries(nir_shader *shader)
+{
+   bool any = false;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block)
+            any |= m5_rq_native_query_op(instr);
+      }
+   }
+   if (!any || !nir_shader_get_entrypoint(shader))
+      return false;
+   /* Calls would hide both query operations and side effects. */
+   unsigned impls = 0;
+   nir_foreach_function_impl(impl, shader)
+      impls++;
+   if (impls != 1)
+      return false;
+
+   /* The lowering's merges often carry one value from every path; fold them
+    * first so they are not mistaken for query-selected values. */
+   bool progress = false;
+   NIR_PASS(progress, shader, nir_opt_remove_phis);
+   NIR_PASS(progress, shader, nir_opt_copy_prop);
+   NIR_PASS(progress, shader, nir_opt_dce);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_shader_clear_pass_flags(shader);
+   struct m5_rq_taint t = {
+      .loops = _mesa_pointer_set_create(NULL),
+   };
+   do {
+      bool jump = false;
+      t.progress = false;
+      m5_rq_taint_list(&impl->body, false, &jump, &t);
+      /* A selected jump outside every loop would end the invocation. */
+      t.external |= jump;
+   } while (t.progress && !t.external);
+
+   /* Every surviving side effect must be independent of the query. Only
+    * native query operations may be selected; reorderable loads are pure. */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (!instr->pass_flags || m5_rq_native_query_op(instr))
+            continue;
+         if (instr->type == nir_instr_type_call ||
+             (instr->type == nir_instr_type_intrinsic &&
+              !(nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic]
+                   .flags & NIR_INTRINSIC_CAN_ELIMINATE))) {
+            if (!t.external &&
+                debug_get_bool_option("ASAHI_M5_RQ_DEAD_DIAG", false)) {
+               fprintf(stderr, "M5-RQ live query consumer: ");
+               nir_print_instr(instr, stderr);
+               fprintf(stderr, "\n");
+               if (debug_get_bool_option("ASAHI_M5_RQ_DEAD_DIAG_SHADER", false))
+                  nir_print_shader(shader, stderr);
+            }
+            t.external = true;
+         }
+      }
+   }
+   if (t.external) {
+      _mesa_set_destroy(t.loops, NULL);
+      nir_shader_clear_pass_flags(shader);
+      return progress;
+   }
+
+   /* Selected values are only used by selected instructions. Detach them,
+    * then remove selected instructions outside selected control flow (and
+    * the phis that merge it), and finally that control flow itself. */
+   struct set *ifs = _mesa_pointer_set_create(NULL);
+   m5_rq_collect_ifs(&impl->body, ifs);
+   struct util_dynarray defs = UTIL_DYNARRAY_INIT;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = instr->pass_flags ? nir_instr_def(instr) : NULL;
+         if (def && !nir_def_is_unused(def))
+            util_dynarray_append(&defs, def);
+      }
+   }
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   util_dynarray_foreach(&defs, nir_def *, def) {
+      /* New instructions are zero-allocated: pass_flags stays clear. */
+      nir_def_rewrite_uses(*def, nir_undef(&b, (*def)->num_components,
+                                           (*def)->bit_size));
+   }
+   util_dynarray_fini(&defs);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->pass_flags && instr->type != nir_instr_type_jump)
+            nir_instr_remove(instr);
+      }
+   }
+   m5_rq_remove_selected_cf(&impl->body, ifs, t.loops);
+   _mesa_set_destroy(ifs, NULL);
+   _mesa_set_destroy(t.loops, NULL);
+   nir_shader_clear_pass_flags(shader);
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, shader, nir_opt_dce);
+   return true;
 }
