@@ -141,7 +141,8 @@ validate_src(agx_instr *I, unsigned s, struct regfile *file, agx_index idx)
 }
 
 static bool
-validate_block(agx_context *ctx, agx_block *block, struct regfile *blocks)
+validate_block(agx_context *ctx, agx_block *block, struct regfile *blocks,
+               const unsigned bounds[RA_CLASSES])
 {
    struct regfile *file = &blocks[block->index];
    bool success = true;
@@ -165,7 +166,7 @@ validate_block(agx_context *ctx, agx_block *block, struct regfile *blocks)
          struct regfile *pred_file = &blocks[(*pred)->index];
 
          for (enum ra_class cls = 0; cls < RA_CLASSES; ++cls) {
-            for (unsigned r = 0; r < AGX_NUM_MODELED_REGS; ++r) {
+            for (unsigned r = 0; r < bounds[cls]; ++r) {
                if (first_pred)
                   file->r[cls][r] = pred_file->r[cls][r];
                else if (!vars_equal(file->r[cls][r], pred_file->r[cls][r]))
@@ -283,14 +284,44 @@ validate_block(agx_context *ctx, agx_block *block, struct regfile *blocks)
    return success;
 }
 
+static void
+include_register_span(unsigned bounds[RA_CLASSES], agx_index idx, unsigned width)
+{
+   if (idx.type != AGX_INDEX_NORMAL && idx.type != AGX_INDEX_REGISTER)
+      return;
+
+   assert(idx.type != AGX_INDEX_NORMAL || idx.has_reg);
+   unsigned reg = idx.type == AGX_INDEX_NORMAL ? idx.reg : idx.value;
+   assert(reg < AGX_NUM_MODELED_REGS && width <= AGX_NUM_MODELED_REGS - reg);
+   enum ra_class cls = ra_class_for_index(idx);
+   bounds[cls] = MAX2(bounds[cls], reg + width);
+}
+
 void
 agx_validate_ra(agx_context *ctx)
 {
+   unsigned bounds[RA_CLASSES] = {0};
+   agx_foreach_instr_global(ctx, I) {
+      unsigned copy_width = 0;
+      if (I->op == AGX_OPCODE_PHI ||
+          (I->op == AGX_OPCODE_MOV &&
+           I->dest[0].type == AGX_INDEX_REGISTER &&
+           I->src[0].type == AGX_INDEX_REGISTER))
+         copy_width = agx_index_size_16(I->dest[0]);
+
+      agx_foreach_src(I, q)
+         include_register_span(bounds, I->src[q],
+                               MAX2(copy_width, agx_index_size_16(I->src[q])));
+      agx_foreach_dest(I, q)
+         include_register_span(bounds, I->dest[q],
+                               agx_index_size_16(I->dest[q]));
+   }
+
    bool succ = true;
    struct regfile *blocks = calloc(ctx->num_blocks, sizeof(*blocks));
 
    agx_foreach_block(ctx, block) {
-      succ &= validate_block(ctx, block, blocks);
+      succ &= validate_block(ctx, block, blocks, bounds);
    }
 
    if (!succ) {

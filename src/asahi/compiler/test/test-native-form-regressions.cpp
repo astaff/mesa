@@ -9,6 +9,8 @@ extern "C" {
 }
 #include <gtest/gtest.h>
 #include <vector>
+#include <csignal>
+#include <cstdlib>
 
 TEST(NativeForms, CollectSplitSameWidthAndChains)
 {
@@ -2666,3 +2668,250 @@ TEST(NativeForms, TextureFmaPublicationPacksWithoutCopy)
       ralloc_free(mem);
    }
 }
+
+#ifndef NDEBUG
+
+static agx_index
+validation_span_value(agx_builder *b, bool memory, unsigned reg,
+                      agx_size size, unsigned channels)
+{
+   agx_index value = agx_vec_temp(b->shader, size, channels);
+   value.has_reg = true;
+   value.reg = reg;
+   value.memory = memory;
+   agx_index uniform = agx_uniform(0, size);
+   uniform.channels_m1 = channels - 1;
+   agx_mov_to(b, value, uniform);
+   return value;
+}
+
+static void
+validation_span_diamond(bool memory, unsigned reg, agx_size size,
+                        unsigned channels, bool clobber)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *left = agx_test_block(b->shader);
+   agx_block *right = agx_test_block(b->shader);
+   agx_block *join = agx_test_block(b->shader);
+   agx_block_add_successor(entry, left);
+   agx_block_add_successor(entry, right);
+   agx_block_add_successor(left, join);
+   agx_block_add_successor(right, join);
+   agx_index value = validation_span_value(b, memory, reg, size, channels);
+   if (clobber) {
+      b->cursor = agx_after_block(right);
+      validation_span_value(b, memory, reg + agx_index_size_16(value) - 1,
+                            AGX_SIZE_16, 1);
+   }
+   b->cursor = agx_after_block(join);
+   agx_unit_test(b, value);
+   agx_validate_ra(b->shader);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, RegisterValidationTracksMergeSpansAndClobbers)
+{
+   for (bool memory : {false, true}) {
+      for (agx_size size : {AGX_SIZE_16, AGX_SIZE_32, AGX_SIZE_64}) {
+         for (unsigned channels : {1u, 3u, 4u}) {
+            unsigned width = channels * agx_size_align_16(size);
+            for (unsigned reg : {8u, 128u, AGX_NUM_MODELED_REGS - width}) {
+               for (bool clobber : {false, true}) {
+                  EXPECT_EXIT({
+                     std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+                     validation_span_diamond(memory, reg, size, channels, clobber);
+                     std::_Exit(0);
+                  }, ::testing::ExitedWithCode(clobber ? 77 : 0),
+                     clobber ? "failed to validate RA" : "");
+               }
+            }
+         }
+      }
+   }
+}
+
+TEST(NativeForms, RegisterValidationTracksPhysicalMovesAndSwaps)
+{
+   for (agx_size size : {AGX_SIZE_16, AGX_SIZE_32, AGX_SIZE_64}) {
+      for (unsigned channels : {1u, 3u, 4u}) {
+         EXPECT_EXIT({
+            std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_block *entry = agx_start_block(b->shader);
+            agx_block *next = agx_test_block(b->shader);
+            agx_block_add_successor(entry, next);
+            agx_index a = validation_span_value(b, false, 16, size, channels);
+            agx_index z = validation_span_value(b, false, 64, size, channels);
+            unsigned spill_reg = AGX_NUM_MODELED_REGS - agx_index_size_16(a);
+            b->cursor = agx_after_block(next);
+            agx_index spill = agx_memory_register(spill_reg, size);
+            spill.channels_m1 = channels - 1;
+            spill.memory = true;
+            agx_index source = agx_register(16, size);
+            source.channels_m1 = channels - 1;
+            agx_mov_to(b, spill, source);
+            agx_index other = agx_register(64, size);
+            other.channels_m1 = channels - 1;
+            agx_swap(b, spill, other);
+            a.reg = 64;
+            z.memory = true;
+            z.reg = spill_reg;
+            agx_unit_test(b, a);
+            agx_unit_test(b, z);
+            agx_validate_ra(b->shader);
+            ralloc_free(mem);
+            std::_Exit(0);
+         }, ::testing::ExitedWithCode(0), "");
+      }
+   }
+}
+
+TEST(NativeForms, RegisterValidationTracksPhiCopies)
+{
+   for (bool physical : {false, true}) {
+      for (agx_size size : {AGX_SIZE_16, AGX_SIZE_32, AGX_SIZE_64}) {
+         for (unsigned channels : {1u, 3u, 4u}) {
+            EXPECT_EXIT({
+               std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+               void *mem = ralloc_context(NULL);
+               agx_builder *b = agx_test_builder(mem);
+               agx_block *entry = agx_start_block(b->shader);
+               agx_block *left = agx_test_block(b->shader);
+               agx_block *right = agx_test_block(b->shader);
+               agx_block *join = agx_test_block(b->shader);
+               agx_block_add_successor(entry, left);
+               agx_block_add_successor(entry, right);
+               agx_block_add_successor(left, join);
+               agx_block_add_successor(right, join);
+               agx_index value = validation_span_value(b, false, 128, size, channels);
+               b->cursor = agx_after_block(join);
+               agx_index dest = value;
+               dest.reg = 192;
+               if (physical) {
+                  dest = agx_register(192, size);
+                  dest.channels_m1 = channels - 1;
+               }
+               agx_instr *phi = agx_phi_to(b, dest, 2);
+               for (unsigned q = 0; q < 2; ++q) {
+                  phi->src[q] = physical ? agx_register(128, size) : value;
+                  phi->src[q].channels_m1 = channels - 1;
+               }
+               value.reg = 192;
+               agx_unit_test(b, value);
+               agx_validate_ra(b->shader);
+               ralloc_free(mem);
+               std::_Exit(0);
+            }, ::testing::ExitedWithCode(0), "");
+         }
+      }
+   }
+}
+
+TEST(NativeForms, RegisterValidationRetainsLoopHeaderRules)
+{
+   for (bool invalid_livein : {false, true}) {
+      EXPECT_EXIT({
+         std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_block *entry = agx_start_block(b->shader);
+         agx_block *header = agx_test_block(b->shader);
+         agx_block *body = agx_test_block(b->shader);
+         agx_block *exit = agx_test_block(b->shader);
+         agx_block_add_successor(entry, header);
+         agx_block_add_successor(header, body);
+         agx_block_add_successor(header, exit);
+         agx_block_add_successor(body, header);
+         header->loop_header = true;
+         agx_index incoming = validation_span_value(b, false, 128, AGX_SIZE_32, 1);
+         b->cursor = agx_after_block(body);
+         agx_index back = validation_span_value(b, false, 144, AGX_SIZE_32, 1);
+         b->cursor = agx_after_block(header);
+         agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+         value.has_reg = true;
+         value.reg = 160;
+         agx_instr *phi = agx_phi_to(b, value, 2);
+         phi->src[0] = incoming;
+         phi->src[1] = back;
+         agx_unit_test(b, invalid_livein ? incoming : value);
+         agx_validate_ra(b->shader);
+         ralloc_free(mem);
+         std::_Exit(0);
+      }, ::testing::ExitedWithCode(invalid_livein ? 77 : 0),
+         invalid_livein ? "failed to validate RA" : "");
+   }
+}
+
+TEST(NativeForms, RegisterValidationTracksNarrowPhysicalCopySources)
+{
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      for (unsigned channels : {3u, 4u}) {
+         EXPECT_EXIT({
+            std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_block *entry = agx_start_block(b->shader);
+            agx_block *next = agx_test_block(b->shader);
+            agx_block_add_successor(entry, next);
+            bool source_memory = mode == 1;
+            agx_index value = validation_span_value(
+               b, source_memory, source_memory ? AGX_NUM_MODELED_REGS - 2 * channels
+                                              : 128,
+               AGX_SIZE_32, channels);
+            agx_index source = agx_as_register(value);
+            source.channels_m1 = 0;
+            agx_index dest = agx_register(16, AGX_SIZE_32);
+            dest.channels_m1 = channels - 1;
+            dest.memory = mode == 0;
+            b->cursor = agx_after_block(next);
+            if (mode == 2) {
+               agx_instr *phi = agx_phi_to(b, dest, 1);
+               phi->src[0] = source;
+            } else {
+               agx_mov_to(b, dest, source);
+            }
+            value.reg = dest.value;
+            value.memory = dest.memory;
+            agx_unit_test(b, value);
+            agx_validate_ra(b->shader);
+            ralloc_free(mem);
+            std::_Exit(0);
+         }, ::testing::ExitedWithCode(0), "");
+      }
+   }
+}
+
+TEST(NativeForms, RegisterValidationRejectsOutOfModelCopySpans)
+{
+   for (bool phi_copy : {false, true}) {
+      EXPECT_EXIT({
+         std::signal(SIGABRT, +[](int) { std::_Exit(77); });
+         std::signal(SIGSEGV, +[](int) { std::_Exit(78); });
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_block *entry = agx_start_block(b->shader);
+         agx_block *next = agx_test_block(b->shader);
+         agx_block_add_successor(entry, next);
+         b->cursor = agx_after_block(next);
+         agx_index source = agx_register(0, AGX_SIZE_16);
+         source.value = AGX_NUM_MODELED_REGS - 1;
+         source.memory = !phi_copy;
+         agx_index dest = agx_register(16, AGX_SIZE_32);
+         if (phi_copy) {
+            agx_instr *phi = agx_phi_to(b, dest, 1);
+            phi->src[0] = source;
+         } else {
+            agx_mov_to(b, dest, source);
+         }
+         agx_validate_ra(b->shader);
+         ralloc_free(mem);
+         std::_Exit(0);
+      }, ::testing::ExitedWithCode(77),
+         "width <= AGX_NUM_MODELED_REGS - reg");
+   }
+}
+
+#endif
