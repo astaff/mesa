@@ -10,6 +10,8 @@
 
 struct nir_shader;
 struct nir_instr;
+struct nir_builder;
+struct nir_def;
 
 /* BASE bit3 selects an explicit byte-scaled AGX3 load/store index. */
 #define AGX_NIR_MEMORY_INDEX_BYTES 8u
@@ -31,6 +33,11 @@ bool agx_nir_lower_layer(struct nir_shader *s);
 bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
+bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);
+bool agx_nir_lower_compute_derivatives(struct nir_shader *s);
+bool agx_nir_compute_implicit_lod_diagnostic(void);
+struct nir_def *agx_nir_quad_ddx(struct nir_builder *b, struct nir_def *v);
+struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
 
 /* AGX3 ldtg/sttg index threadgroup memory in scalar elements, scaled by the
  * access width; NIR shared offsets are bytes.  Idempotent, so a frontend may

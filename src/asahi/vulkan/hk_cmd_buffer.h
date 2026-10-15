@@ -241,6 +241,7 @@ struct hk_root_descriptor_table {
    uint32_t mesh_draw_id;
    uint64_t mesh_grid_addr;
    uint64_t mesh_prims_query;
+   uint64_t sampler_heap_address;
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
