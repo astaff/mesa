@@ -28,6 +28,9 @@ libasahi_lib_files = files(
   'agx_ioto_state_core.h',
   'agx_g17p_draw_state_upload.h',
   'agx_rt_result.h',
+  'agx_rt_ift.h',
+  'agx_scs_layout.c',
+  'agx_scs_layout.h',
   'agx_bo.c',
   'agx_border.c',
   'agx_chip.c',
@@ -70,6 +73,8 @@ libasahi_lib_files = files(
   'agx_vdm_hal200_direct_draw_core.c',
   'agx_vdm_hal200_direct_draw_core.h',
   'agx_vdm_decode_core.c',
+  'agx_vdm_mesh_core.c',
+  'agx_vdm_mesh_core.h',
   'agx_vdm_decode_core.h',
   'agx_vdm_index_list_core.c',
   'agx_vdm_index_list_core.h',
@@ -110,6 +115,8 @@ libasahi_decode_files = files(
   'agx_vdm_hal200_bind_tail_core.c',
   'agx_vdm_hal200_direct_draw_core.c',
   'agx_vdm_decode_core.c',
+  'agx_vdm_mesh_core.c',
+  'agx_vdm_mesh_core.h',
   'agx_vdm_index_list_core.c',
   'agx_vdm_ppp_state_core.c',
   'agx_vdm_state_core.c',
@@ -180,6 +187,16 @@ libasahi_lib = static_library(
 )
 
 if with_tests
+  foreach rt_test : ['rt-bvh', 'rt-ift', 'scs-layout']
+    test('asahi-' + rt_test,
+      executable('asahi-' + rt_test,
+        ['tests/test-' + rt_test + '.c', 'agx_scs_layout.c'],
+        include_directories : include_directories('.'),
+        c_args : ['-UNDEBUG'],
+      ),
+      suite : ['asahi'],
+    )
+  endforeach
   test(
     'libasahi_tests',
     executable(
@@ -213,4 +230,20 @@ if dep_iokit.found()
     build_by_default : with_tools.contains('asahi'),
     link_with: libasahi_decode,
   )
+endif
+
+if with_tests
+  test('asahi-rt-payload-gen1', executable('asahi-rt-payload-gen1',
+    'tests/test-rt-payload-gen1.c',
+    c_args : ['-ffp-contract=off'],
+    include_directories : include_directories('.'),
+    dependencies : [dep_m]), suite : ['asahi'])
+  test('asahi-rt-blas-gen3', executable('asahi-rt-blas-gen3',
+    'tests/test-rt-blas-gen3.c',
+    c_args : ['-ffp-contract=off'],
+    include_directories : include_directories('.')), suite : ['asahi'])
+  test('asahi-rt-envelope', executable('asahi-rt-envelope',
+    'tests/test-rt-envelope.c',
+    c_args : ['-ffp-contract=off'],
+    include_directories : include_directories('.')), suite : ['asahi'])
 endif

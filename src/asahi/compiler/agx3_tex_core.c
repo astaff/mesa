@@ -125,7 +125,8 @@ agx3_tex_encode_fetch(enum agx_isa_encoding enc,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if (!fetch_ok(enc, d))
+   if (!fetch_ok(enc, d) || (d->heap_uniform_base & 3) ||
+       d->heap_uniform_base > 248)
       return false;
 
    struct agx3_field_kv base[20];
@@ -148,7 +149,9 @@ agx3_tex_encode_fetch(enum agx_isa_encoding enc,
    /* The operand profile.  A sparse residency request does NOT change it: see
     * the note on agx3_tex_sample_desc::sparse below, and
     * agx3_tex_fetch_desc::sparse in the header. */
-   base[nb++] = (struct agx3_field_kv)KV(112, 4);
+   if (d->heap_uniform_base)
+      base[nb++] = (struct agx3_field_kv)KV(83, d->heap_uniform_base);
+   base[nb++] = (struct agx3_field_kv)KV(112, d->heap_uniform_base + 4);
    base[nb++] = (struct agx3_field_kv)KV(118, 3);
    base[nb++] = (struct agx3_field_kv)KV(119, 3);
    base[nb++] = (struct agx3_field_kv)KV(132, sk);
@@ -607,7 +610,9 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if (!sample_ok(enc, d))
+   if (!sample_ok(enc, d) || (d->heap_uniform_base & 3) ||
+       d->heap_uniform_base > 248 ||
+       (d->heap_uniform_base && d->sample_abi != AGX3_TEX_SAMPLE_ABI_DRIVER))
       return false;
 
    /* The fetch baseline plus f74=1: the sample witnesses carry the extra
@@ -652,8 +657,9 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
     * using Apple's profile with the driver's 2D-array descriptor produces a
     * fixed near-half-gray sample on G17P, just as it does for cubes.
     */
-   if (operand_profile & 1)
-      base[nb++] = (struct agx3_field_kv)KV(83, 4);
+   if ((operand_profile & 1) || d->heap_uniform_base)
+      base[nb++] = (struct agx3_field_kv)KV(
+         83, d->heap_uniform_base + ((operand_profile & 1) ? 4 : 0));
    /* The operand profile, which a sparse residency request does NOT change.
     *
     * f112 reads as a small integer but the generated AGX3b tables deposit it
@@ -690,7 +696,8 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
     * their argument-buffer descriptors tolerate it and Honeykrisp's register
     * and uniform descriptors do not is not yet understood.  Hardware decides,
     * so the profile stays where the dense form puts it. */
-   base[nb++] = (struct agx3_field_kv)KV(112, (operand_profile & 2) ? 8 : 4);
+   base[nb++] = (struct agx3_field_kv)KV(
+      112, d->heap_uniform_base + ((operand_profile & 2) ? 8 : 4));
    base[nb++] = (struct agx3_field_kv)KV(118, 3);
    base[nb++] = (struct agx3_field_kv)KV(119, 3);
    base[nb++] = (struct agx3_field_kv)KV(132, sk);

@@ -1,0 +1,55 @@
+#version 460
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, buffer_reference_align = 4, scalar) buffer u32_ref {
+   uint32_t value;
+};
+
+layout(push_constant) uniform CONSTS {
+   uint64_t leaves;
+   uint64_t table;
+   uint32_t leaf_count;
+   uint32_t geometry_count;
+   uint32_t vertices_offset;
+   uint32_t leaf_stride;
+} args;
+
+uint32_t
+load32(uint64_t address)
+{
+   return u32_ref(address).value;
+}
+
+void
+store32(uint64_t address, uint32_t value)
+{
+   u32_ref(address).value = value;
+}
+
+void
+main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   if (i >= args.leaf_count)
+      return;
+   uint64_t node = args.leaves + uint64_t(i) * uint64_t(args.leaf_stride);
+   uint32_t primitive = load32(node + 60ul);
+   uint32_t geometry = load32(node + 64ul) & 0xffffffu;
+   if (geometry >= args.geometry_count)
+      return;
+   uint32_t base = load32(args.table + 16ul + uint64_t(geometry) * 4ul);
+   uint32_t index = base + primitive;
+   if (index >= args.leaf_count)
+      return;
+   uint64_t dst = args.table + uint64_t(args.vertices_offset) + uint64_t(index) * 36ul;
+   for (uint k = 0; k < 9; ++k)
+      store32(dst + uint64_t(k) * 4ul, load32(node + 24ul + uint64_t(k) * 4ul));
+}

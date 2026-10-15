@@ -445,6 +445,10 @@ typedef struct {
     * and are never inferred from generic memory IR. */
    bool scs_zero_extend : 1;
    bool scs_c_load_marker : 1;
+   bool scs_c_status_load;
+   /* Native G17P traversal publishes completion on scoreboard slot 6. */
+   bool scs_rt_wait : 1;
+   uint8_t scs_address_selector;
 
    /* Final st_vary op */
    bool last : 1;

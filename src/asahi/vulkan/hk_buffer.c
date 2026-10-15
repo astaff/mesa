@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_buffer.h"
+#include "hk_acceleration_structure.h"
 
 #include "agx_bo.h"
 #include "agx_device.h"
@@ -343,6 +344,11 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          assert(buffer->vk.device_address == 0);
          buffer->vk.device_address =
             mem->bo->va->addr + pBindInfos[i].memoryOffset;
+      }
+
+      if (buffer->vk.usage & VK_BUFFER_USAGE_2_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) {
+         VK_FROM_HANDLE(hk_device, dev, device);
+         hk_gen1_publish_buffer_as_addresses(dev, &buffer->vk);
       }
 
       const VkBindMemoryStatusKHR *status =

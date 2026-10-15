@@ -162,6 +162,12 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
    unsigned size = agx_size_align_16(I->dest[d].size);
 
    switch (I->op) {
+   case AGX_OPCODE_SCS_LOAD_AGX3:
+   case AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3:
+   case AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3:
+   case AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3:
+      return size * util_last_bit(I->mask ? I->mask : 1);
+
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_PHI:
       /* Tautological */
@@ -297,6 +303,15 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
       return agx_index_size_16(I->src[s]);
 
    switch (I->op) {
+   case AGX_OPCODE_SCS_STORE_AGX3:
+   case AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3:
+   case AGX_OPCODE_SCS_STORE_REGISTER_INDEXED_AGX3:
+   case AGX_OPCODE_SCS_STORE_REGISTER_BASE_AGX3:
+      return s == 0 ? size * util_last_bit(I->mask ? I->mask : 1) : size;
+
+   case AGX_OPCODE_STORE_UVB_M5:
+      return 2 * size;
+
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_EXPORT:
       /* Tautological */

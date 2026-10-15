@@ -158,6 +158,8 @@ shuffle_key32(key32_id_pair val, uint lane)
 #define KEY_SUBGROUP_SHUFFLE shuffle_key32
 #endif
 
+layout(constant_id = MORTON_PHASE_DISPATCH_ID) const bool phase_dispatch = false;
+
 layout(push_constant) uniform CONSTS
 {
    morton_sort_args args;
@@ -518,10 +520,10 @@ main()
    uint32_t kv_count = args.leaf_count;
 
    uint32_t num_wgs_done = 0;
-   while (true) {
+   while (!phase_dispatch || args.pass == 0) {
       uint32_t cur_wg_id;
-      if (gl_NumWorkGroups.x == 1) {
-         cur_wg_id = 0;
+      if (phase_dispatch || gl_NumWorkGroups.x == 1) {
+         cur_wg_id = gl_WorkGroupID.x;
          if (num_wgs_done > 0)
             break;
       } else {
@@ -572,6 +574,16 @@ main()
 
       barrier();
       ++num_wgs_done;
+   }
+
+   if (phase_dispatch) {
+      if (args.pass != 0) {
+         bool pass_even = (args.pass & 1u) == 0;
+         KEY_REF cur_in = pass_even ? KEY_REF(args.ids_even) : KEY_REF(args.ids_odd);
+         KEY_REF cur_out = pass_even ? KEY_REF(args.ids_odd) : KEY_REF(args.ids_even);
+         per_wg_merge(kv_count, gl_WorkGroupID.x, 1u << args.pass, cur_in, cur_out);
+      }
+      return;
    }
 
    uint32_t max_log2_multiplier = findMSB(gl_NumWorkGroups.x - 1) + 1;

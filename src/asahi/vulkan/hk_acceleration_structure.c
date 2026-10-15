@@ -15,6 +15,20 @@
  */
 
 #include "hk_acceleration_structure.h"
+#include "asahi/compiler/agx3_rt_gen1_default.h"
+#include "asahi/compiler/agx3_rt_gen1_triangle.h"
+#include "asahi/compiler/agx3_rt_gen1_aabb.h"
+#include "asahi/compiler/agx3_rt_gen1_instance_push.h"
+#include "asahi/compiler/agx3_rt_gen1_clique.h"
+#include "asahi/compiler/agx3_rt_gen1_runtime_tables.h"
+#include "util/u_dl.h"
+#include "hk_agx3_as_layout.h"
+#include "util/hash_table.h"
+#include "asahi/compiler/agx_nir_gen1_ray_query.h"
+#include "hk_gen1_rt_indirect_contract.h"
+#include "asahi/lib/agx_va_runtime_hole.h"
+#include "asahi/libagx/gen1_as.h"
+#include "util/u_debug.h"
 
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
@@ -37,6 +51,231 @@ static const uint32_t encode_spv[] = {
 static const uint32_t write_spv[] = {
 #include "bvh/hk_bvh_write.spv.h"
 };
+
+static const uint32_t vertex_table_spv[] = {
+#include "bvh/hk_vertex_table.spv.h"
+};
+
+struct hk_vertex_table_layout {
+   uint64_t offset, bytes;
+   uint32_t geometry_count, primitives, vertices_offset;
+};
+
+struct hk_vertex_table_args {
+   uint64_t leaves, table;
+   uint32_t leaf_count, geometry_count, vertices_offset, leaf_stride;
+};
+
+static const uint32_t agx3_node_spv[] = {
+#include "bvh/hk_agx3_leaf.spv.h"
+};
+
+static const uint32_t agx3_envelope_spv[] = {
+#include "bvh/hk_agx3_envelope.spv.h"
+};
+
+static const uint32_t agx3_plan_spv[] = {
+#include "bvh/hk_agx3_plan.spv.h"
+};
+
+static const uint32_t agx3_refit_spv[] = {
+#include "bvh/hk_agx3_refit.spv.h"
+};
+
+static void hk_flush_buffer_write_cp(VkCommandBuffer);
+static void hk_as_phase_begin(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
+static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
+static void hk_agx3_refit_phase(VkCommandBuffer,
+   const struct vk_acceleration_structure_build_state *, unsigned);
+
+/* Native instance records and the AS header name entries in the same table.
+ * Per-lane replacement of those entries aliases child IDs with root IDs. */
+static uint32_t
+hk_gen1_as_id(struct hk_device *dev, struct vk_acceleration_structure *as)
+{
+   uint32_t result = 0, i = 1;
+   simple_mtx_lock(&dev->gen1_as_lock);
+   util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
+      if (*p == as) { result = i; break; }
+      ++i;
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+   return result;
+}
+
+static uint64_t
+hk_gen1_as_metadata_addr_for_id(struct hk_cmd_buffer *cmd, uint32_t id)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->gen1_as_metadata || !id || id >= LIBAGX_GEN1_AS_METADATA_SLOTS) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return 0;
+   }
+   hk_cmd_buffer_retain_bo(cmd, dev->gen1_as_metadata);
+   return dev->gen1_as_metadata->va->addr +
+          (uint64_t)id * LIBAGX_GEN1_AS_METADATA_STRIDE;
+}
+
+uint64_t
+hk_gen1_as_metadata_addr(struct hk_cmd_buffer *cmd,
+                         struct vk_acceleration_structure *as)
+{
+   return hk_gen1_as_metadata_addr_for_id(cmd,
+      hk_gen1_as_id(hk_cmd_buffer_device(cmd), as));
+}
+
+static void
+hk_gen1_as_publish_address(struct hk_device *dev, uint32_t id, uint64_t address)
+{
+   __atomic_store_n((uint64_t *)agx_bo_map(dev->gen1_as_addresses) + id,
+                    address, __ATOMIC_RELEASE);
+   if (dev->gen1_as_query_bank)
+      __atomic_store_n((uint64_t *)agx_bo_map(dev->gen1_as_query_bank) + 2 * id,
+                       address, __ATOMIC_RELEASE);
+}
+
+static uint64_t
+hk_gen1_as_bound_va(const struct vk_acceleration_structure *as)
+{
+   uint64_t address = as->buffer ? as->buffer->device_address : as->addr;
+   if (!address)
+      return 0;
+   return ALIGN_POT(address + (as->buffer ? as->offset : 0), UINT64_C(16384));
+}
+
+void
+hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
+                                    const struct vk_buffer *buffer)
+{
+   if (!dev->g17p_native_as || !buffer->device_address)
+      return;
+   simple_mtx_lock(&dev->gen1_as_lock);
+   uint32_t id = 1;
+   util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
+      if (*p && (*p)->buffer == buffer)
+         hk_gen1_as_publish_address(dev, id, hk_gen1_as_bound_va(*p));
+      ++id;
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreateAccelerationStructureKHR(VkDevice device,
+   const VkAccelerationStructureCreateInfoKHR *info,
+   const VkAllocationCallbacks *alloc, VkAccelerationStructureKHR *out)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   VkResult result = vk_common_CreateAccelerationStructureKHR(device, info, alloc, out);
+   if (result != VK_SUCCESS || !dev->g17p_native_as)
+      return result;
+   VK_FROM_HANDLE(vk_acceleration_structure, as, *out);
+   bool inserted = false;
+   uint32_t id = 1;
+   simple_mtx_lock(&dev->gen1_as_lock);
+   util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
+      if (!*p) { *p = as; inserted = true; break; }
+      ++id;
+   }
+   if (!inserted && util_dynarray_num_elements(&dev->gen1_ases,
+                                  struct vk_acceleration_structure *) < 2047) {
+      struct vk_acceleration_structure **p =
+         util_dynarray_grow(&dev->gen1_ases, struct vk_acceleration_structure *, 1);
+      if (p) { *p = as; inserted = true; }
+   }
+   if (inserted) {
+      hk_gen1_as_publish_address(dev, id, hk_gen1_as_bound_va(as));
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+   if (!inserted) {
+      vk_common_DestroyAccelerationStructureKHR(device, *out, alloc);
+      *out = VK_NULL_HANDLE;
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR handle,
+                                   const VkAllocationCallbacks *alloc)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   VK_FROM_HANDLE(vk_acceleration_structure, as, handle);
+   if (as && dev->g17p_native_as) {
+      simple_mtx_lock(&dev->gen1_as_lock);
+      if (dev->gen1_vertex_tables) {
+         struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_vertex_tables, as);
+         if (entry) {
+            free(entry->data);
+            _mesa_hash_table_remove(dev->gen1_vertex_tables, entry);
+         }
+      }
+      uint32_t id = 1;
+      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
+         if (*p == as) {
+            hk_gen1_as_publish_address(dev, id, 0);
+            *p = NULL;
+            break;
+         }
+         ++id;
+      }
+      simple_mtx_unlock(&dev->gen1_as_lock);
+   }
+   vk_common_DestroyAccelerationStructureKHR(device, handle, alloc);
+}
+
+static uint64_t
+hk_gen1_upload_live_as_table(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
+   const uint32_t tail = HK_GEN1_RQ_PHYSICAL_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES;
+   struct hk_gen1_as_table_chunk *chunk = NULL;
+   bool first = list_is_empty(&cmd->gen1_as_table_chunks);
+   if (!first)
+      chunk = list_last_entry(&cmd->gen1_as_table_chunks,
+                             struct hk_gen1_as_table_chunk, link);
+   if (!chunk || chunk->next == chunk->count) {
+      VkResult result = hk_cmd_pool_alloc_gen1_as_chunk(pool, first ? 1 : 4,
+                                                         &chunk);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return 0;
+      }
+      list_addtail(&chunk->link, &cmd->gen1_as_table_chunks);
+   }
+   const uint32_t row = chunk->next++;
+   memset((uint8_t *)agx_bo_map(chunk->tail) + row * tail, 0, tail);
+   return chunk->va->addr + row * HK_GEN1_AS_TABLE_BYTES;
+}
+
+uint64_t
+hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (dev->gen1_rq_live_as_table)
+      return hk_gen1_upload_live_as_table(cmd);
+   simple_mtx_lock(&dev->gen1_as_lock);
+   unsigned count = util_dynarray_num_elements(&dev->gen1_ases,
+                                              struct vk_acceleration_structure *);
+   assert(count < 2048);
+   struct agx_ptr table = hk_pool_alloc(cmd, HK_GEN1_AS_TABLE_BYTES, 16);
+   if (table.cpu) {
+      memset(table.cpu, 0, HK_GEN1_AS_TABLE_BYTES);
+      uint64_t *words = table.cpu;
+      unsigned i = 1;
+      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
+         if (*p)
+            words[2*i] = hk_gen1_as_bound_va(*p);
+         ++i;
+      }
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+   return table.cpu ? table.gpu : 0;
+}
+
+static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
+static_assert(sizeof(struct hk_agx3_leaf_args) == 24, "native node push ABI");
+static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
+static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 
 static_assert(sizeof(struct hk_bvh_triangle_node) == 48, "node format");
 static_assert(sizeof(struct hk_bvh_aabb_node) == 32, "node format");
@@ -91,6 +330,153 @@ get_pipeline_spv(struct hk_device *dev, const char *name, const uint32_t *spv,
                                           name, key_size, pipeline);
 }
 
+VkResult
+hk_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
+                        const struct hk_agx3_leaf_args *args)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
+       !dev->g17p_native_as)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (!args->job_count)
+      return VK_SUCCESS;
+
+   /* The native phase uses eight invocations per independently writable
+    * node. Job planning bounds the count before it reaches this helper. */
+   assert(args->job_count <= UINT32_MAX / 8);
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   VkResult result = get_pipeline_spv(
+      dev, "hk-agx3-node-encode", agx3_node_spv, sizeof(agx3_node_spv),
+      sizeof(*args), &pipeline, &layout);
+   if (result != VK_SUCCESS)
+      return result;
+
+   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipeline);
+   vk_common_CmdPushConstants(command_buffer, layout,
+                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*args), args);
+   hk_cmd_dispatch_unaligned(command_buffer, args->job_count * 8, 1, 1);
+   return VK_SUCCESS;
+}
+
+VkResult
+hk_cmd_finalize_agx3_as(VkCommandBuffer command_buffer,
+                       const struct hk_agx3_envelope_args *args)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
+       !dev->g17p_native_as)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   if (!args->job_count)
+      return VK_SUCCESS;
+
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   VkResult result = get_pipeline_spv(
+      dev, "hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
+      sizeof(*args), &pipeline, &layout);
+   if (result != VK_SUCCESS)
+      return result;
+
+   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipeline);
+   vk_common_CmdPushConstants(command_buffer, layout,
+                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*args), args);
+   hk_cmd_dispatch_unaligned(command_buffer, ALIGN_POT(args->job_count, 64), 1, 1);
+   return VK_SUCCESS;
+}
+
+VkResult
+hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
+                        const struct hk_agx3_plan_args *args,
+                        VkDeviceAddress node_status,
+                        VkDeviceAddress envelope_status)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
+       !dev->g17p_native_as)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   const struct {
+      const char *name;
+      const uint32_t *code;
+      size_t size;
+      unsigned push_size;
+   } stages[] = {
+      {"hk-agx3-plan", agx3_plan_spv, sizeof(agx3_plan_spv), sizeof(*args)},
+      {"hk-agx3-node-encode", agx3_node_spv, sizeof(agx3_node_spv),
+       sizeof(struct hk_agx3_leaf_args)},
+      {"hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
+       sizeof(struct hk_agx3_envelope_args)},
+   };
+   VkPipeline pipeline[3];
+   VkPipelineLayout layout[3];
+   for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
+      VkResult result = get_pipeline_spv(
+         dev, stages[i].name, stages[i].code, stages[i].size,
+         stages[i].push_size, &pipeline[i], &layout[i]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipeline[0]);
+   const VkMemoryBarrier barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+   };
+   for (unsigned phase = 0; phase < 5; ++phase) {
+      struct hk_agx3_plan_args push = *args;
+      push.phase = phase;
+      vk_common_CmdPushConstants(command_buffer, layout[0],
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
+                                &push);
+      hk_cmd_dispatch_unaligned(command_buffer, args->node_bound, 1, 1);
+      vk_common_CmdPipelineBarrier(
+         command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+         0, 1, &barrier, 0, NULL, 0, NULL);
+   }
+
+   const struct hk_agx3_leaf_args encode = {
+      .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
+   };
+   const struct hk_agx3_envelope_args finish = {
+      .jobs = args->envelope, .status = envelope_status, .job_count = 1,
+      .reserved = dev->g17p_native_as ? 2 : 3,
+      .metadata = args->metadata, .ir_header = args->header,
+      .retained_offset = args->retained_offset,
+      .build_flags = args->build_flags, .node_bound = args->node_bound,
+      .keep_retained = args->keep_retained,
+   };
+   const bool instances = args->geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
+   for (unsigned step = 0; step < 2; ++step) {
+      bool envelope = instances ? step == 0 : step == 1;
+      unsigned stage = envelope ? 2 : 1;
+      vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                               pipeline[stage]);
+      vk_common_CmdPushConstants(command_buffer, layout[stage],
+                                VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                envelope ? sizeof(finish) : sizeof(encode),
+                                envelope ? (const void *)&finish : (const void *)&encode);
+      if (envelope)
+         hk_cmd_dispatch_unaligned(command_buffer, 64, 1, 1);
+      else
+         hk_cmd_dispatch_indirect_addr(command_buffer, args->state);
+      if (step == 0)
+         vk_common_CmdPipelineBarrier(command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+            0, 1, &barrier, 0, NULL, 0, NULL);
+   }
+   return VK_SUCCESS;
+}
+
 /* ---------------------------------------------------------------- */
 /* Layout                                                            */
 
@@ -135,11 +521,100 @@ hk_as_size(VkGeometryTypeKHR geometry_type, uint32_t leaf_node_count)
 }
 
 static VkDeviceSize
+hk_agx3_retained_offset(const struct vk_acceleration_structure_build_state *state)
+{
+   struct hk_agx3_as_layout layout;
+   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+      return 0;
+   return ALIGN_POT(layout.as_bytes - LIBAGX_GEN1_AS_ALIGNMENT_SLACK +
+      (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
+          ? (uint64_t)state->leaf_node_count * 80 : 0), 8);
+}
+
+static bool
+hk_vertex_table_wanted(const struct hk_device *dev,
+                       const struct vk_acceleration_structure_build_state *state)
+{
+   return dev->g17p_native_as && dev->gen1_vertex_directory &&
+          dev->vk.enabled_features.rayTracingPositionFetch &&
+          vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+          (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR) &&
+          state->build_info->geometryCount > 0;
+}
+
+static VkDeviceSize
+hk_get_native_as_size(const struct vk_acceleration_structure_build_state *state)
+{
+   struct hk_agx3_as_layout layout;
+   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+      return 0;
+   if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
+      return hk_agx3_retained_offset(state) + sizeof(struct vk_ir_header) +
+             (uint64_t)state->internal_node_count * sizeof(struct vk_ir_box_node) +
+             LIBAGX_GEN1_AS_ALIGNMENT_SLACK;
+   return layout.as_bytes +
+      (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
+          ? (uint64_t)state->leaf_node_count * 80 : 0);
+}
+
+static bool
+hk_vertex_table_layout(const struct hk_device *dev,
+                       const struct vk_acceleration_structure_build_state *state,
+                       struct hk_vertex_table_layout *out)
+{
+   if (!hk_vertex_table_wanted(dev, state))
+      return false;
+   const uint64_t base = hk_get_native_as_size(state);
+   if (base <= LIBAGX_GEN1_AS_ALIGNMENT_SLACK)
+      return false;
+   out->offset = ALIGN_POT(base - LIBAGX_GEN1_AS_ALIGNMENT_SLACK, UINT64_C(16));
+   out->geometry_count = state->build_info->geometryCount;
+   out->primitives = state->leaf_node_count;
+   out->vertices_offset = ALIGN_POT(16 + 4 * out->geometry_count, 16);
+   out->bytes = (uint64_t)out->vertices_offset + (uint64_t)out->primitives * 36;
+   return true;
+}
+
+static VkDeviceSize
 hk_get_as_size(VkDevice _device,
                const struct vk_acceleration_structure_build_state *state)
 {
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   if (dev->g17p_native_as) {
+      struct hk_vertex_table_layout table;
+      if (hk_vertex_table_layout(dev, state, &table))
+         return table.offset + table.bytes + LIBAGX_GEN1_AS_ALIGNMENT_SLACK;
+      return hk_get_native_as_size(state);
+   }
    return hk_as_size(vk_get_as_geometry_type(state->build_info),
                      state->leaf_node_count);
+}
+
+static VkDeviceSize
+hk_get_encode_scratch_size(VkDevice _device,
+                           const struct vk_acceleration_structure_build_state *state)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   struct hk_agx3_as_layout layout;
+   return dev->g17p_native_as && hk_agx3_as_layout_init(state->leaf_node_count, &layout)
+             ? layout.encode_bytes + ALIGN_POT(sizeof(struct vk_ir_header), 8) -
+                  sizeof(struct vk_ir_header) : 0;
+}
+
+static uint64_t
+hk_as_native_va(struct vk_acceleration_structure *as)
+{
+   /* Native G17P BVHState masks the low 14 address bits. */
+   return ALIGN_POT(vk_acceleration_structure_get_va(as), UINT64_C(16384));
+}
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL
+hk_GetAccelerationStructureDeviceAddressKHR(
+   VkDevice _device, const VkAccelerationStructureDeviceAddressInfoKHR *info)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   VK_FROM_HANDLE(vk_acceleration_structure, as, info->accelerationStructure);
+   return dev->g17p_native_as ? hk_as_native_va(as) : vk_acceleration_structure_get_va(as);
 }
 
 /* ---------------------------------------------------------------- */
@@ -181,6 +656,96 @@ hk_encode_as(VkCommandBuffer commandBuffer,
                              internal_bound + state->leaf_node_count, 1, 1);
 }
 
+static void hk_write_buffer_cp(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
+                               void *data, uint32_t size);
+
+static void
+hk_vertex_table_publish(VkCommandBuffer commandBuffer, struct hk_device *dev,
+                        struct vk_acceleration_structure *as,
+                        const struct hk_vertex_table_layout *table)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   const uint32_t id = hk_gen1_as_id(dev, as);
+   if (!id || id * 16 >= AGX_GEN1_VERTEX_DIRECTORY_BYTES) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   const uint64_t table_va = hk_as_native_va(as) + table->offset;
+   uint32_t entry[4] = {(uint32_t)table_va, (uint32_t)(table_va >> 32),
+                        table->geometry_count, table->primitives};
+   hk_cmd_buffer_retain_bo(cmd, dev->gen1_vertex_directory);
+   hk_write_buffer_cp(commandBuffer, AGX_GEN1_VERTEX_DIRECTORY_VA + (uint64_t)id * 16,
+                      entry, sizeof(entry));
+   simple_mtx_lock(&dev->gen1_as_lock);
+   if (dev->gen1_vertex_tables) {
+      struct hash_entry *existing = _mesa_hash_table_search(dev->gen1_vertex_tables, as);
+      struct hk_vertex_table_layout *copy = existing ? existing->data : malloc(sizeof(*copy));
+      if (copy) {
+         *copy = *table;
+         if (!existing)
+            _mesa_hash_table_insert(dev->gen1_vertex_tables, as, copy);
+      }
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+}
+
+static void
+hk_vertex_table_build(VkCommandBuffer commandBuffer,
+                      const struct vk_acceleration_structure_build_state *state,
+                      struct vk_acceleration_structure *dst)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_vertex_table_layout table;
+   if (!hk_vertex_table_layout(dev, state, &table))
+      return;
+   if (table.offset + table.bytes > dst->size) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   const uint64_t table_va = hk_as_native_va(dst) + table.offset;
+   uint32_t header[4] = {AGX_GEN1_VERTEX_TABLE_MAGIC, table.geometry_count,
+                         table.vertices_offset, table.primitives};
+   hk_write_buffer_cp(commandBuffer, table_va, header, sizeof(header));
+   uint32_t bases[28];
+   uint32_t running = 0, pending = 0, first = 0;
+   for (uint32_t g = 0; g < table.geometry_count; ++g) {
+      bases[pending++] = running;
+      running += state->build_range_infos[g].primitiveCount;
+      if (pending == 28 || g + 1 == table.geometry_count) {
+         hk_write_buffer_cp(commandBuffer, table_va + 16 + (uint64_t)first * 4,
+                            bases, pending * 4);
+         first += pending;
+         pending = 0;
+      }
+   }
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   VkResult result = get_pipeline_spv(dev, "hk-vertex-table", vertex_table_spv,
+                                      sizeof(vertex_table_spv),
+                                      sizeof(struct hk_vertex_table_args),
+                                      &pipeline, &layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   const struct hk_vertex_table_args args = {
+      .leaves = state->build_info->scratchData.deviceAddress + state->scratch.ir_offset,
+      .table = table_va,
+      .leaf_count = table.primitives,
+      .geometry_count = table.geometry_count,
+      .vertices_offset = table.vertices_offset,
+      .leaf_stride = sizeof(struct vk_ir_triangle_node),
+   };
+   vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                              sizeof(args), &args);
+   hk_cmd_dispatch_unaligned(commandBuffer, table.primitives, 1, 1);
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   hk_vertex_table_publish(commandBuffer, dev, dst, &table);
+}
+
 static void
 hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
           struct vk_meta_device *meta,
@@ -190,6 +755,70 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (dev->g17p_native_as) {
+      vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+      for (uint32_t i = 0; i < build_count; ++i) {
+         const struct vk_acceleration_structure_build_state *state = &states[i];
+         if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE) {
+            hk_agx3_refit_phase(commandBuffer, state, 2);
+            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+            VkResult result = vk_cmd_build_as_leaves(commandBuffer, device, meta,
+                                                      build_args, state);
+            if (result != VK_SUCCESS) {
+               vk_command_buffer_set_error(&cmd->vk, result);
+               return;
+            }
+            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+            hk_agx3_refit_phase(commandBuffer, state, 3);
+            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+         }
+         if ((state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) &&
+             (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
+              state->build_info->srcAccelerationStructure != state->build_info->dstAccelerationStructure)) {
+            hk_agx3_refit_phase(commandBuffer, state, 0);
+            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+         }
+
+         VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                        state->build_info->dstAccelerationStructure);
+         struct hk_agx3_as_layout native;
+         if (!hk_agx3_as_layout_init(state->leaf_node_count, &native)) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            return;
+         }
+         const uint64_t scratch = state->build_info->scratchData.deviceAddress;
+         const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
+                                           sizeof(struct vk_ir_header), UINT64_C(8));
+         const struct hk_agx3_plan_args plan = {
+            .intermediate_bvh = scratch + state->scratch.ir_offset,
+            .header = scratch + state->scratch.header_offset,
+            .nodes = encode + native.nodes, .jobs = encode + native.jobs,
+            .envelope = encode + native.envelope, .state = encode + native.state,
+            .output_bvh = hk_as_native_va(dst),
+            .root_offset = state->scratch.internal_node_offset - state->scratch.ir_offset,
+            .leaf_bound = state->leaf_node_count,
+            .node_bound = native.node_bound, .slot_bound = native.slot_bound,
+            .resource_id = hk_gen1_as_id(dev, dst),
+            .geometry_type = vk_get_as_geometry_type(state->build_info),
+            .retained_offset = hk_agx3_retained_offset(state),
+            .build_flags = state->build_info->flags,
+            .keep_retained = state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE &&
+                             state->build_info->srcAccelerationStructure == state->build_info->dstAccelerationStructure,
+         };
+         struct hk_agx3_plan_args native_plan = plan;
+         native_plan.metadata = hk_gen1_as_metadata_addr_for_id(cmd, plan.resource_id);
+         if (!native_plan.metadata)
+            return;
+         VkResult result = hk_cmd_build_agx3_from_ir(commandBuffer, &native_plan,
+            encode + native.node_status, encode + native.envelope_status);
+         if (result != VK_SUCCESS) {
+            vk_command_buffer_set_error(&cmd->vk, result);
+            return;
+         }
+         hk_vertex_table_build(commandBuffer, state, dst);
+      }
+      return;
+   }
    VkPipeline pipeline;
    VkPipelineLayout layout;
    VkResult result =
@@ -208,8 +837,99 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
       hk_encode_as(commandBuffer, &states[i], layout);
 }
 
+static void
+hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
+                    const struct vk_acceleration_structure_build_state *state,
+                    unsigned phase)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_agx3_as_layout layout;
+   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+   VkPipeline pipeline;
+   VkPipelineLayout pipeline_layout;
+   VkResult result = get_pipeline_spv(dev, "hk-agx3-refit", agx3_refit_spv,
+      sizeof(agx3_refit_spv), sizeof(struct hk_agx3_refit_args), &pipeline, &pipeline_layout);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   VK_FROM_HANDLE(vk_acceleration_structure, retained_as,
+      phase == 1 ? state->build_info->srcAccelerationStructure : state->build_info->dstAccelerationStructure);
+   uint64_t scratch = state->build_info->scratchData.deviceAddress;
+   struct hk_agx3_refit_args args = {
+      .retained = hk_as_native_va(retained_as) + hk_agx3_retained_offset(state),
+      .metadata = phase == 1 ? hk_gen1_as_metadata_addr(cmd, retained_as) : 0,
+      .intermediate_bvh = scratch + state->scratch.ir_offset,
+      .header = scratch + state->scratch.header_offset,
+      .parents = scratch + state->scratch.size,
+      .root_offset = state->scratch.internal_node_offset - state->scratch.ir_offset,
+      .leaf_bound = state->leaf_node_count,
+      .node_bound = layout.node_bound, .phase = phase,
+   };
+   unsigned count = phase <= 1
+      ? MAX2(layout.node_bound, (sizeof(struct vk_ir_header) +
+               state->internal_node_count * sizeof(struct vk_ir_box_node)) / 4)
+      : phase == 2 ? state->internal_node_count : state->leaf_node_count;
+   vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+   vk_common_CmdPushConstants(commandBuffer, pipeline_layout,
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args);
+   hk_cmd_dispatch_unaligned(commandBuffer, count, 1, 1);
+}
+
+static void
+hk_native_build_config(VkDevice device,
+                       struct vk_acceleration_structure_build_state *state)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_PLOC &&
+       dev->g17p_native_as)
+      state->config.internal_type = VK_INTERNAL_BUILD_TYPE_HPLOC;
+   if (state->build_info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
+      state->config.internal_type = VK_INTERNAL_BUILD_TYPE_UPDATE;
+   state->config.updateable =
+      (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0;
+}
+
+static VkDeviceSize
+hk_update_scratch_size(VkDevice device,
+                       const struct vk_acceleration_structure_build_state *state)
+{
+   /* Leaf generation writes sort IDs, which alias native encode scratch.
+    * Keep live refit parent/counter state beyond both workspaces. */
+   struct hk_agx3_as_layout layout;
+   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+      return 0;
+   return (VkDeviceSize)state->scratch.size + (uint64_t)layout.node_bound * 16;
+}
+
+static void
+hk_init_update_scratch(VkCommandBuffer commandBuffer,
+                       const struct vk_acceleration_structure_build_state *states,
+                       uint32_t count)
+{
+   for (unsigned i = 0; i < count; ++i)
+      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+         hk_agx3_refit_phase(commandBuffer, &states[i], 1);
+}
+
+static const struct vk_acceleration_structure_build_ops hk_native_as_build_ops = {
+   .begin_debug_marker = hk_as_phase_begin,
+   .end_debug_marker = hk_as_phase_end,
+   .get_build_config = hk_native_build_config,
+   .get_as_size = hk_get_as_size,
+   .get_encode_scratch_size = hk_get_encode_scratch_size,
+   .get_update_scratch_size = hk_update_scratch_size,
+   .init_update_scratch = hk_init_update_scratch,
+   .encode = hk_encode,
+};
+
 static const struct vk_acceleration_structure_build_ops hk_as_build_ops = {
    .get_as_size = hk_get_as_size,
+   .get_encode_scratch_size = hk_get_encode_scratch_size,
    .encode = hk_encode,
 };
 
@@ -270,6 +990,39 @@ hk_flush_buffer_write_cp(VkCommandBuffer commandBuffer)
 }
 
 static void
+hk_as_phase_write(VkCommandBuffer command_buffer,
+                  struct vk_acceleration_structure_build_marker *marker,
+                  bool end)
+{
+   const char *text = getenv("ASAHI_G17P_AS_PHASE_ADDRESS");
+   if (!text)
+      return;
+   uint64_t address = strtoull(text, NULL, 0);
+   if (!address || (address & 3))
+      return;
+   hk_flush_buffer_write_cp(command_buffer);
+   struct vk_acceleration_structure_build_marker record = *marker;
+   if (end)
+      record.step |= 0x80000000u;
+   hk_write_buffer_cp(command_buffer, address, &record, sizeof(record));
+   hk_flush_buffer_write_cp(command_buffer);
+}
+
+static void
+hk_as_phase_begin(VkCommandBuffer command_buffer,
+                  struct vk_acceleration_structure_build_marker *marker)
+{
+   hk_as_phase_write(command_buffer, marker, false);
+}
+
+static void
+hk_as_phase_end(VkCommandBuffer command_buffer,
+                struct vk_acceleration_structure_build_marker *marker)
+{
+   hk_as_phase_write(command_buffer, marker, true);
+}
+
+static void
 hk_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
                         VkDeviceSize size, uint32_t data)
 {
@@ -282,21 +1035,500 @@ hk_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
 /* ---------------------------------------------------------------- */
 /* Device state                                                      */
 
+static bool
+hk_gen1_rq_read(const char *dir,const char *name,void *data,size_t size)
+{
+   char path[4096];
+   if(snprintf(path,sizeof(path),"%s/%s",dir,name)>=sizeof(path))return false;
+   FILE *f=fopen(path,"rb");if(!f)return false;
+   bool ok=fread(data,1,size,f)==size && fgetc(f)==EOF;fclose(f);return ok;
+}
+
+void
+hk_gen1_rq_finish(struct hk_device *dev)
+{
+   if (dev->gen1_rq_code &&
+       debug_get_bool_option("ASAHI_G17P_AABB_REACH_DIAGNOSTIC", false)) {
+      const uint8_t *code = agx_bo_map(dev->gen1_rq_code);
+      const uint32_t *marker = (const uint32_t *)(code + 0x5aff00);
+      fprintf(stderr, "G17P_AABB_REACH code_offset=0x5aff00 words=");
+      for (unsigned i = 0; i < 8; ++i)
+         fprintf(stderr, "%s%08x", i ? "," : "",
+                 __atomic_load_n(marker + i, __ATOMIC_ACQUIRE));
+      fprintf(stderr, "\n");
+   }
+   if (dev->gen1_rq_code && dev->gen1_rq_maps && !getenv("ASAHI_G17P_RQ_BODIES_PATH") &&
+       debug_get_bool_option("ASAHI_G17P_RQ_MINIMAL_TRAP", false)) {
+      const uint8_t *code = agx_bo_map(dev->gen1_rq_code);
+      char line[2048];
+      int used = snprintf(line, sizeof(line), "G17P_RQ_TRAP pid=%d reached=", (int)getpid());
+      for (unsigned slot = 0; slot < AGX3_RT_GEN1_RUNTIME_SLOTS && used > 0 && (size_t)used < sizeof(line); ++slot) {
+         const uint32_t *marker = (const uint32_t *)(code + dev->gen1_rq_maps[slot * 3] + AGX3_RT_GEN1_TRAP_MARKER_OFFSET);
+         uint32_t value = __atomic_load_n(marker, __ATOMIC_ACQUIRE);
+         if (!value) continue;
+         used += snprintf(line + used, sizeof(line) - used, "%u%s,", slot, value == slot + 1 ? "" : "?");
+      }
+      fprintf(stderr, "%s\n", line);
+      const char *log = getenv("ASAHI_G17P_RQ_TRAP_LOG");
+      if (log) {
+         FILE *f = fopen(log, "a");
+         if (f) {
+            fprintf(f, "%s\n", line);
+            fclose(f);
+         }
+      }
+   }
+   for(unsigned i=0;i<dev->gen1_rq_bound_maps;i++) {
+      uint64_t *r=dev->gen1_rq_maps+3*i;
+      agx_bo_bind(&dev->dev,NULL,r[2],r[1],0,DRM_ASAHI_BIND_UNBIND);
+   }
+   if(dev->gen1_rq_code_alias)agx_va_free(&dev->dev,dev->gen1_rq_code_alias,false);
+   agx_bo_unreference(&dev->dev,dev->gen1_rq_code);
+   agx_bo_unreference(&dev->dev,dev->gen1_rq_ift);
+   free(dev->gen1_rq_maps);free(dev->gen1_rq_user_image);
+   dev->gen1_rq_maps=NULL;dev->gen1_rq_user_image=NULL;
+   dev->gen1_rq_code=NULL;dev->gen1_rq_ift=NULL;
+   dev->gen1_rq_code_alias=NULL;dev->gen1_rq_bound_maps=0;
+   dev->gen1_native_rq=false;
+   hk_device_finish_gen1_as_chunks(dev);
+   if (dev->gen1_vertex_directory) {
+      agx_bo_bind(&dev->dev, NULL, AGX_GEN1_VERTEX_DIRECTORY_VA,
+                  AGX_GEN1_VERTEX_DIRECTORY_BYTES, 0, DRM_ASAHI_BIND_UNBIND);
+      agx_bo_unreference(&dev->dev, dev->gen1_vertex_directory);
+      dev->gen1_vertex_directory = NULL;
+   }
+   if (dev->gen1_vertex_directory_va) {
+      agx_va_free(&dev->dev, dev->gen1_vertex_directory_va, false);
+      dev->gen1_vertex_directory_va = NULL;
+   }
+   if (dev->gen1_vertex_tables) {
+      hash_table_foreach(dev->gen1_vertex_tables, entry)
+         free(entry->data);
+      _mesa_hash_table_destroy(dev->gen1_vertex_tables, NULL);
+      dev->gen1_vertex_tables = NULL;
+   }
+   if (dev->gen1_as_lock_ready) {
+      util_dynarray_fini(&dev->gen1_ases);
+      simple_mtx_destroy(&dev->gen1_as_lock);
+      dev->gen1_as_lock_ready=false;
+   }
+   agx_bo_unreference(&dev->dev, dev->gen1_as_metadata);
+   dev->gen1_as_metadata = NULL;
+   agx_bo_unreference(&dev->dev, dev->gen1_as_addresses);
+   dev->gen1_as_addresses = NULL;
+   agx_bo_unreference(&dev->dev, dev->gen1_as_query_bank);
+   dev->gen1_as_query_bank = NULL;
+   dev->gen1_rq_live_as_table = false;
+   dev->gen1_rq_instances=false;
+}
+
+static bool
+hk_gen1_rq_substitute_slot(uint8_t *code, const uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3],
+                           unsigned slot, const uint8_t *body, size_t body_length,
+                           const uint8_t *constants, size_t constants_length,
+                           const uint8_t *entry, size_t entry_length, bool strict)
+{
+   if (slot >= AGX3_RT_GEN1_RUNTIME_SLOTS || rows[slot * 3][1] != 0x4000 ||
+       rows[slot * 3 + 1][0] != rows[slot * 3][0] + 0x4000 ||
+       rows[slot * 3 + 2][0] != rows[slot * 3][0] + 0x8000 ||
+       body_length > 0x4000 || constants_length > 0x4000 || entry_length > 0x4000)
+      return false;
+   uint8_t *base = code + rows[slot * 3][0];
+   if (strict &&
+       (memcmp(base, body, body_length) || memcmp(base + 0x4000, constants, constants_length) ||
+        memcmp(base + 0x8000, entry, entry_length)))
+      return false;
+   memset(base, 0, 0xc000);
+   memcpy(base, body, body_length);
+   memcpy(base + 0x4000, constants, constants_length);
+   memcpy(base + 0x8000, entry, entry_length);
+   return true;
+}
+
+static bool
+hk_gen1_rq_substitute_generated(struct hk_device *dev)
+{
+   static uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3];
+   static uint8_t body[0x4000];
+   uint8_t entry[AGX3_RT_GEN1_ENTRY_MAX_SIZE], constants[AGX3_RT_GEN1_DEFAULT_CONSTANTS_SIZE];
+   const uint8_t *table;
+   size_t body_length, entry_length, table_length;
+   uint8_t *code = agx_bo_map(dev->gen1_rq_code);
+   uint8_t *ift = agx_bo_map(dev->gen1_rq_ift);
+   const uint64_t triangle_va = AGX3_RT_GEN1_RUNTIME_BASE + AGX3_RT_GEN1_TRIANGLE_SLOT * AGX3_RT_GEN1_RUNTIME_SLOT_STRIDE;
+   const uint64_t aabb_va = AGX3_RT_GEN1_RUNTIME_BASE + AGX3_RT_GEN1_AABB_SLOT * AGX3_RT_GEN1_RUNTIME_SLOT_STRIDE;
+   if (!agx3_rt_gen1_runtime_code_map(rows) || memcmp(dev->gen1_rq_maps, rows, sizeof(rows)))
+      return false;
+   if (!agx3_rt_gen1_default_body_generate(body, &body_length) ||
+       !agx3_rt_gen1_default_entry_generate(AGX3_RT_GEN1_RUNTIME_BASE, entry, &entry_length))
+      return false;
+   agx3_rt_gen1_default_constants(constants);
+   if (!hk_gen1_rq_substitute_slot(code, rows, 0, body, body_length, constants, sizeof(constants), entry, entry_length, true))
+      return false;
+   if (!agx3_rt_gen1_triangle_body_generate(body, sizeof(body), &body_length) ||
+       !agx3_rt_gen1_triangle_entry_generate(triangle_va, entry, &entry_length))
+      return false;
+   agx3_rt_gen1_triangle_constants(&table, &table_length);
+   if (!hk_gen1_rq_substitute_slot(code, rows, AGX3_RT_GEN1_TRIANGLE_SLOT, body, body_length, table, table_length, entry, entry_length, true))
+      return false;
+   if (!agx3_rt_gen1_aabb_body_generate(body, sizeof(body), &body_length) ||
+       !agx3_rt_gen1_aabb_entry_generate(aabb_va, entry, &entry_length))
+      return false;
+   agx3_rt_gen1_aabb_constants(&table, &table_length);
+   if (!hk_gen1_rq_substitute_slot(code, rows, AGX3_RT_GEN1_AABB_SLOT, body, body_length, table, table_length, entry, entry_length, true))
+      return false;
+   for (unsigned slot = 0; slot < AGX3_RT_GEN1_RUNTIME_SLOTS; ++slot) {
+      if (slot == 0 || slot == AGX3_RT_GEN1_TRIANGLE_SLOT || slot == AGX3_RT_GEN1_AABB_SLOT)
+         continue;
+      uint8_t *slot_entry = code + rows[slot * 3 + 2][0];
+      if (!agx3_rt_gen1_runtime_entry_generate(slot, entry, &entry_length) ||
+          entry_length > 0x4000 || memcmp(slot_entry, entry, entry_length))
+         return false;
+      memset(slot_entry, 0, 0x4000);
+      memcpy(slot_entry, entry, entry_length);
+   }
+   static uint8_t image[AGX3_RT_GEN1_RUNTIME_USER_IMAGE_BYTES];
+   uint8_t uniforms[AGX3_RT_GEN1_RUNTIME_UNIFORM_BYTES];
+   if (!agx3_rt_gen1_runtime_user_image(hk_gen1_ray_query_scs_layout(dev), image, sizeof(image)) ||
+       memcmp(dev->gen1_rq_user_image, image, sizeof(image)))
+      return false;
+   agx3_rt_gen1_runtime_uniforms(uniforms);
+   if (memcmp(dev->gen1_rq_uniforms, uniforms, sizeof(uniforms)))
+      return false;
+   memcpy(dev->gen1_rq_user_image, image, sizeof(image));
+   memcpy(dev->gen1_rq_uniforms, uniforms, sizeof(uniforms));
+   memcpy(dev->gen1_rq_maps, rows, sizeof(rows));
+   agx3_rt_gen1_runtime_ift(ift);
+   return true;
+}
+
+static bool
+hk_gen1_rq_read_bodies(const char *path, uint8_t *code,
+                       const uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3])
+{
+   FILE *f = fopen(path, "rb");
+   if (!f) return false;
+   uint8_t header[24];
+   uint32_t lengths[AGX3_RT_GEN1_RUNTIME_SLOTS][2];
+   bool ok = fread(header, 1, sizeof(header), f) == sizeof(header) &&
+             !memcmp(header, "G1RQBODY", 8) &&
+             fread(lengths, 1, sizeof(lengths), f) == sizeof(lengths);
+   uint32_t version, count, payload;
+   memcpy(&version, header + 8, 4);
+   memcpy(&count, header + 12, 4);
+   memcpy(&payload, header + 16, 4);
+   ok = ok && version == 1 && count == AGX3_RT_GEN1_RUNTIME_SLOTS;
+   uint64_t total = 0;
+   for (unsigned slot = 0; ok && slot < AGX3_RT_GEN1_RUNTIME_SLOTS; ++slot) {
+      ok = lengths[slot][0] <= rows[slot * 3][1] && lengths[slot][1] <= rows[slot * 3 + 1][1];
+      total += lengths[slot][0] + lengths[slot][1];
+   }
+   ok = ok && total == payload;
+   for (unsigned slot = 0; ok && slot < AGX3_RT_GEN1_RUNTIME_SLOTS; ++slot) {
+      ok = fread(code + rows[slot * 3][0], 1, lengths[slot][0], f) == lengths[slot][0] &&
+           fread(code + rows[slot * 3 + 1][0], 1, lengths[slot][1], f) == lengths[slot][1];
+   }
+   ok = ok && fgetc(f) == EOF;
+   fclose(f);
+   return ok;
+}
+
+static bool
+hk_gen1_rq_generated_slot_matches(const uint8_t *code,
+                                  const uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3],
+                                  unsigned slot, const uint8_t *body, size_t body_length,
+                                  const uint8_t *constants, size_t constants_length)
+{
+   const uint8_t *base = code + rows[slot * 3][0];
+   const uint8_t *constant_base = code + rows[slot * 3 + 1][0];
+   if (memcmp(base, body, body_length) || memcmp(constant_base, constants, constants_length))
+      return false;
+   for (size_t i = body_length; i < rows[slot * 3][1]; ++i)
+      if (base[i]) return false;
+   for (size_t i = constants_length; i < rows[slot * 3 + 1][1]; ++i)
+      if (constant_base[i]) return false;
+   return true;
+}
+
+static bool
+hk_gen1_rq_minimal_from_blob(const char *spec, const char *path, uint8_t *code,
+                             const uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3])
+{
+   uint8_t *blob = calloc(1, 11108352);
+   if (!blob || !path || !hk_gen1_rq_read_bodies(path, blob, rows)) {
+      free(blob);
+      return false;
+   }
+   const char *cursor = spec;
+   bool ok = true;
+   while (ok && *cursor) {
+      bool bodies = true, constants = true;
+      if (cursor[0] == 'b' && cursor[1] == ':') { constants = false; cursor += 2; }
+      else if (cursor[0] == 'c' && cursor[1] == ':') { bodies = false; cursor += 2; }
+      unsigned first, last;
+      if (!strncmp(cursor, "all", 3)) {
+         first = 0; last = AGX3_RT_GEN1_RUNTIME_SLOTS - 1; cursor += 3;
+      } else {
+         char *end;
+         first = last = strtoul(cursor, &end, 0);
+         if (end == cursor) { ok = false; break; }
+         cursor = end;
+         if (*cursor == '-') { last = strtoul(cursor + 1, &end, 0); if (end == cursor + 1) { ok = false; break; } cursor = end; }
+      }
+      if (first > last || last >= AGX3_RT_GEN1_RUNTIME_SLOTS) { ok = false; break; }
+      for (unsigned slot = first; slot <= last; ++slot) {
+         if (bodies) memcpy(code + rows[slot * 3][0], blob + rows[slot * 3][0], rows[slot * 3][1]);
+         if (constants) memcpy(code + rows[slot * 3 + 1][0], blob + rows[slot * 3 + 1][0], rows[slot * 3 + 1][1]);
+      }
+      if (*cursor == ',') cursor++;
+      else if (*cursor) ok = false;
+   }
+   free(blob);
+   return ok;
+}
+static void
+hk_gen1_rq_image_dump(const char *path, const uint8_t *code, const uint8_t *ift)
+{
+   char *ift_path = NULL;
+   FILE *f = fopen(path, "wb");
+   if (f) { fwrite(code, 1, 11108352, f); fclose(f); }
+   if (asprintf(&ift_path, "%s.ift", path) >= 0 && ift_path) {
+      f = fopen(ift_path, "wb");
+      if (f) { fwrite(ift, 1, 0x4000, f); fclose(f); }
+      free(ift_path);
+   }
+}
+static bool
+hk_gen1_rq_init_generated(struct hk_device *dev)
+{
+   static uint64_t rows[AGX3_RT_GEN1_RUNTIME_MAP_ROWS][3];
+   static uint8_t body[0x4000];
+   uint8_t entry[AGX3_RT_GEN1_ENTRY_MAX_SIZE], constants[AGX3_RT_GEN1_DEFAULT_CONSTANTS_SIZE];
+   const uint8_t *table;
+   size_t body_length, entry_length, table_length;
+   const char *path = getenv("ASAHI_G17P_RQ_BODIES_PATH");
+   const bool minimal = !path;
+   dev->gen1_rq_maps = calloc(630, 3 * sizeof(uint64_t));
+   dev->gen1_rq_user_image = malloc(0x60000);
+   if ((!path && !minimal) || !dev->gen1_rq_maps || !dev->gen1_rq_user_image ||
+       !agx3_rt_gen1_runtime_code_map(rows) ||
+       !agx3_rt_gen1_runtime_user_image(hk_gen1_ray_query_scs_layout(dev),
+                                        dev->gen1_rq_user_image, 0x60000))
+      goto fail;
+   memcpy(dev->gen1_rq_maps, rows, sizeof(rows));
+   agx3_rt_gen1_runtime_uniforms(dev->gen1_rq_uniforms);
+   dev->gen1_rq_code_alias = agx_va_alloc(&dev->dev, 0x1a224000, 0x4000,
+      AGX_VA_USC | AGX_VA_FIXED, UINT64_C(0x10010000000));
+   if (!dev->gen1_rq_code_alias) goto fail;
+   dev->gen1_rq_code = agx_bo_create(&dev->dev, 11108352, 0x4000,
+      AGX_BO_EXEC | AGX_BO_LOW_VA | AGX_BO_WRITEBACK, "Gen1 ray query programs");
+   dev->gen1_rq_ift = agx_bo_create(&dev->dev, 0x4000, 0x4000,
+      AGX_BO_WRITEBACK, "Gen1 intersection table");
+   if (!dev->gen1_rq_code || !dev->gen1_rq_ift) goto fail;
+   uint8_t *code = agx_bo_map(dev->gen1_rq_code);
+   memset(code, 0, 11108352);
+   if (minimal) {
+      const bool trap = debug_get_bool_option("ASAHI_G17P_RQ_MINIMAL_TRAP", false);
+      for (unsigned slot = 0; slot < AGX3_RT_GEN1_RUNTIME_SLOTS; ++slot) {
+         if (!agx3_rt_gen1_stub_body_generate(slot, trap, body, sizeof(body), &body_length)) goto fail;
+         memcpy(code + rows[slot * 3][0], body, body_length);
+         if (!agx3_rt_gen1_runtime_constants(slot, &table, &table_length) || table_length > rows[slot * 3 + 1][1])
+            goto fail;
+         memcpy(code + rows[slot * 3 + 1][0], table, table_length);
+      }
+      if (!agx3_rt_gen1_instance_push_body_generate(body, sizeof(body), &body_length)) goto fail;
+      agx3_rt_gen1_instance_push_constants(&table, &table_length);
+      memcpy(code + rows[AGX3_RT_GEN1_INSTANCE_PUSH_SLOT * 3][0], body, body_length);
+      memcpy(code + rows[AGX3_RT_GEN1_INSTANCE_PUSH_SLOT * 3 + 1][0], table, table_length);
+      for (unsigned i = 0, slot; agx3_rt_gen1_clique_slot(i, &slot); ++i) {
+         if (!agx3_rt_gen1_clique_body_generate(slot, body, sizeof(body), &body_length)) goto fail;
+         memcpy(code + rows[slot * 3][0], body, body_length);
+      }
+      if (!agx3_rt_gen1_default_body_generate(body, &body_length)) goto fail;
+      agx3_rt_gen1_default_constants(constants);
+      memcpy(code + rows[0][0], body, body_length);
+      memcpy(code + rows[1][0], constants, sizeof(constants));
+      if (!agx3_rt_gen1_triangle_body_generate(body, sizeof(body), &body_length)) goto fail;
+      agx3_rt_gen1_triangle_constants(&table, &table_length);
+      memcpy(code + rows[AGX3_RT_GEN1_TRIANGLE_SLOT * 3][0], body, body_length);
+      memcpy(code + rows[AGX3_RT_GEN1_TRIANGLE_SLOT * 3 + 1][0], table, table_length);
+      if (!agx3_rt_gen1_aabb_body_generate(body, sizeof(body), &body_length)) goto fail;
+      agx3_rt_gen1_aabb_constants(&table, &table_length);
+      memcpy(code + rows[AGX3_RT_GEN1_AABB_SLOT * 3][0], body, body_length);
+      memcpy(code + rows[AGX3_RT_GEN1_AABB_SLOT * 3 + 1][0], table, table_length);
+   } else if (!hk_gen1_rq_read_bodies(path, code, rows)) {
+      goto fail;
+   }
+   if (minimal) {
+      const char *from_blob = getenv("ASAHI_G17P_RQ_MINIMAL_FROM_BLOB");
+      if (from_blob && *from_blob &&
+          !hk_gen1_rq_minimal_from_blob(from_blob, getenv("ASAHI_G17P_RQ_BODIES_PATH"), code, rows))
+         goto fail;
+   }
+   agx3_rt_gen1_runtime_ift(agx_bo_map(dev->gen1_rq_ift));
+   for (unsigned slot = 0; slot < AGX3_RT_GEN1_RUNTIME_SLOTS; ++slot) {
+      uint8_t *slot_entry = code + rows[slot * 3 + 2][0];
+      if (!agx3_rt_gen1_runtime_entry_generate(slot, entry, &entry_length) || entry_length > 0x4000)
+         goto fail;
+      memcpy(slot_entry, entry, entry_length);
+   }
+   if (!agx3_rt_gen1_default_body_generate(body, &body_length)) goto fail;
+   agx3_rt_gen1_default_constants(constants);
+   if (!hk_gen1_rq_generated_slot_matches(code, rows, 0, body, body_length, constants, sizeof(constants)))
+      goto fail;
+   if (!agx3_rt_gen1_triangle_body_generate(body, sizeof(body), &body_length)) goto fail;
+   agx3_rt_gen1_triangle_constants(&table, &table_length);
+   if (!hk_gen1_rq_generated_slot_matches(code, rows, AGX3_RT_GEN1_TRIANGLE_SLOT, body, body_length, table, table_length))
+      goto fail;
+   if (!agx3_rt_gen1_aabb_body_generate(body, sizeof(body), &body_length)) goto fail;
+   agx3_rt_gen1_aabb_constants(&table, &table_length);
+   if (!hk_gen1_rq_generated_slot_matches(code, rows, AGX3_RT_GEN1_AABB_SLOT, body, body_length, table, table_length))
+      goto fail;
+   if (!agx3_rt_gen1_instance_push_body_generate(body, sizeof(body), &body_length)) goto fail;
+   agx3_rt_gen1_instance_push_constants(&table, &table_length);
+   if (!hk_gen1_rq_generated_slot_matches(code, rows, AGX3_RT_GEN1_INSTANCE_PUSH_SLOT, body, body_length, table, table_length))
+      goto fail;
+   for (unsigned i = 0, slot; agx3_rt_gen1_clique_slot(i, &slot); ++i) {
+      if (!agx3_rt_gen1_clique_body_generate(slot, body, sizeof(body), &body_length) ||
+          !agx3_rt_gen1_runtime_constants(slot, &table, &table_length) ||
+          !hk_gen1_rq_generated_slot_matches(code, rows, slot, body, body_length, table, table_length))
+         goto fail;
+   }
+   {
+      const char *dump = getenv("ASAHI_G17P_RQ_IMAGE_DUMP");
+      if (dump && *dump) hk_gen1_rq_image_dump(dump, code, agx_bo_map(dev->gen1_rq_ift));
+   }
+   for (unsigned i = 0; i < 630; i++) {
+      uint64_t *r = dev->gen1_rq_maps + 3 * i;
+      if (agx_bo_bind(&dev->dev, dev->gen1_rq_code, r[2], r[1], r[0],
+                      DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE))
+         goto fail;
+      dev->gen1_rq_bound_maps++;
+   }
+   dev->gen1_native_rq = true;
+   return true;
+fail:
+   hk_gen1_rq_finish(dev);
+   return false;
+}
+
+static bool
+hk_gen1_rq_init(struct hk_device *dev,const char *dir)
+{
+   dev->gen1_rq_maps=calloc(630,3*sizeof(uint64_t));
+   dev->gen1_rq_user_image=malloc(0x60000);
+   if(!dev->gen1_rq_maps || !dev->gen1_rq_user_image ||
+      !hk_gen1_rq_read(dir,"code-map.bin",dev->gen1_rq_maps,630*24) ||
+      !hk_gen1_rq_read(dir,"data.bin",dev->gen1_rq_user_image,0x60000) ||
+      !hk_gen1_rq_read(dir,"uniforms-gen1.bin",dev->gen1_rq_uniforms,320))goto fail;
+   dev->gen1_rq_code_alias=agx_va_alloc(&dev->dev,0x1a224000,0x4000,
+      AGX_VA_USC|AGX_VA_FIXED,UINT64_C(0x10010000000));
+   if(!dev->gen1_rq_code_alias)goto fail;
+   dev->gen1_rq_code=agx_bo_create(&dev->dev,11108352,0x4000,
+      AGX_BO_EXEC|AGX_BO_LOW_VA|AGX_BO_WRITEBACK,"Gen1 ray query programs");
+   dev->gen1_rq_ift=agx_bo_create(&dev->dev,0x4000,0x4000,
+      AGX_BO_WRITEBACK,"Gen1 intersection table");
+   if(!dev->gen1_rq_code || !dev->gen1_rq_ift ||
+      !hk_gen1_rq_read(dir,"drivers-relocated.bin",agx_bo_map(dev->gen1_rq_code),11108352) ||
+      !hk_gen1_rq_read(dir,"ift-relocated.bin",agx_bo_map(dev->gen1_rq_ift),0x4000))goto fail;
+   for(unsigned i=0;i<630;i++) {
+      uint64_t *r=dev->gen1_rq_maps+3*i;
+      if((r[0]|r[1]|r[2])&0x3fff || !r[1] || r[0]>11108352 ||
+         r[1]>11108352-r[0] || r[2]<UINT64_C(0x10010000000) ||
+         r[2]>=UINT64_C(0x1002a224000) || r[1]>UINT64_C(0x1002a224000)-r[2])goto fail;
+      if(agx_bo_bind(&dev->dev,dev->gen1_rq_code,r[2],r[1],r[0],
+                     DRM_ASAHI_BIND_READ|DRM_ASAHI_BIND_WRITE))goto fail;
+      dev->gen1_rq_bound_maps++;
+   }
+   dev->gen1_native_rq=true;return true;
+fail:
+   hk_gen1_rq_finish(dev);return false;
+}
+
 VkResult
 hk_device_init_accel_struct_state(struct hk_device *dev)
 {
+   dev->g17p_native_as = hk_g17p_rt_enabled(dev->dev.chip);
+   const char *capture=getenv("ASAHI_G17P_RQ_CAPTURE_DIR");
+   if(capture && dev->g17p_native_as && !hk_gen1_rq_init(dev,capture))
+      return vk_error(dev,VK_ERROR_INITIALIZATION_FAILED);
+   if (!capture && dev->g17p_native_as && !hk_gen1_rq_init_generated(dev))
+      return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+   dev->gen1_rq_instances = dev->gen1_native_rq;
+   dev->gen1_rq_candidates = dev->gen1_rq_instances;
+   dev->gen1_rq_live_as_table = dev->gen1_rq_instances &&
+      debug_get_bool_option("ASAHI_G17P_RQ_LIVE_AS_TABLE", false);
+   dev->gen1_native_fragment_rq = dev->gen1_rq_candidates &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
+   dev->gen1_native_graphics_rq = dev->gen1_native_fragment_rq;
+   if (dev->g17p_native_as) {
+      simple_mtx_init(&dev->gen1_as_lock, mtx_plain);
+      util_dynarray_init(&dev->gen1_ases, NULL);
+      dev->gen1_as_lock_ready=true;
+      dev->gen1_vertex_tables = _mesa_pointer_hash_table_create(NULL);
+      dev->gen1_vertex_directory_va = agx_va_alloc(&dev->dev, AGX_GEN1_VERTEX_DIRECTORY_BYTES,
+         0x4000, AGX_VA_USC | AGX_VA_FIXED, AGX_GEN1_VERTEX_DIRECTORY_VA);
+      dev->gen1_vertex_directory = agx_bo_create(&dev->dev, AGX_GEN1_VERTEX_DIRECTORY_BYTES,
+         0x4000, AGX_BO_WRITEBACK, "Gen1 vertex table directory");
+      if (!dev->gen1_vertex_directory_va || !dev->gen1_vertex_directory ||
+          agx_bo_bind(&dev->dev, dev->gen1_vertex_directory, AGX_GEN1_VERTEX_DIRECTORY_VA,
+                      AGX_GEN1_VERTEX_DIRECTORY_BYTES, 0,
+                      DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
+         mesa_loge("Gen1 vertex table directory unavailable (va=%p bo=%p)",
+                   (void *)dev->gen1_vertex_directory_va, (void *)dev->gen1_vertex_directory);
+         if (dev->gen1_vertex_directory)
+            agx_bo_unreference(&dev->dev, dev->gen1_vertex_directory);
+         if (dev->gen1_vertex_directory_va)
+            agx_va_free(&dev->dev, dev->gen1_vertex_directory_va, false);
+         dev->gen1_vertex_directory = NULL;
+         dev->gen1_vertex_directory_va = NULL;
+      } else {
+         memset(agx_bo_map(dev->gen1_vertex_directory), 0, AGX_GEN1_VERTEX_DIRECTORY_BYTES);
+      }
+      if (dev->gen1_rq_live_as_table) {
+         simple_mtx_init(&dev->gen1_as_chunk_cache_lock, mtx_plain);
+         for (unsigned i = 0; i < 2; ++i) {
+            list_inithead(&dev->gen1_as_free_chunks[i]);
+            dev->gen1_as_free_chunk_count[i] = 0;
+         }
+         dev->gen1_as_chunk_cache_lock_ready = true;
+      }
+      /* GPU-only live metadata: builds/copies initialize all64 bytes. */
+      dev->gen1_as_metadata = agx_bo_create(&dev->dev,
+         LIBAGX_GEN1_AS_METADATA_SLOTS * LIBAGX_GEN1_AS_METADATA_STRIDE,
+         16384, AGX_BO_WRITEBACK, "Gen1 AS live metadata");
+      dev->gen1_as_addresses = agx_bo_create(&dev->dev,
+         LIBAGX_GEN1_AS_METADATA_SLOTS * sizeof(uint64_t), 16384,
+         AGX_BO_WRITEBACK, "Gen1 AS creation addresses");
+      if (dev->gen1_rq_live_as_table)
+         dev->gen1_as_query_bank = agx_bo_create(&dev->dev,
+            HK_GEN1_AS_TABLE_AS_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES, 16384,
+            0, "Gen1 live AS query bank");
+      if (!dev->gen1_as_metadata || !dev->gen1_as_addresses ||
+          (dev->gen1_rq_live_as_table && !dev->gen1_as_query_bank)) {
+         hk_gen1_rq_finish(dev);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      memset(agx_bo_map(dev->gen1_as_addresses), 0,
+             LIBAGX_GEN1_AS_METADATA_SLOTS * sizeof(uint64_t));
+      if (dev->gen1_as_query_bank)
+         memset(agx_bo_map(dev->gen1_as_query_bank), 0,
+                HK_GEN1_AS_TABLE_AS_SLOTS * HK_GEN1_AS_TABLE_ENTRY_BYTES);
+   }
    dev->accel_struct_args = (struct vk_acceleration_structure_build_args){
       .subgroup_size = 32,
-      .bvh_bounds_offset = offsetof(struct hk_bvh_header, bounds),
+      .bvh_bounds_offset = dev->g17p_native_as ? 0x50 : offsetof(struct hk_bvh_header, bounds),
       /* This software node format does not store propagated cull flags. */
       .root_flags_offset = 0,
       .morton_sort_workgroup_size = 512,
       .morton_sort_kvs_per_thread = 2,
       .propagate_cull_flags = false,
-      .emit_markers = false,
+      .emit_markers = dev->g17p_native_as && getenv("ASAHI_G17P_AS_PHASE_ADDRESS") != NULL,
+      .has_update = dev->g17p_native_as,
+      .morton_phase_dispatch = dev->g17p_native_as,
    };
 
-   dev->vk.as_build_ops = &hk_as_build_ops;
+   dev->vk.as_build_ops = dev->g17p_native_as ? &hk_native_as_build_ops : &hk_as_build_ops;
    dev->vk.write_buffer_cp = hk_write_buffer_cp;
    dev->vk.flush_buffer_write_cp = hk_flush_buffer_write_cp;
    dev->vk.cmd_dispatch_unaligned = hk_cmd_dispatch_unaligned;
@@ -317,8 +1549,90 @@ hk_GetAccelerationStructureBuildSizesKHR(
 {
    VK_FROM_HANDLE(hk_device, dev, _device);
 
+   if (dev->g17p_native_as) {
+      uint64_t leaves = 0;
+      for (uint32_t i = 0; i < pBuildInfo->geometryCount; ++i)
+         leaves += pMaxPrimitiveCounts[i];
+      if (!leaves) {
+         struct hk_agx3_as_layout layout;
+         hk_agx3_as_layout_init(0, &layout);
+         pSizeInfo->accelerationStructureSize = layout.as_bytes;
+         pSizeInfo->buildScratchSize = 256;
+         pSizeInfo->updateScratchSize = 256;
+         return;
+      }
+   }
+
    vk_get_as_build_sizes(_device, buildType, pBuildInfo, pMaxPrimitiveCounts,
                          pSizeInfo, &dev->accel_struct_args);
+}
+
+static bool
+hk_gen1_capture_stress_input(struct hk_cmd_buffer *cmd,
+   const VkAccelerationStructureBuildGeometryInfoKHR *info,
+   const VkAccelerationStructureBuildRangeInfoKHR *range)
+{
+   const char *dir = getenv("ASAHI_G17P_CAPTURE_STRESS_INPUT");
+   if (!dir || !dir[0] || info->geometryCount != 1 ||
+       info->type != VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
+       info->mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR ||
+       range->primitiveCount != 60000)
+      return false;
+   const VkAccelerationStructureGeometryKHR *g = info->pGeometries ?
+      info->pGeometries : info->ppGeometries[0];
+   if (g->geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR ||
+       g->geometry.triangles.vertexFormat != VK_FORMAT_R32G32B32_SFLOAT ||
+       g->geometry.triangles.vertexStride != 12 ||
+       g->geometry.triangles.indexType != VK_INDEX_TYPE_NONE_KHR ||
+       g->geometry.triangles.transformData.deviceAddress)
+      return false;
+   struct agx_device *dev = &hk_cmd_buffer_device(cmd)->dev;
+   uint64_t address = g->geometry.triangles.vertexData.deviceAddress +
+      range->primitiveOffset + (uint64_t)range->firstVertex * 12;
+   const uint64_t bytes = UINT64_C(60000) * 36;
+   struct agx_bo *found = NULL;
+   uint64_t offset = 0;
+   simple_mtx_lock(&dev->bo_map_lock);
+   for (uint32_t handle = 0; handle < dev->max_handle; ++handle) {
+      struct agx_bo *bo = agx_lookup_bo(dev, handle);
+      if (bo->va && address >= bo->va->addr &&
+          address - bo->va->addr <= bo->size &&
+          bytes <= bo->size - (address - bo->va->addr)) {
+         found = bo;
+         offset = address - bo->va->addr;
+         agx_bo_reference(bo);
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->bo_map_lock);
+   bool ok = false;
+   if (found) {
+      const uint8_t *map = agx_bo_map(found);
+      if (map && offset <= agx_bo_map_size(found) &&
+          bytes <= agx_bo_map_size(found) - offset) {
+         char path[4096];
+         if (snprintf(path, sizeof(path), "%s/stress-vertices.bin", dir) < sizeof(path)) {
+            FILE *f = fopen(path, "wb");
+            if (f) {
+               ok = fwrite(map + offset, 1, bytes, f) == bytes;
+               ok &= fclose(f) == 0;
+            }
+         }
+         if (snprintf(path, sizeof(path), "%s/stress-build.json", dir) < sizeof(path)) {
+            FILE *f = fopen(path, "wb");
+            if (f) {
+               fprintf(f, "{\"primitive_count\":60000,\"vertex_stride\":12,\"max_vertex\":%u,\"geometry_flags\":%u,\"build_flags\":%u,\"input_address\":\"0x%llx\",\"bytes\":2160000,\"capture_ok\":%s}\n",
+                       g->geometry.triangles.maxVertex, g->flags, info->flags,
+                       (unsigned long long)address, ok ? "true" : "false");
+               fclose(f);
+            }
+         }
+      }
+      agx_bo_unreference(dev, found);
+   }
+   fprintf(stderr, "Gen1 stress input capture ok=%u; diagnostic command buffer rejected before submission\n", ok);
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   return true;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -330,16 +1644,101 @@ hk_CmdBuildAccelerationStructuresKHR(
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   if (dev->g17p_native_as && getenv("ASAHI_G17P_CAPTURE_STRESS_INPUT")) {
+      for (uint32_t i = 0; i < infoCount; ++i)
+         if (hk_gen1_capture_stress_input(cmd, &pInfos[i], ppBuildRangeInfos[i]))
+            return;
+   }
+   uint32_t empty_count = 0;
+   if (dev->g17p_native_as) {
+      for (uint32_t i = 0; i < infoCount; ++i) {
+         const VkAccelerationStructureGeometryKHR *geometry =
+            pInfos[i].geometryCount ? (pInfos[i].pGeometries ?
+               pInfos[i].pGeometries : pInfos[i].ppGeometries[0]) : NULL;
+         uint64_t primitives = 0;
+         bool compatible = geometry != NULL ||
+            (pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+             pInfos[i].geometryCount == 0);
+         for (uint32_t g = 0; g < pInfos[i].geometryCount; ++g) {
+            const VkAccelerationStructureGeometryKHR *next =
+               pInfos[i].pGeometries ? &pInfos[i].pGeometries[g] :
+                                      pInfos[i].ppGeometries[g];
+            compatible &= next->geometryType == geometry->geometryType;
+            primitives += ppBuildRangeInfos[i][g].primitiveCount;
+         }
+         struct hk_agx3_as_layout native;
+         bool triangles =
+            pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+            (!geometry || geometry->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR);
+         bool aabbs = dev->gen1_rq_candidates && geometry &&
+            pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+            geometry->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR;
+         bool instances = dev->gen1_rq_instances && geometry &&
+            pInfos[i].geometryCount == 1 &&
+            pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR &&
+            geometry->geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR;
+         if ((pInfos[i].mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR &&
+              pInfos[i].mode != VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) ||
+             !compatible || (!triangles && !instances && !aabbs) || primitives > UINT32_MAX ||
+             !hk_agx3_as_layout_init(primitives, &native)) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         empty_count += primitives == 0;
+      }
+   }
+
+   const uint32_t nonempty_count = infoCount - empty_count;
+   VkAccelerationStructureBuildGeometryInfoKHR *nonempty_infos = NULL;
+   const VkAccelerationStructureBuildRangeInfoKHR **nonempty_ranges = NULL;
+   if (empty_count && nonempty_count) {
+      nonempty_infos = malloc(nonempty_count * sizeof(*nonempty_infos));
+      nonempty_ranges = malloc(nonempty_count * sizeof(*nonempty_ranges));
+      if (!nonempty_infos || !nonempty_ranges) {
+         free(nonempty_infos);
+         free(nonempty_ranges);
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+   }
+
    /* A build binds its own compute pipelines and push constants, so the
     * application's compute state has to survive it. */
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
 
-   vk_cmd_build_acceleration_structures(commandBuffer, &dev->vk, &dev->meta,
-                                        infoCount, pInfos, ppBuildRangeInfos,
-                                        &dev->accel_struct_args);
+   if (empty_count) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < infoCount; ++i) {
+         uint64_t primitives = 0;
+         for (uint32_t g = 0; g < pInfos[i].geometryCount; ++g)
+            primitives += ppBuildRangeInfos[i][g].primitiveCount;
+         if (!primitives) {
+            VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                           pInfos[i].dstAccelerationStructure);
+            uint32_t id = hk_gen1_as_id(dev, dst);
+            uint64_t metadata = hk_gen1_as_metadata_addr_for_id(cmd, id);
+            if (!metadata)
+               break;
+            libagx_gen1_as_empty(cmd, agx_1d(1), AGX_BARRIER_ALL,
+               hk_as_native_va(dst), metadata, id, pInfos[i].flags,
+               pInfos[i].geometryCount ? vk_get_as_geometry_type(&pInfos[i]) : VK_GEOMETRY_TYPE_TRIANGLES_KHR);
+         } else if (nonempty_infos) {
+            nonempty_infos[n] = pInfos[i];
+            nonempty_ranges[n++] = ppBuildRangeInfos[i];
+         }
+      }
+      hk_flush_buffer_write_cp(commandBuffer);
+   }
+   if (nonempty_count)
+      vk_cmd_build_acceleration_structures(commandBuffer, &dev->vk, &dev->meta,
+         nonempty_count, nonempty_infos ? nonempty_infos : pInfos,
+         nonempty_ranges ? nonempty_ranges : ppBuildRangeInfos,
+         &dev->accel_struct_args);
 
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+   free(nonempty_infos);
+   free(nonempty_ranges);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -350,8 +1749,10 @@ hk_GetDeviceAccelerationStructureCompatibilityKHR(
    VK_FROM_HANDLE(hk_device, dev, _device);
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
-   bool compat = memcmp(pVersionInfo->pVersionData,
-                        pdev->vk.properties.driverUUID, VK_UUID_SIZE) == 0;
+   const uint8_t format_uuid[VK_UUID_SIZE] = LIBAGX_GEN1_AS_SERIAL_FORMAT_UUID_BYTES;
+   bool compat = dev->g17p_native_as &&
+      memcmp(pVersionInfo->pVersionData, pdev->vk.properties.driverUUID, VK_UUID_SIZE) == 0 &&
+      memcmp(pVersionInfo->pVersionData + VK_UUID_SIZE, format_uuid, VK_UUID_SIZE) == 0;
    *pCompatibility = compat
                         ? VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR
                         : VK_ACCELERATION_STRUCTURE_COMPATIBILITY_INCOMPATIBLE_KHR;
@@ -363,6 +1764,155 @@ hk_GetDeviceAccelerationStructureCompatibilityKHR(
  * stays false, so a conformant application never reaches them.  They fail
  * loudly rather than silently returning success on an untouched structure.
  */
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdCopyAccelerationStructureKHR(
+   VkCommandBuffer commandBuffer, const VkCopyAccelerationStructureInfoKHR *info)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_acceleration_structure, src, info->src);
+   VK_FROM_HANDLE(vk_acceleration_structure, dst, info->dst);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->g17p_native_as ||
+       (info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR &&
+        info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   const uint64_t padding = hk_as_native_va(src) -
+                            vk_acceleration_structure_get_va(src);
+   if (padding > src->size || src->size - padding < 192 ||
+       DIV_ROUND_UP(src->size - padding, 16) > UINT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   uint32_t dst_id = hk_gen1_as_id(dev, dst);
+   uint64_t dst_metadata = hk_gen1_as_metadata_addr_for_id(cmd, dst_id);
+   uint64_t src_metadata = hk_gen1_as_metadata_addr(cmd, src);
+   if (!dst_metadata || !src_metadata)
+      return;
+   libagx_gen1_as_copy(cmd, agx_1d(DIV_ROUND_UP(src->size - padding, 16)),
+                      AGX_BARRIER_ALL, hk_as_native_va(dst),
+                      hk_as_native_va(src), dst_metadata, src_metadata, dst_id,
+                      info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR);
+   if (info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR &&
+       dev->gen1_vertex_tables) {
+      struct hk_vertex_table_layout table;
+      bool found = false;
+      simple_mtx_lock(&dev->gen1_as_lock);
+      struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_vertex_tables, src);
+      if (entry) {
+         table = *(struct hk_vertex_table_layout *)entry->data;
+         found = true;
+      }
+      simple_mtx_unlock(&dev->gen1_as_lock);
+      if (found && table.offset + table.bytes <= dst->size)
+         hk_vertex_table_publish(commandBuffer, dev, dst, &table);
+   }
+}
+
+static uint64_t
+hk_gen1_as_serial_uuid(struct hk_cmd_buffer *cmd)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+   const uint8_t format_uuid[VK_UUID_SIZE] = LIBAGX_GEN1_AS_SERIAL_FORMAT_UUID_BYTES;
+   uint8_t uuid[2 * VK_UUID_SIZE];
+   memcpy(uuid, pdev->vk.properties.driverUUID, VK_UUID_SIZE);
+   memcpy(uuid + VK_UUID_SIZE, format_uuid, VK_UUID_SIZE);
+   return hk_pool_upload(cmd, uuid, sizeof(uuid), 16);
+}
+
+static int
+hk_gen1_as_address_compare(const void *a, const void *b)
+{
+   const struct libagx_gen1_as_address *x = a, *y = b;
+   return x->address < y->address ? -1 : x->address > y->address ? 1 :
+          x->resource_id < y->resource_id ? -1 : x->resource_id > y->resource_id;
+}
+
+static uint64_t
+hk_gen1_as_address_map(struct hk_cmd_buffer *cmd, uint32_t *count)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   simple_mtx_lock(&dev->gen1_as_lock);
+   uint32_t bound = util_dynarray_num_elements(&dev->gen1_ases,
+                                              struct vk_acceleration_structure *);
+   struct agx_ptr map = hk_pool_alloc(cmd,
+      MAX2(bound, 1) * sizeof(struct libagx_gen1_as_address), 16);
+   *count = 0;
+   if (map.cpu) {
+      struct libagx_gen1_as_address *entries = map.cpu;
+      uint32_t id = 1;
+      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, as) {
+         uint64_t address = *as ? hk_gen1_as_bound_va(*as) : 0;
+         if (address) entries[(*count)++] = (struct libagx_gen1_as_address) {
+            .address = address, .resource_id = id,
+         };
+         ++id;
+      }
+      qsort(entries, *count, sizeof(*entries), hk_gen1_as_address_compare);
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+   return map.cpu ? map.gpu : 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdCopyAccelerationStructureToMemoryKHR(VkCommandBuffer commandBuffer,
+   const VkCopyAccelerationStructureToMemoryInfoKHR *info)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_acceleration_structure, src, info->src);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->g17p_native_as || info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_SERIALIZE_KHR) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   uint64_t padding = hk_as_native_va(src) - vk_acceleration_structure_get_va(src);
+   if (padding > src->size || src->size - padding < LIBAGX_GEN1_AS_EMPTY_BYTES ||
+       DIV_ROUND_UP(src->size - padding, 16) > UINT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   uint64_t metadata = hk_gen1_as_metadata_addr(cmd, src);
+   uint64_t uuid = hk_gen1_as_serial_uuid(cmd);
+   if (!metadata || !uuid) return;
+   libagx_gen1_as_serialize(cmd, agx_1d(DIV_ROUND_UP(src->size - padding, 16)),
+      AGX_BARRIER_ALL, info->dst.deviceAddress, hk_as_native_va(src),
+      metadata, uuid, src->size - padding);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
+   const VkCopyMemoryToAccelerationStructureInfoKHR *info)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(vk_acceleration_structure, dst, info->dst);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->g17p_native_as || info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_DESERIALIZE_KHR) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   uint64_t padding = hk_as_native_va(dst) - vk_acceleration_structure_get_va(dst);
+   if (padding > dst->size || dst->size - padding < LIBAGX_GEN1_AS_EMPTY_BYTES ||
+       DIV_ROUND_UP(dst->size - padding, 16) > UINT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   uint32_t id = hk_gen1_as_id(dev, dst), map_count;
+   uint64_t metadata = hk_gen1_as_metadata_addr_for_id(cmd, id);
+   uint64_t uuid = hk_gen1_as_serial_uuid(cmd);
+   uint64_t map = hk_gen1_as_address_map(cmd, &map_count);
+   if (!metadata || !uuid || !map) return;
+   uint32_t invocations = DIV_ROUND_UP(dst->size - padding, 16);
+   libagx_gen1_as_deserialize(cmd, agx_1d(invocations), AGX_BARRIER_ALL,
+      hk_as_native_va(dst), info->src.deviceAddress, metadata, uuid, dst->size - padding, id);
+   hk_cmd_buffer_retain_bo(cmd, dev->gen1_as_addresses);
+   libagx_gen1_as_deserialize_references(cmd,
+      agx_1d((dst->size - padding) / 128), AGX_BARRIER_ALL,
+      hk_as_native_va(dst), info->src.deviceAddress, map, map_count,
+      dev->gen1_as_addresses->va->addr, uuid, dst->size - padding);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_BuildAccelerationStructuresKHR(
    VkDevice _device, VkDeferredOperationKHR deferredOperation,
@@ -404,4 +1954,13 @@ hk_WriteAccelerationStructuresPropertiesKHR(
    VkQueryType queryType, size_t dataSize, void *pData, size_t stride)
 {
    return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+uint64_t
+hk_gen1_ray_query_scs_layout(const struct hk_device *dev)
+{
+   if (dev->gen1_rq_candidates)
+      return UINT64_C(0x0130000060010070);
+   return dev->gen1_rq_instances ? UINT64_C(0x0058000060010070) :
+                                  UINT64_C(0x0028000060000070);
 }

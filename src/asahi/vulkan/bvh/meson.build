@@ -12,7 +12,12 @@ hk_bvh_includes = files(
 # subdir'd before src/asahi, so the common bvh_spv has already been consumed
 # by then and vk_bvh_include_dir / vk_glsl_shader_preamble are in scope.
 hk_bvh_spv = []
-foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write']]
+foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
+             ['agx3_leaf.comp', 'hk_agx3_leaf'],
+             ['agx3_envelope.comp', 'hk_agx3_envelope'],
+             ['agx3_plan.comp', 'hk_agx3_plan'],
+             ['agx3_refit.comp', 'hk_agx3_refit'],
+             ['vertex_table.comp', 'hk_vertex_table']]
   command = [
     prog_glslang, '-V',
     '-I' + vk_bvh_include_dir,

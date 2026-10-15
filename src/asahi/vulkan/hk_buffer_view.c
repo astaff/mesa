@@ -22,6 +22,7 @@
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
+#include "vk_acceleration_structure.h"
 
 VkFormatFeatureFlags2
 hk_get_buffer_format_features(struct hk_physical_device *pdev,
@@ -35,6 +36,10 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
 
    if (agx_vbo_supports_format(p_format))
       features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+
+   if (pdev->vk.supported_extensions.KHR_acceleration_structure &&
+       vk_acceleration_struct_vtx_format_supported(vk_format))
+      features |= VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
 
    if (ail_pixel_format[p_format].texturable &&
        !util_format_is_depth_or_stencil(p_format)) {

@@ -23,6 +23,7 @@
 #include "hk_memory_budget_core.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
+#include "hk_nir_lower_mesh.h"
 #include "hk_private.h"
 #include "hk_ray_tracing_core.h"
 #include "hk_shader.h"
@@ -72,6 +73,8 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
       agx_chip_descriptor_generation(dev->chip),
       agx_chip_sampler_generation(dev->chip),
       agx_chip_sampler_heap_element_size(dev->chip),
+      hk_g17p_rt_enabled(dev->chip),
+      hk_g17p_rt_enabled(dev->chip),
    };
 
    _mesa_blake3_update(ctx, values, sizeof(values));
@@ -276,6 +279,9 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_texel_buffer_alignment = true,
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
+      
+
+      .EXT_mesh_shader = false,
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = true,
       .EXT_ycbcr_2plane_444_formats = false,
@@ -304,6 +310,13 @@ hk_get_device_features(
       .independentBlend = true,
       .geometryShader = true,
       .tessellationShader = true,
+
+      
+      .taskShader = false,
+      .meshShader = supported_extensions->EXT_mesh_shader,
+      .multiviewMeshShader = false,
+      .primitiveFragmentShadingRateMeshShader = false,
+      .meshShaderQueries = supported_extensions->EXT_mesh_shader,
       .sampleRateShading = true,
       .dualSrcBlend = true,
       .logicOp = true,
@@ -427,18 +440,20 @@ hk_get_device_features(
       .accelerationStructureCaptureReplay = false,
       .accelerationStructureIndirectBuild = false,
       .accelerationStructureHostCommands = false,
-      .descriptorBindingAccelerationStructureUpdateAfterBind = false,
+      .descriptorBindingAccelerationStructureUpdateAfterBind =
+         supported_extensions->KHR_acceleration_structure,
       .rayQuery = supported_extensions->KHR_ray_query,
       .rayTraversalPrimitiveCulling = supported_extensions->KHR_ray_query ||
                                       supported_extensions->KHR_ray_tracing_pipeline,
 
-      /* VK_KHR_ray_tracing_pipeline.  Shader-group handle capture/replay is
-       * off because shaderGroupHandleCaptureReplaySize is zero: a handle is a
-       * device-unique index with nothing to replay.  The pipeline stack size
+      /* VK_KHR_ray_tracing_pipeline.  The pipeline stack size
        * is static scratch in the compiled megakernel, so the dynamic state
        * cannot change it and is not advertised either. */
       .rayTracingPipeline = supported_extensions->KHR_ray_tracing_pipeline,
-      .rayTracingPipelineShaderGroupHandleCaptureReplay = false,
+      .pipelineLibraryGroupHandles =
+         supported_extensions->EXT_pipeline_library_group_handles,
+      .rayTracingPipelineShaderGroupHandleCaptureReplay =
+         supported_extensions->KHR_ray_tracing_pipeline,
       .rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false,
       .rayTracingPipelineTraceRaysIndirect =
          supported_extensions->KHR_ray_tracing_pipeline,
@@ -446,6 +461,8 @@ hk_get_device_features(
       /* VK_KHR_ray_tracing_maintenance1 */
       .rayTracingMaintenance1 =
          supported_extensions->KHR_ray_tracing_maintenance1,
+      .rayTracingPositionFetch =
+         supported_extensions->KHR_ray_tracing_position_fetch,
       .rayTracingPipelineTraceRaysIndirect2 =
          supported_extensions->KHR_ray_tracing_maintenance1,
       .bufferDeviceAddressMultiDevice = false,
@@ -892,6 +909,12 @@ hk_supported_shader_stages(const struct vk_features *features)
    if (features->geometryShader)
       stages |= VK_SHADER_STAGE_GEOMETRY_BIT;
 
+   if (features->taskShader)
+      stages |= VK_SHADER_STAGE_TASK_BIT_EXT;
+
+   if (features->meshShader)
+      stages |= VK_SHADER_STAGE_MESH_BIT_EXT;
+
    return stages;
 }
 
@@ -1013,7 +1036,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH,
       .maxShaderGroupStride = 16384,
       .shaderGroupBaseAlignment = 64,
-      .shaderGroupHandleCaptureReplaySize = 0,
+      .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
       .maxRayDispatchInvocationCount = 1u << 30,
       .shaderGroupHandleAlignment = 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
@@ -1055,6 +1078,40 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxTessellationControlTotalOutputComponents = 4216,
       .maxTessellationEvaluationInputComponents = 128,
       .maxTessellationEvaluationOutputComponents = max_vgt_output_components,
+
+      
+
+
+
+
+      .maxTaskWorkGroupTotalCount = 1u << 22,
+      .maxTaskWorkGroupCount = {65535, 65535, 65535},
+      .maxTaskWorkGroupInvocations = 1024,
+      .maxTaskWorkGroupSize = {1024, 1024, 1024},
+      .maxTaskPayloadSize = 16384,
+      .maxTaskSharedMemorySize = 32768,
+      .maxTaskPayloadAndSharedMemorySize = 32768,
+      .maxMeshWorkGroupTotalCount = 1u << 22,
+      .maxMeshWorkGroupCount = {65535, 65535, 65535},
+      .maxMeshWorkGroupInvocations = 1024,
+      .maxMeshWorkGroupSize = {1024, 1024, 1024},
+      .maxMeshSharedMemorySize = 28672,
+      .maxMeshPayloadAndSharedMemorySize = 28672 + 16384,
+      .maxMeshOutputMemorySize = 32768,
+      .maxMeshPayloadAndOutputMemorySize = 32768 + 16384,
+      .maxMeshOutputComponents = 128,
+      .maxMeshOutputVertices = 256,
+      .maxMeshOutputPrimitives = 256,
+      .maxMeshOutputLayers = 8,
+      .maxMeshMultiviewViewCount = 1,
+      .meshOutputPerVertexGranularity = 32,
+      .meshOutputPerPrimitiveGranularity = 32,
+      .maxPreferredTaskWorkGroupInvocations = 32,
+      .maxPreferredMeshWorkGroupInvocations = 32,
+      .prefersLocalInvocationVertexOutput = true,
+      .prefersLocalInvocationPrimitiveOutput = true,
+      .prefersCompactVertexOutput = true,
+      .prefersCompactPrimitiveOutput = true,
 
       /* Set to match maxVertexOutputComponents, hardware limit is higher. */
       .maxFragmentInputComponents = max_vgt_output_components,
@@ -1670,6 +1727,17 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_device_extension_table supported_extensions;
    hk_get_device_extensions(instance, &supported_extensions);
+   if (hk_g17p_rt_enabled(pdev->dev.chip)) {
+      supported_extensions.KHR_acceleration_structure = true;
+      supported_extensions.KHR_deferred_host_operations = true;
+      supported_extensions.KHR_ray_query =
+         (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY) != 0;
+      supported_extensions.KHR_ray_tracing_pipeline = true;
+      supported_extensions.EXT_pipeline_library_group_handles = true;
+      supported_extensions.KHR_ray_tracing_maintenance1 = true;
+      supported_extensions.KHR_ray_tracing_position_fetch = true;
+   }
+
 
    if (pdev->dev.chip == AGX_CHIP_G17P) {
       /* Advanced blending is hardware-qualified on A18 Pro for every
@@ -1682,6 +1750,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    struct vk_features supported_features;
+   supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17P &&
+      hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 

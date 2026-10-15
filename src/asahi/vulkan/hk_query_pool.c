@@ -14,6 +14,7 @@
 #include "hk_entrypoints.h"
 #include "hk_pipeline_statistics_core.h"
 #include "hk_shader.h"
+#include "hk_acceleration_structure.h"
 
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
@@ -22,6 +23,7 @@
 #include "asahi/lib/agx_bo.h"
 #include "asahi/libagx/libagx.h"
 #include "asahi/libagx/query.h"
+#include "asahi/libagx/gen1_as.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 
@@ -42,6 +44,15 @@ hk_has_available(const struct hk_query_pool *pool)
    return pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP;
 }
 
+static inline bool
+hk_is_acceleration_structure_query(VkQueryType type)
+{
+   return type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ||
+          type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ||
+          type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ||
+          type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR;
+}
+
 static uint16_t *
 hk_pool_oq_index_ptr(const struct hk_query_pool *pool)
 {
@@ -60,6 +71,11 @@ hk_reports_per_query(struct hk_query_pool *pool)
    case VK_QUERY_TYPE_OCCLUSION:
    case VK_QUERY_TYPE_TIMESTAMP:
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
+   case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
       return 1;
    case VK_QUERY_TYPE_PIPELINE_STATISTICS:
       return util_bitcount(pool->vk.pipeline_statistics);
@@ -146,6 +162,49 @@ hk_query_report_map(struct hk_device *dev, struct hk_query_pool *pool,
    } else {
       return (void *)((char *)agx_bo_map(pool->bo) +
                       hk_query_offset(pool, query));
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdWriteAccelerationStructuresPropertiesKHR(
+   VkCommandBuffer commandBuffer, uint32_t accelerationStructureCount,
+   const VkAccelerationStructureKHR *pAccelerationStructures,
+   VkQueryType queryType, VkQueryPool queryPool, uint32_t firstQuery)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   /* Live sidecar metadata includes retained update topology. Serialization
+    * requires the matching native serialization format and
+    * relocation path; do not invent a size for an unimplemented format. */
+   if (!dev->g17p_native_as || pool->vk.query_type != queryType ||
+       !hk_is_acceleration_structure_query(queryType) ||
+       firstQuery > pool->vk.query_count ||
+       accelerationStructureCount > pool->vk.query_count - firstQuery) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (!accelerationStructureCount || !hk_query_command_cs(cmd))
+      return;
+
+   for (uint32_t i = 0; i < accelerationStructureCount; ++i) {
+      VK_FROM_HANDLE(vk_acceleration_structure, as, pAccelerationStructures[i]);
+      uint64_t metadata = hk_gen1_as_metadata_addr(cmd, as);
+      if (!metadata)
+         return;
+      libagx_gen1_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
+         libagx_gen1_as_native_address(vk_acceleration_structure_get_va(as)),
+         metadata, hk_query_report_addr(dev, pool, firstQuery + i),
+         queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? 0 :
+         queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? 1 :
+         queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ? 2 : 3);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+      /* The helper's strong barrier completes the value before the existing
+       * queue-write path makes availability system-wide coherent. */
+      hk_queue_write(cmd, hk_query_available_addr(pool, firstQuery + i), 1,
+                      false);
    }
 }
 
@@ -256,7 +315,9 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    if (pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP &&
        pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION &&
        pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS &&
-       pool->vk.query_type != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) {
+       pool->vk.query_type != VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT &&
+       pool->vk.query_type != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT &&
+       !hk_is_acceleration_structure_query(pool->vk.query_type)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -628,6 +689,14 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       break;
    }
 
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT: {
+      cmd->state.gfx.descriptors.root_dirty = true;
+      cmd->state.gfx.descriptors.root.mesh_prims_query =
+         end ? 0 : hk_query_report_addr(dev, pool, query);
+      graphics = true;
+      break;
+   }
+
    case VK_QUERY_TYPE_PIPELINE_STATISTICS: {
       struct hk_root_descriptor_table *root = &cmd->state.gfx.descriptors.root;
       cmd->state.gfx.descriptors.root_dirty = true;
@@ -805,8 +874,10 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
       if ((pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP &&
            pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION &&
            pool->vk.query_type != VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT &&
+           pool->vk.query_type != VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT &&
            pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS &&
-           pool->vk.query_type != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT) ||
+           pool->vk.query_type != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT &&
+           !hk_is_acceleration_structure_query(pool->vk.query_type)) ||
           firstQuery > pool->vk.query_count ||
           queryCount > pool->vk.query_count - firstQuery) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);

@@ -16,9 +16,13 @@ libasahi_agx_files = files(
   'agx_nir_lower_discard_zs_emit.c',
   'agx_nir_lower_interpolation.c',
   'agx_nir_lower_g17p_combined_sampler.c',
+  'agx_nir_ray_query.c',
+  'agx_nir_gen1_ray_query.c',
   'agx_nir_lower_shared_bitsize.c',
   'agx_nir_lower_subgroups.c',
   'agx_nir_lower_texture.c',
+  'agx_nir_m5_mesh.c',
+  'agx3_mesh_core.c',
   'agx_nir_opt_preamble.c',
   'agx_lower_64bit.c',
   'agx_lower_divergent_shuffle.c',
@@ -66,6 +70,17 @@ libasahi_agx_files = files(
   'agx3_fltnorm_core.c',
   'agx3_writeout_core.c',
   'agx3_zs_core.c',
+  'agx3_rt_core.c',
+  'agx3_rt_gen1_entry.c',
+  'agx3_rt_gen1_default.c',
+  'agx3_rt_gen1_triangle.c',
+  'agx3_rt_gen1_aabb.c',
+  'agx3_rt_gen1_instance_push.c',
+  'agx3_rt_gen1_runtime_constants.c',
+  'agx3_rt_gen1_clique.c',
+  'agx3_rt_gen1_runtime_tables.c',
+  'agx3_rt_gen1_traversal.c',
+  'agx3_rt_gen1_body.c',
   'agx3_slot_core.c',
   'agx3_resource_ir.c',
   'agx3_lower_texture_publications.c',
@@ -173,6 +188,7 @@ if with_tests
          'test/test-mrt-terminal-tail.cpp',
          'test/test-agx3-cprog-spill-certificate.cpp',
          'test/test-agx3-sr.cpp',
+         'test/test-agx3-scs.cpp',
          'test/test-agx3-uniform-alu.cpp',
          'test/test-agx3-integer-fusion.cpp',
          'test/test-agx3-integer-lowering.cpp',
@@ -187,5 +203,109 @@ if with_tests
     ),
     suite : ['asahi'],
     protocol : 'gtest',
+  )
+
+  test(
+    'agx3_rt_core',
+    executable(
+      'agx3_rt_core_test',
+      files(
+        'agx3_rt_core.c',
+        'agx3_binder.c',
+        'agx3_compose/agx3_compose.c',
+        'agx3_compose/agx3b_tables.c',
+        'agx3_compose/agx3c_tables.c',
+        'test/test-agx3-rt-core.c',
+      ),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_gen1_traversal',
+    executable('agx3_gen1_traversal_test', files('test/test-gen1-traversal.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler]),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_rt_gen1_entry',
+    executable(
+      'agx3_rt_gen1_entry_test',
+      files('test/test-agx3-rt-gen1-entry.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_gen1_ray_query',
+    executable('agx3_gen1_ray_query_test', files('test/test-gen1-ray-query.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler]),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_gen1_scs_nir',
+    executable(
+      'agx3_gen1_scs_nir_test',
+      files('test/test-gen1-scs-nir.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_gen1_hit_commit',
+    executable(
+      'agx3_gen1_hit_commit_test',
+      files('test/test-gen1-hit-commit.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_gen1_status',
+    executable(
+      'agx3_gen1_status_test',
+      files('test/test-gen1-status.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_ray_query_prerequisites',
+    executable(
+      'agx3_ray_query_prerequisites_test',
+      files('test/test-agx3-ray-query-prerequisites.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
   )
 endif

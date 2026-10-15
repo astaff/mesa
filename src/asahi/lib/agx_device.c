@@ -1429,6 +1429,18 @@ uint32_t
 agx_create_command_queue(struct agx_device *dev,
                          enum drm_asahi_priority priority)
 {
+   const uint64_t layouts[2] = {0};
+   return agx_create_command_queue_with_render_scs(dev, priority, layouts);
+}
+
+uint32_t
+agx_create_command_queue_with_render_scs(struct agx_device *dev,
+   enum drm_asahi_priority priority, const uint64_t layouts[2])
+{
+   if ((dev->debug & AGX_DBG_1QUEUE) && (layouts[0] || layouts[1])) {
+      errno = EINVAL;
+      return UINT32_MAX;
+   }
 
    if (dev->debug & AGX_DBG_1QUEUE) {
       // Abuse this lock for this, it's debug only anyway
@@ -1443,10 +1455,14 @@ agx_create_command_queue(struct agx_device *dev,
       .vm_id = dev->vm_id,
       .priority = priority,
       .usc_exec_base = dev->shader_base,
+      .render_scs_layout = {layouts[0], layouts[1]},
    };
 
-   int ret =
-      dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_QUEUE_CREATE, &queue_create);
+   unsigned request = DRM_IOCTL_ASAHI_QUEUE_CREATE;
+   if (!layouts[0] && !layouts[1])
+      request = _IOC(_IOC_DIR(request), _IOC_TYPE(request), _IOC_NR(request),
+                     offsetof(struct drm_asahi_queue_create, render_scs_layout));
+   int ret = dev->ops.simple_ioctl(dev, request, &queue_create);
    if (ret) {
       int saved_errno = errno;
       if (dev->debug & AGX_DBG_1QUEUE)

@@ -2246,6 +2246,12 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
                          enum agx3_barrier_scope scope,
                          struct agx3_encoded_scoped_barrier *out)
 {
+   if (scope == AGX3_BARRIER_SCOPE_SUBGROUP_SHARED) {
+      if (!is_agx3_encoding(encoding) || out == NULL)
+         return false;
+      memset(out, 0, sizeof(*out));
+      return true;
+   }
    static const uint8_t canonical_b[][AGX3_SCOPED_BARRIER_MAX_LENGTH] = {
       [AGX3_BARRIER_SCOPE_EXECUTION] =
          {0x07, 0x04, 0x54, 0x41, 0x09, 0x00},

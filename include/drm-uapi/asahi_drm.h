@@ -284,6 +284,7 @@ enum drm_asahi_feature {
 	 * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
 	 */
 	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 7,
+	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 8,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
@@ -750,6 +751,7 @@ struct drm_asahi_queue_create {
 	 * fix a 4GiB VA carveout for USC memory and pass its base address here.
 	 */
 	__u64 usc_exec_base;
+	__u64 render_scs_layout[2];
 };
 
 /**
@@ -1343,6 +1345,24 @@ struct drm_asahi_cmd_render_with_prior {
 	__u64 prior_cdm;
 };
 
+struct drm_asahi_render_ray_query_stage {
+	__u64 scs_layout;
+	__u32 intersection_aux;
+	__u32 intersection_pad;
+	__u64 intersection_pool;
+	__u64 intersection_pool_bytes;
+	__u32 intersection_first;
+	__u32 intersection_count;
+	__u64 intersection_default;
+	__u64 intersection_default_control;
+};
+
+struct drm_asahi_cmd_render_with_ray_query {
+	struct drm_asahi_cmd_render_with_prior legacy;
+	struct drm_asahi_render_ray_query_stage ray_query[2];
+};
+
+
 /**
  * struct drm_asahi_cmd_compute - Command to submit compute
  *
@@ -1383,6 +1403,7 @@ struct drm_asahi_cmd_compute {
 
 	/** @ts: Timestamps for the compute command */
 	struct drm_asahi_timestamps ts;
+
 };
 
 struct drm_asahi_cmd_compute_with_prior {
@@ -1393,6 +1414,14 @@ struct drm_asahi_cmd_compute_with_prior {
 	__u64 scs_layout;
 	__u64 prior_vdm;
 	__u64 prior_cdm;
+	__u32 cdm_auxiliary_allocation;
+	__u32 reserved;
+	__u64 intersection_pool;
+	__u64 intersection_pool_bytes;
+	__u32 intersection_first;
+	__u32 intersection_count;
+	__u64 intersection_default_program;
+	__u64 intersection_default_control;
 };
 
 /**

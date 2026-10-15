@@ -151,6 +151,7 @@ struct vk_acceleration_structure_build_args {
    bool propagate_cull_flags;
    bool emit_markers;
    bool has_update;
+   bool morton_phase_dispatch;
 };
 
 struct vk_acceleration_structure_build_ops {
@@ -206,6 +207,11 @@ VkResult vk_get_bvh_build_pipeline_spv(struct vk_device *device, struct vk_meta_
                                        const struct vk_acceleration_structure_build_args *args,
                                        uint32_t flags, VkPipeline *pipeline,
                                        bool unaligned_dispatch);
+
+VkResult vk_cmd_build_as_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
+                                struct vk_meta_device *meta,
+                                const struct vk_acceleration_structure_build_args *args,
+                                const struct vk_acceleration_structure_build_state *state);
 
 void vk_cmd_build_acceleration_structures(VkCommandBuffer cmdbuf,
                                           struct vk_device *device,

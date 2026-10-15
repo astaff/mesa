@@ -754,6 +754,10 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       const char *slot_name =
          gl_varying_slot_name_for_stage(slot, MESA_SHADER_GEOMETRY);
 
+      if (output->type == nir_type_invalid) {
+         output->type = nir_type_float32;
+         output->nr_components = 4;
+      }
       enum glsl_base_type type =
          nir_get_glsl_base_type_for_nir_type(output->type);
 

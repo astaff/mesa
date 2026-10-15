@@ -2703,6 +2703,23 @@ barrier("fence_pbe_to_tex_pixel_agx")
 # Unknown fence used in the helper program on exit.
 barrier("fence_helper_exit_agx")
 
+intrinsic("intersect_ray_gen1_agx", src_comp=[1, 1, 1, 1], indices=[BASE])
+intrinsic("continue_ray_gen1_agx", src_comp=[1], indices=[BASE])
+
+intrinsic("load_scs_agx", [], dest_comp=0, bit_sizes=[16, 32], indices=[BASE])
+intrinsic("store_scs_agx", [0], indices=[BASE])
+intrinsic("load_scs_indexed_agx", [1, 1], dest_comp=0, bit_sizes=[16, 32],
+          indices=[BASE, COMPONENT, FLAGS])
+intrinsic("store_scs_indexed_agx", [0, 1, 1],
+          indices=[BASE, COMPONENT])
+intrinsic("load_scs_uniform_agx", [1, 1], dest_comp=0, bit_sizes=[16, 32],
+          indices=[BASE, FORMAT, COMPONENT, FLAGS])
+intrinsic("store_scs_uniform_agx", [0, 1, 1], indices=[BASE, FORMAT, COMPONENT])
+intrinsic("load_scs_base_agx", [1], dest_comp=0, bit_sizes=[16, 32],
+          indices=[BASE, FORMAT, COMPONENT, FLAGS])
+intrinsic("store_scs_base_agx", [0, 1], indices=[BASE, FORMAT, COMPONENT])
+
+
 # Helper shader intrinsics
 # src[] = { value }.
 intrinsic("doorbell_agx", src_comp=[1])
@@ -3353,3 +3370,20 @@ system_value("is_depth_clamp_emulated_kk", 1, bit_sizes=[1])
 system_value("is_viewport_z_transform_emulated_kk", 1, bit_sizes=[1])
 # Loads the viewport Z range for a given viewport index.
 load("viewport_z_range_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
+
+# Native G17P/G17X SR59 identifies the resident SCS thread.
+system_value("scs_thread_index_agx", 1, bit_sizes=[32])
+
+intrinsic("allocate_mesh_uvb_agx", [1, 1])
+intrinsic("store_mesh_uvb_agx", [2], indices=[FLAGS])
+intrinsic("store_object_childcount_agx", [1])
+
+intrinsic("load_mesh_payload_address_agx", dest_comp=2, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("load_mesh_primitive_storage_agx", dest_comp=2, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("mesh_payload_entry_barrier_agx")
+
+intrinsic("object_payload_exit_barrier_agx")

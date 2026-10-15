@@ -12,10 +12,12 @@
 #include "agx_scratch.h"
 #include "agx_tilebuffer.h"
 #include "hk_buffer.h"
+#include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
 #include "hk_g17p_patch.h"
 #include "hk_descriptor_set.h"
 #include "hk_device.h"
+#include "hk_gen1_rt_indirect_contract.h"
 #include "hk_entrypoints.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "asahi/compiler/agx3_compute_program.h"
@@ -25,6 +27,8 @@
 #include "libagx_shaders.h"
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx3_g17p_grid_helper_core.h"
+#include "asahi/lib/agx_scs_layout.h"
+#include "asahi/lib/agx_rt_compute_gen1.h"
 #include "util/log.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
@@ -547,8 +551,8 @@ hk_g17p_compute_shader_supported(struct hk_shader *s,
           linked->b.bo && linked->b.bo->va && linked->b.size != 0 &&
           linked->b.size <= UINT32_MAX && linked->b.nr_gprs != 0 &&
           !s->b.info.has_preamble && s->b.info.preamble_scratch_size == 0 &&
-          s->b.info.scratch_size <= AGX3_G17P_MAX_SPILL_B &&
-          linked->b.scratch_size <= AGX3_G17P_MAX_SPILL_B &&
+          s->b.info.scratch_size <= AGX3_G17P_MAX_COMPUTE_SPILL_B &&
+          linked->b.scratch_size <= AGX3_G17P_MAX_COMPUTE_SPILL_B &&
           s->b.info.agx3_staging_known &&
           s->b.info.local_size <= 32768 &&
           s->b.info.texture_state_count == 0 &&
@@ -602,8 +606,9 @@ hk_g17p_internal_graphics_uniform_ranges(
 
    if (!!texture_pointers != s->info.agx3_indexed_sampler_valid)
       return false;
-   const unsigned uniform_base = s->info.agx3_indexed_sampler_valid
-      ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS : 0;
+   const unsigned uniform_base = (s->info.agx3_indexed_sampler_valid
+      ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS : 0) +
+      (s->info.agx3_gen1_fragment_rq ? 168 : 0);
 
    const unsigned nr_vbos = DIV_ROUND_UP(
       BITSET_LAST_BIT(s->info.vs.attrib_components_read), 4);
@@ -704,20 +709,16 @@ hk_g17p_compute_uniform_ranges(
       return true;
    }
 
-   const unsigned root_uniform = (s->info.agx3_storage_image_valid ||
-                                  s->info.agx3_sampled_storage_valid ||
-                                  s->info.agx3_indexed_storage_valid)
-                                    ? AGX_G17P_STORAGE_ROOT_HALFS
-                                 : texture_pointers
-                                    ? AGX_G17P_TXF_ROOT_HALFS
-                                    : 0;
+   const unsigned root_uniform = s->info.agx3_root_uniform;
    if (!hk_agx3_g17p_root_range(root_uniform, s->info.set_count, root_ptr, &ranges[0]))
       return false;
 
    size_t count = 1;
    if (texture_pointers) {
+      const unsigned texture_uniform = root_uniform >= 168 ? 168 : 0;
       ranges[count++] = (struct agx3_ioto_uniform_range){
-         .start_halfs = 0, .size_halfs = root_uniform,
+         .start_halfs = texture_uniform,
+         .size_halfs = root_uniform - texture_uniform,
          .address = texture_pointers,
       };
    }
@@ -790,9 +791,11 @@ hk_g17p_build_compute_program_raw(
 }
 
 static bool
-hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                              struct hk_shader *s,
                               struct hk_linked_shader *linked,
                               uint64_t root_ptr, uint64_t texture_pointers,
+                              struct agx_workgroup local_size,
                               bool internal_graphics,
                               enum agx_ioto_g17p_compute_ldshdr_f1 kind,
                               const char *trace,
@@ -813,6 +816,86 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       return false;
    }
 
+   if(s->b.info.uses_ray_traversal && hk_cmd_buffer_device(cmd)->gen1_native_rq) {
+      struct hk_device *dev=hk_cmd_buffer_device(cmd);
+      if((internal_graphics && !dev->gen1_native_graphics_rq) ||
+         range_count>=HK_G17P_COMPUTE_MAX_RANGES) {
+         vk_command_buffer_set_error(&cmd->vk,VK_ERROR_FEATURE_NOT_PRESENT);return false;
+      }
+      const uint64_t packed = hk_gen1_ray_query_scs_layout(dev);
+      struct agx_scs_layout_gen2 scs;
+      if (!agx_scs_layout_gen1_init(packed, &scs)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return false;
+      }
+      const uint64_t state_size = MAX2(UINT64_C(0x60000),
+         ALIGN_POT((uint64_t)scs.end[12], 0x4000));
+      struct agx_ptr state=hk_pool_alloc(cmd,state_size,0x4000);
+      struct agx_ptr u=hk_pool_alloc(cmd,512,16);
+      if(!state.cpu || !u.cpu)return false;
+      memcpy(state.cpu,dev->gen1_rq_user_image,0x60000);
+      if (state_size > 0x60000)
+         memset((uint8_t *)state.cpu + 0x60000, 0, state_size - 0x60000);
+      memset(u.cpu,0,512);memcpy(u.cpu,dev->gen1_rq_uniforms,320);
+      for(unsigned i=0;i<74;i+=2) {
+         uint64_t value;memcpy(&value,(uint8_t*)u.cpu+4*i,8);
+         if(value>=UINT64_C(0x20d0000000) && value<UINT64_C(0x20d0060000)) {
+            value+=state.gpu-UINT64_C(0x20d0000000);
+            memcpy((uint8_t*)u.cpu+4*i,&value,8);
+         }
+      }
+      uint32_t context[28]={0,0,0x60000070,0x280000,0,0,0,0,0,64,1,1,
+                             0,0,1,1,0,0x6f,0,0,0x2f8000,0,0,0,0,0,
+                             0x00400040,0x7fff0005};
+      const bool launch_shape = dev->gen1_native_graphics_rq &&
+         s->b.info.workgroup_size[0] == 0 && s->b.info.workgroup_size[1] == 0 &&
+         s->b.info.workgroup_size[2] == 0;
+      if (!agx_rt_compute_gen1_context_local(context,
+             launch_shape ? local_size.x : s->b.info.workgroup_size[0],
+             launch_shape ? local_size.y : s->b.info.workgroup_size[1],
+             launch_shape ? local_size.z : s->b.info.workgroup_size[2])) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return false;
+      }
+      uint64_t table=state.gpu+0x50000,ctx=u.gpu+352;
+      if (dev->gen1_rq_instances) {
+         table=hk_gen1_upload_as_table(cmd);
+         if (!table) return false;
+         const uint32_t constants[]={0x3f7ffffe,0x3f800001,0x6000,0x8000,
+            0xfe00001,0x1000,0x100,0x10002,0x1ffff,0x20000,0x400000,
+            0x1f000000,0x34a00000,0x40000000,0xfffeff00};
+         memcpy((uint8_t *)u.cpu+118*2,constants,sizeof(constants));
+         uint32_t *uw=u.cpu;
+         uw[106/2]=88;
+         uw[48/2]=scs.end[6];uw[50/2]=scs.end[11];
+         uw[52/2]=packed;uw[54/2]=packed>>32;
+         memcpy((uint8_t *)u.cpu+32*2,&table,8);
+         agx_scs_layout_gen1_parameters(&scs, (uint8_t *)state.cpu + 0x4000);
+         context[2]=packed;context[3]=packed>>32;
+         context[20]=scs.end[5];
+
+      }
+      if(dev->gen1_rq_candidates) {
+         const uint32_t constants[]={0x3fffffff,0x3f7ffffe,0x3f800001,
+            0x6000,0x8000,0x10000,0x60400,0x3ffd0fe0,0x914348a1,
+            0x100,0x10002,0x1ffff,0x20000,0xfffff,0x400000,
+            0x1f000001,0x34a00000,0xfe000000,0xfe1ffffe,0xfffe0000,0xfffeff00};
+         memcpy((uint8_t*)u.cpu+110*2,constants,sizeof(constants));
+         ((uint32_t*)u.cpu)[104/2]=304;
+      }
+      memcpy(context+12,&table,8);memcpy((uint8_t*)u.cpu+352,context,sizeof(context));
+      memcpy((uint8_t*)u.cpu+320,&ctx,8);memcpy((uint8_t*)u.cpu+328,&table,8);
+      ranges[range_count++]=(struct agx3_ioto_uniform_range){
+         .start_halfs=0,.size_halfs=168,.address=u.gpu,
+      };
+      hk_cmd_buffer_retain_bo(cmd,dev->gen1_rq_code);
+      hk_cmd_buffer_retain_bo(cmd,dev->gen1_rq_ift);
+      if (!cs) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return false;
+      }
+      cs->gen1_native_rq = true;
+   }
    struct agx3_g17p_compute_program_desc desc;
    if (!hk_g17p_linked_program_desc(s, linked, kind, ranges, range_count,
                                     &desc)) {
@@ -1006,7 +1089,9 @@ hk_g17p_append_indirect_launch(
    uint64_t helper_program_va;
    struct hk_g17p_compute_program_ref helper_program;
    if (!hk_g17p_build_compute_program(
-          cmd, helper_s, helper_s->only_linked, helper_root_ptr.gpu, 0, false,
+          cmd, cmd->current_cs.cs, helper_s, helper_s->only_linked,
+          helper_root_ptr.gpu, 0,
+          local_size, false,
           AGX3_G17P_GRID_HELPER_LDSHDR_F1, "grid-helper", helper_ranges,
           &helper_range_count, &helper_program_va, &helper_program))
       return false;
@@ -1250,6 +1335,43 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    const bool internal_graphics = s->info.stage != MESA_SHADER_COMPUTE;
+   if (s->b.info.uses_ray_traversal && dev->gen1_native_rq) {
+      bool valid = !internal_graphics || dev->gen1_native_graphics_rq;
+      if (agx_is_indirect(grid)) {
+         struct hk_gen1_rt_indirect_contract contract;
+         struct agx_precompiled_shader *setup = NULL;
+         /* The shared native indirect helper already publishes a private
+          * six-u32 geometry block. Admit only RT's32x1x1 profile and the
+          * validated Gen1 resident window under an explicit diagnostic. */
+         valid = valid &&
+            debug_get_bool_option("ASAHI_G17P_RT_INDIRECT_DIAGNOSTIC", false) &&
+            dev->gen1_rq_instances && dev->gen1_rq_candidates &&
+            grid.mode == AGX_CDM_MODE_INDIRECT_GLOBAL &&
+            local_size.x == 32 && local_size.y == 1 && local_size.z == 1 &&
+            cmd->state.cs.descriptors.root.cs.trace_rays_addr != 0 &&
+            cmd->state.cs.descriptors.root.cs.grid_helper_sparse_map_addr == 0 &&
+            hk_gen1_rt_indirect_contract_init(hk_gen1_ray_query_scs_layout(dev), &contract);
+         if (valid)
+            setup = agx_get_precompiled(&dev->bg_eot, LIBAGX_TRACE_RAYS_INDIRECT_SETUP);
+         valid = valid && setup && setup->info.main_size && setup->info.nr_gprs &&
+            setup->info.agx3_staging_known && setup->info.push_count >= 26 &&
+            setup->info.workgroup_size[0] == 1 && setup->info.workgroup_size[1] == 1 &&
+            setup->info.workgroup_size[2] == 1 && setup->info.nr_preamble_gprs == 0 &&
+            setup->info.preamble_size == 0 && setup->info.local_size == 0 &&
+            setup->info.agx3_tps_size == 0 && setup->info.printf_uniform == 0;
+         if (valid)
+            mesa_logi("Gen1 indirect RT diagnostic: resident=%u warp_stride=%u state=%u "
+                      "kernel_pages=%u as_table=%u; GPU geometry helper enabled",
+                      contract.physical_slots, contract.query_stride, contract.state_bytes,
+                      contract.kernel_scs_pages, contract.as_table_bytes);
+      } else {
+         valid = valid && grid.count[0] && grid.count[1] && grid.count[2];
+      }
+      if (!valid) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+   }
 
    /* Only an application compute dispatch can name a sparse argument buffer;
     * an internal graphics kernel's indirect grid is a driver record. */
@@ -1607,7 +1729,8 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint64_t program_va;
    struct hk_g17p_compute_program_ref program;
    if (!hk_g17p_build_compute_program(
-          cmd, s, linked, root_ptr, texture_pointers, internal_graphics,
+          cmd, cs, s, linked, root_ptr, texture_pointers, local_size,
+          internal_graphics,
           indirect ? AGX3_G17P_INDIRECT_MAIN_LDSHDR_F1
                    : AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
           "main", ranges, &range_count, &program_va, &program))
@@ -1857,7 +1980,12 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
    desc->root.cs.trace_rays_addr = record_addr;
    desc->root_dirty = true;
 
+   const bool conditional_active = cmd->state.conditional.active;
+   cmd->state.conditional.active = false;
+
    dispatch(cmd, grid);
+
+   cmd->state.conditional.active = conditional_active;
 
    /* Carry the state back before restoring, so a pushed descriptor set the
     * flush above allocated stays owned by the ray-tracing state. */
@@ -1866,6 +1994,23 @@ hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd, struct hk_api_shader *shader,
 
    cmd->state.cs = saved;
    cmd->state.cs.descriptors.root_dirty = true;
+}
+
+void
+hk_cmd_dispatch_indirect_addr(VkCommandBuffer command_buffer,
+                             VkDeviceAddress address)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
+   struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   assert(address && !(address & 3));
+   if (desc->push_dirty)
+      hk_cmd_buffer_flush_push_descriptors(cmd, desc);
+   desc->root.cs.base_group[0] = 0;
+   desc->root.cs.base_group[1] = 0;
+   desc->root.cs.base_group[2] = 0;
+   desc->root.cs.group_count_addr = address;
+   desc->root.cs.grid_helper_sparse_map_addr = 0;
+   dispatch(cmd, agx_grid_indirect(address));
 }
 
 VKAPI_ATTR void VKAPI_CALL

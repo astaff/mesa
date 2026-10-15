@@ -1895,7 +1895,10 @@ agx_get_sr_native_width_to(agx_builder *b, agx_index dst, enum agx_sr sr)
    case AGX_SR_THREAD_INDEX_IN_THREADGROUP:
    case AGX_SR_THREAD_INDEX_IN_SUBGROUP:
    case AGX_SR_SUBGROUP_INDEX_IN_THREADGROUP:
+   case AGX_SR_MESH_PAYLOAD_HI:
+   case AGX_SR_MESH_PRIMITIVE_STORAGE_HI:
    case AGX_SR_BACKGROUND_LAYER_ID:
+   case AGX_SR_SCS_THREAD_INDEX:
       narrow_agx3 = true;
       break;
    default:
@@ -3013,6 +3016,9 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       return agx_load_compute_dimension(
          b, dst, instr, AGX_SR_THREAD_POSITION_IN_THREADGROUP_X);
 
+   case nir_intrinsic_load_scs_thread_index_agx:
+      return agx_get_sr_native_width_to(b, dst, AGX_SR_SCS_THREAD_INDEX);
+
    case nir_intrinsic_load_local_invocation_index:
       return agx_get_sr_native_width_to(
          b, dst, AGX_SR_THREAD_INDEX_IN_THREADGROUP);
@@ -3088,7 +3094,12 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
             }
 
             if (modes & nir_var_mem_shared) {
-               agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_THREADGROUP);
+               const bool subgroup =
+                  nir_intrinsic_execution_scope(instr) <= SCOPE_SUBGROUP &&
+                  nir_intrinsic_memory_scope(instr) <= SCOPE_SUBGROUP;
+               agx_scoped_barrier_agx3(
+                  b, subgroup ? AGX3_BARRIER_SCOPE_SUBGROUP_SHARED
+                              : AGX3_BARRIER_SCOPE_THREADGROUP);
                emitted = true;
             }
          }
@@ -3237,6 +3248,28 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       return agx_get_sr_native_width_to(b, dst,
                                         AGX_SR_THREAD_INDEX_IN_SUBGROUP);
 
+   case nir_intrinsic_load_mesh_payload_address_agx: {
+      agx_index parts[2]={agx_temp(b->shader,AGX_SIZE_32),
+                          agx_temp(b->shader,AGX_SIZE_32)};
+      agx_get_sr_native_width_to(b,parts[0],AGX_SR_MESH_PAYLOAD_LO);
+      agx_get_sr_native_width_to(b,parts[1],AGX_SR_MESH_PAYLOAD_HI);
+      return agx_emit_collect_to(b,dst,2,parts);
+   }
+   case nir_intrinsic_load_mesh_primitive_storage_agx: {
+      agx_index parts[2]={agx_temp(b->shader,AGX_SIZE_32),
+                          agx_temp(b->shader,AGX_SIZE_32)};
+      agx_get_sr_native_width_to(b,parts[0],AGX_SR_MESH_PRIMITIVE_STORAGE_LO);
+      agx_get_sr_native_width_to(b,parts[1],AGX_SR_MESH_PRIMITIVE_STORAGE_HI);
+      return agx_emit_collect_to(b,dst,2,parts);
+   }
+   case nir_intrinsic_allocate_mesh_uvb_agx:
+      return agx_allocate_uvb_m5(b, agx_src_index(&instr->src[0]),
+                                 agx_src_index(&instr->src[1]));
+   case nir_intrinsic_store_mesh_uvb_agx:
+      return agx_store_uvb_m5(b, agx_src_index(&instr->src[0]),
+                              nir_intrinsic_flags(instr));
+   case nir_intrinsic_store_object_childcount_agx:
+      return agx_store_object_childcount_m5(b, agx_src_index(&instr->src[0]));
    case nir_intrinsic_load_subgroup_id:
       return agx_get_sr_native_width_to(
          b, dst, AGX_SR_SUBGROUP_INDEX_IN_THREADGROUP);
@@ -3372,6 +3405,82 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_quad_ballot_agx: {
       return agx_quad_ballot_to(b, dst, agx_src_index(&instr->src[0]));
    }
+
+   case nir_intrinsic_intersect_ray_gen1_agx:
+      return agx_intersect_ray_gen1(b, agx_src_index(&instr->src[0]),
+         agx_src_index(&instr->src[1]), agx_src_index(&instr->src[2]),
+         agx_src_index(&instr->src[3]), nir_intrinsic_base(instr));
+   case nir_intrinsic_continue_ray_gen1_agx:
+      return agx_continue_ray_gen1(b, agx_src_index(&instr->src[0]),
+                                  nir_intrinsic_base(instr));
+
+   case nir_intrinsic_load_scs_agx: {
+      agx_instr *load = agx_scs_load_agx3_to(
+         b, dst, nir_intrinsic_base(instr),
+         instr->def.bit_size == 16 ? AGX_FORMAT_I16 : AGX_FORMAT_I32,
+         BITFIELD_MASK(instr->def.num_components));
+      agx_emit_cached_split(b, dst, instr->def.num_components);
+      return load;
+   }
+
+   case nir_intrinsic_store_scs_agx:
+      return agx_scs_store_agx3(b, agx_src_index(&instr->src[0]),
+                               nir_intrinsic_base(instr),
+                               instr->src[0].ssa->bit_size == 16
+                                  ? AGX_FORMAT_I16 : AGX_FORMAT_I32,
+                               BITFIELD_MASK(instr->num_components));
+
+   case nir_intrinsic_load_scs_indexed_agx: {
+      agx_instr *load = agx_scs_load_register_indexed_agx3_to(
+         b, dst, agx_src_index(&instr->src[0]),
+         agx_src_index(&instr->src[1]), nir_intrinsic_base(instr),
+         instr->def.bit_size == 16 ? AGX_FORMAT_I16 : AGX_FORMAT_I32,
+         BITFIELD_MASK(instr->def.num_components),
+         nir_intrinsic_component(instr), nir_intrinsic_flags(instr) & 1);
+      agx_emit_cached_split(b, dst, instr->def.num_components);
+      return load;
+   }
+
+   case nir_intrinsic_store_scs_indexed_agx:
+      return agx_scs_store_register_indexed_agx3(
+         b, agx_src_index(&instr->src[0]), agx_src_index(&instr->src[1]),
+         agx_src_index(&instr->src[2]), nir_intrinsic_base(instr),
+         AGX_FORMAT_I32, BITFIELD_MASK(instr->num_components),
+         nir_intrinsic_component(instr));
+
+   case nir_intrinsic_load_scs_uniform_agx:
+   case nir_intrinsic_load_scs_base_agx: {
+      const bool uniform = instr->intrinsic == nir_intrinsic_load_scs_uniform_agx;
+      unsigned flags = nir_intrinsic_flags(instr);
+      enum agx_format fmt = agx_format_for_pipe(nir_intrinsic_format(instr));
+      unsigned mask = BITFIELD_MASK(instr->def.num_components);
+      agx_instr *load = uniform ? agx_scs_load_uniform_indexed_agx3_to(
+         b, dst, agx_src_index(&instr->src[0]), agx_src_index(&instr->src[1]),
+         nir_intrinsic_base(instr), fmt, mask, nir_intrinsic_component(instr),
+         !!(flags & 2), !!(flags & 1)) :
+         agx_scs_load_register_base_agx3_to(
+         b, dst, agx_src_index(&instr->src[0]), nir_intrinsic_base(instr),
+         fmt, mask, nir_intrinsic_component(instr), !!(flags & 1), !!(flags & 4));
+      load->scs_rt_wait = !!(flags & 8);
+      agx_emit_cached_split(b, dst, instr->def.num_components);
+      return load;
+   }
+
+   case nir_intrinsic_store_scs_uniform_agx:
+   case nir_intrinsic_store_scs_base_agx: {
+      const bool uniform = instr->intrinsic == nir_intrinsic_store_scs_uniform_agx;
+      enum agx_format fmt = agx_format_for_pipe(nir_intrinsic_format(instr));
+      unsigned mask = BITFIELD_MASK(instr->num_components);
+      return uniform ? agx_scs_store_uniform_indexed_agx3(
+         b, agx_src_index(&instr->src[0]), agx_src_index(&instr->src[1]),
+         agx_src_index(&instr->src[2]), nir_intrinsic_base(instr), fmt, mask,
+         nir_intrinsic_component(instr)) :
+         agx_scs_store_register_base_agx3(
+         b, agx_src_index(&instr->src[0]), agx_src_index(&instr->src[1]),
+         nir_intrinsic_base(instr), fmt, mask, nir_intrinsic_component(instr));
+   }
+
+
 
    case nir_intrinsic_doorbell_agx: {
       return agx_doorbell(b, nir_src_as_uint(instr->src[0]));
@@ -11368,6 +11477,115 @@ agx_nir_split_g17p_sample_tests(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+static bool
+agx_validate_scs_nir(nir_shader *nir, const struct agx_shader_key *key,
+                     bool *uses_scs)
+{
+   *uses_scs = false;
+   nir_foreach_function_with_impl(func, impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            bool valid = true, memory = false;
+            switch (in->intrinsic) {
+            case nir_intrinsic_load_scs_agx:
+               memory = true;
+               valid = in->def.num_components <= 4 &&
+                       (in->def.bit_size == 32 ||
+                        (in->def.bit_size == 16 && in->def.num_components == 1));
+               break;
+            case nir_intrinsic_store_scs_agx:
+               memory = true;
+               valid = in->src[0].ssa->num_components <= 4 &&
+                       (in->src[0].ssa->bit_size == 32 ||
+                        (in->src[0].ssa->bit_size == 16 &&
+                         in->src[0].ssa->num_components == 1));
+               break;
+            case nir_intrinsic_load_scs_indexed_agx:
+            case nir_intrinsic_store_scs_indexed_agx: {
+               const bool store = in->intrinsic == nir_intrinsic_store_scs_indexed_agx;
+               const nir_def *value = store ? in->src[0].ssa : &in->def;
+               memory = true;
+               valid = (value->bit_size == 32 || (!store && value->bit_size == 16 && value->num_components == 1)) &&
+                       value->num_components <= 4 &&
+                       in->src[store ? 1 : 0].ssa->bit_size == 32 &&
+                       in->src[store ? 2 : 1].ssa->bit_size == 32 &&
+                       nir_intrinsic_component(in) <= 4 &&
+                       (store || !(nir_intrinsic_flags(in) & ~1u));
+               break;
+            }
+            case nir_intrinsic_load_scs_uniform_agx:
+            case nir_intrinsic_store_scs_uniform_agx:
+            case nir_intrinsic_load_scs_base_agx:
+            case nir_intrinsic_store_scs_base_agx: {
+               const bool uniform = in->intrinsic == nir_intrinsic_load_scs_uniform_agx ||
+                                    in->intrinsic == nir_intrinsic_store_scs_uniform_agx;
+               const bool store = in->intrinsic == nir_intrinsic_store_scs_uniform_agx ||
+                                  in->intrinsic == nir_intrinsic_store_scs_base_agx;
+               const nir_def *value = store ? in->src[0].ssa : &in->def;
+               unsigned format = nir_intrinsic_format(in);
+               unsigned width = format == PIPE_FORMAT_R8_UINT ? 8 :
+                                format == PIPE_FORMAT_R16_UINT ? 16 :
+                                format == PIPE_FORMAT_R32_UINT ? 32 : 0;
+               unsigned flags = store ? 0 : nir_intrinsic_flags(in);
+               memory = true;
+               valid = width && value->num_components <= 4 &&
+                  (width == 32 || value->num_components == 1) &&
+                  value->bit_size == ((width == 32 || (flags & 2)) ? 32 : 16) &&
+                  in->src[store ? 1 : 0].ssa->bit_size == (uniform ? 64 : 32) &&
+                  !(nir_intrinsic_base(in) & (width / 8 - 1));
+               if (uniform)
+                  valid &= in->src[store ? 2 : 1].ssa->bit_size == 32 &&
+                           nir_intrinsic_component(in) <= 4 && !(flags & ~3u) && (!(flags & 2) || width < 32);
+               else
+                  valid &= nir_intrinsic_component(in) <= 4 && !(flags & ~13u) &&
+                           (!(flags & 8) || key->dev.encoding == AGX_ISA_ENCODING_AGX3B) &&
+                           (!(flags & 4) || ((flags & 1 || key->dev.encoding == AGX_ISA_ENCODING_AGX3B) && width == 8 &&
+                                            nir_intrinsic_component(in) == 4));
+               break;
+            }
+            case nir_intrinsic_intersect_ray_gen1_agx:
+               valid = key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                  in->src[0].ssa->bit_size == 64 &&
+                  in->src[1].ssa->bit_size == 64 &&
+                  in->src[2].ssa->bit_size == 32 &&
+                  in->src[3].ssa->bit_size == 32 &&
+                  nir_intrinsic_base(in) <= 511;
+               break;
+            case nir_intrinsic_continue_ray_gen1_agx:
+               valid = key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                  in->src[0].ssa->bit_size == 32 && nir_intrinsic_base(in) <= 1;
+               break;
+            default:
+               continue;
+            }
+            if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                (in->intrinsic == nir_intrinsic_load_scs_uniform_agx ||
+                 in->intrinsic == nir_intrinsic_load_scs_base_agx ||
+                 in->intrinsic == nir_intrinsic_load_scs_indexed_agx))
+               valid &= nir_intrinsic_flags(in) == 0 ||
+                        (in->intrinsic == nir_intrinsic_load_scs_base_agx &&
+                         (nir_intrinsic_flags(in) == 4 || nir_intrinsic_flags(in) == 8 ||
+                          nir_intrinsic_flags(in) == 12) &&
+                         nir_intrinsic_format(in) == PIPE_FORMAT_R8_UINT &&
+                         nir_intrinsic_component(in) == 4);
+            *uses_scs = true;
+            if (memory)
+               valid &= nir_intrinsic_base(in) >= INT16_MIN &&
+                        nir_intrinsic_base(in) <= INT16_MAX;
+            if (!valid || (key->dev.encoding != AGX_ISA_ENCODING_AGX3C &&
+                           key->dev.encoding != AGX_ISA_ENCODING_AGX3B)) {
+               agx_set_refusal(NULL, "unsupported SCS intrinsic", __LINE__);
+               return false;
+            }
+         }
+      }
+   }
+   return true;
+}
+
 bool
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
@@ -11382,6 +11600,10 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    struct util_dynarray binary = UTIL_DYNARRAY_INIT;
 
    memset(out, 0, sizeof *out);
+
+   bool uses_scs;
+   if (!agx_validate_scs_nir(nir, key, &uses_scs))
+      return false;
 
    /* Record API/source arithmetic before backend lowering introduces its own
     * 64-bit address and invocation-ID calculations. */
@@ -11690,7 +11912,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
    info->local_size = nir->info.shared_size;
    info->uses_resource_info_query = nir->info.uses_resource_info_query;
-   info->uses_ray_traversal = nir->info.ray_queries != 0;
+   info->uses_ray_traversal = nir->info.ray_queries != 0 || uses_scs;
    /* NIR ray_queries counts inline intersection_query variables, matching the
     * G17S next()/committed witness whose ShaderInfo ID32 is nonzero.  Future
     * one-shot/full traversal lowerings must set uses_ray_traversal without
@@ -11785,8 +12007,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
       info->reads_tib = nir->info.fs.uses_fbfetch_output;
       info->early_fragment_tests = nir->info.fs.early_fragment_tests;
-   } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
-      info->imageblock_stride = nir->info.cs.image_block_size_per_thread_agx;
+   } else if (nir->info.stage == MESA_SHADER_COMPUTE ||
+              nir->info.stage == MESA_SHADER_MESH ||
+              nir->info.stage == MESA_SHADER_TASK) {
+      if (nir->info.stage == MESA_SHADER_COMPUTE)
+         info->imageblock_stride = nir->info.cs.image_block_size_per_thread_agx;
 
       for (unsigned i = 0; i < 3; ++i) {
          info->workgroup_size[i] = nir->info.workgroup_size[i];

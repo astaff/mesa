@@ -17,6 +17,7 @@ hk_files = files(
   'hk_cs_root_size.h',
   'hk_cmd_clear.c',
   'hk_cmd_dispatch.c',
+  'hk_gen1_query_state.c',
   'hk_cmd_draw.c',
   'hk_cmd_meta.c',
   'hk_cmd_trace_rays.c',

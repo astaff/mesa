@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "pipe/p_defines.h"
+#include "util/u_debug.h"
 #include "vulkan/vulkan_core.h"
 #include "agx_abi.h"
 #include "agx_nir_texture.h"
@@ -372,10 +373,63 @@ load_image_handle(nir_builder *b, const struct lower_descriptors_ctx *ctx,
 }
 
 static bool
+lower_g17p_r32_3d_diagnostic(nir_builder *b, nir_intrinsic_instr *intr,
+                           const struct lower_descriptors_ctx *ctx)
+{
+   if (ctx->descriptor_generation != 9 ||
+       !debug_get_bool_option("ASAHI_G17P_R32_3D_ADDRESS_DIAGNOSTIC", false) ||
+       (intr->intrinsic != nir_intrinsic_image_deref_load &&
+        intr->intrinsic != nir_intrinsic_image_deref_store) ||
+       nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_3D ||
+       nir_intrinsic_format(intr) != PIPE_FORMAT_R32_SINT)
+      return false;
+
+   const struct hk_storage_image_descriptor_layout native =
+      hk_storage_image_descriptor_layout(ctx->descriptor_generation);
+   nir_def *pbe = load_image_handle(b, ctx, intr->src[0], native.pbe);
+   nir_def *texture = load_image_handle(b, ctx, intr->src[0], native.texture);
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *size = nir_bindless_image_size(
+      b, 3, 32, texture, nir_imm_int(b, 0),
+      .image_dim = GLSL_SAMPLER_DIM_3D, .image_array = false);
+   nir_def *valid = nir_ball(b, nir_ult(b, nir_trim_vector(b, coord, 3), size));
+   nir_def *address = nir_bindless_image_texel_address(
+      b, 64, pbe, coord, intr->src[2].ssa,
+      .image_dim = GLSL_SAMPLER_DIM_3D, .image_array = false,
+      .format = PIPE_FORMAT_R32_SINT, .access = nir_intrinsic_access(intr));
+   const enum gl_access_qualifier access = nir_intrinsic_access(intr) &
+      (ACCESS_COHERENT | ACCESS_VOLATILE | ACCESS_RESTRICT | ACCESS_NON_TEMPORAL);
+
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_push_if(b, valid);
+   nir_def *value = NULL;
+   if (intr->intrinsic == nir_intrinsic_image_deref_store) {
+      nir_store_global(b, nir_channel(b, intr->src[3].ssa, 0), address,
+                       .align_mul = 4, .access = access);
+   } else {
+      value = nir_load_global(b, 1, 32, address, .align_mul = 4,
+                              .access = access);
+   }
+   nir_push_else(b, NULL);
+   nir_pop_if(b, NULL);
+   if (value) {
+      nir_def *loaded = nir_if_phi(b, value, zero);
+      nir_def *vec = nir_vec4(b, loaded, zero, zero, nir_b2i32(b, valid));
+      nir_def_rewrite_uses(&intr->def, nir_trim_vector(b, vec,
+                                                     intr->def.num_components));
+   }
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static bool
 lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
 {
    b->cursor = nir_before_instr(&intr->instr);
+
+   if (lower_g17p_r32_3d_diagnostic(b, intr, ctx))
+      return true;
 
    /* Reads and queries use the texture descriptor; writes and atomics PBE. */
    const struct hk_storage_image_descriptor_layout native =
@@ -523,6 +577,16 @@ lower_uvs_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
    case nir_intrinsic_load_draw_id: {
       b->cursor = nir_instr_remove(&intrin->instr);
 
+      
+
+      if (args->sw_stage == MESA_SHADER_MESH &&
+          intrin->intrinsic == nir_intrinsic_load_draw_id) {
+         unsigned offset = hk_root_descriptor_offset(mesh_draw_id);
+         nir_def *val = load_root(b, 1, 32, nir_imm_int(b, offset), 4);
+         nir_def_rewrite_uses(&intrin->def, nir_u2uN(b, val, intrin->def.bit_size));
+         return true;
+      }
+
       unsigned base = args->uniform_base +
                       AGX_ABI_VUNI_FIRST_VERTEX(args->nr_vbos);
       unsigned size = 32;
@@ -546,10 +610,10 @@ lower_uvs_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
       unsigned off1 = hk_root_descriptor_offset(draw.pipeline_stats);
       unsigned off2 = hk_root_descriptor_offset(draw.pipeline_stats_flags);
-      static_assert(hk_root_descriptor_offset(draw.pipeline_stats) == 368,
+      static_assert(hk_root_descriptor_offset(draw.pipeline_stats) == 432,
                     "pipeline-statistics compiler oracle ABI");
       static_assert(hk_root_descriptor_offset(draw.pipeline_stats_flags) ==
-                       376,
+                       440,
                     "pipeline-statistics compiler oracle ABI");
 
       nir_def *base = load_root(b, 1, 64, nir_imm_int(b, off1), 8);
@@ -673,6 +737,15 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
 
    case nir_intrinsic_load_num_workgroups: {
       b->cursor = nir_instr_remove(&intrin->instr);
+
+      
+
+      if (b->shader->info.stage == MESA_SHADER_MESH) {
+         unsigned offset = hk_root_descriptor_offset(mesh_grid_addr);
+         nir_def *ptr = load_root(b, 1, 64, nir_imm_int(b, offset), 8);
+         nir_def_rewrite_uses(&intrin->def, load_speculatable(b, 3, 32, ptr, 4));
+         return true;
+      }
 
       unsigned offset = hk_root_descriptor_offset(cs.group_count_addr);
       nir_def *ptr = load_root(b, 1, 64, nir_imm_int(b, offset), 4);
@@ -1266,8 +1339,12 @@ hk_nir_lower_descriptors(nir_shader *nir,
     * TODO: See if we can unify this, not sure if the fast path matters on
     * Apple. This is inherited from NVK.
     */
+   const nir_metadata preserved =
+      ctx.descriptor_generation == 9 &&
+      debug_get_bool_option("ASAHI_G17P_R32_3D_ADDRESS_DIAGNOSTIC", false)
+         ? nir_metadata_none : nir_metadata_control_flow;
    bool pass_lower_descriptors = nir_shader_instructions_pass(
-      nir, try_lower_descriptors_instr, nir_metadata_control_flow, &ctx);
+      nir, try_lower_descriptors_instr, preserved, &ctx);
 
    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);

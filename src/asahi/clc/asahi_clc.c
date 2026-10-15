@@ -267,6 +267,12 @@ target_supports_program(const char *target, const nir_function *func)
     * compressed render-pass clears dispatch this program for metadata/body. */
    return strcmp(target, "g17p") ||
           !strcmp(func->name, "libagx_fill_uint4") ||
+          !strcmp(func->name, "libagx_gen1_as_property") ||
+          !strcmp(func->name, "libagx_gen1_as_copy") ||
+          !strcmp(func->name, "libagx_gen1_as_serialize") ||
+          !strcmp(func->name, "libagx_gen1_as_deserialize") ||
+          !strcmp(func->name, "libagx_gen1_as_deserialize_references") ||
+          !strcmp(func->name, "libagx_gen1_as_empty") ||
           !strcmp(func->name, "libagx_fast_clear") ||
           !strcmp(func->name, "libagx_copy_image") ||
           !strcmp(func->name, "libagx_mipmap_unorm8x4") ||

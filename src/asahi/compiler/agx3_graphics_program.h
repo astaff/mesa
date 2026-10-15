@@ -52,6 +52,7 @@ struct agx3_g17p_graphics_program_desc {
    uint16_t nr_gprs;
    bool compiler_d_valid;
    uint32_t compiler_d;
+   uint32_t threadgroup_memory_size_B;
    bool fragment;
    bool writes_sample_mask;
    uint8_t colour_classes;

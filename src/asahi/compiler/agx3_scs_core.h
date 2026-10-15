@@ -12,9 +12,9 @@
  * signed 16-bit byte displacement.  Loads and stores may move one, two or four
  * 32-bit components.
  *
- * The two register-base kinds and any component mask other than one are
- * witnessed on AGX3b only and fail closed on AGX3c.  Other scales still fail
- * closed.
+ * AGX3c supports W32 vectors and direct, uniform-indexed, and register-base
+ * addressing witnessed in Apple's ray setup. Its destination-less traversal
+ * epilogue has a separate descriptor and API below.
  */
 
 #pragma once
@@ -92,7 +92,42 @@ struct agx3_scs_desc {
     * lowering leaves this clear while decode/replay preserves Apple vectors.
     */
    bool c_load_marker;
+
+   /* AGX3c f27 marks the index operand's final use. Store-side f76=1 is
+    * preserved without assigning an unverified scheduling meaning to it. */
+   bool index_kill;
+   bool c_store_marker;
+
+   /* Native AGX3c byte-status polling pairs f75=2 and f77=2. Keep the
+    * combination explicit; its conversion semantics are not established. */
+   bool c_status_load;
+   bool b_status_load;
+
+   /* Final use of the slot-B GPR base in native M5 instanced traversal. */
+   bool base_kill;
 };
+
+/* Native AGX3c traversal epilogue: f9=0 and f12=0 mean there is no ordinary
+ * destination or scoreboard slot. Do not lower this through a GPR load.
+ * f24=1 supplies a 16-bit index; f28=1 and f80=1 are fixed native controls.
+ * The operation's wider memory/coherency semantics remain to be qualified. */
+struct agx3_scs_epilogue_desc {
+   uint16_t index;
+   uint16_t base_register;
+   int16_t byte_offset;
+   uint8_t component_mask;
+   uint8_t address_selector;
+   bool index_kill;
+   bool base_kill;
+   bool c_load_marker;
+};
+
+bool agx3_scs_encode_epilogue(enum agx_isa_encoding enc,
+                              const struct agx3_scs_epilogue_desc *desc,
+                              uint8_t out[AGX3_SCS_MAX_LENGTH], uint8_t *length);
+bool agx3_scs_decode_epilogue(enum agx_isa_encoding enc, const uint8_t *bytes,
+                              size_t length,
+                              struct agx3_scs_epilogue_desc *out);
 
 bool agx3_scs_encode_load(enum agx_isa_encoding enc,
                           const struct agx3_scs_desc *desc,
@@ -100,6 +135,12 @@ bool agx3_scs_encode_load(enum agx_isa_encoding enc,
 bool agx3_scs_encode_store(enum agx_isa_encoding enc,
                            const struct agx3_scs_desc *desc,
                            uint8_t out[AGX3_SCS_MAX_LENGTH], uint8_t *length);
+
+/* Accept only encodings that reproduce every input byte when re-encoded. */
+bool agx3_scs_decode_load(enum agx_isa_encoding enc, const uint8_t *bytes,
+                         size_t length, struct agx3_scs_desc *out);
+bool agx3_scs_decode_store(enum agx_isa_encoding enc, const uint8_t *bytes,
+                          size_t length, struct agx3_scs_desc *out);
 
 #ifdef __cplusplus
 }

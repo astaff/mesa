@@ -427,6 +427,8 @@ bool agx_nir_lower_g17p_1x_sample_shading(nir_shader *s);
 bool agx_nir_lower_fs_active_samples_to_register(nir_shader *s);
 
 bool agx_nir_lower_non_monolithic_uniforms(nir_shader *nir, unsigned nr);
+bool agx_nir_lower_non_monolithic_uniforms_at(nir_shader *nir, unsigned nr,
+                                              unsigned uniform_base);
 
 #ifdef __cplusplus
 } /* extern C */

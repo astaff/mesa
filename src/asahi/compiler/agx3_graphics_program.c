@@ -12,6 +12,7 @@
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx_ioto_state_core.h"
 #include "util/macros.h"
+#include "util/u_debug.h"
 
 #include <string.h>
 
@@ -47,6 +48,23 @@ graphics_state_tail(const struct agx3_g17p_graphics_program_desc *desc,
          return false;
    } else {
       memcpy(staged.bytes, vertex_speclm, AGX_IOTO_SPECLM_SIZE);
+   }
+   if (desc->threadgroup_memory_size_B) {
+      if (desc->fragment || desc->threadgroup_memory_size_B > 32768)
+         return false;
+
+      struct agx_ioto_state_tail local = {
+         .type = AGX_IOTO_STATE_TAIL_TYPE0,
+      };
+      local.speclm.f[18] = ALIGN_POT(desc->threadgroup_memory_size_B, 64);
+      local.speclm.f[24] = 1;
+      local.ldshdr.f[0] = desc->shader_va;
+      local.ldshdr.f[23] = 1;
+      struct agx_ioto_state_tail_output packed;
+      if (!agx_ioto_state_tail_pack(AGX_CHIP_G17P, &local, &packed))
+         return false;
+      memcpy(staged.bytes, packed.bytes, AGX_IOTO_SPECLM_SIZE);
+      staged.bytes[3] |= UINT8_C(0x40);
    }
    uint8_t *spectpr_out =
       staged.bytes + AGX_IOTO_SPECLM_SIZE + AGX_IOTO_LDSHDR_SIZE;
@@ -206,7 +224,10 @@ graphics_program_write_unpublished(
    /* Zero remains the conservative no-colour/default-fragment spelling.  It
     * has the same loader release mask as one active colour partition. */
    const unsigned colour_classes =
-      !desc->fragment ? 0 : desc->colour_classes ? desc->colour_classes : 1;
+      !desc->fragment ? 0
+      : desc->colour_classes ? desc->colour_classes
+      : debug_get_bool_option("ASAHI_G17P_ZERO_COLOUR_RELEASE_DIAGNOSTIC", false)
+         ? 0 : 1;
 
    struct agx_ioto_state_tail_output tail;
    if (!graphics_state_tail(desc, &tail))

@@ -273,6 +273,16 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
    agx_foreach_ssa_src(I, s) {
       agx_index src = I->src[s];
+      if (I->op == AGX_OPCODE_INTERSECT_RAY_GEN1 ||
+          I->op == AGX_OPCODE_SCS_STORE_AGX3 ||
+          I->op == AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3 ||
+          I->op == AGX_OPCODE_SCS_STORE_REGISTER_INDEXED_AGX3 ||
+          I->op == AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3 ||
+          I->op == AGX_OPCODE_SCS_STORE_REGISTER_BASE_AGX3 ||
+          I->op == AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3 ||
+          I->op == AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3)
+         continue;
+
       /* Either compared source of a tied minimum/maximum may be inlined,
        * because the fold below carries it into its partner as well and so
        * keeps the tie. */
@@ -280,6 +290,10 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !(s < 2 && agx_g17p_tied_minmax(ctx, I)))
          continue;
       if (src.neg)
+         continue;
+      if (I->op == AGX_OPCODE_ALLOCATE_UVB_M5 ||
+          I->op == AGX_OPCODE_STORE_UVB_M5 ||
+          I->op == AGX_OPCODE_STORE_OBJECT_CHILDCOUNT_M5)
          continue;
 
       /* G17P's native subtraction takes two registers. Instruction selection
@@ -614,6 +628,9 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
           !(I->op == AGX_OPCODE_DEVICE_LOAD && s == 0) &&
           !(I->op == AGX_OPCODE_DEVICE_STORE && s == 1) &&
           !(I->op == AGX_OPCODE_ATOMIC && s == 1) &&
+          !(I->op == AGX_OPCODE_INTERSECT_RAY_GEN1 && s < 2) &&
+          !(I->op == AGX_OPCODE_SCS_LOAD_UNIFORM_INDEXED_AGX3 && s == 0) &&
+          !(I->op == AGX_OPCODE_SCS_STORE_UNIFORM_INDEXED_AGX3 && s == 1) &&
           !(I->op == AGX_OPCODE_TEXTURE_SAMPLE && (s == 3 || s == 4) &&
             ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             def->src[0].type == AGX_INDEX_UNIFORM))

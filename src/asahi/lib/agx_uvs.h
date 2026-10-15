@@ -8,10 +8,12 @@
 #include <stdint.h>
 #include "agx_pack.h"
 #include "shader_enums.h"
+#include "../compiler/agx_mesh_abi.h"
 
 struct nir_shader;
 
 /* Matches the hardware order */
+
 enum uvs_group {
    UVS_POSITION,
    UVS_VARYINGS,
@@ -49,7 +51,7 @@ struct agx_unlinked_uvs_layout {
    /* Size of the UVS_VARYINGS */
    uint8_t user_size;
 
-   uint8_t pad;
+   bool mesh_primitive_page;
 
    /* Number of 32-bit components written for each slot. TODO: Model 16-bit.
     *

@@ -58,7 +58,7 @@
  * guard, leaves it clear (agx3_sr_desc::fragment_active_index).
  */
 static bool
-agx3_sr_witnessed(uint8_t sr, enum agx3_sr_width width)
+agx3_sr_witnessed(enum agx_isa_encoding enc, uint8_t sr, enum agx3_sr_width width)
 {
    if (width == AGX3_SR_W16) {
       switch (sr) {
@@ -69,11 +69,17 @@ agx3_sr_witnessed(uint8_t sr, enum agx3_sr_width width)
       case 2: case 39: case 41:
       /* G17P builtin BG array reloads read their layer with 34c31046. */
       case 12:
+      /* G17P instance main +0x61a and M5 ray entry read SR59. */
+      case 59:
          return true;
+      case 65:
+         return enc == AGX_ISA_ENCODING_AGX3B;
       default:
          return false;
       }
    }
+   if (width == AGX3_SR_W32 && sr == 64)
+      return enc == AGX_ISA_ENCODING_AGX3B;
    if (width == AGX3_SR_W32)
       return (sr >= 23 && sr <= 28) || (sr >= 46 && sr <= 49) || sr == 51;
    return false;
@@ -85,7 +91,7 @@ agx3_sr_encode(enum agx_isa_encoding enc, const struct agx3_sr_desc *d,
 {
    if (d == NULL || d->dest >= 256)
       return false;
-   if (!agx3_sr_witnessed(d->sr, d->width))
+   if (!agx3_sr_witnessed(enc, d->sr, d->width))
       return false;
    /* 32-bit reads write a register pair; every witness is 2-aligned. */
    if (d->width == AGX3_SR_W32 && (d->dest & 1) != 0)

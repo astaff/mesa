@@ -312,6 +312,8 @@ agx_assign_uvs(struct agx_varyings_vs *varyings,
    /* Layer/viewport always flat-shaded, no other special varyings are */
    flat_mask &= BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32);
    flat_mask |= VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT;
+   if (layout->mesh_primitive_page)
+      flat_mask |= BITFIELD64_BIT(AGX_MESH_PRIMITIVE_PAGE_SLOT);
 
    /* The internal cull distance slots are always linearly-interpolated */
    linear_mask |= BITFIELD64_RANGE(VARYING_SLOT_CULL_PRIMITIVE, 2);
@@ -413,6 +415,12 @@ agx_link_varyings_vs_fs(void *out, struct agx_varyings_vs *vs,
          } else if (b.slot == VARYING_SLOT_PRIMITIVE_ID &&
                     !vs->slots[VARYING_SLOT_PRIMITIVE_ID]) {
             cfg.source = AGX_COEFFICIENT_SOURCE_PRIMITIVE_ID;
+            
+
+
+            const char *probe_source = getenv("ASAHI_MESH_PP_VIT_SOURCE");
+            if (probe_source)
+               cfg.source = atoi(probe_source) & 7;
             *generate_primitive_id = true;
          } else if (b.slot == VARYING_SLOT_POS) {
             assert(b.offset >= 2 && "gl_Position.xy are not varyings");

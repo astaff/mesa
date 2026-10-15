@@ -238,6 +238,9 @@ struct hk_root_descriptor_table {
 
    /* Process-local on G17P; loaded through the root instead of cached code. */
    uint64_t printf_buffer_address;
+   uint32_t mesh_draw_id;
+   uint64_t mesh_grid_addr;
+   uint64_t mesh_prims_query;
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
@@ -667,6 +670,12 @@ struct hk_graphics_state {
       enum mesa_prim prim;
    } tess;
 
+   
+   struct {
+      struct agx_ptr params;
+      uint64_t grid, object_program, object_params;
+   } mesh;
+
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;
    struct vk_sample_locations_state _dynamic_sl;
@@ -771,6 +780,9 @@ struct hk_cs {
     * samplers (especially for GL/DX11-era engines).
     */
    bool uses_sampler_heap;
+   bool gen1_native_rq;
+   bool gen1_native_fragment_rq;
+   bool gen1_native_vertex_rq;
 
    /* Scratch requirements */
    struct {
@@ -962,6 +974,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    }
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
+   a->gen1_native_rq |= b->gen1_native_rq;
    a->scratch.cs.main |= b->scratch.cs.main;
    a->scratch.cs.preamble |= b->scratch.cs.preamble;
 
@@ -1030,6 +1043,14 @@ struct hk_ioto_arena {
    uint64_t chunk_bytes;
 };
 
+struct hk_gen1_as_table_chunk {
+   struct list_head link;
+   struct agx_bo *tail;
+   struct agx_bo *bank;
+   struct agx_va *va;
+   uint32_t next, count;
+};
+
 struct hk_cmd_buffer {
    struct vk_command_buffer vk;
 
@@ -1060,6 +1081,7 @@ struct hk_cmd_buffer {
    /* Most recently addressed span. Recording often references the current
     * 4 KiB VDM chunk many times before moving to the next one. */
    struct hk_vdm_allocation *g17p_vdm_last_allocation;
+   struct list_head gen1_as_table_chunks;
 
    /* List of all recorded control streams */
    struct list_head control_streams;
@@ -1271,8 +1293,13 @@ hk_bound_hw_vs(struct hk_graphics_state *gfx)
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
    struct hk_api_shader *tes = gfx->shaders[MESA_SHADER_TESS_EVAL];
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
+   struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
 
-   if (gs)
+   
+
+   if (mesh)
+      return &mesh->variants[HK_MESH_VARIANT_MAIN];
+   else if (gs)
       return &gs->variants[HK_GS_VARIANT_RAST];
    else if (tes)
       return &tes->variants[HK_VS_VARIANT_HW];
@@ -1286,6 +1313,11 @@ hk_bound_sw_vs(struct hk_graphics_state *gfx)
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
    struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
 
+   
+
+   if (!vs)
+      return hw_vs;
+
    if (hw_vs == &vs->variants[HK_VS_VARIANT_HW])
       return hw_vs;
    else
@@ -1298,6 +1330,10 @@ hk_bound_sw_vs_before_gs(struct hk_graphics_state *gfx)
    struct hk_api_shader *vs = gfx->shaders[MESA_SHADER_VERTEX];
    struct hk_api_shader *tes = gfx->shaders[MESA_SHADER_TESS_EVAL];
    struct hk_api_shader *api = tes ?: vs;
+
+   
+   if (!api)
+      return NULL;
 
    return &api->variants[HK_VS_VARIANT_SW];
 }
@@ -1762,6 +1798,9 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
                               const struct hk_shader *s);
 
+uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
+                                      struct hk_shader *s,
+                                      struct hk_linked_shader *linked, bool object);
 uint64_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
 
@@ -1783,6 +1822,9 @@ void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
 void hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                              struct hk_shader *s, struct agx_grid grid,
                              struct agx_workgroup local_size);
+
+bool hk_gen1_upload_fragment_query_state(struct hk_cmd_buffer *cmd, bool vertex_stage,
+   struct agx3_ioto_uniform_range *range);
 
 void hk_g17p_prewarm_linked_compute_shader(struct hk_device *dev,
                                             struct hk_shader *s,
@@ -1827,6 +1869,11 @@ void hk_cmd_dispatch_rays(struct hk_cmd_buffer *cmd,
 void hk_cmd_dispatch_unaligned(VkCommandBuffer commandBuffer,
                                uint32_t invocations_x, uint32_t invocations_y,
                                uint32_t invocations_z);
+
+/* Driver-owned, resident indirect arguments addressed through their primary
+ * GPU VA. Sparse application buffers must use the public entrypoint. */
+void hk_cmd_dispatch_indirect_addr(VkCommandBuffer command_buffer,
+                                   VkDeviceAddress address);
 
 static inline void
 hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,

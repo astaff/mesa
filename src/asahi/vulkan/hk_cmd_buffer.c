@@ -175,6 +175,8 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
 
+   hk_cmd_pool_free_gen1_as_chunks(pool, &cmd->gen1_as_table_chunks);
+
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_MAIN, &cmd->uploader.main.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_USC, &cmd->uploader.usc.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_ROOT, &cmd->uploader.root.bos);
@@ -245,6 +247,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    list_inithead(&cmd->uploader.usc.bos);
    list_inithead(&cmd->uploader.root.bos);
    list_inithead(&cmd->vdm_allocations);
+   list_inithead(&cmd->gen1_as_table_chunks);
    list_inithead(&cmd->control_streams);
 
    *cmd_buffer_out = &cmd->vk;
@@ -1088,7 +1091,8 @@ hk_CmdBindDescriptorSets2KHR(
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
-   if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+   if (pBindDescriptorSetsInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
+       VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) {
       hk_bind_descriptor_sets(cmd, &cmd->state.gfx.descriptors,
                               pBindDescriptorSetsInfo);
    }
@@ -1127,7 +1131,8 @@ hk_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
-   if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+   if (pPushConstantsInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
+       VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT))
       hk_push_constants(cmd, &cmd->state.gfx.descriptors, pPushConstantsInfo);
 
    if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -1188,7 +1193,8 @@ hk_CmdPushDescriptorSet2KHR(
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
 
-   if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS) {
+   if (pPushDescriptorSetInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
+       VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) {
       hk_push_descriptor_set(cmd, &cmd->state.gfx.descriptors,
                              pPushDescriptorSetInfo);
    }
@@ -1447,12 +1453,14 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
     * launches: the API vertex shader, the post-tessellation vertex program,
     * or the geometry raster-copy variant. */
    struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const bool mesh=gfx->shaders[MESA_SHADER_MESH]!=NULL;
    const struct hk_shader *vs =
-      gfx->shaders[MESA_SHADER_VERTEX] ? hk_bound_hw_vs(gfx) : NULL;
+      (gfx->shaders[MESA_SHADER_VERTEX]||mesh) ? hk_bound_hw_vs(gfx) : NULL;
    if (!vs || cf->nr_bindings > HK_AGX3_G17P_MAX_COEFFICIENTS ||
        cf->nr_cf > HK_AGX3_G17P_MAX_COEFFICIENTS ||
-       vs->agx3_vdm_state_update.source_layout !=
-          AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT ||
+       ((!mesh || vs->info.stage!=MESA_SHADER_MESH) &&
+        vs->agx3_vdm_state_update.source_layout !=
+          AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT) ||
        vs->info.uvs.user_size > HK_AGX3_G17P_MAX_USER_WORDS)
       return false;
 
@@ -1553,7 +1561,13 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
             next_cf += b->count;
             continue;
          }
-         const bool user_slot = (b->slot >= VARYING_SLOT_VAR0 &&
+         const bool primitive_page = mesh &&
+            vs->info.uvs.mesh_primitive_page &&
+            b->slot == AGX_MESH_PRIMITIVE_PAGE_SLOT &&
+            b->count == vs->info.uvs.components[AGX_MESH_PRIMITIVE_PAGE_SLOT] &&
+            b->count >= 1 && b->count <= 2 &&
+            b->offset == 0 && !b->smooth && !b->perspective;
+         const bool user_slot = primitive_page || (b->slot >= VARYING_SLOT_VAR0 &&
                                  b->slot <= VARYING_SLOT_VAR31) ||
                                 b->slot == VARYING_SLOT_LAYER ||
                                 b->slot == VARYING_SLOT_VIEWPORT || clip_slot ||
@@ -1867,6 +1881,16 @@ hk_g17p_graphics_uniform_ranges(
    const uint64_t root_ptr = cmd->state.gfx.root;
    size_t count = 0;
    const unsigned root_uniform = s->info.agx3_root_uniform;
+   const unsigned texture_uniform_base = s->info.agx3_gen1_fragment_rq ? 168 : 0;
+   if (s->info.agx3_gen1_fragment_rq) {
+      if (linked->g17p_prolog_uses_root ||
+          agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) ||
+          hk_cmd_uses_blend_constant(cmd) ||
+          !hk_gen1_upload_fragment_query_state(
+             cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count]))
+         return hk_g17p_graphics_ranges_refused(range_count,count);
+      count++;
+   }
 
    const bool native_spills = s->info.stage == MESA_SHADER_FRAGMENT &&
       agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer);
@@ -1874,9 +1898,9 @@ hk_g17p_graphics_uniform_ranges(
    if (s->info.stage == MESA_SHADER_VERTEX) {
       const unsigned nr_attribs = DIV_ROUND_UP(
          BITSET_LAST_BIT(s->info.vs.attrib_components_read), 4);
-      const unsigned uniform_base = s->info.agx3_indexed_sampler_valid
+      const unsigned uniform_base = (s->info.agx3_indexed_sampler_valid
          ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
-         : 0;
+         : 0) + texture_uniform_base;
       if (nr_attribs > AGX_MAX_VBUFS)
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
@@ -1932,6 +1956,9 @@ hk_g17p_graphics_uniform_ranges(
          };
       }
 
+   } else if (s->info.stage == MESA_SHADER_MESH) {
+      
+
    } else if ((s->info.stage == MESA_SHADER_GEOMETRY ||
                s->info.stage == MESA_SHADER_TESS_EVAL) &&
               s->b.info.stage == MESA_SHADER_VERTEX) {
@@ -1965,7 +1992,7 @@ hk_g17p_graphics_uniform_ranges(
          sources[count] = HK_G17P_RANGE_SOURCE_ROOT;
          count++;
       }
-   } else {
+   } else if (s->info.stage != MESA_SHADER_MESH) {
       return hk_g17p_graphics_ranges_refused(range_count, count);
    }
 
@@ -2060,7 +2087,7 @@ hk_g17p_graphics_uniform_ranges(
 
       sources[count] = HK_G17P_RANGE_SOURCE_UPLOADED;
       ranges[count++] = (struct agx3_ioto_uniform_range){
-         .start_halfs = 0,
+         .start_halfs = texture_uniform_base,
          .size_halfs = 8,
          .address = pointers_va,
       };
@@ -2078,7 +2105,7 @@ hk_g17p_graphics_uniform_ranges(
       const uint64_t pointers_va = dev->rodata.indexed_heap_pointers;
       sources[count] = HK_G17P_RANGE_SOURCE_CONSTANT;
       ranges[count++] = (struct agx3_ioto_uniform_range){
-         .start_halfs = 0, .size_halfs = 8, .address = pointers_va,
+         .start_halfs = texture_uniform_base, .size_halfs = 8, .address = pointers_va,
       };
    }
 
@@ -2716,6 +2743,60 @@ hk_g17p_graphics_program_desc_init(
    return true;
 }
 
+uint64_t
+hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                              struct hk_linked_shader *linked, bool object)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (dev->dev.chip != AGX_CHIP_G17P || !linked ||
+       !linked->b.g17p_compiler_d_valid ||
+       hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)
+      goto refused;
+   struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   size_t count = 0;
+   if (object) {
+      const uint64_t grid = cmd->state.gfx.mesh.object_params ?: cmd->state.gfx.mesh.grid;
+      if (!grid)
+         goto refused;
+      ranges[count++] = (struct agx3_ioto_uniform_range) {
+         .start_halfs = 0, .size_halfs = 4,
+         .address = hk_pool_upload(cmd, &grid, sizeof(grid), 8),
+      };
+   } else if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked,
+                                               ranges, &count, NULL)) {
+      goto refused;
+   }
+
+   struct agx3_g17p_graphics_program_desc d = {
+      .threadgroup_memory_size_B = object ? 0 : s->b.info.local_size,
+      .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
+      .uniform_ranges = ranges, .uniform_range_count = count,
+      .shader_binary_size = linked->b.size,
+      .scratch_size = MAX2(linked->b.scratch_size,
+                           s->b.info.scratch_size),
+      .nr_gprs = linked->b.nr_gprs,
+      .compiler_d_valid = linked->b.g17p_compiler_d_valid,
+      .compiler_d = linked->b.g17p_compiler_d,
+
+   };
+   size_t bound;
+   if (!agx3_g17p_graphics_program_bound(dev->dev.chip, ranges, count, &bound))
+      goto refused;
+   struct agx_ptr allocation = hk_pool_usc_alloc(cmd, bound, 64);
+   if (!allocation.cpu)
+      return 0;
+   d.program_va = allocation.gpu;
+   struct agx3_g17p_graphics_program program;
+   if (!agx3_g17p_graphics_program_generate(dev->dev.chip, &d, &program))
+      goto refused;
+   memcpy(allocation.cpu, program.bytes, program.length);
+   return allocation.gpu;
+refused:
+   mesa_loge("native mesh/object program refused: object=%u", object);
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   return 0;
+}
+
 static uint64_t
 hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked)
@@ -2739,7 +2820,8 @@ hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          agfx->shaders[MESA_SHADER_VERTEX] ? hk_bound_hw_vs(agfx) : NULL;
       const uint8_t flags = hk_g17p_launch_flags(cmd, s);
       struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, stage, linked);
-      if (hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
+      if (!s->info.agx3_gen1_fragment_rq &&
+          hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
          const uint64_t published =
             hk_g17p_launch_replay(cmd, launch, linked, cached);
          if (published)
