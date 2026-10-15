@@ -798,6 +798,13 @@ hk_hash_graphics_state(struct vk_physical_device *device,
                           sizeof(no_fragment_shader));
    }
 
+   /* M5 triangle mesh point-size removal is a pipeline-only lowering. */
+   if (agx_chip_g17_m5(((struct hk_physical_device *)device)->dev.chip) &&
+       (stages & VK_SHADER_STAGE_MESH_BIT_EXT)) {
+      const bool pipeline_mesh = state != NULL;
+      _mesa_blake3_update(&blake3_ctx, &pipeline_mesh, sizeof(pipeline_mesh));
+   }
+
    enum hk_feature_key feature_key = hk_make_feature_key(features);
    _mesa_blake3_update(&blake3_ctx, &feature_key, sizeof(feature_key));
 
@@ -5222,7 +5229,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
           !(nir->info.outputs_written & VARYING_BIT_PSIZ))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_mesh_default_point_size, nir_metadata_control_flow, NULL);
-      if (dev->dev.chip == AGX_CHIP_G17P &&
+      if ((dev->dev.chip == AGX_CHIP_G17P ||
+           (state && agx_chip_g17_m5(dev->dev.chip))) &&
           nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES &&
           !(nir->info.outputs_read & VARYING_BIT_PSIZ))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,

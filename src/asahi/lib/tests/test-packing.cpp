@@ -4,6 +4,9 @@
  */
 
 #include "agx_pack.h"
+#include "agx_vdm_mesh_core.h"
+#include <cstring>
+#include <array>
 
 #include <gtest/gtest.h>
 
@@ -81,5 +84,34 @@ TEST(Groups, Decode)
          __gen_from_groups(group_cases[i].encoded, group_cases[i].group_size,
                            group_cases[i].length),
          expected);
+   }
+}
+
+
+TEST(M5MeshLimits, MatchesNativePackets)
+{
+   struct { uint32_t vertices, primitives, words, prefix, prim_limit, vert_limit; } cases[] = {
+      {6, 2, 4, 0x504, 0x1, 0x9},
+      {6, 2, 5, 0x605, 0x1, 0xb},
+      {192, 64, 4, 0x504, 0x3003f, 0xc1},
+   };
+   for (const auto &c : cases) {
+      agx_vdm_mesh_state_info info = {};
+      ASSERT_TRUE(agx_vdm_m5_mesh_set_output_limits(&info, c.vertices, c.primitives, c.words));
+      EXPECT_EQ(info.raw_prefix[0], c.prefix);
+      EXPECT_EQ(info.raw_tail[1], c.prim_limit);
+      EXPECT_EQ(info.raw_tail[4], c.vert_limit);
+   }
+}
+
+TEST(M5MeshLimits, RejectsInvalidLimitsWithoutMutation)
+{
+   for (const auto &c : {std::array<uint32_t, 3>{0, 1, 4}, {1, 0, 4},
+                        {257, 1, 4}, {1, 257, 4}, {1, 1, 3}, {1, 1, 256}}) {
+      agx_vdm_mesh_state_info info;
+      memset(&info, 0x5a, sizeof(info));
+      const auto before = info;
+      EXPECT_FALSE(agx_vdm_m5_mesh_set_output_limits(&info, c[0], c[1], c[2]));
+      EXPECT_EQ(memcmp(&info, &before, sizeof(info)), 0);
    }
 }

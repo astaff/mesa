@@ -26,6 +26,12 @@ struct agx_vdm_mesh_dispatch_info {
 
 bool agx_vdm_mesh_threadgroup_pack(const uint32_t size[3], uint32_t *word);
 bool agx_vdm_mesh_threadgroup_unpack(uint32_t word, uint32_t size[3]);
+/* Captured HAL300 limits: max primitive index and vertex output arena. */
+bool agx_vdm_m5_mesh_set_output_limits(struct agx_vdm_mesh_state_info *info,
+                                     uint32_t max_vertices,
+                                     uint32_t max_primitives,
+                                     uint32_t uvs_words);
+
 bool agx_vdm_mesh_state_pack(enum agx_chip chip,
                              const struct agx_vdm_mesh_state_info *info,
                              uint8_t out[AGX_VDM_MESH_STATE_LENGTH]);

@@ -10004,6 +10004,12 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                   ? DIV_ROUND_UP(hw_vs->b.info.local_size, 16) : 9},
          };
          if (dev->dev.chip == AGX_CHIP_G17S) {
+            if (!agx_vdm_m5_mesh_set_output_limits(
+                   &state, hw_vs->info.mesh.max_vertices,
+                   hw_vs->info.mesh.max_primitives, hw_vs->info.uvs.size)) {
+               vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+               return;
+            }
             const char *tail0 = getenv("ASAHI_MESH_PP_TAIL0");
             if (tail0 && !strcmp(tail0, "1"))
                state.raw_tail[0] = 1;
