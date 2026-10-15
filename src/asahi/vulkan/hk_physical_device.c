@@ -443,7 +443,8 @@ hk_get_device_features(
          supported_extensions->KHR_acceleration_structure,
       .accelerationStructureIndirectBuild =
          supported_extensions->KHR_acceleration_structure,
-      .accelerationStructureHostCommands = false,
+      .accelerationStructureHostCommands =
+         supported_extensions->KHR_acceleration_structure,
       .descriptorBindingAccelerationStructureUpdateAfterBind =
          supported_extensions->KHR_acceleration_structure,
       .rayQuery = supported_extensions->KHR_ray_query,

@@ -147,6 +147,12 @@ struct hk_device {
    unsigned gen1_rq_bound_maps;
    uint8_t *gen1_rq_user_image;
    uint8_t gen1_rq_uniforms[320];
+   struct {
+      simple_mtx_t lock;
+      bool lock_ready;
+      struct hk_queue *queue;
+      VkCommandPool pool;
+   } host_as;
    struct agx_bg_eot_cache bg_eot;
    /* frg-codegen v4 BG/EOT device cache (hk_cmd_draw.c). */
    struct hk_g17p_bg_eot_dev_cache *g17p_bg_eot_dev_cache;
