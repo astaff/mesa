@@ -2849,12 +2849,6 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &global_loads);
 
-   if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
-      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,
-               shared_var_info);
-      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_task_payload,
-               nir_address_format_32bit_offset);
-   }
 
    if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,
