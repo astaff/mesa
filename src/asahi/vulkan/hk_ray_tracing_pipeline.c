@@ -3248,48 +3248,12 @@ hk_compile_rt_kernel(
  * raygen (only a library can be created that way) has nothing to compile;
  * hk_cmd_trace_rays.c refuses to trace with it.
  */
-static bool
-hk_rt_stage_uses_ray_query(const nir_shader *nir)
-{
-   nir_foreach_variable_with_modes(var, nir, nir_var_shader_temp) {
-      if (var->data.ray_query)
-         return true;
-   }
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_function_temp_variable(var, impl) {
-         if (var->data.ray_query)
-            return true;
-      }
-   }
-   return false;
-}
-
 static VkResult
 hk_compile_ray_tracing_pipeline(
    struct hk_device *dev, struct hk_ray_tracing_pipeline *pipeline,
    const VkRayTracingPipelineCreateInfoKHR *create_info,
    const VkAllocationCallbacks *pAllocator)
 {
-   /* On the native path an intersection shader runs inside the generated
-    * TraceRay query's candidate loop, so a ray query inside it is a second
-    * simultaneously live native query that is suspended and resumed around
-    * the nested traversal. That interleaving is not qualified: the first
-    * such CTS case (ray_query.acceleration_structures.format.*.isect_shader)
-    * timed out the compute scheduler on M5. Refuse the pipeline instead of
-    * hanging the device until the multi-query ownership model covers it. */
-   if (dev->m5_native_rq && dev->m5_rq_instances) {
-      for (uint32_t i = 0; i < pipeline->stage_count; i++) {
-         const nir_shader *nir = pipeline->stages[i]->nir;
-         if (nir->info.stage == MESA_SHADER_INTERSECTION &&
-             hk_rt_stage_uses_ray_query(nir)) {
-            return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                             "native M5 RT: a ray query inside an intersection "
-                             "shader nests a live query inside the TraceRay "
-                             "query; not yet supported");
-         }
-      }
-   }
-
    /* Only M5 compiles one kernel per ray-generation group; elsewhere the
     * pipeline is one megakernel. */
    if (!agx_chip_g17_m5(dev->dev.chip)) {
@@ -3299,7 +3263,6 @@ hk_compile_ray_tracing_pipeline(
       pipeline->shader = kernel.shader;
       return result;
    }
-
    uint32_t raygen_count = 0;
    for (uint32_t i = 0; i < pipeline->group_count; i++) {
       const struct hk_ray_tracing_group *group = pipeline->groups + i;
