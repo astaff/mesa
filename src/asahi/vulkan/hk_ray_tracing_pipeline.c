@@ -3341,9 +3341,23 @@ hk_compile_ray_tracing_pipeline(
 }
 
 /* The common binary entrypoints own vk_rt_pipeline objects.  Honeykrisp's
- * megakernel and retained library NIR have a different layout and lifetime. */
+ * megakernel (or, on M5, per-raygen kernels) and retained library NIR have a
+ * different layout and lifetime. */
 #define HK_RT_BINARY_MAGIC   0x42524b48u
 #define HK_RT_BINARY_VERSION 1u
+
+/* What an RT binary carries after the stage NIR. */
+enum hk_rt_binary_executable {
+   HK_RT_BINARY_LIBRARY = 0,
+   HK_RT_BINARY_MEGAKERNEL = 1,
+   HK_RT_BINARY_RAYGEN_KERNELS = 2, /* M5 */
+};
+
+static bool
+hk_rt_binaries_native(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+}
 
 static void
 hk_rt_pipeline_key(struct hk_device *dev,
@@ -3424,7 +3438,9 @@ hk_rt_binary_serialize(struct hk_device *dev,
    blob_write_uint32(blob, pipeline->stage_count);
    blob_write_uint32(blob, pipeline->group_count);
    blob_write_uint32(blob, pipeline->base.stages);
-   blob_write_uint32(blob, pipeline->shader != NULL);
+   blob_write_uint32(blob, pipeline->kernel_count ? HK_RT_BINARY_RAYGEN_KERNELS
+                           : pipeline->shader ? HK_RT_BINARY_MEGAKERNEL
+                                              : HK_RT_BINARY_LIBRARY);
    blob_write_bytes(blob, &pipeline->stack_sizes,
                     sizeof(pipeline->stack_sizes));
    blob_write_uint32(blob, pipeline->stack_size);
@@ -3444,6 +3460,15 @@ hk_rt_binary_serialize(struct hk_device *dev,
    if (pipeline->shader && !pipeline->shader->vk.ops->serialize(
                               &dev->vk, &pipeline->shader->vk, blob))
       return false;
+   if (pipeline->kernel_count) {
+      blob_write_uint32(blob, pipeline->kernel_count);
+      for (uint32_t i = 0; i < pipeline->kernel_count; ++i) {
+         const struct vk_shader *shader = &pipeline->kernels[i].shader->vk;
+         blob_write_uint32(blob, pipeline->kernels[i].raygen_handle_index);
+         if (!shader->ops->serialize(&dev->vk, shader, blob))
+            return false;
+      }
+   }
    return !blob->out_of_memory;
 }
 
@@ -3454,7 +3479,7 @@ hk_CreatePipelineBinariesKHR(VkDevice device,
                              VkPipelineBinaryHandlesInfoKHR *out)
 {
    VK_FROM_HANDLE(hk_device, dev, device);
-   if (dev->dev.chip != AGX_CHIP_G17P)
+   if (!hk_rt_binaries_native(dev))
       return vk_common_CreatePipelineBinariesKHR(device, info, alloc, out);
 
    if (info->pPipelineCreateInfo &&
@@ -3506,7 +3531,7 @@ hk_GetPipelineKeyKHR(VkDevice device, const VkPipelineCreateInfoKHR *info,
        !vk_find_struct_const(info->pNext, RAY_TRACING_PIPELINE_CREATE_INFO_KHR))
       return vk_common_GetPipelineKeyKHR(device, info, key);
    VK_FROM_HANDLE(hk_device, dev, device);
-   if (dev->dev.chip != AGX_CHIP_G17P)
+   if (!hk_rt_binaries_native(dev))
       return vk_common_GetPipelineKeyKHR(device, info, key);
 
    const VkRayTracingPipelineCreateInfoKHR *rt =
@@ -3559,9 +3584,13 @@ hk_rt_binary_deserialize(struct hk_device *dev,
    uint32_t stages = blob_read_uint32(&blob);
    uint32_t groups = blob_read_uint32(&blob);
    pipeline->base.stages = blob_read_uint32(&blob);
-   bool executable = blob_read_uint32(&blob);
+   const uint32_t executable = blob_read_uint32(&blob);
+   const uint32_t kernels_kind = agx_chip_g17_m5(dev->dev.chip)
+                                    ? HK_RT_BINARY_RAYGEN_KERNELS
+                                    : HK_RT_BINARY_MEGAKERNEL;
    if (blob.overrun ||
-       executable ==
+       (executable != HK_RT_BINARY_LIBRARY && executable != kernels_kind) ||
+       (executable != HK_RT_BINARY_LIBRARY) ==
           !!(pipeline->base.flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ||
        stages > size / sizeof(uint32_t) ||
        groups > size / sizeof(pipeline->groups[0]))
@@ -3600,7 +3629,7 @@ hk_rt_binary_deserialize(struct hk_device *dev,
          goto done;
       }
    }
-   if (executable) {
+   if (executable == HK_RT_BINARY_MEGAKERNEL) {
       struct vk_shader *shader = NULL;
       result = dev->vk.shader_ops->deserialize(
          &dev->vk, &blob, dev->vk.physical->properties.shaderBinaryVersion,
@@ -3608,6 +3637,32 @@ hk_rt_binary_deserialize(struct hk_device *dev,
       if (result != VK_SUCCESS)
          goto done;
       pipeline->shader = container_of(shader, struct hk_api_shader, vk);
+   } else if (executable == HK_RT_BINARY_RAYGEN_KERNELS) {
+      const uint32_t kernel_count = blob_read_uint32(&blob);
+      if (blob.overrun || kernel_count == 0 || kernel_count > groups)
+         goto done;
+      pipeline->kernels = calloc(kernel_count, sizeof(*pipeline->kernels));
+      if (!pipeline->kernels) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto done;
+      }
+      for (uint32_t i = 0; i < kernel_count; ++i) {
+         const uint32_t handle = blob_read_uint32(&blob);
+         struct vk_shader *shader = NULL;
+         if (blob.overrun) {
+            result = VK_ERROR_UNKNOWN;
+            goto done;
+         }
+         result = dev->vk.shader_ops->deserialize(
+            &dev->vk, &blob, dev->vk.physical->properties.shaderBinaryVersion,
+            alloc, &shader);
+         if (result != VK_SUCCESS)
+            goto done;
+         pipeline->kernels[i].shader =
+            container_of(shader, struct hk_api_shader, vk);
+         pipeline->kernels[i].raygen_handle_index = handle;
+         pipeline->kernel_count++;
+      }
    }
    result =
       blob.overrun || blob.current != blob.end ? VK_ERROR_UNKNOWN : VK_SUCCESS;
@@ -3653,8 +3708,7 @@ hk_create_ray_tracing_pipeline(
 
    const VkPipelineBinaryInfoKHR *binaries =
       vk_find_struct_const(create_info->pNext, PIPELINE_BINARY_INFO_KHR);
-   if (dev->dev.chip == AGX_CHIP_G17P &&
-       binaries && binaries->binaryCount) {
+   if (hk_rt_binaries_native(dev) && binaries && binaries->binaryCount) {
       if (binaries->binaryCount != 1) {
          result = VK_ERROR_UNKNOWN;
          goto fail;
@@ -3666,7 +3720,7 @@ hk_create_ray_tracing_pipeline(
       *out_pipeline = vk_pipeline_to_handle(&pipeline->base);
       return VK_SUCCESS;
    }
-   if (dev->dev.chip == AGX_CHIP_G17P)
+   if (hk_rt_binaries_native(dev))
       hk_rt_pipeline_key(dev, create_info, pipeline->binary_key);
 
    pipeline->stage_count = create_info->stageCount;
