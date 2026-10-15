@@ -56,12 +56,37 @@ agx_nir_m5_canonicalize_empty_mesh(nir_shader *s)
    return true;
 }
 
+#define M5_MESH_MAX_PLANES (4 + 128 + 1 + 8)
+
 struct mesh_layout {
    unsigned output_base, primitive_count, vertex_count, position;
    unsigned plane_stride, planes, bytes;
    bool storage_probe;
    const struct agx_m5_mesh_varyings *varyings;
+
+   /* Per-primitive outputs (see agx_m5_mesh_unwelds): the API body writes
+    * vertex planes to vertex_source and per-primitive planes to
+    * primitive_source; the export region at position then holds three
+    * private vertices per primitive. */
+   bool unweld;
+   unsigned export_vertices;
+   unsigned vertex_source, vertex_stride;
+   unsigned primitive_source, primitive_stride;
+   int16_t layer_plane, viewport_plane;
+   int16_t vertex_plane[M5_MESH_MAX_PLANES], primitive_plane[M5_MESH_MAX_PLANES];
 };
+
+static bool
+agx_m5_mesh_unwelds(const struct agx_m5_mesh_varyings *varyings)
+{
+   if (varyings->lv)
+      return true;
+   for (unsigned slot = 0; slot < 64; ++slot) {
+      if (varyings->primitive_comps[slot])
+         return true;
+   }
+   return false;
+}
 
 static struct mesh_layout
 mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
@@ -74,8 +99,11 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
     * in selector order. */
    const unsigned count = ALIGN_POT(3 * s->info.mesh.max_primitives_out, 16);
    const unsigned position = count + 16;
-   const unsigned stride = ALIGN_POT(s->info.mesh.max_vertices_out, 4) * 4;
-   return (struct mesh_layout) {
+   const bool unweld = agx_m5_mesh_unwelds(varyings);
+   const unsigned export_vertices = unweld
+      ? 3 * s->info.mesh.max_primitives_out : s->info.mesh.max_vertices_out;
+   const unsigned stride = ALIGN_POT(export_vertices, 4) * 4;
+   struct mesh_layout layout = {
       .output_base = base, .primitive_count = base + count,
       .vertex_count = base + count + 4, .position = base + position,
       .plane_stride = stride, .planes = varyings->size,
@@ -83,7 +111,62 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
       .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
                        !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1"),
       .varyings = varyings,
+      .unweld = unweld,
+      .export_vertices = export_vertices,
+      .layer_plane = -1, .viewport_plane = -1,
    };
+   if (!unweld)
+      return layout;
+
+   /* Classify each exported UVS word as a vertex or primitive word. */
+   unsigned vertex_planes = 0, primitive_planes = 0;
+   for (unsigned plane = 0; plane < M5_MESH_MAX_PLANES; ++plane)
+      layout.vertex_plane[plane] = layout.primitive_plane[plane] = -1;
+   for (unsigned plane = 0; plane < MIN2(varyings->size, M5_MESH_MAX_PLANES); ++plane) {
+      if (varyings->lv && plane == varyings->lv_first)
+         continue; /* packed from the layer/viewport words */
+      int primitive_slot = -1;
+      for (unsigned slot = 0; slot < 64; ++slot) {
+         if ((varyings->primitive_comps[slot] ||
+              (varyings->lv && slot == VARYING_SLOT_LAYER)) &&
+             plane >= varyings->first[slot] &&
+             plane < varyings->first[slot] + varyings->components[slot])
+            primitive_slot = slot;
+      }
+      if (primitive_slot < 0)
+         layout.vertex_plane[plane] = vertex_planes++;
+      else if (varyings->primitive_comps[primitive_slot])
+         layout.primitive_plane[plane] = primitive_planes++;
+      /* else: the unwritten layer word, exported as zero */
+   }
+   if (varyings->primitive_comps[VARYING_SLOT_LAYER])
+      layout.layer_plane =
+         layout.primitive_plane[varyings->first[VARYING_SLOT_LAYER]];
+   if (varyings->primitive_comps[VARYING_SLOT_VIEWPORT])
+      layout.viewport_plane =
+         layout.primitive_plane[varyings->first[VARYING_SLOT_VIEWPORT]];
+
+   layout.vertex_stride = ALIGN_POT(s->info.mesh.max_vertices_out, 4) * 4;
+   layout.primitive_stride = ALIGN_POT(s->info.mesh.max_primitives_out, 4) * 4;
+   const unsigned vertex_source = position + varyings->size * stride;
+   const unsigned primitive_source =
+      vertex_source + vertex_planes * layout.vertex_stride;
+   layout.vertex_source = base + vertex_source;
+   layout.primitive_source = base + primitive_source;
+   layout.bytes = ALIGN_POT(primitive_source +
+                            primitive_planes * layout.primitive_stride, 64);
+   return layout;
+}
+
+/* Shared address of a vertex-output word written by the API body. */
+static unsigned
+vertex_plane_address(const struct mesh_layout *layout, unsigned plane)
+{
+   if (!layout->unweld)
+      return layout->position + layout->plane_stride * plane;
+   assert(layout->vertex_plane[plane] >= 0);
+   return layout->vertex_source +
+          layout->vertex_stride * layout->vertex_plane[plane];
 }
 
 static unsigned
@@ -136,7 +219,7 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
       }
       u_foreach_bit(c,nir_intrinsic_write_mask(i)) {
          nir_def *address=nir_iadd_imm(b,element,
-            layout->position+layout->plane_stride*(first+component+c));
+            vertex_plane_address(layout,first+component+c));
          nir_store_shared(b,probe ? nir_channel(b,probe,component+c)
                                   : nir_channel(b,value,c),address,
                             .write_mask=1,.align_mul=4);
@@ -146,8 +229,8 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
                4 * (slot - VARYING_SLOT_CLIP_DIST0) + component + c;
             if (clip < layout->varyings->clip_distance_count) {
                nir_def *clip_address = nir_iadd_imm(b, element,
-                  layout->position + layout->plane_stride *
-                  (layout->varyings->clip_distance_first + clip));
+                  vertex_plane_address(layout,
+                     layout->varyings->clip_distance_first + clip));
                nir_store_shared(b, nir_channel(b, value, c), clip_address,
                                 .write_mask = 1, .align_mul = 4);
             }
@@ -157,6 +240,23 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
    }
    case nir_intrinsic_store_per_primitive_output: {
       b->cursor=nir_before_instr(&i->instr);
+      const unsigned slot = vertex_output_slot(i);
+      if (slot != VARYING_SLOT_PRIMITIVE_INDICES) {
+         /* A primitive word: the export below replicates it to the three
+          * private vertices of its primitive. */
+         nir_def *element = nir_imul_imm(b, i->src[1].ssa, 4);
+         nir_def *value = widen_output(b, i, i->src[0].ssa);
+         u_foreach_bit(c, nir_intrinsic_write_mask(i)) {
+            int plane = layout->primitive_plane[layout->varyings->first[slot] +
+                                                nir_intrinsic_component(i) + c];
+            assert(plane >= 0);
+            nir_store_shared(b, nir_channel(b, value, c),
+               nir_iadd_imm(b, element, layout->primitive_source +
+                                        layout->primitive_stride * plane),
+               .write_mask = 1, .align_mul = 4);
+         }
+         break;
+      }
       nir_def *element=nir_imul_imm(b,i->src[1].ssa,3);
       unsigned component=nir_intrinsic_component(i);
       u_foreach_bit(c,nir_intrinsic_write_mask(i)) {
@@ -206,11 +306,38 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
             if (in->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
-            if (i->intrinsic != nir_intrinsic_store_per_vertex_output)
+            if (i->intrinsic != nir_intrinsic_store_per_vertex_output &&
+                i->intrinsic != nir_intrinsic_store_per_primitive_output)
                continue;
             if (!nir_src_is_const(i->src[2]))
                return false;
             const unsigned slot = vertex_output_slot(i);
+            if (i->intrinsic == nir_intrinsic_store_per_primitive_output) {
+               if (slot == VARYING_SLOT_PRIMITIVE_INDICES)
+                  continue;
+               /* Per-primitive user words become flat words of the
+                * primitive's private vertices; layer/viewport fill the
+                * vertex layer/viewport word. The fragment side reads both
+                * as flat inputs (agx_nir_lower_m5_mesh_fragment). */
+               const unsigned end = nir_intrinsic_component(i) +
+                                    util_last_bit(nir_intrinsic_write_mask(i));
+               const unsigned bits = i->src[0].ssa->bit_size;
+               if (slot >= 64 || end > 4 || (bits != 32 && bits != 16))
+                  return false;
+               if (USER_VARYINGS & BITFIELD64_BIT(slot)) {
+                  varyings->primitive_comps[slot] =
+                     MAX2(varyings->primitive_comps[slot], end);
+               } else if (slot == VARYING_SLOT_LAYER ||
+                          slot == VARYING_SLOT_VIEWPORT) {
+                  if (end != 1)
+                     return false;
+                  varyings->primitive_comps[slot] = 1;
+                  varyings->lv = true;
+               } else {
+                  return false;
+               }
+               continue;
+            }
             if (slot == VARYING_SLOT_POS)
                continue;
             if (slot >= 64 || !(MESH_VERTEX_VARYINGS & BITFIELD64_BIT(slot)))
@@ -223,9 +350,26 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
          }
       }
    }
+   for (unsigned slot = VARYING_SLOT_VAR0; slot < 64; ++slot) {
+      if (!varyings->primitive_comps[slot])
+         continue;
+      /* A location is either per-vertex or per-primitive. */
+      if (varyings->components[slot])
+         return false;
+      varyings->components[slot] = varyings->primitive_comps[slot];
+   }
+   /* Like the M5 vertex stage (hk_lower_hw_vs with layer_as_varying), the
+    * layer is also a flat user word for fragment reads, zero when only the
+    * viewport is written, and a written viewport is one as well. */
+   if (varyings->lv) {
+      varyings->components[VARYING_SLOT_LAYER] = 1;
+      varyings->components[VARYING_SLOT_VIEWPORT] =
+         varyings->primitive_comps[VARYING_SLOT_VIEWPORT];
+   }
    /* Declaration order. A single user slot (or one interpolation class) sits
     * at the base of the user section for every fragment shader; otherwise the
-    * fragment shader chooses the class order at draw time. */
+    * fragment shader chooses the class order at draw time. The UVS groups
+    * that follow are layer/viewport, then clip distances. */
    unsigned next = 4, slots = 0;
    for (unsigned slot = 0; slot < 64; ++slot) {
       if (!varyings->components[slot])
@@ -234,6 +378,8 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
       next += varyings->components[slot];
       slots++;
    }
+   if (varyings->lv)
+      varyings->lv_first = next++;
    varyings->clip_distance_first = next;
    varyings->size = next + varyings->clip_distance_count;
    varyings->dynamic = slots > 1;
@@ -244,19 +390,37 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
 static bool
 varyings_valid(const struct agx_m5_mesh_varyings *v)
 {
-   if (v->size < 4 || v->size > 4 + 128 + 8 ||
+   const unsigned lv = v->lv ? 1 : 0;
+   if (v->size < 4 || v->size > 4 + 128 + 8 + lv ||
        v->clip_distance_count > 8 ||
+       v->size < 4 + lv + v->clip_distance_count ||
        (v->clip_distance_count &&
         v->clip_distance_first + v->clip_distance_count != v->size))
       return false;
-   uint8_t used[4 + 128 + 8] = {0};
+   /* User words, then the optional layer/viewport word, then clip words. */
+   const unsigned user_end = v->size - v->clip_distance_count - lv;
+   if (v->lv && v->lv_first != user_end)
+      return false;
+   uint8_t used[M5_MESH_MAX_PLANES] = {0};
    unsigned user = 0;
    for (unsigned slot = 0; slot < 64; ++slot) {
       if (!v->components[slot])
          continue;
-      if (!(MESH_VERTEX_VARYINGS & BITFIELD64_BIT(slot)) || v->components[slot] > 4 ||
+      const bool lv_word = v->lv && (slot == VARYING_SLOT_LAYER ||
+                                     slot == VARYING_SLOT_VIEWPORT);
+      if (lv_word) {
+         if (v->components[slot] != 1 ||
+             (slot == VARYING_SLOT_VIEWPORT && !v->primitive_comps[slot]))
+            return false;
+      } else if (!(MESH_VERTEX_VARYINGS & BITFIELD64_BIT(slot)) ||
+                 (v->primitive_comps[slot] &&
+                  (!(USER_VARYINGS & BITFIELD64_BIT(slot)) ||
+                   v->primitive_comps[slot] != v->components[slot]))) {
+         return false;
+      }
+      if (v->components[slot] > 4 ||
           v->first[slot] < 4 ||
-          v->first[slot] + v->components[slot] > v->size - v->clip_distance_count)
+          v->first[slot] + v->components[slot] > user_end)
          return false;
       for (unsigned c = 0; c < v->components[slot]; ++c) {
          if (used[v->first[slot] + c]++)
@@ -264,7 +428,11 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
       }
       user += v->components[slot];
    }
-   return user + 4 + v->clip_distance_count == v->size;
+   if (v->lv != (v->primitive_comps[VARYING_SLOT_LAYER] ||
+                 v->primitive_comps[VARYING_SLOT_VIEWPORT]) ||
+       (v->lv && !v->components[VARYING_SLOT_LAYER]))
+      return false;
+   return user + 4 + lv + v->clip_distance_count == v->size;
 }
 
 bool
@@ -281,6 +449,12 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
 {
    const uint64_t primitive_outputs =
       s->info.per_primitive_outputs & s->info.outputs_written;
+   uint64_t primitive_slots = VARYING_BIT_PRIMITIVE_INDICES;
+   for (unsigned slot = 0; slot < 64; ++slot) {
+      if (varyings->primitive_comps[slot])
+         primitive_slots |= BITFIELD64_BIT(slot);
+   }
+   const bool unweld = agx_m5_mesh_unwelds(varyings);
    unsigned threads=s->info.workgroup_size[0]*s->info.workgroup_size[1]*
                     s->info.workgroup_size[2];
    if(s->info.stage!=MESA_SHADER_MESH || s->info.shared_size>32768 ||
@@ -288,15 +462,21 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       s->info.mesh.max_vertices_out==0 || s->info.mesh.max_vertices_out>256 ||
       s->info.mesh.max_primitives_out==0 || s->info.mesh.max_primitives_out>256 ||
       s->info.mesh.primitive_type!=MESA_PRIM_TRIANGLES ||
-      (primitive_outputs&~VARYING_BIT_PRIMITIVE_INDICES) ||
-      s->info.outputs_written & ~(VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES|MESH_VERTEX_VARYINGS) ||
+      /* Interstage compaction can leave per_primitive_outputs stale; with
+       * per-primitive words every store is checked against them below. */
+      (primitive_outputs&~(unweld ? ~UINT64_C(0) : primitive_slots)) ||
+      s->info.outputs_written & ~(VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES|MESH_VERTEX_VARYINGS|
+                                  (primitive_slots & (VARYING_BIT_LAYER|VARYING_BIT_VIEWPORT))) ||
+      /* Every primitive gets three private vertices within the native
+       * 256-vertex output limit. */
+      (unweld && 3 * s->info.mesh.max_primitives_out > 256) ||
       varyings->clip_distance_count != s->info.clip_distance_array_size ||
       !varyings_valid(varyings))
       return false;
    struct mesh_layout layout = mesh_layout(s, varyings);
    if (layout.output_base + layout.bytes > 32768)
       return false;
-   unsigned physical_threads=MAX2(threads,MIN2(s->info.mesh.max_vertices_out,32));
+   unsigned physical_threads=MAX2(threads,MIN2(layout.export_vertices,32));
    bool counts=false;
    nir_foreach_function_impl(impl,s) {
       nir_foreach_block(block,impl) {
@@ -330,12 +510,25 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
                }
                break;
             }
-            case nir_intrinsic_store_per_primitive_output:
-               if(nir_intrinsic_io_semantics(i).location!=VARYING_SLOT_PRIMITIVE_INDICES ||
-                  nir_intrinsic_component(i)+i->src[0].ssa->num_components>3 ||
-                  !nir_src_is_const(i->src[2]) || nir_src_as_uint(i->src[2])!=0)
+            case nir_intrinsic_store_per_primitive_output: {
+               if (!nir_src_is_const(i->src[2]))
                   return false;
+               const unsigned slot=vertex_output_slot(i);
+               const unsigned bits=i->src[0].ssa->bit_size;
+               const unsigned end=nir_intrinsic_component(i)+
+                                  util_last_bit(nir_intrinsic_write_mask(i));
+               if (slot==VARYING_SLOT_PRIMITIVE_INDICES) {
+                  if(nir_intrinsic_io_semantics(i).location!=VARYING_SLOT_PRIMITIVE_INDICES ||
+                     nir_intrinsic_component(i)+i->src[0].ssa->num_components>3 ||
+                     nir_src_as_uint(i->src[2])!=0)
+                     return false;
+               } else if (slot>=64 || !varyings->primitive_comps[slot] ||
+                          end>varyings->primitive_comps[slot] ||
+                          (bits!=32 && bits!=16)) {
+                  return false;
+               }
                break;
+            }
             case nir_intrinsic_load_per_vertex_output:
             case nir_intrinsic_load_per_primitive_output:
             case nir_intrinsic_launch_mesh_workgroups:return false;
@@ -405,12 +598,85 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    nir_shader_intrinsics_pass(s,lower,nir_metadata_none,&layout);
    nir_function_impl *impl=nir_shader_get_entrypoint(s);
    nir_builder b=nir_builder_at(nir_after_cf_list(&impl->body));
+   const unsigned max_primitives = s->info.mesh.max_primitives_out;
+   if (layout.unweld) {
+      /* Per-primitive words have no native vertex form here. Give every
+       * primitive three private vertices: copy each referenced vertex's
+       * words, replicate the primitive's words (flat on every corner, so
+       * any provoking vertex selects them), and rewrite the index list to
+       * the identity. Primitive order, winding and the interpolated values
+       * are unchanged. SIMD group 0 copies, in the same 32-lane batches
+       * as the export, between two rendezvous: UVB stores read only words
+       * published by a threadgroup barrier, as for API output stores (a
+       * SIMD-group barrier between the copy and the export left stale
+       * words on hardware). Each lane reads and then rewrites only the
+       * index bytes of its own private vertices. */
+      nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
+                     .memory_semantics=NIR_MEMORY_ACQ_REL,.memory_modes=nir_var_mem_shared);
+      nir_push_if(&b, nir_ieq_imm(&b, nir_load_subgroup_id(&b), 0));
+      nir_def *primitives = nir_umin(&b, nir_u2u32(&b, nir_load_shared(&b, 1, 16,
+         nir_imm_int(&b, layout.primitive_count), .align_mul = 2)),
+         nir_imm_int(&b, max_primitives));
+      nir_def *vertices = nir_imul_imm(&b, primitives, 3);
+      nir_def *lane = nir_load_subgroup_invocation(&b);
+      for (unsigned base = 0; base < 3 * max_primitives; base += 32) {
+         nir_def *j = nir_iadd_imm(&b, lane, base);
+         nir_push_if(&b, nir_ult(&b, j, vertices));
+         nir_def *index = nir_u2u32(&b, nir_load_shared(&b, 1, 8,
+            nir_iadd_imm(&b, j, layout.output_base), .align_mul = 1));
+         nir_def *source = nir_imul_imm(&b,
+            nir_umin(&b, index, nir_imm_int(&b, s->info.mesh.max_vertices_out - 1)), 4);
+         nir_def *primitive = nir_imul_imm(&b, nir_udiv_imm(&b, j, 3), 4);
+         nir_def *target = nir_imul_imm(&b, j, 4);
+         for (unsigned plane = 0; plane < layout.planes; ++plane) {
+            nir_def *value;
+            if (varyings->lv && plane == varyings->lv_first) {
+               nir_def *layer = nir_imm_int(&b, 0), *viewport = nir_imm_int(&b, 0);
+               if (layout.layer_plane >= 0)
+                  layer = nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, primitive,
+                     layout.primitive_source + layout.primitive_stride * layout.layer_plane),
+                     .align_mul = 4);
+               if (layout.viewport_plane >= 0)
+                  viewport = nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, primitive,
+                     layout.primitive_source + layout.primitive_stride * layout.viewport_plane),
+                     .align_mul = 4);
+               /* render_target_array_index low, viewport_array_index high,
+                * as agx_nir_lower_uvs packs the vertex-stage word. */
+               value = nir_pack_32_2x16_split(&b, nir_u2u16(&b, layer),
+                                              nir_u2u16(&b, viewport));
+            } else if (layout.vertex_plane[plane] >= 0) {
+               value = nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, source,
+                  layout.vertex_source + layout.vertex_stride * layout.vertex_plane[plane]),
+                  .align_mul = 4);
+            } else if (layout.primitive_plane[plane] < 0) {
+               value = nir_imm_int(&b, 0);
+            } else {
+               value = nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, primitive,
+                  layout.primitive_source +
+                  layout.primitive_stride * layout.primitive_plane[plane]),
+                  .align_mul = 4);
+            }
+            nir_store_shared(&b, value, nir_iadd_imm(&b, target,
+               layout.position + layout.plane_stride * plane), .write_mask = 1,
+               .align_mul = 4);
+         }
+         nir_store_shared(&b, nir_u2u8(&b, j),
+            nir_iadd_imm(&b, j, layout.output_base), .write_mask = 1,
+            .align_mul = 1);
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_if(&b, NULL);
+   }
    nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
                   .memory_semantics=NIR_MEMORY_ACQ_REL,.memory_modes=nir_var_mem_shared);
    /* Native write_uvb helpers execute on SIMD group0 after rendezvous. */
    nir_push_if(&b,nir_ieq_imm(&b,nir_load_subgroup_id(&b),0));
    nir_def *p=nir_load_shared(&b,1,16,nir_imm_int(&b,layout.primitive_count),.align_mul=2);
    nir_def *v=nir_load_shared(&b,1,16,nir_imm_int(&b,layout.vertex_count),.align_mul=2);
+   if (layout.unweld) {
+      p = nir_umin(&b, p, nir_imm_intN_t(&b, max_primitives, 16));
+      v = nir_imul_imm(&b, p, 3);
+   }
    nir_allocate_mesh_uvb_agx(&b,p,v);
    nir_def *lane=nir_load_subgroup_invocation(&b);
    nir_def *primitive_words=nir_udiv_imm(&b,
@@ -426,7 +692,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    /* Plane k publishes UVS word k unless the fragment interpolation order is
     * a draw-time choice; then user planes take the root UVS index of their
     * slot, like an unlinked vertex shader's store_uvs_agx. */
-   nir_def *selector[4 + 128 + 8] = {NULL};
+   nir_def *selector[M5_MESH_MAX_PLANES] = {NULL};
    if (varyings->dynamic) {
       for (unsigned slot = 0; slot < 64; ++slot) {
          if (!varyings->components[slot])
@@ -437,7 +703,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
             selector[varyings->first[slot] + c] = nir_iadd_imm(&b, base, c);
       }
    }
-   for(unsigned vertex=0;vertex<s->info.mesh.max_vertices_out;vertex+=32) {
+   for(unsigned vertex=0;vertex<layout.export_vertices;vertex+=32) {
       nir_push_if(&b,nir_ult(&b,nir_iadd_imm(&b,lane,vertex),nir_u2u32(&b,v)));
       for(unsigned plane=0;plane<layout.planes;plane++) {
          const unsigned address=layout.position+layout.plane_stride*plane+4*vertex;
@@ -454,8 +720,50 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    nir_pop_if(&b,NULL);
    s->info.shared_size=layout.output_base+layout.bytes;
    s->info.outputs_written=0;s->info.per_primitive_outputs=0;
+   /* The native output limits describe the exported vertices. */
+   s->info.mesh.max_vertices_out=layout.export_vertices;
    nir_progress(true,impl,nir_metadata_none);
    return true;
+}
+
+/* agx_nir_lower_m5_mesh gives every primitive private vertices and stores
+ * its per-primitive user, layer and viewport words on all of them, so the
+ * fragment shader reads them as ordinary flat inputs. Like the mesh side,
+ * UVS words are 32-bit; narrower inputs are narrowed after the load. */
+static bool
+lower_m5_primitive_input(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   (void)data;
+   if (i->intrinsic != nir_intrinsic_load_per_primitive_input)
+      return false;
+   nir_io_semantics sem = nir_intrinsic_io_semantics(i);
+   const unsigned location = sem.location;
+   if (!((location >= VARYING_SLOT_VAR0 && location < VARYING_SLOT_VAR0 + 32) ||
+         location == VARYING_SLOT_LAYER || location == VARYING_SLOT_VIEWPORT) ||
+       (i->def.bit_size != 32 && i->def.bit_size != 16))
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   const nir_alu_type base =
+      nir_alu_type_get_base_type(nir_intrinsic_dest_type(i));
+   nir_def *value = nir_load_input(b, i->def.num_components, 32,
+      i->src[0].ssa, .base = nir_intrinsic_base(i),
+      .component = nir_intrinsic_component(i), .dest_type = base | 32,
+      .io_semantics = sem);
+   if (i->def.bit_size != 32)
+      value = nir_convert_to_bit_size(b, value, base, i->def.bit_size);
+   b->shader->info.per_primitive_inputs &=
+      ~BITFIELD64_RANGE(location, MAX2(sem.num_slots, 1));
+   nir_def_replace(&i->def, value);
+   return true;
+}
+
+bool
+agx_nir_lower_m5_mesh_fragment(nir_shader *s)
+{
+   if (s->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   return nir_shader_intrinsics_pass(s, lower_m5_primitive_input,
+                                     nir_metadata_control_flow, NULL);
 }
 
 /* The retained native object and matching mesh both access the same pointer:

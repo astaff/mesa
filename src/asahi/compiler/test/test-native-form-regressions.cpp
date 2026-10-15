@@ -5275,3 +5275,169 @@ TEST(NativeForms, M5MeshOutputStillRequiresCount)
    EXPECT_FALSE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
    ralloc_free(b.shader);
 }
+
+/* Two triangles sharing vertices 1 and 2, a smooth per-vertex VAR1 and
+ * per-primitive VAR0/viewport (and optionally layer) words. */
+static nir_shader *
+m5_mesh_per_primitive_shader(bool layer, unsigned max_primitives,
+                             gl_varying_slot extra_primitive_slot)
+{
+   nir_builder b=nir_builder_init_simple_shader(MESA_SHADER_MESH,&agx_nir_options,"mesh per-primitive words");
+   b.shader->info.workgroup_size[0]=4;b.shader->info.workgroup_size[1]=b.shader->info.workgroup_size[2]=1;
+   b.shader->info.mesh.max_vertices_out=4;b.shader->info.mesh.max_primitives_out=max_primitives;
+   b.shader->info.mesh.primitive_type=MESA_PRIM_TRIANGLES;b.shader->info.io_lowered=true;
+   b.shader->info.outputs_written=VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES|VARYING_BIT_VAR(0)|
+      VARYING_BIT_VAR(1)|VARYING_BIT_VIEWPORT|(layer?VARYING_BIT_LAYER:0);
+   b.shader->info.per_primitive_outputs=VARYING_BIT_PRIMITIVE_INDICES|VARYING_BIT_VAR(0)|
+      VARYING_BIT_VIEWPORT|(layer?VARYING_BIT_LAYER:0);
+   nir_def *lane=nir_load_local_invocation_index(&b);
+   nir_set_vertex_and_primitive_count(&b,nir_imm_int(&b,4),nir_imm_int(&b,2),nir_imm_int(&b,0));
+   nir_store_per_vertex_output(&b,nir_vec4(&b,nir_u2f32(&b,lane),nir_imm_float(&b,0),nir_imm_float(&b,0),
+      nir_imm_float(&b,1)),lane,nir_imm_int(&b,0),.write_mask=15,.src_type=nir_type_float32,
+      .io_semantics={.location=VARYING_SLOT_POS,.num_slots=1});
+   nir_store_per_vertex_output(&b,nir_imm_vec2(&b,.5,.25),lane,nir_imm_int(&b,0),.write_mask=3,
+      .src_type=nir_type_float32,.io_semantics={.location=VARYING_SLOT_VAR1,.num_slots=1});
+   nir_push_if(&b,nir_ult_imm(&b,lane,2));
+   nir_def *first=nir_imul_imm(&b,lane,2);
+   nir_store_per_primitive_output(&b,nir_vec3(&b,first,nir_iadd_imm(&b,first,1),nir_iadd_imm(&b,first,2)),
+      lane,nir_imm_int(&b,0),.write_mask=7,.src_type=nir_type_uint32,
+      .io_semantics={.location=VARYING_SLOT_PRIMITIVE_INDICES,.num_slots=1});
+   nir_store_per_primitive_output(&b,nir_vec4(&b,nir_u2f32(&b,lane),nir_imm_float(&b,1),nir_imm_float(&b,0),
+      nir_imm_float(&b,1)),lane,nir_imm_int(&b,0),.write_mask=15,.src_type=nir_type_float32,
+      .io_semantics={.location=VARYING_SLOT_VAR0,.num_slots=1});
+   nir_store_per_primitive_output(&b,lane,lane,nir_imm_int(&b,0),.write_mask=1,.src_type=nir_type_int32,
+      .io_semantics={.location=VARYING_SLOT_VIEWPORT,.num_slots=1});
+   if (layer)
+      nir_store_per_primitive_output(&b,nir_iadd_imm(&b,lane,3),lane,nir_imm_int(&b,0),.write_mask=1,
+         .src_type=nir_type_int32,.io_semantics={.location=VARYING_SLOT_LAYER,.num_slots=1});
+   if (extra_primitive_slot != VARYING_SLOT_POS)
+      nir_store_per_primitive_output(&b,lane,lane,nir_imm_int(&b,0),.write_mask=1,.src_type=nir_type_int32,
+         .io_semantics={.location=extra_primitive_slot,.num_slots=1});
+   nir_pop_if(&b,NULL);
+   return b.shader;
+}
+
+TEST(NativeForms, M5MeshPerPrimitiveWordsUsePrivateVertices)
+{
+   for (bool layer : {false, true}) {
+      nir_shader *s=m5_mesh_per_primitive_shader(layer,2,VARYING_SLOT_POS);
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_m5_mesh_gather_varyings(s,&v));
+      /* Slot order: layer, viewport, VAR0, VAR1; then the packed
+       * layer/viewport word, as the vertex stage's UVS layout. */
+      EXPECT_TRUE(v.lv);EXPECT_TRUE(v.dynamic);
+      EXPECT_EQ(v.components[VARYING_SLOT_LAYER],1u);EXPECT_EQ(v.first[VARYING_SLOT_LAYER],4u);
+      EXPECT_EQ(v.primitive_comps[VARYING_SLOT_LAYER],layer?1u:0u);
+      EXPECT_EQ(v.components[VARYING_SLOT_VIEWPORT],1u);EXPECT_EQ(v.first[VARYING_SLOT_VIEWPORT],5u);
+      EXPECT_EQ(v.components[VARYING_SLOT_VAR0],4u);EXPECT_EQ(v.primitive_comps[VARYING_SLOT_VAR0],4u);
+      EXPECT_EQ(v.first[VARYING_SLOT_VAR0],6u);
+      EXPECT_EQ(v.components[VARYING_SLOT_VAR1],2u);EXPECT_EQ(v.primitive_comps[VARYING_SLOT_VAR1],0u);
+      EXPECT_EQ(v.first[VARYING_SLOT_VAR1],10u);
+      EXPECT_EQ(v.lv_first,12u);EXPECT_EQ(v.size,13u);EXPECT_EQ(v.primitive_stride_B,0u);
+      /* Linked (declaration) order, so every plane has a fixed UVS index. */
+      v.dynamic=false;
+      ASSERT_TRUE(agx_nir_lower_m5_mesh(s,&v));
+      /* Three private vertices per primitive. */
+      EXPECT_EQ(s->info.mesh.max_vertices_out,6u);
+      /* Index bytes 16, counts 16, export 13 planes x 32, vertex sources
+       * 6 x 16, primitive sources (VAR0 4 + viewport 1 + layer) x 16. */
+      const unsigned primitive_planes=5+(layer?1:0);
+      EXPECT_EQ(s->info.shared_size,(32+13*32+6*16+primitive_planes*16+63)&~63u);
+      unsigned index_words=0,vertex_planes=0,index_loads=0,u8_stores=0,pack=0,rendezvous=0,loops=0;
+      nir_foreach_block(block,nir_shader_get_entrypoint(s))nir_foreach_instr(in,block) {
+         if(in->type==nir_instr_type_alu&&nir_instr_as_alu(in)->op==nir_op_pack_32_2x16_split)pack++;
+         if(in->type==nir_instr_type_intrinsic&&nir_instr_as_intrinsic(in)->intrinsic==nir_intrinsic_barrier&&
+            nir_intrinsic_execution_scope(nir_instr_as_intrinsic(in))==SCOPE_WORKGROUP)rendezvous++;
+         if(in->type!=nir_instr_type_intrinsic)continue;
+         nir_intrinsic_instr *i=nir_instr_as_intrinsic(in);
+         EXPECT_NE(i->intrinsic,nir_intrinsic_store_per_primitive_output);
+         EXPECT_NE(i->intrinsic,nir_intrinsic_load_mesh_primitive_storage_agx);
+         if(i->intrinsic==nir_intrinsic_load_shared&&i->def.bit_size==8)index_loads++;
+         if(i->intrinsic==nir_intrinsic_store_shared&&i->src[0].ssa->bit_size==8)u8_stores++;
+         if(i->intrinsic!=nir_intrinsic_store_mesh_uvb_agx)continue;
+         if(nir_intrinsic_flags(i)){index_words++;continue;}
+         vertex_planes++;
+         ASSERT_TRUE(nir_src_is_const(i->src[0]));
+         EXPECT_EQ(nir_src_comp_as_uint(i->src[0],1),32+32*(nir_src_comp_as_uint(i->src[0],0)&65535));
+      }
+      /* One 32-vertex batch of 13 planes and one index batch. SIMD group 0
+       * copies between two rendezvous, without a loop. */
+      foreach_list_typed(nir_cf_node,node,node,&nir_shader_get_entrypoint(s)->body)
+         loops+=node->type==nir_cf_node_loop;
+      EXPECT_EQ(index_words,1u);EXPECT_EQ(vertex_planes,13u);
+      EXPECT_EQ(rendezvous,2u);EXPECT_EQ(loops,0u);
+      /* The copy reads every index byte once and rewrites it. */
+      EXPECT_EQ(index_loads,1u);EXPECT_GE(u8_stores,2u);EXPECT_EQ(pack,1u);
+      nir_validate_shader(s,"mesh per-primitive private vertices");agx_preprocess_nir_m5(s);
+      agx_shader_key key={};key.dev.chip=AGX_CHIP_G17S;key.dev.encoding=AGX_ISA_ENCODING_AGX3C;key.no_preamble=true;
+      agx_shader_part part={};ASSERT_TRUE(agx_compile_shader_nir(s,&key,&part))<<agx_last_compile_refusal();
+      free(part.binary);ralloc_free(s);
+   }
+}
+
+TEST(NativeForms, M5MeshPerPrimitiveRefusalsLeaveShaderUntouched)
+{
+   /* No private-vertex form beyond the native 256 output vertices, and no
+    * mapping yet for mesh-written primitive IDs or primitive culling. */
+   const struct { unsigned primitives; gl_varying_slot extra; bool gather; } rows[] = {
+      {86, VARYING_SLOT_POS, true},
+      {2, VARYING_SLOT_PRIMITIVE_ID, false},
+      {2, VARYING_SLOT_CULL_PRIMITIVE, false},
+   };
+   for (const auto &r : rows) {
+      nir_shader *s=m5_mesh_per_primitive_shader(false,r.primitives,r.extra);
+      struct agx_m5_mesh_varyings v;
+      EXPECT_EQ(agx_m5_mesh_gather_varyings(s,&v),r.gather);
+      if (r.gather)
+         EXPECT_FALSE(agx_nir_lower_m5_mesh(s,&v));
+      EXPECT_EQ(s->info.shared_size,0u);EXPECT_EQ(s->info.mesh.max_vertices_out,4u);
+      ralloc_free(s);
+   }
+   /* 85 primitives fit: 255 private vertices. */
+   nir_shader *s=m5_mesh_per_primitive_shader(false,85,VARYING_SLOT_POS);
+   struct agx_m5_mesh_varyings v;
+   ASSERT_TRUE(agx_m5_mesh_gather_varyings(s,&v));
+   ASSERT_TRUE(agx_nir_lower_m5_mesh(s,&v));
+   EXPECT_EQ(s->info.mesh.max_vertices_out,255u);
+   nir_validate_shader(s,"mesh 85 primitives");ralloc_free(s);
+}
+
+TEST(NativeForms, M5MeshFragmentReadsPrimitiveWordsFlat)
+{
+   nir_builder b=nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,&agx_nir_options,"fs per-primitive inputs");
+   b.shader->info.io_lowered=true;
+   b.shader->info.per_primitive_inputs=VARYING_BIT_VAR(0)|VARYING_BIT_VAR(1)|VARYING_BIT_VIEWPORT|
+                                       VARYING_BIT_PRIMITIVE_ID;
+   nir_def *color=nir_load_per_primitive_input(&b,4,32,nir_imm_int(&b,0),.component=0,
+      .dest_type=nir_type_float32,.io_semantics={.location=VARYING_SLOT_VAR0,.num_slots=1});
+   nir_def *half=nir_load_per_primitive_input(&b,2,16,nir_imm_int(&b,0),.component=1,
+      .dest_type=nir_type_float16,.io_semantics={.location=VARYING_SLOT_VAR1,.num_slots=1});
+   nir_def *viewport=nir_load_per_primitive_input(&b,1,32,nir_imm_int(&b,0),
+      .dest_type=nir_type_int32,.io_semantics={.location=VARYING_SLOT_VIEWPORT,.num_slots=1});
+   nir_def *id=nir_load_per_primitive_input(&b,1,32,nir_imm_int(&b,0),
+      .dest_type=nir_type_int32,.io_semantics={.location=VARYING_SLOT_PRIMITIVE_ID,.num_slots=1});
+   nir_store_global(&b,nir_vec4(&b,nir_channel(&b,color,0),nir_f2f32(&b,nir_channel(&b,half,1)),
+      nir_i2f32(&b,viewport),nir_i2f32(&b,id)),nir_imm_int64(&b,0x1000),.write_mask=15,.align_mul=16);
+   ASSERT_TRUE(agx_nir_lower_m5_mesh_fragment(b.shader));
+   unsigned flat=0,primitive=0,narrowed=0;
+   nir_foreach_block(block,b.impl)nir_foreach_instr(in,block) {
+      if(in->type==nir_instr_type_alu&&nir_instr_as_alu(in)->op==nir_op_f2f16)narrowed++;
+      if(in->type!=nir_instr_type_intrinsic)continue;
+      nir_intrinsic_instr *i=nir_instr_as_intrinsic(in);
+      if(i->intrinsic==nir_intrinsic_load_per_primitive_input) {
+         primitive++;
+         EXPECT_EQ(nir_intrinsic_io_semantics(i).location,VARYING_SLOT_PRIMITIVE_ID);
+      }
+      if(i->intrinsic==nir_intrinsic_load_input) {
+         flat++;EXPECT_EQ(i->def.bit_size,32u);
+         EXPECT_EQ(nir_alu_type_get_type_size(nir_intrinsic_dest_type(i)),32u);
+         if(nir_intrinsic_io_semantics(i).location==VARYING_SLOT_VAR1)
+            EXPECT_EQ(nir_intrinsic_component(i),1u);
+      }
+   }
+   EXPECT_EQ(flat,3u);EXPECT_EQ(primitive,1u);EXPECT_EQ(narrowed,1u);
+   EXPECT_EQ(b.shader->info.per_primitive_inputs,VARYING_BIT_PRIMITIVE_ID);
+   nir_validate_shader(b.shader,"fs per-primitive inputs");
+   EXPECT_FALSE(agx_nir_lower_m5_mesh_fragment(b.shader));
+   ralloc_free(b.shader);
+}

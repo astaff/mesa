@@ -5102,6 +5102,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       ralloc_free(nir);
       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
    }
+   /* M5 mesh shaders export per-primitive words on private vertices. */
+   if (agx_chip_g17_m5(dev->dev.chip) &&
+       nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, agx_nir_lower_m5_mesh_fragment);
 
 
    /* G17P compiles the custom-border emulation in only once the physical
@@ -5374,7 +5378,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             .write_mask = BITFIELD_MASK(page_words), .src_type = nir_type_uint32,
             .io_semantics = {.location = AGX_MESH_PRIMITIVE_PAGE_SLOT, .num_slots = 1});
       }
-      agx_nir_lower_uvs(layout.shader, &shader->info.uvs, false);
+      /* An M5 mesh layer/viewport is also a user word (see
+       * agx_m5_mesh_gather_varyings), as for the M5 vertex stage. */
+      agx_nir_lower_uvs(layout.shader, &shader->info.uvs,
+                        m5_mesh && layout_ok && varyings.lv);
       shader->info.uvs.mesh_primitive_page = varyings.primitive_stride_B != 0;
       shader->info.mesh.primitive_stride_B = varyings.primitive_stride_B;
       ralloc_free(layout.shader);
@@ -5399,6 +5406,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       layout_ok &= varyings.size == shader->info.uvs.size;
       layout_ok &= !varyings.clip_distance_count ||
          varyings.clip_distance_first == shader->info.uvs.group_offs[UVS_CLIP_DIST];
+      layout_ok &= !m5_mesh || !varyings.lv ||
+         varyings.lv_first == shader->info.uvs.group_offs[UVS_LAYER_VIEWPORT];
       if (!layout_ok ||
           !(m5_mesh ? agx_nir_lower_m5_task_payload_probe(nir)
                     : agx_nir_lower_gen1_task_payload_probe(nir)) ||
@@ -5409,6 +5418,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "native mesh layout outside captured triangle contract");
       }
+      /* Per-primitive outputs can raise the exported vertex count. */
+      shader->info.mesh.max_vertices = nir->info.mesh.max_vertices_out;
       if (agx_chip_g17_m5(dev->dev.chip))
          agx_preprocess_nir_m5(nir);
       else
