@@ -260,6 +260,7 @@ agx_g17p_sample_exports_end(const struct agx_g17p_colour_layout *l,
    return agx_g17p_sample_zs_base_layout(l, nr_samples, nr_samples);
 }
 
+void agx_nir_lower_sample_exports_to_end(struct nir_shader *shader);
 bool agx_nir_needs_sample_count(const struct nir_shader *shader);
 bool agx_nir_specialize_sample_count(struct nir_shader *shader, unsigned samples);
 bool agx_nir_unroll_g17p_samples(struct nir_shader *shader,

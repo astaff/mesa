@@ -6323,6 +6323,8 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    /* A refusal of these inputs is final: remember it with the programs. */
 #define HK_MONO_REFUSE(why)                                                    \
    do {                                                                        \
+      if (shader->info.fs.m5_inline_sample_shading)                             \
+         mesa_loge("M5 inline sample shading: %s", why);                        \
       final_refusal = true;                                                    \
       goto fail;                                                               \
    } while (0)
@@ -6339,7 +6341,9 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    if (!mem)
       return NULL;
    const unsigned main_samples = MAX2(shader->g17p_mono_key.fs.nr_samples, 1);
-   if (ekey->native_spills || ekey->link.sample_shading ||
+   const bool inline_samples = shader->info.fs.m5_inline_sample_shading;
+   if ((ekey->native_spills && !inline_samples) ||
+       (ekey->link.sample_shading && !inline_samples) ||
        MAX2(ekey->nr_samples, 1) != main_samples)
       HK_MONO_REFUSE("epilog shape");
 
@@ -6356,7 +6360,13 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
          if (refused)
             HK_MONO_FAIL("refused before");
          if (part) {
-            if (hk_g17p_mono_part_refusal(shader, part))
+            struct agx_shader_part expected = shader->b;
+            if (inline_samples && ekey->native_spills)
+               expected.info.push_count = MAX2(expected.info.push_count,
+                                               ekey->emrt_heap_base + 4);
+            if (inline_samples
+                   ? hk_g17p_mono_layout_mismatch(&expected, part)
+                   : hk_g17p_mono_part_refusal(shader, part))
                HK_MONO_FAIL("cached program");
             ralloc_free(mem);
             return part;
@@ -6382,9 +6392,18 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
 
    /* The epilog, exactly as the split path builds it. */
    eb = nir_builder_init_simple_shader(0, &agx_nir_options, NULL);
-   build_g17p_fs_epilog(&eb, ekey);
+   if (inline_samples) {
+      struct agx_fs_epilog_key pixel = *ekey;
+      pixel.link.sample_shading = false;
+      pixel.defer_monolithic_msaa = true;
+      agx_nir_fs_epilog(&eb, &pixel);
+      agx_nir_lower_sample_exports_to_end(nir);
+   } else {
+      build_g17p_fs_epilog(&eb, ekey);
+   }
    agx_preprocess_nir(eb.shader);
-   NIR_PASS(_, eb.shader, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
+   if (!inline_samples)
+      NIR_PASS(_, eb.shader, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
 
    /* Epilog code reading uniforms (blend constants and the like) would
     * need uniforms the main's layout does not reserve. */
@@ -6393,6 +6412,13 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (inline_samples && ekey->native_spills &&
+             (op == nir_intrinsic_bindless_image_agx ||
+              op == nir_intrinsic_bindless_image_store ||
+              (op == nir_intrinsic_load_preamble &&
+               nir_intrinsic_base(nir_instr_as_intrinsic(instr)) ==
+                  ekey->emrt_heap_base)))
+            continue;
          if (op == nir_intrinsic_load_preamble ||
              op == nir_intrinsic_load_blend_const_color_rgba ||
              op == nir_intrinsic_load_blend_const_color_r_float ||
@@ -6428,11 +6454,31 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
+   if (inline_samples) {
+      struct agx_g17p_colour_layout layout;
+      agx_g17p_colour_layout_init(&layout, ekey->link.loc_written,
+                                  ekey->link.size_32, ekey->link.colour_comps,
+                                  ekey->link.packed_colour);
+      NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
+      NIR_PASS(_, nir, agx_nir_unroll_g17p_samples_layout,
+               ekey->nr_samples, &layout);
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, nir, nir_opt_constant_folding);
+         NIR_PASS(progress, nir, nir_opt_algebraic);
+      } while (progress);
+      NIR_PASS(_, nir, agx_nir_hoist_g17p_zs_writes);
+      NIR_PASS(_, nir, agx_nir_lower_g17p_tile_samples, ekey->nr_samples);
+      nir->info.fs.uses_sample_shading = false;
+   }
 
    struct agx_shader_key key = shader->g17p_mono_key;
+   if (inline_samples)
+      key.fs.inside_sample_loop = false;
    key.no_stop = false;
    key.secondary = false;
-   key.g17p_emrt = false;
+   key.g17p_emrt = inline_samples && ekey->native_spills;
    if (shader->b.info.rodata.size_16 && shader->b.binary) {
       key.g17p_rodata_hint =
          (const uint16_t *)((const uint8_t *)shader->b.binary +
@@ -6454,7 +6500,13 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    }
    nir = NULL; /* consumed */
 
-   const char *why = hk_g17p_mono_part_refusal(shader, part);
+   struct agx_shader_part expected = shader->b;
+   if (inline_samples && ekey->native_spills)
+      expected.info.push_count = MAX2(expected.info.push_count,
+                                      ekey->emrt_heap_base + 4);
+   const char *why = inline_samples
+      ? hk_g17p_mono_layout_mismatch(&expected, part)
+      : hk_g17p_mono_part_refusal(shader, part);
    if (why)
       HK_MONO_REFUSE(why);
 
@@ -6530,8 +6582,9 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
 
    /* Inline blend: try one monolithic fragment program first;
     * any refusal falls through to the split link below, unchanged. */
-   if (agx_native_graphics(&dev->dev) &&
-       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
+   if ((shader->info.fs.m5_inline_sample_shading ||
+        (agx_native_graphics(&dev->dev) &&
+         (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND))) &&
        !prolog && key->nr_samples_shaded == 0 && shader->g17p_mono_nir) {
       struct agx_shader_part *mono = hk_g17p_inline_epilog_part(
          dev, shader, &key->epilog, g17p_tile_partitions);
@@ -6555,6 +6608,11 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
          }
          ralloc_free(mono_key_clone);
       }
+   }
+
+   if (shader->info.fs.m5_inline_sample_shading) {
+      mesa_loge("M5: required inline sample shading could not be linked");
+      return NULL;
    }
 
    struct agx_shader_part *epilog =
@@ -9079,6 +9137,13 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
          return false;
       key->epilog.emrt_heap_base = ALIGN_POT(base, 4);
       key->epilog.blend_constant_base = key->epilog.emrt_heap_base + 4;
+      /* The M5 image-write encoder accepts the low 256 uniform halves. The
+       * resource heaps occupy 0..7 and the root starts at 12; the mandatory
+       * inline program can use the reserved 8..11 gap for its spill heap. */
+      if (fs->info.fs.m5_inline_sample_shading &&
+          !fs->info.agx3_gen1_fragment_rq &&
+          fs->info.agx3_root_uniform == AGX_ABI_FUNI_ROOT)
+         key->epilog.emrt_heap_base = 8;
    }
 
    if (!key->epilog.native_spills &&

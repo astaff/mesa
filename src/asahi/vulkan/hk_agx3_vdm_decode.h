@@ -40,6 +40,8 @@ hk_shader_binary_version(enum agx_chip chip)
    case AGX_CHIP_G15P:
       return HK_AGX2_SHADER_BINARY_VERSION;
    case AGX_CHIP_G17P:
+   case AGX_CHIP_G17G:
+   case AGX_CHIP_G17S:
       return HK_AGX3_SHADER_BINARY_VERSION;
    default:
       return HK_CLASSIC_SHADER_BINARY_VERSION;

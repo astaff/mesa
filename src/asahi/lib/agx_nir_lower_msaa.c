@@ -269,8 +269,8 @@ specialize_g17p_sample_copy(nir_cf_list *copy,
  * it. Conditional depth/stencil writes need phis here: moving their exports
  * directly to the end would move uses outside the defining branch.
  */
-static void
-lower_sample_exports_to_end(nir_shader *shader)
+void
+agx_nir_lower_sample_exports_to_end(nir_shader *shader)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    nir_block *end = nir_cursor_current_block(nir_after_impl(impl));
@@ -375,7 +375,7 @@ agx_nir_unroll_g17p_samples_layout(nir_shader *shader, unsigned nr_samples,
       }
    }
 
-   lower_sample_exports_to_end(shader);
+   agx_nir_lower_sample_exports_to_end(shader);
 
    nir_cf_list body;
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));

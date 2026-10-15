@@ -105,7 +105,8 @@ struct hk_shader_info {
          /* G17P: the shader may leave pixels unwritten: it discards, demotes
           * or writes the sample mask. */
          bool may_kill;
-         uint8_t _pad[3];
+         bool m5_inline_sample_shading;
+         uint8_t _pad[2];
       } fs;
 
       struct {

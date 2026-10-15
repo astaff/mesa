@@ -3409,7 +3409,7 @@ hk_native_fs_registers(enum agx_chip chip)
 }
 
 static bool
-hk_g17p_unrolls_sample_shading(const nir_shader *nir,
+hk_native_sample_shading_supported(const nir_shader *nir,
                                const struct hk_fs_key *key, enum agx_chip chip)
 {
    const unsigned samples = hk_native_fs_samples(chip, key);
@@ -3442,7 +3442,8 @@ hk_g17p_unrolls_sample_shading(const nir_shader *nir,
 
    agx_g17p_colour_layout_init(&layout, locations, size_32, comps, true);
    return agx_g17p_sample_exports_end(&layout, samples) <=
-          hk_native_fs_registers(chip);
+          hk_native_fs_registers(chip) ||
+          (agx_chip_g17_m5(chip) && samples == 8);
 }
 
 static void
@@ -4195,23 +4196,27 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
       if (nir->info.fs.uses_sample_shading &&
           (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))) {
-         /* hk_compile_shader() kept sample shading only for a fixed count.
-          * The linked epilog unrolls the same samples. */
+         /* A split shader exports each sample through fixed registers. M5
+          * fragments that exceed that file retain one sample's NIR until
+          * the epilog can be inlined, then unroll the complete body. */
          const unsigned raster_samples = hk_native_fs_samples(dev->dev.chip, &key->fs);
          const unsigned registers = hk_native_fs_registers(dev->dev.chip);
          assert(raster_samples == 2 || raster_samples == 4 ||
                 (agx_chip_g17_m5(dev->dev.chip) && raster_samples == 8));
 
          /* M5 unrolls up to eight samples in its larger register file, the
-          * same count and file hk_g17p_unrolls_sample_shading() admitted. */
+          * same count and file hk_native_sample_shading_supported() admitted. */
          if (!agx_nir_lower_g17p_sample_shading_file(
                 nir, &shader->info.fs.epilog_key, raster_samples, registers,
                 agx_chip_g17_m5(dev->dev.chip))) {
-            assert(!"the gate admitted a fragment whose exports do not fit");
-            ralloc_free(nir);
-            return vk_errorf(dev, VK_ERROR_UNKNOWN,
-                             "G17P: %u-sample colour exports exceed the %u-half register file",
-                             raster_samples, registers);
+            if (agx_chip_g17_m5(dev->dev.chip) && raster_samples == 8) {
+               shader->info.fs.m5_inline_sample_shading = true;
+            } else {
+               ralloc_free(nir);
+               return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                                "G17P: %u-sample colour exports exceed the %u-half register file",
+                                raster_samples, registers);
+            }
          }
       } else if (nir->info.fs.uses_sample_shading) {
          /* Ensure the sample mask is preserved in register */
@@ -4233,7 +4238,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, agx_nir_specialize_sample_count,
                   key->fs.g17p_samples);
 
-      NIR_PASS(_, nir, agx_nir_lower_fs_active_samples_to_register);
+      if (!shader->info.fs.m5_inline_sample_shading)
+         NIR_PASS(_, nir, agx_nir_lower_fs_active_samples_to_register);
       /* G17P exposes the raster layer through the flat coefficient table.
        * SR28 is the compute grid-Z register and does not hold a fragment
        * layer on this generation. */
@@ -4485,14 +4491,15 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    assert(nir->info.io_lowered);
 
-   /* Inline blend: keep what fast-link needs to rebuild this
-    * fragment program with its colour epilog inlined. Per-sample shading and
-    * internal shaders keep the split parts. */
-   if (agx_native_graphics(&dev->dev) &&
-       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
-       sw_stage == MESA_SHADER_FRAGMENT &&
-       nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.internal &&
-       !nir->info.fs.uses_sample_shading) {
+   /* Preserve NIR for optional G17P inline blending and mandatory M5
+    * sample shading whose split exports exceed the register file. */
+   if ((sw_stage == MESA_SHADER_FRAGMENT &&
+        shader->info.fs.m5_inline_sample_shading) ||
+       (agx_native_graphics(&dev->dev) &&
+        (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
+        sw_stage == MESA_SHADER_FRAGMENT &&
+        nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.internal &&
+        !nir->info.fs.uses_sample_shading)) {
       struct blob blob;
       blob_init(&blob);
       nir_serialize(&blob, nir, false);
@@ -4505,6 +4512,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          }
       }
       blob_finish(&blob);
+      if (shader->info.fs.m5_inline_sample_shading) {
+         if (!shader->g17p_mono_nir) {
+            ralloc_free(nir);
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         /* This compile supplies resource metadata only. Command recording
+          * requires the complete inline program before any draw can run. */
+         NIR_PASS(_, nir, agx_nir_lower_g17p_1x_sample_shading);
+         backend_key.fs.inside_sample_loop = false;
+      }
    }
 
    /* Native query lowering and descriptor optimization can turn the last
@@ -4835,7 +4852,7 @@ hk_compile_fs_sample_variant(struct hk_device *dev,
       key.fs.m5_position_samples = samples;
 
    if (samples > 1 && nir->info.fs.uses_sample_shading &&
-       !hk_g17p_unrolls_sample_shading(nir, &key.fs, dev->dev.chip)) {
+       !hk_native_sample_shading_supported(nir, &key.fs, dev->dev.chip)) {
       ralloc_free(nir);
       return vk_error(dev, VK_ERROR_UNKNOWN);
    }
@@ -5179,7 +5196,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
           nir->info.fs.uses_sample_shading &&
           !sample_variants &&
-          !hk_g17p_unrolls_sample_shading(nir, &key->fs, dev->dev.chip)) {
+          !hk_native_sample_shading_supported(nir, &key->fs, dev->dev.chip)) {
          g17p_collapsed_sample_shading = true;
          NIR_PASS(_, nir, agx_nir_lower_g17p_1x_sample_shading);
       }
@@ -5713,7 +5730,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             key->fs.g17p_samples = samples;
             if (agx_chip_g17_m5(dev->dev.chip))
                key->fs.m5_position_samples = samples;
-            if (!hk_g17p_unrolls_sample_shading(nir, &key->fs, dev->dev.chip)) {
+            if (!hk_native_sample_shading_supported(nir, &key->fs, dev->dev.chip)) {
                ralloc_free(nir);
                hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
                /* Same contract as above: not a legal code for any caller of
