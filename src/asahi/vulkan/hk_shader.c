@@ -313,6 +313,68 @@ hk_cf_list_has_ray_query(struct exec_list *cf_list)
    return false;
 }
 
+/* A ray query addressed through a non-constant array index. Unrolling the
+ * loop that produces the index lets query arrays split into fixed native
+ * contexts, so such loops are left to the unroller. */
+static bool
+hk_cf_list_has_indexed_ray_query(struct exec_list *cf_list)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                !nir_intrinsic_is_ray_query(nir_instr_as_intrinsic(instr)->intrinsic))
+               continue;
+            nir_deref_instr *deref =
+               nir_src_as_deref(nir_instr_as_intrinsic(instr)->src[0]);
+            for (; deref && deref->deref_type != nir_deref_type_var;
+                 deref = nir_deref_instr_parent(deref)) {
+               if (deref->deref_type == nir_deref_type_array &&
+                   !nir_src_is_const(deref->arr.index))
+                  return true;
+            }
+         }
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (hk_cf_list_has_indexed_ray_query(&nif->then_list) ||
+             hk_cf_list_has_indexed_ray_query(&nif->else_list))
+            return true;
+         break;
+      }
+      case nir_cf_node_loop:
+         if (hk_cf_list_has_indexed_ray_query(&nir_cf_node_as_loop(node)->body))
+            return true;
+         break;
+      default:
+         break;
+      }
+   }
+   return false;
+}
+
+/* Keep loops that run whole native queries. Unrolled, each iteration copies
+ * the complete traversal (a 64-iteration TES loop compiled to 317 KB).
+ * Opt-in (ASAHI_M5_RQ_KEEP_LOOPS) until its CTS qualification is complete. */
+static void
+hk_keep_m5_ray_query_loops(struct exec_list *cf_list)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         hk_keep_m5_ray_query_loops(&nif->then_list);
+         hk_keep_m5_ray_query_loops(&nif->else_list);
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         if (hk_cf_list_has_ray_query(&loop->body) &&
+             !hk_cf_list_has_indexed_ray_query(&loop->body))
+            loop->control = nir_loop_control_dont_unroll;
+         hk_keep_m5_ray_query_loops(&loop->body);
+      }
+   }
+}
+
 static void
 hk_keep_ray_query_loops(struct exec_list *cf_list)
 {
@@ -373,6 +435,11 @@ hk_nir_has_m5_native_query(const struct hk_device *dev, nir_shader *nir)
 void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
+   if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip) &&
+       debug_get_bool_option("ASAHI_M5_RQ_KEEP_LOOPS", false)) {
+      nir_foreach_function_impl(impl, nir)
+         hk_keep_m5_ray_query_loops(&impl->body);
+   }
    if ((nir->info.stage == MESA_SHADER_VERTEX ||
         nir->info.stage == MESA_SHADER_TESS_EVAL) &&
        debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_KEEP_LOOPS_DIAGNOSTIC", false)) {
