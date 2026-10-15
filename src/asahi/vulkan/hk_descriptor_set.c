@@ -803,7 +803,6 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
 
    for (uint32_t w = 0; w < write_count; w++) {
       const VkWriteDescriptorSet *write = &writes[w];
-      assert(write->dstSet == VK_NULL_HANDLE);
 
       switch (write->descriptorType) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
