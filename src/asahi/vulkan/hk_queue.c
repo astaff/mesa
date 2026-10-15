@@ -1420,7 +1420,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                cmd.prior_vdm = command_prior[HK_SYNC_VDM];
                cmd.prior_cdm = command_prior[HK_SYNC_CDM];
             }
-            if (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq) {
+            if (!agx_chip_g17_m5(dev->dev.chip) &&
+                (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq)) {
                struct drm_asahi_cmd_render_with_ray_query extended = {.legacy = cmd};
                for (unsigned stage = 0; stage < 2; ++stage) {
                   if (!(stage ? cs->gen1_native_fragment_rq

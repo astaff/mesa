@@ -107,12 +107,16 @@ agx3_pixel_atomic_acquire(enum agx_isa_encoding enc,
       return false;
    memset(out, 0, AGX3_PIXEL_MAX_LENGTH);
    *len = 0;
-   if (enc != AGX_ISA_ENCODING_AGX3B)
+   if (!enc_ok(enc))
       return false;
 
-   const struct agx3_field_kv fields[] = {KV(14, 4)};
-   if (!agx3_bind_compose(enc, "pixwait", 0, fields, NELEM(fields), NULL, 0,
-                          out, len)) {
+   const struct agx3_field_kv fields[] = {KV(14, 4), KV(34, 0)};
+   const struct agx3_field_kv base_c[] = {KV(16, 3), KV(17, 122)};
+   if (!agx3_bind_compose(enc, "pixwait", 0,
+                          is_b(enc) ? fields : base_c,
+                          is_b(enc) ? 1 : NELEM(base_c),
+                          is_b(enc) ? NULL : fields,
+                          is_b(enc) ? 0 : NELEM(fields), out, len)) {
       memset(out, 0, AGX3_PIXEL_MAX_LENGTH);
       *len = 0;
       return false;
@@ -217,6 +221,7 @@ agx3_pixel_release(enum agx_isa_encoding enc, uint32_t writeout, bool last,
 
    if (!enc_ok(enc) || !wait_mask_ok(enc, wait_mask) ||
        !(in_set(writeout, witnessed, NELEM(witnessed)) ||
+         (enc == AGX_ISA_ENCODING_AGX3C && writeout == 4) ||
          (writeout == 204 || writeout == 240)))
       return false;
 

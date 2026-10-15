@@ -5,6 +5,7 @@
 #include "agx_nir_m5_ray_query.h"
 #include "agx3_scs_core.h"
 #include "agx3_sr_core.h"
+#include "agx3_pixel_core.h"
 #include "agx3_graphics_program.h"
 #include "asahi/lib/agx3_compute_program_core.h"
 #include "compiler/nir/nir_builder.h"
@@ -272,15 +273,32 @@ standard_ray_query(unsigned count, bool array, mesa_shader_stage stage)
             assert(!nir_intrinsic_is_ray_query(nir_instr_as_intrinsic(instr)->intrinsic));
       }
    }
-   b.shader->info.stage = MESA_SHADER_COMPUTE;
+   b.shader->info.stage = stage == MESA_SHADER_FRAGMENT ? stage : MESA_SHADER_COMPUTE;
    agx_preprocess_nir(b.shader);
    struct agx_shader_key key = {
       .dev = {.chip = AGX_CHIP_G17S, .encoding = AGX_ISA_ENCODING_AGX3C},
       .no_preamble = true,
    };
    struct agx_shader_part part = {0};
-   assert(agx_compile_shader_nir(b.shader, &key, &part));
+   bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
+   if (!compiled) fprintf(stderr, "Query compile refusal: %s\n", agx_last_compile_refusal());
+   assert(compiled);
    assert(part.info.uses_ray_traversal && part.info.main_size);
+   if (stage == MESA_SHADER_FRAGMENT) {
+      const uint8_t acquire[] = {0x27, 0x00, 0x00, 0x05, 0x00, 0x00};
+      unsigned acquires = 0;
+      for (size_t i = part.info.main_offset;
+           i + sizeof(acquire) <= part.info.main_offset + part.info.main_size; ++i)
+         acquires += !memcmp(part.binary + i, acquire, sizeof(acquire));
+      assert(acquires == 1);
+      assert(!part.info.agx3_colour_link.rt_query_write_acquired);
+      const uint8_t release[] = {0x27, 0x00, 0x00, 0x04, 0x00, 0x00};
+      unsigned releases = 0;
+      for (size_t i = part.info.main_offset;
+           i + sizeof(release) <= part.info.main_offset + part.info.main_size; ++i)
+         releases += !memcmp(part.binary + i, release, sizeof(release));
+      assert(releases == 1);
+   }
    free(part.binary);
    ralloc_free(b.shader);
    if (saved) {
@@ -433,6 +451,8 @@ int main(int argc,char **argv)
  batch_completion_latch(2);
  standard_ray_query(1, false, MESA_SHADER_COMPUTE);
  standard_ray_query(1, false, MESA_SHADER_TESS_CTRL);
+ standard_ray_query(1, false, MESA_SHADER_VERTEX);
+ standard_ray_query(1, false, MESA_SHADER_FRAGMENT);
  standard_ray_query(2, false, MESA_SHADER_COMPUTE);
  standard_ray_query(8, false, MESA_SHADER_COMPUTE);
  standard_ray_query(4, true, MESA_SHADER_COMPUTE);

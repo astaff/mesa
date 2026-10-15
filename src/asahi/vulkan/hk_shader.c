@@ -3939,13 +3939,17 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    bool default_layer = true;
    if ((sw_stage == MESA_SHADER_FRAGMENT && dev->gen1_native_fragment_rq) ||
        (sw_stage != MESA_SHADER_FRAGMENT && sw_stage != MESA_SHADER_COMPUTE &&
-        dev->gen1_native_graphics_rq)) {
+        dev->gen1_native_graphics_rq) ||
+       (dev->m5_native_rq && (nir->info.stage == MESA_SHADER_VERTEX ||
+                               nir->info.stage == MESA_SHADER_FRAGMENT))) {
       nir_foreach_function_impl(impl, nir) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
                if (instr->type == nir_instr_type_intrinsic &&
                    nir_instr_as_intrinsic(instr)->intrinsic ==
-                      nir_intrinsic_intersect_ray_gen1_agx)
+                      nir_intrinsic_intersect_ray_gen1_agx ||
+                   (instr->type == nir_instr_type_intrinsic && dev->m5_native_rq &&
+                    nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_intersect_ray_agx))
                   shader->info.agx3_gen1_fragment_rq = true;
             }
          }
@@ -4336,7 +4340,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * query prefix for them as well as compute, and only for live queries. */
    const bool m5_native_query_abi =
       (nir->info.stage == MESA_SHADER_COMPUTE ||
-       sw_stage == MESA_SHADER_TESS_CTRL) && dev->m5_native_rq &&
+       sw_stage == MESA_SHADER_TESS_CTRL ||
+       sw_stage == MESA_SHADER_GEOMETRY) && dev->m5_native_rq &&
       (!debug_get_bool_option("ASAHI_M5_SHADER_LOCAL_RQ_ABI", true) ||
        hk_m5_needs_query_abi(nir));
    if (m5_native_query_abi)
@@ -4350,7 +4355,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       ((sw_stage == MESA_SHADER_COMPUTE && dev->gen1_native_rq &&
         hk_nir_has_ray_query(nir)) ||
        shader->info.agx3_gen1_fragment_rq) ? 168 : 0;
-   if (sw_stage != MESA_SHADER_VERTEX || !shader->info.agx3_gen1_fragment_rq)
+   if ((sw_stage != MESA_SHADER_VERTEX || !shader->info.agx3_gen1_fragment_rq) &&
+       !(m5_native_query_abi && shader->info.agx3_gen1_fragment_rq))
       root += texture_uniform_base;
    shader->info.set_count = set_count;
    shader->info.agx3_root_uniform = root;

@@ -1731,6 +1731,23 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       programs[2].threads = 3;
       programs[2].usage_flags = DRM_ASAHI_RENDER_PROGRAM_OBJECT;
    }
+   for (unsigned stage = 0; stage < 2; ++stage) {
+      if (!(stage ? cs->gen1_native_fragment_rq : cs->gen1_native_vertex_rq))
+         continue;
+      if (!v2) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      programs[stage].usage_flags |= DRM_ASAHI_RENDER_PROGRAM_SCS;
+      programs[stage].scs_layout = UINT64_C(0x01140000600100e8);
+      programs[stage].auxiliary_allocation = 14;
+      programs[stage].intersection_pool = dev->m5_rq_ift->va->addr;
+      programs[stage].intersection_pool_bytes = 0x8000;
+      programs[stage].intersection_first = 1;
+      programs[stage].intersection_count = 112;
+      programs[stage].intersection_default_program = dev->m5_rq_default_program;
+      programs[stage].intersection_default_control = dev->m5_rq_default_control;
+   }
    const struct drm_asahi_render_program legacy[2] = {programs[0].legacy, programs[1].legacy};
    const size_t count = mesh ? 3 : 2;
    const void *values = v2 ? (const void *)programs : (const void *)legacy;

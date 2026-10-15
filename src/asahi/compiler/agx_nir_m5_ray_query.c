@@ -1365,7 +1365,9 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
                            const struct agx_m5_ray_query_layout *layout)
 {
    const bool kernel = layout && layout->compute_kernel &&
-      shader->info.stage == MESA_SHADER_TESS_CTRL;
+      (shader->info.stage == MESA_SHADER_TESS_CTRL ||
+       shader->info.stage == MESA_SHADER_VERTEX ||
+       shader->info.stage == MESA_SHADER_FRAGMENT);
    if (!layout || (!kernel && shader->info.stage != MESA_SHADER_COMPUTE) ||
        (!kernel && shader->info.workgroup_size_variable) ||
        layout->payload_uniform > 508 ||

@@ -8,6 +8,7 @@
 #include "hk_ppp_state.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
+#include "asahi/lib/agx_scs_layout.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -22,6 +23,7 @@
 #include "hk_agx3_vdm_decode.h"
 #include "asahi/lib/agx_ioto_load_core.h"
 #include "hk_buffer.h"
+#include "hk_acceleration_structure.h"
 #include "hk_cmd_pool.h"
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
@@ -2122,6 +2124,71 @@ hk_m5_compute_uniform_dma_ranges(
    return true;
 }
 
+static bool
+hk_m5_graphics_query_uniforms(struct hk_cmd_buffer *cmd, bool vertex,
+                             struct agx3_ioto_uniform_range *range)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const uint64_t packed = UINT64_C(0x01140000600100e8);
+   struct agx_scs_layout_gen2 scs;
+   if (!dev->m5_native_rq || !dev->m5_rq_instances ||
+       !agx_scs_layout_gen2_init(packed, &scs) || !cmd->current_cs.gfx)
+      return false;
+   const uint64_t size = MAX2(UINT64_C(0x800000),
+      ALIGN_POT((uint64_t)scs.end[12], 0x4000));
+   struct agx_ptr state = hk_pool_alloc(cmd, size, 0x4000);
+   struct agx_ptr uniforms = hk_pool_alloc(cmd, 512, 16);
+   uint64_t table = hk_m5_upload_as_table(cmd);
+   if (!state.cpu || !uniforms.cpu || !table)
+      return false;
+   memcpy(state.cpu, dev->m5_rq_user_image, 0x800000);
+   if (size > 0x800000)
+      memset((uint8_t *)state.cpu + 0x800000, 0, size - 0x800000);
+   agx_scs_layout_gen2_parameters(&scs, (uint8_t *)state.cpu + 0x80020);
+   memset(uniforms.cpu, 0, 512);
+   memcpy(uniforms.cpu, dev->m5_rq_uniforms, sizeof(dev->m5_rq_uniforms));
+   uint64_t sizes = (uint64_t)scs.end[6] | ((uint64_t)scs.end[11] << 32);
+   uint64_t driver = scs.end[5];
+   memcpy((uint8_t *)uniforms.cpu + 48*2, &sizes, 8);
+   memcpy((uint8_t *)uniforms.cpu + 52*2, &packed, 8);
+   memcpy((uint8_t *)uniforms.cpu + 56*2, &driver, 8);
+   uint64_t query_payload = UINT64_C(0x3fffffff00008000);
+   memcpy((uint8_t *)uniforms.cpu + 152*2, &query_payload, 8);
+   for (unsigned i = 0; i < 80; i += 2) {
+      uint64_t pointer;
+      memcpy(&pointer, (uint8_t *)uniforms.cpu + i*4, 8);
+      if (pointer >= UINT64_C(0x10000000000) && pointer < UINT64_C(0x10000800000)) {
+         pointer += state.gpu - UINT64_C(0x10000000000);
+         memcpy((uint8_t *)uniforms.cpu + i*4, &pointer, 8);
+      }
+   }
+   memcpy((uint8_t *)uniforms.cpu + 32*2, &table, 8);
+   uint32_t context[32] = {0, 0, (uint32_t)packed, (uint32_t)(packed >> 32)};
+   const uint32_t offsets[] = {0x18000,0x18200,0x18400,0x18500,0x18700,0x19b00};
+   for (unsigned i = 0; i < 6; ++i) {
+      uint64_t pointer = i == 4 ? table : state.gpu + offsets[i];
+      memcpy(context + 4 + 2*i, &pointer, 8);
+   }
+   context[20] = scs.end[5];
+   context[22] = scs.end[10] - scs.end[5];
+   const unsigned levels = (packed >> 16) & 0xff;
+   context[23] = (levels + (levels > 1)) * 8;
+   uint64_t extra = state.gpu + 0x80050;
+   memcpy(context + 26, &extra, 8);
+   extra = state.gpu + 0x18900;
+   memcpy(context + 30, &extra, 8);
+   uint64_t ctx = uniforms.gpu + 352;
+   memcpy((uint8_t *)uniforms.cpu + 352, context, sizeof(context));
+   memcpy((uint8_t *)uniforms.cpu + 320, &ctx, 8);
+   memcpy((uint8_t *)uniforms.cpu + 328, &table, 8);
+   *range = (struct agx3_ioto_uniform_range){0, 168, uniforms.gpu};
+   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_code);
+   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_ift);
+   if (vertex) cmd->current_cs.gfx->gen1_native_vertex_rq = true;
+   else cmd->current_cs.gfx->gen1_native_fragment_rq = true;
+   return true;
+}
+
 /* sources, when not NULL, receives each range's enum hk_g17p_range_source. */
 static bool
 hk_g17p_graphics_uniform_ranges(
@@ -2147,8 +2214,9 @@ hk_g17p_graphics_uniform_ranges(
       if (linked->g17p_prolog_uses_root ||
           agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) ||
           hk_cmd_uses_blend_constant(cmd) ||
-          !hk_gen1_upload_fragment_query_state(
-             cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count]))
+          !(agx_chip_g17_m5(dev->dev.chip)
+             ? hk_m5_graphics_query_uniforms(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])
+             : hk_gen1_upload_fragment_query_state(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])))
          return hk_g17p_graphics_ranges_refused(range_count,count);
       count++;
    }

@@ -8926,7 +8926,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              scan_I->op == AGX_OPCODE_IMAGE_WRITE)
             has_memory_write = true;
          if (scan_I->op == AGX_OPCODE_INTERSECT_RAY_GEN1 ||
-             scan_I->op == AGX_OPCODE_CONTINUE_RAY_GEN1)
+             scan_I->op == AGX_OPCODE_CONTINUE_RAY_GEN1 ||
+             scan_I->op == AGX_OPCODE_INTERSECT_RAY_M5 ||
+             scan_I->op == AGX_OPCODE_CONTINUE_RAY_M5)
             has_ray_traversal = true;
          if (scan_I->op == AGX_OPCODE_DEVICE_LOAD)
             device_loads_left++;
@@ -9196,7 +9198,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    const bool g17p_pixel_protocol =
       g17p_colour_protocol || g17p_blend_protocol || has_coverage_write;
    const bool g17p_colourless_fragment =
-      enc == AGX_ISA_ENCODING_AGX3B && ctx->stage == MESA_SHADER_FRAGMENT &&
+      (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+      ctx->stage == MESA_SHADER_FRAGMENT &&
       !ctx->key->fs.ignore_tib_dependencies && tile_stores_left == 0 &&
       !(ctx->nir && (ctx->nir->info.outputs_written &
                      BITFIELD64_RANGE(FRAG_RESULT_DATA0, AGX_MAX_RTS)));
@@ -9229,7 +9232,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          ctx->agx3_colour_link.straight_line = false;
    }
    const bool fragment_ray_query = has_ray_traversal &&
-      enc == AGX_ISA_ENCODING_AGX3B && ctx->stage == MESA_SHADER_FRAGMENT;
+      (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+      ctx->stage == MESA_SHADER_FRAGMENT;
    if (fragment_ray_query && (ctx->key->fs.nr_samples > 1 ||
        (ctx->agx3_colour_link.colour_classes & ~1u)))
       goto fail;
@@ -11896,6 +11900,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                const uint8_t publish[] = {0x17, 0x11, 0, 6, 0, 0};
                if (!agx3_append(emission, publish, sizeof(publish)))
                   AGX3_REFUSE(I);
+               if (fragment_ray_query && !ray_query_acquired) {
+                  uint8_t pixel[AGX3_PIXEL_MAX_LENGTH], pixel_len;
+                  const bool ok = g17p_colourless_fragment
+                     ? agx3_pixel_atomic_acquire(enc, pixel, &pixel_len)
+                     : agx3_pixel_wait(enc, 4, 0, pixel, &pixel_len);
+                  if (!ok || !agx3_append(emission, pixel, pixel_len))
+                     AGX3_REFUSE(I);
+                  ray_query_acquired = true;
+                  ctx->agx3_colour_link.rt_query_write_acquired = !g17p_colourless_fragment;
+               }
                ctx->agx3_staging_halfs = MAX2(ctx->agx3_staging_halfs, 6);
             } else {
                if (I->nr_srcs != 1 ||
@@ -17268,6 +17282,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             AGX3_REFUSE(I);
          }
       }
+   }
+
+   if (enc == AGX_ISA_ENCODING_AGX3C && fragment_ray_query &&
+       g17p_colourless_fragment && ray_query_acquired) {
+      uint8_t release[AGX3_PIXEL_MAX_LENGTH], release_len;
+      if (!agx3_pixel_release(enc, 4, false, 0, release, &release_len) ||
+          !agx3_append(emission, release, release_len))
+         AGX3_PACK_FAIL();
    }
 
    if (early_compare) {
