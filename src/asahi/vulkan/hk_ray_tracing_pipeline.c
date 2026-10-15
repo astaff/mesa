@@ -1957,9 +1957,14 @@ hk_init_ray_tracing_groups(
             current = seen;
          }
       } else {
+         pipeline->groups[i].handle.index = 0;
+      }
+   }
+
+   for (i = 0; i < create_info->groupCount; i++) {
+      if (!pipeline->groups[i].handle.index)
          pipeline->groups[i].handle.index =
             p_atomic_inc_return(&dev->rt_group_handle_alloc);
-      }
    }
 
    if (!create_info->pLibraryInfo)

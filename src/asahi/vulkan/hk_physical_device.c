@@ -437,7 +437,8 @@ hk_get_device_features(
        * extensions above.  Host-side builds stay off: they are unimplemented
        * and a conformant application therefore never reaches them. */
       .accelerationStructure = supported_extensions->KHR_acceleration_structure,
-      .accelerationStructureCaptureReplay = false,
+      .accelerationStructureCaptureReplay =
+         supported_extensions->KHR_acceleration_structure,
       .accelerationStructureIndirectBuild =
          supported_extensions->KHR_acceleration_structure,
       .accelerationStructureHostCommands = false,
@@ -455,7 +456,8 @@ hk_get_device_features(
          supported_extensions->EXT_pipeline_library_group_handles,
       .rayTracingPipelineShaderGroupHandleCaptureReplay =
          supported_extensions->KHR_ray_tracing_pipeline,
-      .rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false,
+      .rayTracingPipelineShaderGroupHandleCaptureReplayMixed =
+         supported_extensions->KHR_ray_tracing_pipeline,
       .rayTracingPipelineTraceRaysIndirect =
          supported_extensions->KHR_ray_tracing_pipeline,
 

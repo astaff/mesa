@@ -83,6 +83,7 @@ static const uint32_t agx3_refit_spv[] = {
 };
 
 static void hk_flush_buffer_write_cp(VkCommandBuffer);
+static uint64_t hk_as_native_va(struct vk_acceleration_structure *);
 static void hk_as_phase_begin(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_agx3_refit_phase(VkCommandBuffer,
@@ -165,10 +166,22 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
    const VkAllocationCallbacks *alloc, VkAccelerationStructureKHR *out)
 {
    VK_FROM_HANDLE(hk_device, dev, device);
+   VkAccelerationStructureCreateInfoKHR native_info;
+   const VkDeviceAddress replay_address = dev->g17p_native_as ? info->deviceAddress : 0;
+   if (replay_address) {
+      native_info = *info;
+      native_info.deviceAddress = 0;
+      info = &native_info;
+   }
    VkResult result = vk_common_CreateAccelerationStructureKHR(device, info, alloc, out);
    if (result != VK_SUCCESS || !dev->g17p_native_as)
       return result;
    VK_FROM_HANDLE(vk_acceleration_structure, as, *out);
+   if (replay_address && hk_as_native_va(as) != replay_address) {
+      vk_common_DestroyAccelerationStructureKHR(device, *out, alloc);
+      *out = VK_NULL_HANDLE;
+      return vk_error(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS);
+   }
    bool inserted = false;
    uint32_t id = 1;
    simple_mtx_lock(&dev->gen1_as_lock);
