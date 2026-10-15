@@ -184,6 +184,13 @@ struct vk_bvh_geometry_data {
    uint32_t index_format;
 };
 
+struct vk_build_range_info {
+   uint32_t primitive_count;
+   uint32_t primitive_offset;
+   uint32_t first_vertex;
+   uint32_t transform_offset;
+};
+
 struct key32_id_pair {
    uint32_t id;
    uint32_t key;
@@ -407,6 +414,8 @@ TYPE(vk_global_sync_data, 4);
 
 TYPE(vk_bvh_geometry_data, 8);
 
+TYPE(vk_build_range_info, 4);
+
 /* A GLSL-adapted copy of VkAccelerationStructureInstanceKHR. */
 struct AccelerationStructureInstance {
    mat3x4 transform;
@@ -448,6 +457,8 @@ struct leaf_args {
    VOID_REF ids;
 
    vk_bvh_geometry_data geom_data;
+
+   REF(vk_build_range_info) indirect;
 };
 
 #define VK_MORTON_BUILD_FLAGS (VK_BUILD_FLAG_64BIT_KEYS)

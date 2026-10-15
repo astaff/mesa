@@ -697,6 +697,8 @@ build_leaves(VkCommandBuffer commandBuffer, struct vk_device *device,
             continue;
 
          leaf_consts.geom_data = vk_fill_geometry_data(build_info->type, states[i].leaf_node_count, j, geom, build_range_info);
+         leaf_consts.indirect = states[i].indirect_addr ?
+            states[i].indirect_addr + (uint64_t)j * states[i].indirect_stride : 0;
 
          disp->CmdPushConstants(commandBuffer, layout,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leaf_consts), &leaf_consts);
@@ -1251,6 +1253,21 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
                                      const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos,
                                      const struct vk_acceleration_structure_build_args *args)
 {
+   vk_cmd_build_acceleration_structures_indirect(commandBuffer, device, meta, infoCount, pInfos,
+                                                 ppBuildRangeInfos, NULL, NULL, args);
+}
+
+void
+vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
+                                              struct vk_device *device,
+                                              struct vk_meta_device *meta,
+                                              uint32_t infoCount,
+                                              const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+                                              const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos,
+                                              const VkDeviceAddress *pIndirectDeviceAddresses,
+                                              const uint32_t *pIndirectStrides,
+                                              const struct vk_acceleration_structure_build_args *args)
+{
    VK_FROM_HANDLE(vk_command_buffer, cmd_buffer, commandBuffer);
    const struct vk_acceleration_structure_build_ops *ops = device->as_build_ops;
 
@@ -1287,6 +1304,10 @@ vk_cmd_build_acceleration_structures(VkCommandBuffer commandBuffer,
                                                  pInfos + i, args);
 
       states[i].build_range_infos = ppBuildRangeInfos[i];
+      if (pIndirectDeviceAddresses) {
+         states[i].indirect_addr = pIndirectDeviceAddresses[i];
+         states[i].indirect_stride = pIndirectStrides[i];
+      }
       /* The leaf node dispatch code uses leaf_node_count as a base index. */
       states[i].leaf_node_count = 0;
 

@@ -438,7 +438,8 @@ hk_get_device_features(
        * and a conformant application therefore never reaches them. */
       .accelerationStructure = supported_extensions->KHR_acceleration_structure,
       .accelerationStructureCaptureReplay = false,
-      .accelerationStructureIndirectBuild = false,
+      .accelerationStructureIndirectBuild =
+         supported_extensions->KHR_acceleration_structure,
       .accelerationStructureHostCommands = false,
       .descriptorBindingAccelerationStructureUpdateAfterBind =
          supported_extensions->KHR_acceleration_structure,
