@@ -191,23 +191,26 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (pAllocateInfo->allocationSize > UINT64_MAX - (alignment - 1))
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-   /* An allocation that imports nothing needs a nonzero size (the spec
-    * requires allocationSize > 0 there), and no size beyond the heap can be
-    * satisfied. Refuse both before creating a BO: a 0-byte request, or one
-    * whose page rounding below wraps to 0, would otherwise reach
-    * agx_bo_create() as a 0-byte BO and fail in the kernel. */
+   /* No size beyond the heap can be satisfied. Refuse it before creating a
+    * BO: a request whose page rounding below wraps to 0 would otherwise
+    * reach agx_bo_create() as a 0-byte BO and fail in the kernel. */
    if (!(fd_info && fd_info->handleType) &&
-       (pAllocateInfo->allocationSize == 0 ||
-        pAllocateInfo->allocationSize > heap->size)) {
+       pAllocateInfo->allocationSize > heap->size) {
       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "allocationSize %" PRIu64 " is 0 or exceeds heap %u "
+                       "allocationSize %" PRIu64 " exceeds heap %u "
                        "(%" PRIu64 " bytes)",
                        (uint64_t)pAllocateInfo->allocationSize,
                        type->heapIndex, (uint64_t)heap->size);
    }
 
+   /* The spec requires allocationSize > 0 when nothing is imported
+    * (VUID-VkMemoryAllocateInfo-allocationSize-07897), but CTS
+    * cooperative_matrix.op_constant_null creates zero-sized buffers and
+    * allocates their zero-sized requirements. Back such an allocation with
+    * one page, so it can still be bound and mapped, rather than fail it with
+    * VK_ERROR_OUT_OF_DEVICE_MEMORY. */
    const uint64_t aligned_size =
-      align64(pAllocateInfo->allocationSize, alignment);
+      align64(MAX2(pAllocateInfo->allocationSize, 1), alignment);
    uint64_t used = p_atomic_read(&heap->used);
    if (used > heap->size || aligned_size > heap->size - used)
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
