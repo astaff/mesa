@@ -6,6 +6,7 @@
 #include "agx3_binder.h"
 #include "asahi/lib/agx_ioto_program_core.h"
 #include "agx3_ioto_load_packer.h"
+#include "agx3_cprog_input.h"
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx_ppp_hal300_graphics_core.h"
 #include "asahi/lib/agx3_compute_program_core.h"
@@ -602,6 +603,61 @@ test_multiround_uniforms(enum agx_chip chip)
    return 0;
 }
 
+/* Compute loaders that publish a few hundred constant-program inputs (UBO
+ * contents read by a preamble, as in ubo.*_compute) must fit the M5 program
+ * buffer, and the body bound must still cover what the loader writes for
+ * aligned pairs, lone halves and pairs at odd compact positions. */
+static int
+test_cprog_input_bound(enum agx_chip chip)
+{
+   const struct agx3_ioto_uniform_range ranges[] = {
+      { .start_halfs = 0, .size_halfs = 8, .address = 0x4000001000 },
+      { .start_halfs = 8, .size_halfs = 128, .address = 0x5000010000 },
+      { .start_halfs = 136, .size_halfs = 128, .address = 0x5000010240 },
+      { .start_halfs = 264, .size_halfs = 128, .address = 0x5000010480 },
+      { .start_halfs = 392, .size_halfs = 24, .address = 0x5000020000 },
+      { .start_halfs = 416, .size_halfs = 6, .address = 0x4000001098 },
+   };
+   for (unsigned pattern = 0; pattern < 3; ++pattern) {
+      uint64_t halves[AGX3_CPROG_INPUT_WORDS] = {0};
+      for (unsigned h = 8; h < 422; ++h) {
+         const bool selected = pattern == 0 ? true
+                             : pattern == 1 ? (h & 1)
+                             : (h == 9 || h >= 10);
+         if (selected)
+            halves[h / 64] |= UINT64_C(1) << (h % 64);
+      }
+      struct agx3_cprog_inputs inputs;
+      CHECK(agx3_cprog_inputs_init(halves, &inputs));
+      const struct agx3_ioto_uniform_program_desc load_desc = {
+         .program_va = 0x10000100000, .ranges = ranges,
+         .range_count = ARRAY_SIZE(ranges), .patchable = true,
+         .cprog_inputs = &inputs,
+      };
+      size_t bound, chunks;
+      CHECK(agx3_ioto_uniform_program_desc_body_bound(chip, &load_desc,
+                                                      &bound, &chunks));
+      if (pattern == 0)
+         CHECK(bound <= AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE);
+
+      uint8_t body[2 * AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
+      struct agx_ioto_inflight_load loads[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
+      struct agx_ioto_inflight_load sort[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
+      struct agx_ioto_load_cache_entry cache[AGX3_G17P_GRAPHICS_MAX_LOAD_CHUNKS];
+      const struct agx3_ioto_uniform_program_workspace workspace = {
+         .body = body, .body_capacity = sizeof(body),
+         .loads = loads, .load_capacity = ARRAY_SIZE(loads),
+         .sort = sort, .sort_capacity = ARRAY_SIZE(sort),
+         .cache = cache, .cache_capacity = ARRAY_SIZE(cache),
+      };
+      size_t body_size, copy_offset;
+      CHECK(agx3_ioto_uniform_program_body_generate(chip, &load_desc, workspace,
+                                                    &body_size, &copy_offset));
+      CHECK(body_size <= bound);
+   }
+   return 0;
+}
+
 static int
 test_load_completion_wait(enum agx_chip chip)
 {
@@ -697,6 +753,8 @@ int main(void) {
            test_load_completion_wait(AGX_CHIP_G17S) ||
            test_multiround_uniforms(AGX_CHIP_G17G) ||
            test_multiround_uniforms(AGX_CHIP_G17S) ||
+           test_cprog_input_bound(AGX_CHIP_G17G) ||
+           test_cprog_input_bound(AGX_CHIP_G17S) ||
            test_color_disabled() || test_visibility() || test_line_width() || test_polygon_and_primitive_msaa() || test_g17g_programs(AGX_CHIP_G17G) || test_g17g_programs(AGX_CHIP_G17S) ||
            test_m5_dispatch(AGX_CHIP_G17G) || test_m5_dispatch(AGX_CHIP_G17S) ||
            test_m5_single_kick_launch(AGX_CHIP_G17G) ||
