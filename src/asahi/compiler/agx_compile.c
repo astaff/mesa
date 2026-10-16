@@ -7873,6 +7873,7 @@ set_speculate(nir_builder *b, nir_instr *instr, UNUSED void *_)
 
 static bool agx_g17p_discard_word(nir_shader *nir);
 static bool agx_m5_discard_word(nir_shader *nir);
+static bool agx_m5_split_or_selects(nir_shader *nir);
 
 /* Drop a constant program left without instructions. */
 static void
@@ -8294,6 +8295,16 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (byte_indices)
       NIR_PASS(_, nir, agx_nir_scalarize_int64);
    NIR_PASS(_, nir, nir_lower_int64);
+
+   /* After the selects of trivial if-else statements exist. */
+   if (m5) {
+      bool folded = false;
+      NIR_PASS(folded, nir, agx_m5_split_or_selects);
+      if (folded) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
 
    /* We need to lower fmin/fmax again after nir_opt_algebraic_late due to f2fmp
     * wackiness. This is usually a no-op but is required for correctness in
@@ -12343,6 +12354,75 @@ agx_g17p_discard_word(nir_shader *nir)
  * unchanged. Bit 0 is the only bit the one-sample word reads, so the update
  * is unchanged by construction.
  */
+/* Whether `d` is b2f of `c` or of its inversion; *value is then the float
+ * that b2f gives when `c` holds. */
+static bool
+agx_b2f_of(nir_def *d, nir_def *c, unsigned c_comp, bool *inverted)
+{
+   nir_alu_instr *b2f = nir_def_as_alu_or_null(d);
+   if (!b2f || (b2f->op != nir_op_b2f32 && b2f->op != nir_op_b2f16))
+      return false;
+   nir_def *x = b2f->src[0].src.ssa;
+   unsigned xc = b2f->src[0].swizzle[0];
+   nir_alu_instr *inot = nir_def_as_alu_or_null(x);
+   *inverted = inot && inot->op == nir_op_inot;
+   if (*inverted) {
+      x = inot->src[0].src.ssa;
+      xc = inot->src[0].swizzle[xc];
+   }
+   return x == c && xc == c_comp;
+}
+
+/*
+ * bcsel(a || b, b2f(!a), r) is 0.0 when a holds, else 1.0 when b holds, else
+ * r: split it into bcsel(a, 0.0, bcsel(b, 1.0, r)) (likewise for b2f(a) and
+ * for b in place of a). Minecraft's linear fog builds this per distance (0
+ * before the start, 1 past the end, the ramp between); AGX has no boolean
+ * OR or NOT, so the backend built it from three selects, two of them needing
+ * their uniform comparand copied into a GPR on M5. Apple's fragment uses two
+ * selects. The values are exact (b2f gives +0.0 and 1.0). M5 only, so other
+ * targets keep their compiles.
+ */
+static bool
+agx_m5_split_or_select(nir_builder *b, nir_alu_instr *sel, void *data)
+{
+   if (sel->op != nir_op_bcsel || sel->def.num_components != 1)
+      return false;
+   nir_alu_instr *ior = nir_def_as_alu_or_null(sel->src[0].src.ssa);
+   if (!ior || ior->op != nir_op_ior || ior->def.num_components != 1 ||
+       ior->def.bit_size != 1)
+      return false;
+
+   for (unsigned first = 0; first < 2; ++first) {
+      nir_def *a = ior->src[first].src.ssa;
+      unsigned ac = ior->src[first].swizzle[0];
+      bool inverted;
+      if (!agx_b2f_of(sel->src[1].src.ssa, a, ac, &inverted) ||
+          a->num_components <= ac)
+         continue;
+
+      b->cursor = nir_before_instr(&sel->instr);
+      const unsigned bits = sel->def.bit_size;
+      nir_def *ca = nir_channel(b, a, ac);
+      nir_def *cb = nir_mov_alu(b, ior->src[!first], 1);
+      nir_def *r = nir_mov_alu(b, sel->src[2], 1);
+      /* a holds: b2f(a) = 1, b2f(!a) = 0. Otherwise b holds: the opposite. */
+      nir_def *when_a = nir_imm_floatN_t(b, inverted ? 0.0 : 1.0, bits);
+      nir_def *when_b = nir_imm_floatN_t(b, inverted ? 1.0 : 0.0, bits);
+      nir_def *split = nir_bcsel(b, ca, when_a, nir_bcsel(b, cb, when_b, r));
+      nir_def_replace(&sel->def, split);
+      return true;
+   }
+   return false;
+}
+
+static bool
+agx_m5_split_or_selects(nir_shader *nir)
+{
+   return nir_shader_alu_pass(nir, agx_m5_split_or_select,
+                              nir_metadata_control_flow, NULL);
+}
+
 static bool
 agx_m5_discard_word_instr(nir_builder *b, nir_intrinsic_instr *intr,
                           void *data)
