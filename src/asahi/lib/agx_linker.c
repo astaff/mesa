@@ -641,6 +641,15 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       }
    }
 
+   /* The linked program is what runs; its parts are dumped at compile. */
+   if ((agx_get_compiler_debug() & AGX_DBG_SHADERS) &&
+       (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip))) {
+      fprintf(stderr, "AGX3 linked: fragment=%u size=%zu hex=", fragment, size);
+      for (size_t i = 0; i < size; ++i)
+         fprintf(stderr, "%02x", linked_map[i]);
+      fprintf(stderr, "\n");
+   }
+
    return true;
 
 invalid_start_marker:
