@@ -332,6 +332,17 @@ TEST(AGX3UniformALU, RefusesInvalidInputsWithoutWriting)
                                           AGX3_UNIFORM_FADD, 0, src, false,
                                           false, 0, bytes, &length));
    src[1].discard = false;
+   /* M5 ADD takes one uniform and one register; only the uniform may be
+    * negated, and the result is never saturated. */
+   src[0].neg = true;
+   EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
+                                          AGX3_UNIFORM_FADD, 0, src, false,
+                                          false, 0, bytes, &length));
+   src[0].neg = false;
+   EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
+                                          AGX3_UNIFORM_FADD, 0, src, true,
+                                          false, 0, bytes, &length));
+   src[0].kind = AGX3_FLOAT_UNIFORM;
    EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
                                           AGX3_UNIFORM_FADD, 0, src, false,
                                           false, 0, bytes, &length));
@@ -654,6 +665,187 @@ TEST(AGX3UniformALU, M5NativeMultiplyAndFmaUniformWitnesses)
    }
 }
 
+/* Native G17G Minecraft 26.3 terrain, entity, cloud and
+ * sky pipelines: every distinct f32 ADD/MUL/FMA with a uniform operand or a
+ * uniform-file result in their mains and constant programs whose fields the
+ * encoder names, re-encoded from the decoded operands. */
+TEST(AGX3UniformALU, M5NativeUniformOperandAndResultShapes)
+{
+   const struct {
+      agx3_uniform_float_op op; bool uniform_dest; uint16_t dest;
+      bool sat, cache; uint8_t wait; agx3_uniform_float_src src[3];
+      uint8_t length; uint8_t expected[16];
+   } cases[] = {
+      {AGX3_UNIFORM_FMA, false, 8, false, true, 0, {{AGX3_FLOAT_REGISTER, 6, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 4, false, true, false, false, false}, {AGX3_FLOAT_IMMEDIATE, 48, false, false, false, false, false}}, 8, {0x49,0x87,0x26,0x05,0x21,0xb0,0x02,0x0a}},
+      {AGX3_UNIFORM_FMUL, true, 32, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 8, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {}}, 6, {0x09,0x89,0x45,0x89,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, true, 36, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {}}, 6, {0x29,0x99,0x55,0x09,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, true, 34, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 10, false, false, true, false, false}, {}}, 6, {0x19,0x99,0x45,0x8b,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, true, 38, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 8, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {}}, 6, {0x39,0x89,0x55,0x0b,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {}}, 6, {0x69,0x0d,0x2d,0x1f,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {}}, 6, {0x99,0x21,0x24,0x83,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {}}, 6, {0x79,0x23,0x24,0x81,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 32, false, true, false, false, false}, {}}, 6, {0x99,0x83,0x24,0x21,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 34, false, true, false, false, false}, {}}, 6, {0x79,0x81,0x24,0x23,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {}}, 6, {0x99,0x25,0x24,0x83,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, true, false, false, false}, {}}, 6, {0x79,0x81,0x24,0x27,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, true, false, false, false}, {}}, 6, {0x99,0x83,0x24,0x25,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {}}, 6, {0x79,0x27,0x24,0x81,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 90, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 20, false, false, false, false, false}, {}}, 6, {0xd9,0x03,0xad,0x15,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 88, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 22, false, false, false, false, false}, {}}, 6, {0xc9,0x01,0xad,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 88, false, true, 0, {{AGX3_FLOAT_REGISTER, 88, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {}}, 6, {0xc9,0x59,0xad,0x1b,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 90, false, true, 0, {{AGX3_FLOAT_REGISTER, 90, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {}}, 6, {0xd9,0x5b,0xad,0x19,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 52, false, true, 0, {{AGX3_FLOAT_REGISTER, 62, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 28, false, true, false, false, false}, {}}, 6, {0xa9,0x3f,0x6c,0x1d,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 56, true, true, 0, {{AGX3_FLOAT_REGISTER, 52, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {}}, 8, {0xc9,0x35,0x6d,0x1f,0x01,0x02,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 20, false, false, false, false, false}, {}}, 6, {0x99,0x83,0x25,0x15,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 22, false, false, false, false, false}, {}}, 6, {0x89,0x81,0x25,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {}}, 6, {0x99,0x13,0x2d,0x19,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {}}, 6, {0x89,0x11,0x2d,0x1b,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {}}, 6, {0x89,0x3f,0x25,0x8f,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 40, false, true, false, false, false}, {}}, 6, {0x79,0x91,0x24,0x29,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 20, false, true, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}, {}}, 6, {0xa9,0x0f,0x2d,0x31,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 44, false, true, false, false, false}, {}}, 6, {0x79,0x93,0x24,0x2d,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}, {}}, 6, {0xb9,0x0f,0x2d,0x33,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 26, false, true, 0, {{AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}}, 8, {0xd9,0x39,0x26,0x8d,0x21,0x38,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}}, 8, {0xa9,0x3b,0x26,0x8d,0x21,0x3a,0x82,0x08}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {}}, 6, {0x19,0x03,0x2d,0x3f,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 6, {0x09,0x83,0x26,0x39,0xa0,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x89,0x83,0x26,0x3b,0xa0,0x10}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}}, 8, {0x79,0x3d,0x26,0x8d,0x21,0x3c,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x19,0x03,0x2e,0x3d,0xa0,0x04}},
+      {AGX3_UNIFORM_FADD, false, 8, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 16, false, true, false, false, false}, {}}, 6, {0x49,0x8b,0x24,0x11,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 8, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {}}, 6, {0x49,0x09,0x2d,0x19,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 20, false, true, false, false, false}, {}}, 6, {0x59,0x89,0x24,0x15,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {}}, 6, {0x59,0x0b,0x2d,0x1b,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 0, false, true, 0, {{AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {}}, 6, {0x09,0x25,0x35,0x01,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {}}, 6, {0x19,0x27,0x35,0x03,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 8, false, false, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {}}, 6, {0x49,0x09,0x0d,0x23,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 6, {0x09,0x89,0x26,0x1d,0xa0,0x00}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}}, 6, {0x19,0x89,0x26,0x1f,0xa0,0x0c}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_UNIFORM, 40, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {}}, 6, {0x19,0x29,0x35,0x05,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 42, false, false, false, false, false}, {}}, 6, {0x19,0x03,0x2d,0x2b,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x29,0x09,0x2e,0x21,0xa0,0x04}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 40, false, true, false, false, false}, {}}, 6, {0x79,0x93,0x24,0x29,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}, {}}, 6, {0x79,0x0f,0x2d,0x31,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 44, false, true, false, false, false}, {}}, 6, {0x89,0x8d,0x24,0x2d,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}, {}}, 6, {0x89,0x11,0x2d,0x33,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {}}, 6, {0x69,0x0d,0x2d,0x3f,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 24, false, true, 0, {{AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}}, 8, {0xc9,0x39,0x26,0x83,0x21,0x38,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}}, 8, {0xb9,0x3b,0x26,0x83,0x21,0x3a,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x09,0x8d,0x26,0x39,0xa0,0x10}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x79,0x8d,0x26,0x3b,0xa0,0x0e}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}}, 8, {0x99,0x3d,0x26,0x83,0x21,0x3c,0x82,0x08}},
+      {AGX3_UNIFORM_FMUL, false, 10, false, true, 0, {{AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 6, false, false, true, false, false}, {}}, 6, {0x59,0x3f,0x25,0x87,0x80,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x29,0x0d,0x2e,0x3d,0xa0,0x04}},
+      {AGX3_UNIFORM_FADD, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 20, false, true, false, false, false}, {}}, 6, {0x29,0x81,0x24,0x15,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 6, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 8, false, false, false, false, false}, {}}, 6, {0x39,0x83,0x25,0x09,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 18, false, false, false, false, false}, {}}, 6, {0x19,0x01,0x2d,0x13,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}}, 8, {0x09,0x19,0x26,0x83,0x21,0x18,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}}, 8, {0x29,0x1b,0x26,0x83,0x21,0x1a,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 12, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 6, {0x09,0x83,0x26,0x0d,0xa0,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 14, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x29,0x83,0x26,0x0f,0xa0,0x04}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}}, 8, {0x29,0x1d,0x26,0x83,0x21,0x1c,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 16, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x19,0x03,0x2e,0x11,0xa0,0x04}},
+      {AGX3_UNIFORM_FMA, true, 24, false, false, 8, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 68, false, false, false, true, false}}, 8, {0xc9,0xc1,0x06,0x81,0x81,0x44,0x42,0x80}},
+      {AGX3_UNIFORM_FMA, true, 26, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 66, false, false, false, true, false}}, 8, {0xd9,0xc1,0x06,0x83,0x81,0x42,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 28, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0xe9,0xc1,0x06,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 30, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 62, false, false, false, true, false}}, 8, {0xf9,0x41,0x0e,0x07,0x81,0x3e,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 32, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}}, 8, {0x09,0xb9,0x46,0x81,0x81,0x40,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 34, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 58, false, false, false, true, false}}, 8, {0x19,0xb9,0x46,0x83,0x81,0x3a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 36, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x29,0xb9,0x46,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 38, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 52, false, false, false, true, false}}, 8, {0x39,0x39,0x4e,0x07,0x81,0x34,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 40, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 50, false, false, false, true, false}}, 8, {0x49,0xaf,0x46,0x81,0x81,0x32,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 42, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x59,0xaf,0x46,0x83,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 44, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 42, false, false, false, true, false}}, 8, {0x69,0xaf,0x46,0x05,0x81,0x2a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 46, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 44, false, false, false, true, false}}, 8, {0x79,0x2f,0x4e,0x07,0x81,0x2c,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 48, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 40, false, false, false, true, false}}, 8, {0x89,0x8f,0x56,0x01,0x81,0x28,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 50, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 8, {0x99,0x8f,0x56,0x03,0x81,0x10,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 52, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 8, {0xa9,0x8f,0x56,0x05,0x81,0x00,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 70, false, false, false, false, true}, {AGX3_FLOAT_IMMEDIATE, 2, false, false, false, false, false}}, 8, {0x29,0x05,0x2e,0x46,0x21,0x82,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 70, false, false, false, false, true}, {AGX3_FLOAT_IMMEDIATE, 2, false, false, false, false, false}}, 8, {0x19,0x03,0x2e,0x46,0x21,0x82,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 40, false, true, 0, {{AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}}, 8, {0x49,0x19,0x66,0x91,0x21,0x30,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}}, 8, {0xb9,0x1b,0x26,0x91,0x21,0x32,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 40, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 40, false, false, false, true, false}}, 6, {0x49,0x93,0x66,0x21,0xa0,0x28}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}}, 6, {0xb9,0x93,0x26,0x23,0xa0,0x16}},
+      {AGX3_UNIFORM_FMA, false, 40, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 52, false, false, false, false, false}}, 8, {0x49,0x1d,0x66,0x91,0x21,0x34,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 46, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 40, false, false, false, true, false}}, 6, {0x79,0x93,0x66,0x25,0xa0,0x28}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 54, false, false, false, false, false}}, 8, {0x89,0x1f,0x36,0x11,0x21,0x36,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x89,0x93,0x26,0x27,0xa0,0x10}},
+      {AGX3_UNIFORM_FMUL, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 36, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 64, false, false, false, false, false}, {}}, 6, {0x99,0xa5,0x25,0x41,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 36, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {}}, 6, {0xb9,0x25,0x2d,0x39,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 38, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 66, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 6, {0x99,0xa7,0x26,0x43,0xa0,0x12}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 38, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}}, 6, {0xb9,0x27,0x2e,0x3b,0xa0,0x16}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 20, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}}, 6, {0xb9,0x95,0x26,0x3d,0xa0,0x16}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 68, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 6, {0x99,0x15,0x2e,0x45,0xa0,0x12}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 74, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 72, false, false, false, false, false}}, 8, {0xa9,0x15,0x2e,0x4b,0x21,0x48,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 74, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 72, false, false, false, false, false}}, 8, {0x99,0x13,0x2e,0x4b,0x21,0x48,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, true, 20, false, false, 8, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 68, false, false, false, true, false}}, 8, {0xa9,0xc1,0x06,0x01,0x81,0x44,0x42,0x80}},
+      {AGX3_UNIFORM_FMA, true, 22, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 66, false, false, false, true, false}}, 8, {0xb9,0xc1,0x06,0x83,0x81,0x42,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 24, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0xc9,0xc1,0x06,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 26, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 62, false, false, false, true, false}}, 8, {0xd9,0x41,0x0e,0x07,0x81,0x3e,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 28, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}}, 8, {0xe9,0xb9,0x06,0x01,0x81,0x40,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 30, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 58, false, false, false, true, false}}, 8, {0xf9,0xb9,0x06,0x83,0x81,0x3a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 32, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x09,0xb9,0x46,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 34, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 52, false, false, false, true, false}}, 8, {0x19,0x39,0x4e,0x07,0x81,0x34,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 36, false, false, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 50, false, false, false, true, false}}, 8, {0x29,0x01,0x46,0xaf,0x81,0x32,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 38, false, false, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x39,0x83,0x46,0xaf,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 40, false, false, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 42, false, false, false, true, false}}, 8, {0x49,0x05,0x46,0xaf,0x81,0x2a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 42, false, false, 0, {{AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 44, false, false, false, true, false}}, 8, {0x59,0x07,0x56,0x2f,0x81,0x2c,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 44, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 34, false, false, false, true, false}}, 8, {0x69,0x8f,0x56,0x01,0x81,0x22,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 46, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 8, {0x79,0x8f,0x56,0x03,0x81,0x10,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 48, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 8, {0x89,0x8f,0x56,0x05,0x81,0x12,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 74, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 66, false, false, false, false, false}}, 8, {0x89,0x4b,0x36,0x13,0x21,0x42,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 72, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 64, false, false, false, false, false}}, 8, {0x69,0x0d,0x2e,0x49,0x21,0x40,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 76, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 68, false, false, false, false, false}}, 8, {0x59,0x0b,0x2e,0x4d,0x21,0x44,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 44, false, false, false, false, false}}, 8, {0xa9,0x1d,0x26,0x91,0x21,0x2c,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 46, false, false, false, false, false}}, 8, {0x79,0x1f,0x26,0x91,0x21,0x2e,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}}, 6, {0x99,0x8d,0x26,0x25,0xa0,0x14}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x79,0x8d,0x26,0x27,0xa0,0x0e}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}}, 8, {0x79,0x21,0x26,0x91,0x21,0x30,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}}, 8, {0x89,0x23,0x36,0x11,0x21,0x32,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 40, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x79,0x8d,0x26,0x29,0xa0,0x0e}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 42, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x69,0x0d,0x2e,0x2b,0xa0,0x10}},
+      {AGX3_UNIFORM_FMA, true, 40, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 50, false, false, false, true, false}}, 8, {0x49,0xaf,0x46,0x01,0x81,0x32,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 48, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 34, false, false, false, true, false}}, 8, {0x89,0x8f,0x56,0x01,0x81,0x22,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 52, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 8, {0xa9,0x8f,0x56,0x05,0x81,0x12,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 70, false, false, false, false, true}, {AGX3_FLOAT_IMMEDIATE, 2, false, false, false, false, false}}, 8, {0x09,0x01,0x2e,0x46,0x21,0x82,0x02,0x02}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 64, false, false, false, false, false}, {}}, 6, {0x99,0x11,0x2c,0x41,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 66, false, false, false, false, false}, {}}, 6, {0x09,0x01,0x2c,0x43,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}}, 8, {0xa9,0x19,0x26,0x93,0x21,0x30,0x82,0x00}},
+      {AGX3_UNIFORM_FADD, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 68, false, false, false, false, false}, {}}, 6, {0x89,0x17,0x2c,0x45,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 32, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}}, 6, {0x09,0x81,0x66,0x21,0xa0,0x14}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 52, false, false, false, false, false}}, 8, {0xa9,0x1d,0x26,0x93,0x21,0x34,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 20, false, false, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}}, 6, {0xa9,0x81,0x06,0x25,0xa0,0x14}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}}, 8, {0x29,0x1b,0x26,0x93,0x21,0x32,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x69,0x81,0x26,0x23,0xa0,0x04}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 54, false, false, false, false, false}}, 8, {0x79,0x1f,0x36,0x13,0x21,0x36,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x69,0x01,0x26,0x27,0xa0,0x0e}},
+
+   };
+   unsigned failed = 0;
+   for (const auto &c : cases) {
+      uint8_t bytes[16] = {0}, length = 0;
+      const bool ok = c.uniform_dest
+         ? agx3_uniform_float_store_encode(AGX_ISA_ENCODING_AGX3C, c.op,
+                                           c.dest, c.src, c.wait, bytes,
+                                           &length)
+         : agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C, c.op, c.dest,
+                                     c.src, c.sat, c.cache, c.wait, bytes,
+                                     &length);
+      if (!ok || length != c.length || std::memcmp(bytes, c.expected, length)) {
+         ++failed;
+         fprintf(stderr, "mismatch op=%u ud=%u dest=%u ok=%u len=%u/%u got=",
+                 (unsigned)c.op, c.uniform_dest, c.dest, ok, length, c.length);
+         for (unsigned i = 0; i < length; ++i)
+            fprintf(stderr, "%02x", bytes[i]);
+         fprintf(stderr, " want=");
+         for (unsigned i = 0; i < c.length; ++i)
+            fprintf(stderr, "%02x", c.expected[i]);
+         fprintf(stderr, "\n");
+      }
+   }
+   EXPECT_EQ(failed, 0u);
+}
+
 TEST(AGX3UniformALU, M5LoweringRetainsWitnessedFloatUniforms)
 {
    void *mem = ralloc_context(NULL);
@@ -666,9 +858,24 @@ TEST(AGX3UniformALU, M5LoweringRetainsWitnessedFloatUniforms)
                               value, agx_uniform(158, AGX_SIZE_32));
    agx_instr *add = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
                               value, agx_uniform(158, AGX_SIZE_32));
+   /* U*R+U and R*U+imm (native terrain/sky witnesses) keep both uniforms. */
+   agx_instr *fma = agx_ffma_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                agx_uniform(56, AGX_SIZE_32), value,
+                                agx_uniform(56, AGX_SIZE_32));
+   agx_instr *fma_imm = agx_ffma_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                    value, agx_uniform(70, AGX_SIZE_16),
+                                    agx_immediate_f(1.0));
+   /* An absolute uniform is not a witnessed operand. */
+   agx_instr *add_abs = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                    value,
+                                    agx_abs(agx_uniform(158, AGX_SIZE_32)));
    agx_lower_uniform_sources(b->shader);
    EXPECT_EQ(mul->src[1].type, AGX_INDEX_UNIFORM);
-   EXPECT_NE(add->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(add->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(fma->src[0].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(fma->src[2].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(fma_imm->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_NE(add_abs->src[1].type, AGX_INDEX_UNIFORM);
    ralloc_free(mem);
 }
 
@@ -678,7 +885,9 @@ TEST(AGX3UniformALU, M5FloatUniformEightCompletionSlots)
       {AGX3_FLOAT_REGISTER, 26}, {AGX3_FLOAT_UNIFORM, 294},
       {AGX3_FLOAT_REGISTER, 40},
    };
-   for (auto op : {AGX3_UNIFORM_FMUL, AGX3_UNIFORM_FMA}) {
+   /* ADD has endpoints 0..3 only; a multi-producer wait takes its 12-byte
+    * ep3, as Minecraft's terrain vertex shaders need. */
+   for (auto op : {AGX3_UNIFORM_FADD, AGX3_UNIFORM_FMUL, AGX3_UNIFORM_FMA}) {
       std::set<std::string> unique;
       for (unsigned wait = 0; wait < 256; ++wait) {
          uint8_t bytes[16], length = 0;

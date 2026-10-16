@@ -380,7 +380,8 @@ m5_native_float_uniform(const agx_context *ctx, const agx_instr *I)
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
        ctx->is_preamble || I->nr_dests != 1 ||
        I->dest[0].size != AGX_SIZE_32 || agx_channels(I->dest[0]) != 1 ||
-       (I->op != AGX_OPCODE_FMUL && I->op != AGX_OPCODE_FFMA))
+       (I->op != AGX_OPCODE_FADD && I->op != AGX_OPCODE_FMUL &&
+        I->op != AGX_OPCODE_FFMA))
       return false;
    const bool fma = I->op == AGX_OPCODE_FFMA;
    if (I->nr_srcs != (fma ? 3 : 2))
@@ -388,20 +389,27 @@ m5_native_float_uniform(const agx_context *ctx, const agx_instr *I)
    struct agx3_uniform_float_src src[3] = {0};
    agx_foreach_src(I, s) {
       const agx_index v = I->src[s];
-      if (v.memory || v.size != AGX_SIZE_32 || agx_channels(v) != 1 ||
-          (v.type != AGX_INDEX_UNIFORM && v.type != AGX_INDEX_NORMAL))
+      const bool uniform = v.type == AGX_INDEX_UNIFORM;
+      if (v.memory || agx_channels(v) != 1 ||
+          (v.type == AGX_INDEX_IMMEDIATE ? v.value > 255
+           : v.type != AGX_INDEX_NORMAL && !uniform) ||
+          (v.type != AGX_INDEX_IMMEDIATE && v.size != AGX_SIZE_32 &&
+           !(uniform && v.size == AGX_SIZE_16)))
          return false;
       src[s] = (struct agx3_uniform_float_src){
-         .kind = v.type == AGX_INDEX_UNIFORM ? AGX3_FLOAT_UNIFORM
-                                            : AGX3_FLOAT_REGISTER,
-         .value = v.type == AGX_INDEX_UNIFORM ? v.value : 0,
+         .kind = uniform ? AGX3_FLOAT_UNIFORM
+                 : v.type == AGX_INDEX_IMMEDIATE ? AGX3_FLOAT_IMMEDIATE
+                                                 : AGX3_FLOAT_REGISTER,
+         .value = v.type == AGX_INDEX_NORMAL ? 0 : v.value,
          .abs = v.abs, .neg = v.neg,
+         .half = uniform && v.size == AGX_SIZE_16,
       };
    }
    uint8_t out[16], length;
    return agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
-      fma ? AGX3_UNIFORM_FMA : AGX3_UNIFORM_FMUL, 0, src, I->saturate,
-      false, 0, out, &length);
+      fma ? AGX3_UNIFORM_FMA
+          : I->op == AGX_OPCODE_FMUL ? AGX3_UNIFORM_FMUL : AGX3_UNIFORM_FADD,
+      0, src, I->saturate, false, 0, out, &length);
 }
 
 /* Native M5 bounded-buffer code uses uniform compare/select operands.

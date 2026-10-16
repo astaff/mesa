@@ -249,11 +249,17 @@ agx3_lower_uniform_half_exports(agx_context *ctx)
  * and RA. Only fold a same-block, single-use scalar value into its uniform
  * export. Native AIR-NT add/mul/fma witnesses ground plain f32 inputs and
  * low-file aligned outputs. Texture/sampler state stores are unrelated.
+ *
+ * M5 (G17G) constant programs witness two shapes only: an
+ * all-register FMA (the vertex matrix products) and an immediate*register
+ * MUL (agx3_uniform_float_store_encode). The other values keep their
+ * uniform store.
  */
 bool
 agx3_lower_uniform_program(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
+   if ((!m5 && ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B) ||
        !ctx->is_preamble || !ctx->alloc)
       return false;
 
@@ -322,6 +328,7 @@ agx3_lower_uniform_program(agx_context *ctx)
             admitted &= !alu->saturate && alu->nr_dests == 1 &&
                alu->nr_srcs == (alu->op == AGX_OPCODE_FFMA ? 3 : 2);
             bool has_register = false;
+            unsigned registers = 0, immediates = 0;
             agx_foreach_src(alu, s) {
                const agx_index src = alu->src[s];
                const bool reg = src.type == AGX_INDEX_NORMAL ||
@@ -331,8 +338,16 @@ agx3_lower_uniform_program(agx_context *ctx)
                   ((reg && src.size == AGX_SIZE_32 && agx_channels(src) == 1) ||
                    (immediate && src.value <= 255));
                has_register |= reg;
+               registers += reg;
+               immediates += immediate;
             }
             admitted &= has_register;
+            if (m5) {
+               admitted &= alu->op == AGX_OPCODE_FFMA ? registers == 3
+                           : alu->op == AGX_OPCODE_FMUL
+                              ? registers == 1 && immediates == 1
+                              : false;
+            }
          }
          if (!admitted)
             continue;

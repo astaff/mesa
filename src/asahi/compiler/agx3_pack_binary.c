@@ -610,8 +610,7 @@ agx3_try_uniform_float(struct util_dynarray *emission,
    const bool half = I->op == AGX_OPCODE_HADD || I->op == AGX_OPCODE_HMUL ||
                      I->op == AGX_OPCODE_HFMA;
    const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
-   if ((!m5 && enc != AGX_ISA_ENCODING_AGX3B) ||
-       (m5 && (half || I->op == AGX_OPCODE_FADD)) ||
+   if ((!m5 && enc != AGX_ISA_ENCODING_AGX3B) || (m5 && half) ||
        (!half && I->op != AGX_OPCODE_FADD && I->op != AGX_OPCODE_FMUL &&
         I->op != AGX_OPCODE_FFMA))
       return 0;

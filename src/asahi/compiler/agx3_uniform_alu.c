@@ -17,26 +17,85 @@ uniform_float_encode(enum agx_isa_encoding encoding,
        (!half && (dest & 1)) || wait_mask > (m5 ? 0xff : 0x3f))
       return false;
 
-   /* Retained native G17G shaders witness R/U MUL and R/U/R
-    * FMA. Keep other source shapes and half/uniform destinations outside
-    * this first M5 admission. Negative uniform FMA multiplicands occur in
-    * svgfReproject; plain uniform MUL occurs in both native ray kernels. */
+   /* Retained native G17G shaders witness, for a GPR result:
+    *   MUL R*U and U*R (also saturated);
+    *   ADD R+U and U+R, the uniform optionally negated;
+    *   FMA R*U+R, R*U+U and U*R+U, and R*U+imm, the uniform multiplicand
+    *   optionally negated and a register multiplicand negated in U*R+U;
+    * and for a uniform result in a constant program:
+    *   FMA R*R+R and MUL imm*R.
+    * Native Minecraft terrain/entity/sky pipelines compiled natively for
+    * G17G (vertex constant programs: 48 U=RRR FMAs, fragment
+    * constant programs: 12 U=IR MULs; mains: 39 ADDs, 29 U-addend FMAs and 5
+    * R*U+imm FMAs) are asserted byte for byte in test-agx3-uniform-alu.cpp.
+    * Half arithmetic stays outside this admission. */
    if (m5) {
-      if (half || uniform_dest || op == AGX3_UNIFORM_FADD ||
-          (op == AGX3_UNIFORM_FMA && saturate) || dest >= 252 ||
-          !((src[0].kind == AGX3_FLOAT_REGISTER &&
-             src[1].kind == AGX3_FLOAT_UNIFORM) ||
-            (src[1].kind == AGX3_FLOAT_REGISTER &&
-             src[0].kind == AGX3_FLOAT_UNIFORM)) ||
-          (op == AGX3_UNIFORM_FMA && src[2].kind != AGX3_FLOAT_REGISTER))
-         return false;
-      for (unsigned i = 0; i < (op == AGX3_UNIFORM_FMA ? 3 : 2); ++i) {
-         /* Mixed half uniform sources are AGX3B witnesses only. */
-         if (src[i].abs || src[i].half ||
-             (src[i].kind == AGX3_FLOAT_REGISTER &&
-                           (src[i].neg || src[i].value >= 252)) ||
-             (op == AGX3_UNIFORM_FMUL && src[i].neg))
+      const unsigned count = op == AGX3_UNIFORM_FMA ? 3 : 2;
+      unsigned regs = 0, uniforms = 0, immediates = 0;
+      for (unsigned i = 0; i < count; ++i) {
+         regs += src[i].kind == AGX3_FLOAT_REGISTER;
+         uniforms += src[i].kind == AGX3_FLOAT_UNIFORM;
+         immediates += src[i].kind == AGX3_FLOAT_IMMEDIATE;
+         /* A 16-bit uniform multiplicand of an f32 FMA is witnessed (R*U+imm,
+          * f43=1); other half operands stay outside. */
+         if (src[i].abs ||
+             (src[i].half && (src[i].kind != AGX3_FLOAT_UNIFORM ||
+                              op != AGX3_UNIFORM_FMA || i == 2)) ||
+             (src[i].kind == AGX3_FLOAT_REGISTER && src[i].value >= 252))
             return false;
+      }
+      if (half || dest >= 252 || (saturate && op != AGX3_UNIFORM_FMUL))
+         return false;
+      if (uniform_dest) {
+         /* U=RRR FMA and U=IR MUL, unmodified. */
+         if (op == AGX3_UNIFORM_FADD ||
+             (op == AGX3_UNIFORM_FMA && regs != 3) ||
+             (op == AGX3_UNIFORM_FMUL && (regs != 1 || immediates != 1)))
+            return false;
+         for (unsigned i = 0; i < count; ++i) {
+            if (src[i].neg)
+               return false;
+         }
+      } else {
+         const bool u0 = src[0].kind == AGX3_FLOAT_UNIFORM;
+         const bool u1 = src[1].kind == AGX3_FLOAT_UNIFORM;
+         if (op != AGX3_UNIFORM_FMA) {
+            /* One register and one uniform; only ADD negates (the
+             * uniform). */
+            if (regs != 1 || uniforms != 1)
+               return false;
+            for (unsigned i = 0; i < 2; ++i) {
+               if (src[i].neg && (op != AGX3_UNIFORM_FADD ||
+                                  src[i].kind != AGX3_FLOAT_UNIFORM))
+                  return false;
+            }
+         } else {
+            /* Exactly one uniform multiplicand and one register one. */
+            if (u0 == u1 || (src[0].kind != AGX3_FLOAT_REGISTER &&
+                             src[1].kind != AGX3_FLOAT_REGISTER))
+               return false;
+            switch (src[2].kind) {
+            case AGX3_FLOAT_REGISTER:
+               if (src[2].neg)
+                  return false;
+               break;
+            case AGX3_FLOAT_UNIFORM:
+               if (src[2].neg || src[2].value >= 512)
+                  return false;
+               break;
+            case AGX3_FLOAT_IMMEDIATE:
+               break;
+            default:
+               return false;
+            }
+            for (unsigned i = 0; i < 2; ++i) {
+               /* Negated register multiplicands are witnessed only with a
+                * uniform addend. */
+               if (src[i].neg && src[i].kind == AGX3_FLOAT_REGISTER &&
+                   src[2].kind != AGX3_FLOAT_UNIFORM)
+                  return false;
+            }
+         }
       }
    }
 
@@ -64,7 +123,9 @@ uniform_float_encode(enum agx_isa_encoding encoding,
          if (src[i].value >= 512 || (!source_half && (src[i].value & 1)) ||
              src[i].abs ||
              (src[i].neg &&
-              (source_half || op != AGX3_UNIFORM_FMA || (!m5 && i != 2))) ||
+              (source_half ||
+               (op != AGX3_UNIFORM_FMA && !(m5 && op == AGX3_UNIFORM_FADD)) ||
+               (!m5 && i != 2))) ||
              src[i].cache || src[i].discard)
             return false;
          break;
@@ -102,8 +163,15 @@ uniform_float_encode(enum agx_isa_encoding encoding,
                                                             : "f32fma");
    uint8_t best[16], best_length = 0;
    for (unsigned swap = 0; swap < 2; ++swap) {
-      if (m5 && op == AGX3_UNIFORM_FMA &&
+      /* M5 places an FMA's uniform multiplicand in the second operand
+       * unless the addend is a uniform too (U*R+U), and a uniform-result
+       * MUL's immediate in the first. */
+      if (m5 && op == AGX3_UNIFORM_FMA && !uniform_dest &&
+          src[2].kind != AGX3_FLOAT_UNIFORM &&
           src[1 ^ swap].kind != AGX3_FLOAT_UNIFORM)
+         continue;
+      if (m5 && op == AGX3_UNIFORM_FMUL && uniform_dest &&
+          src[swap].kind != AGX3_FLOAT_IMMEDIATE)
          continue;
       struct agx3_field_kv fields[48] = {
          {uniform_dest ? 3 : 2, dest},
@@ -140,9 +208,15 @@ uniform_float_encode(enum agx_isa_encoding encoding,
          fields[n++] = (struct agx3_field_kv){91, 2};
       }
       if (m5) {
-         fields[n++] = (struct agx3_field_kv){op == AGX3_UNIFORM_FMA ? 95 : 78, 3};
-         fields[n++] = (struct agx3_field_kv){op == AGX3_UNIFORM_FMA ? 96 : 79,
-                                            op == AGX3_UNIFORM_FMA ? 55 : 62};
+         /* f95/f78 is 3 for a GPR result and 1 for a uniform one; ADD has
+          * f50=3/f51=48 instead. */
+         const unsigned kind = uniform_dest ? 1 : 3;
+         fields[n++] = (struct agx3_field_kv){
+            op == AGX3_UNIFORM_FMA ? 95 : op == AGX3_UNIFORM_FMUL ? 78 : 50,
+            op == AGX3_UNIFORM_FADD ? 3 : kind};
+         fields[n++] = (struct agx3_field_kv){
+            op == AGX3_UNIFORM_FMA ? 96 : op == AGX3_UNIFORM_FMUL ? 79 : 51,
+            op == AGX3_UNIFORM_FMA ? 55 : op == AGX3_UNIFORM_FMUL ? 62 : 48};
       }
       const unsigned wait_base = half ? (op == AGX3_UNIFORM_FMA ? 68 : 51)
                                  : op == AGX3_UNIFORM_FADD ? 52
@@ -155,7 +229,11 @@ uniform_float_encode(enum agx_isa_encoding encoding,
       /* M5 adds the slot-seven/eight endpoints, and its MUL endpoints
        * are not ordered by length. Use the same complete endpoint domain
        * as the native register-only FALU encoder. */
-      const unsigned last_ep = m5 ? (op == AGX3_UNIFORM_FMA ? 7 : 5)
+      /* M5 f32add has endpoints 0..3 only; its 12-byte ep3 carries the
+       * independent wait fields, as for the register ADD encoder. */
+      const unsigned last_ep = m5 ? (op == AGX3_UNIFORM_FMA    ? 7
+                                     : op == AGX3_UNIFORM_FADD ? 3
+                                                               : 5)
                                   : op == AGX3_UNIFORM_FMA ? 5 : 3;
       /* Compact wait selectors express one slot. Use the independent fields
        * for multiple producers, without draining unrelated outstanding work. */
