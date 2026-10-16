@@ -22,15 +22,24 @@ struct agx3_rt_m5_intersect_desc {
  * indices 4..4+N-1; query-model74b witnesses this for N = 2, 3, 4, 5 and 8. */
 #define AGX3_RT_M5_MAX_LIVE_QUERIES 8
 
-/* Live queries the lowering admits: two (TraceRay + a nested any-hit query,
- * and two interleaved queries) are hardware-validated. Three or more compile
- * with the witnessed slots but returned wrong results on M5 (CTS
- * rayqueryterminate, 8 live queries), so they stay refused until the
- * per-query activation state is derived. The native witnesses show no
- * N-dependent launch or metadata field, so a hardware bisection build may
- * override this value (-DAGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES=N, N <= 8). */
+/* Live queries the lowering admits: every witnessed allocation index.
+ *
+ * On M5 hardware (R347 tree, R342 kernel) the only CTS cases with 3 to 8
+ * simultaneously live queries are ray_query.multiple_ray_queries.* (3, 4
+ * and 7), ray_query.stress.ahit_shader.* (3) and
+ * ray_query.builtin.rayqueryterminate.* outside any-hit and intersection
+ * shaders (8, from a split rayQueryEXT[8]). All 34 pass with this limit,
+ * also three more times at three workers, and are refused with a limit of
+ * 2. A 3,219-case sample of the other ray query, ray tracing pipeline and
+ * acceleration-structure cases has the same results with either limit;
+ * this value is the only difference between the two builds. An earlier
+ * note that three or more live queries gave wrong results (rayqueryterminate,
+ * 8 live queries) does not reproduce. More than 8 (the any-hit and
+ * intersection rayqueryterminate variants with 9, ray_query.misc.
+ * dynamic_indexing with 48) stays refused. A hardware bisection build may
+ * still override it (-DAGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES=N, N <= 8). */
 #ifndef AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES
-#define AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES 2
+#define AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES AGX3_RT_M5_MAX_LIVE_QUERIES
 #endif
 
 /* Native query stack entry: f2 is the 32-bit GPR result (an even half index)
