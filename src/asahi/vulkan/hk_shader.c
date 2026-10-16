@@ -2888,14 +2888,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             .compute_kernel = true,
          };
          /* Geometry queries are lowered here and then cloned into the poly
-          * kernels and the raster vertex program. Hardware runs of those
-          * draws have requested GPU recovery and the cause is not isolated,
-          * so they stay refused unless explicitly requested for diagnosis. */
+          * kernels and the raster vertex program. Earlier recoveries in GS
+          * query draws predate the dead-query removal from the poly kernels
+          * (agx_nir_m5_remove_dead_ray_queries); with it, all 578 geometry
+          * ray-query CTS cases ran on one worker without a fault.
+          * ASAHI_M5_GS_RAY_QUERY_DISABLE=1 refuses them for diagnosis. */
          const bool refused_stage = nir->info.stage == MESA_SHADER_GEOMETRY &&
-            !debug_get_bool_option("ASAHI_M5_GS_RAY_QUERY_DIAGNOSTIC", false);
+            debug_get_bool_option("ASAHI_M5_GS_RAY_QUERY_DISABLE", false);
          if (refused_stage || !agx_nir_lower_m5_ray_query(nir, &layout)) {
             mesa_loge(refused_stage
-               ? "M5 native ray query: geometry stage is diagnostic-only"
+               ? "M5 native ray query: geometry stage disabled"
                : "M5 native ray query: unsupported query shape or operation");
             if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
                nir_print_shader(nir, stderr);
