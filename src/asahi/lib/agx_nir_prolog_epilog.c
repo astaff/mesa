@@ -847,6 +847,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
    }
 
    /* Alpha-to-coverage must be lowered before alpha-to-one */
+   const bool discards_before_a2c = b->shader->info.fs.uses_discard;
    if (key->blend.alpha_to_coverage)
       NIR_PASS(_, b->shader, nir_lower_alpha_to_coverage, false,
                NULL);
@@ -872,6 +873,34 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
    const bool zs_carries_write_samples =
       (key->link.write_z || key->link.write_s) && key->nr_samples > 1 &&
       !key->defer_monolithic_msaa;
+
+   /* M5 carries alpha coverage the same way. Native G17G multisample
+    * fragments that write depth (native G17G compiler zs_depth_4x_a2c,
+    * zs_cdepth_4x_a2c and zs_depth_2x_a2c) evaluate it into each sample's
+    * DEPTHF coverage word and issue no MOVMSK; the colour store follows
+    * unmasked. A separate kill ahead of the words would be a second coverage
+    * update. Sample-rate epilogs keep the kill: they are lowered per sample
+    * below. */
+   nir_def *zs_alpha_coverage = NULL;
+   if (key->m5_coverage && zs_carries_write_samples &&
+       key->blend.alpha_to_coverage && !key->link.sample_shading) {
+      nir_foreach_block(block, b->impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_demote_samples)
+               continue;
+            nir_builder mask_b = nir_builder_at(nir_before_instr(instr));
+            nir_def *covered =
+               nir_u2u16(&mask_b, nir_inot(&mask_b, intr->src[0].ssa));
+            zs_alpha_coverage = zs_alpha_coverage
+               ? nir_iand(&mask_b, zs_alpha_coverage, covered) : covered;
+            nir_instr_remove(instr);
+         }
+      }
+      b->shader->info.fs.uses_discard = discards_before_a2c;
+   }
 
    /* already_ran_zs says the main shader has already triggered the
     * depth/stencil tests, so the epilog must not trigger them again.  It does
@@ -944,6 +973,8 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
          write_samples ? nir_iand(b, write_samples,
                                   nir_load_active_samples_agx(b))
                        : nir_imm_intN_t(b, 0xFF, 16);
+      if (zs_alpha_coverage)
+         zs_samples = nir_iand(b, zs_samples, zs_alpha_coverage);
       nir_def *depth =
          nir_load_exported_agx(b, 1, 32, .base = AGX_ABI_FOUT_Z);
 

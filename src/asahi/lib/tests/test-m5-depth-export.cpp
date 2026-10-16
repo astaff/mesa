@@ -1,0 +1,197 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ *
+ * M5 fragment epilog depth/stencil export forms, against native
+ * Native G17G compiler fragments:
+ *  - alpha-to-coverage: one DEPTHF per sample with the alpha coverage folded
+ *    into its word, and no separate MOVMSK.
+ */
+#include <gtest/gtest.h>
+#include <stdio.h>
+#include <string>
+#include <vector>
+#include "asahi/compiler/agx_compile.h"
+#include "compiler/nir/nir_builder.h"
+#include "agx_tilebuffer.h"
+#include "agx_linker.h"
+extern "C" {
+#include "asahi/compiler/agx_nir.h"
+#include "asahi/compiler/agx_debug.h"
+#include "asahi/isa/disasm.h"
+}
+
+namespace {
+
+class M5DepthExport : public ::testing::Test {
+ protected:
+   M5DepthExport() { glsl_type_singleton_init_or_ref(); }
+   ~M5DepthExport() { glsl_type_singleton_decref(); }
+};
+
+struct epilog_shape {
+   enum agx_chip chip;
+   unsigned samples;
+   bool z, s, a2c;
+};
+
+static nir_shader *
+build_epilog(const epilog_shape &shape)
+{
+   agx_fs_epilog_key fs = {};
+   fs.nr_samples = shape.samples;
+   fs.max_sample_size_B = AGX_G17P_MAX_BYTES_PER_SAMPLE;
+   fs.max_bytes_per_tile = 32768;
+   fs.max_samples_per_tile = 2048;
+   fs.link.loc_written = 1;
+   fs.link.size_32 = 1;
+   fs.link.colour_comps = BITFIELD_MASK(4);
+   fs.link.write_z = shape.z;
+   fs.link.write_s = shape.s;
+   fs.blend.alpha_to_coverage = shape.a2c;
+   agx_fs_epilog_apply_device_policy(shape.chip, &fs);
+   fs.rt_formats[0] = PIPE_FORMAT_R8G8B8A8_UNORM;
+   fs.remap[0] = 0;
+   for (unsigned rt = 1; rt < ARRAY_SIZE(fs.remap); ++rt)
+      fs.remap[rt] = -1;
+   fs.blend.rt[0].colormask = 0xf;
+   fs.blend.rt[0].mode = agx_pack_blend_standard(
+      PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+      PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 depth export epilog");
+   agx_nir_fs_epilog(&b, &fs);
+   return b.shader;
+}
+
+struct counts {
+   unsigned store_zs = 0, demotes = 0, coverage_updates = 0;
+};
+
+static counts
+count_nir(nir_shader *s)
+{
+   counts c;
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         c.store_zs += intr->intrinsic == nir_intrinsic_store_zs_agx;
+         c.demotes += intr->intrinsic == nir_intrinsic_demote_samples;
+         c.coverage_updates += intr->intrinsic == nir_intrinsic_sample_mask_agx;
+      }
+   }
+   return c;
+}
+
+/* Mnemonics of an AGX3c binary, in order. */
+static std::vector<std::string>
+mnemonics(const agx_shader_part &part)
+{
+   std::vector<std::string> out;
+   const uint8_t *code = (const uint8_t *)part.binary + part.info.main_offset;
+   size_t len = part.info.main_size, i = 0;
+   while (i < len) {
+      char *text = NULL;
+      size_t text_len = 0;
+      FILE *fp = open_memstream(&text, &text_len);
+      uint8_t buf[32] = {0};
+      memcpy(buf, code + i, MIN2(sizeof(buf), len - i));
+      signed ret = agx3c_disassemble_instr((BITSET_WORD *)buf, fp, i,
+                                           len - i, false);
+      fclose(fp);
+      std::string line = text ? text : "";
+      free(text);
+      unsigned length = abs(ret);
+      if (length == 0)
+         break;
+      /* Keep the mnemonic: the first word after the decoder's
+       * "# XXX: Unknown bit set N" notes. */
+      size_t at = 0;
+      while (at < line.size()) {
+         size_t start = line.find_first_not_of(" \t\n", at);
+         if (start == std::string::npos)
+            break;
+         size_t end = line.find_first_of(" \t\n", start);
+         std::string word = line.substr(start, end - start);
+         at = end;
+         if (word == "#" || word == "XXX:" || word == "Unknown" ||
+             word == "bit" || word == "set" ||
+             word.find_first_not_of("0123456789") == std::string::npos)
+            continue;
+         out.push_back(word);
+         break;
+      }
+      i += length;
+   }
+   return out;
+}
+
+static unsigned
+count_of(const std::vector<std::string> &m, const char *name)
+{
+   unsigned n = 0;
+   for (const auto &s : m)
+      n += s == name;
+   return n;
+}
+
+static bool
+compile_m5(nir_shader *s, unsigned samples, agx_shader_part *part)
+{
+   agx_preprocess_nir(s);
+   if (samples > 1)
+      agx_nir_lower_g17p_tile_samples(s, samples);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   key.no_preamble = true;
+   key.secondary = true;
+   key.fs.nr_samples = samples;
+   BITSET_SET(key.g17p_tile_partitions, 0);
+   return agx_compile_shader_nir(s, &key, part);
+}
+
+} /* namespace */
+
+/* Native zs_depth_{2,4}x_a2c, zs_cdepth_4x_a2c, zs_stencil_4x_a2c and
+ * zs_depth_stencil_4x_a2c. */
+TEST_F(M5DepthExport, AlphaToCoverageFoldsIntoSampleWords)
+{
+   for (unsigned samples : {2u, 4u}) {
+      for (unsigned zs : {1u, 2u, 3u}) {
+         SCOPED_TRACE(::testing::Message() << samples << " samples, zs=" << zs);
+         nir_shader *s = build_epilog({AGX_CHIP_G17S, samples, !!(zs & 1),
+                                       !!(zs & 2), true});
+         counts c = count_nir(s);
+         EXPECT_EQ(c.demotes, 0u);
+         EXPECT_EQ(c.coverage_updates, 0u);
+         EXPECT_FALSE(s->info.fs.uses_discard);
+         agx_shader_part part = {};
+         ASSERT_TRUE(compile_m5(s, samples, &part)) << agx_last_compile_refusal();
+         std::vector<std::string> m = mnemonics(part);
+         EXPECT_EQ(count_of(m, "depthf"), samples);
+         EXPECT_EQ(count_of(m, "movmsk"), 0u);
+         EXPECT_EQ(count_of(m, "cndlt"), 0u);
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+}
+
+/* Without a depth or stencil write, alpha-to-coverage keeps its kill; off
+ * M5 it stays a separate coverage update. */
+TEST_F(M5DepthExport, OtherShapesUnchanged)
+{
+   nir_shader *s = build_epilog({AGX_CHIP_G17S, 4, false, false, true});
+   counts c = count_nir(s);
+   EXPECT_EQ(c.store_zs, 0u);
+   EXPECT_TRUE(s->info.fs.uses_discard);
+   ralloc_free(s);
+
+   s = build_epilog({AGX_CHIP_G17P, 4, true, false, true});
+   c = count_nir(s);
+   EXPECT_GT(c.demotes + c.coverage_updates, 0u);
+   ralloc_free(s);
+}
