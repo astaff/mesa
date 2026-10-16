@@ -2504,9 +2504,9 @@ agx_emit_image_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *intr)
     * not decorated Aliased, which SPIR-V's Simple/GLSL/Vulkan memory models
     * let the consumer assume does not alias another memory object
     * declaration) together mean no store of this shader can write what the
-    * load reads, so it may be moved across them. M5 encodes the read as a
-    * native SMP, which Apple's compiler issues ahead of earlier image writes
-    * (native725 vs_copy). */
+    * load reads, so the M5 copy schedule may move it across them. M5 encodes
+    * the read as a native SMP, which Apple's compiler issues ahead of earlier
+    * image writes (native725 vs_copy). */
    const enum gl_access_qualifier access = nir_intrinsic_access(intr);
    I->memory_can_reorder =
       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&

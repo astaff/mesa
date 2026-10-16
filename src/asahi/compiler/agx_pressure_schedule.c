@@ -129,7 +129,8 @@ struct sched_dag_state {
 
 static struct dag *
 create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniforms,
-           struct util_dynarray *all_nodes, struct sched_dag_state *state)
+           struct util_dynarray *all_nodes, struct sched_dag_state *state,
+           bool reorder_loads)
 {
    struct dag *dag = dag_create(ctx);
    struct util_dynarray nodes;
@@ -212,10 +213,13 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
       enum agx_schedule_class dep = agx_opcodes_info[I->op].schedule_class;
       assert(dep != AGX_SCHEDULE_CLASS_INVALID && "invalid instruction seen");
 
-      /* Nothing in the shader writes a reorderable load's memory
-       * (ACCESS_CAN_REORDER), so it needs no memory-order edge, exactly
-       * like texture_load. */
-      if (I->op == AGX_OPCODE_IMAGE_LOAD && I->memory_can_reorder)
+      /* No store of the shader can write a reorderable load's memory
+       * (memory_can_reorder), so the copy schedule may drop its memory-order
+       * edges, exactly like texture_load's. Other schedules keep them: the
+       * bottom-up pressure order would otherwise sink such loads next to
+       * their uses, shortening the latency they already hide. */
+      if (reorder_loads && I->op == AGX_OPCODE_IMAGE_LOAD &&
+          I->memory_can_reorder)
          dep = AGX_SCHEDULE_CLASS_NONE;
 
       bool barrier = dep == AGX_SCHEDULE_CLASS_BARRIER;
@@ -407,7 +411,7 @@ agx_pressure_schedule(agx_context *ctx)
    agx_foreach_block(ctx, block) {
       struct sched_ctx sctx = {
          .dag = create_dag(ctx, block, memctx, native_uniforms, NULL,
-                           &dag_state),
+                           &dag_state, false),
       };
       /* Preserve the original order if a complete dependency graph cannot be
        * built (invalid range or workspace allocation failure). */
@@ -767,7 +771,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    struct util_dynarray all;
    util_dynarray_init(&all, memctx);
    struct dag *dag = create_dag(ctx, block, memctx, native_uniforms, &all,
-                                dag_state);
+                                dag_state, hoist_past_writes);
    if (!dag)
       return false;
 

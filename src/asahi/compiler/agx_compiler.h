@@ -445,8 +445,8 @@ typedef struct {
    /* TODO: Handle loads more efficiently */
    bool coherent : 1;
    /* M5 image load from memory no store of this shader can write (NIR
-    * ACCESS_CAN_REORDER and ACCESS_RESTRICT, not coherent): the schedulers
-    * may move it across memory stores. */
+    * ACCESS_CAN_REORDER and ACCESS_RESTRICT, not coherent): the M5 copy
+    * schedule may move it across memory stores. */
    bool memory_can_reorder : 1;
    /* AGX3 memory index scale excludes the access-format size. */
    bool memory_index_is_bytes : 1;
