@@ -419,6 +419,53 @@ dead_ray_query(bool live)
    printf("M5_DEAD_RAY_QUERY_PASS live=%u\n", live);
 }
 
+/* Which break left a query-selected loop is a query result: the phis after
+ * the loop merge one value per break, here constants. A store of such a phi
+ * keeps the query, as rayQueryProceedEXT's "found" flag after the traversal
+ * loop does in ray_query.builtin.getworldrayorigin.geom. */
+static void
+dead_ray_query_loop_exit(void)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_GEOMETRY, &agx_nir_options, "M5 query loop exit");
+   nir_variable *found =
+      nir_local_variable_create(b.impl, glsl_bool_type(), "found");
+   /* Defined before the loop, as the lowering's hoisted constants are. */
+   nir_def *yes = nir_imm_true(&b), *no = nir_imm_false(&b);
+   nir_push_loop(&b);
+   {
+      nir_def *q = nir_load_scs_thread_index_agx(&b);
+      nir_push_if(&b, nir_ieq_imm(&b, q, 0));
+      {
+         nir_store_var(&b, found, yes, 1);
+         nir_jump(&b, nir_jump_break);
+      }
+      nir_pop_if(&b, NULL);
+      nir_store_var(&b, found, no, 1);
+      nir_jump(&b, nir_jump_break);
+   }
+   nir_pop_loop(&b, NULL);
+   nir_store_global(&b, nir_b2i32(&b, nir_load_var(&b, found)),
+                    nir_imm_int64(&b, 0x10003010000ull), .align_mul = 4,
+                    .write_mask = 1);
+   nir_lower_vars_to_ssa(b.shader);
+   agx_nir_m5_remove_dead_ray_queries(b.shader);
+   unsigned queries = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         queries += instr->type == nir_instr_type_intrinsic &&
+            nir_instr_as_intrinsic(instr)->intrinsic ==
+               nir_intrinsic_load_scs_thread_index_agx;
+      }
+   }
+   ralloc_free(b.shader);
+   if (queries != 1) {
+      fprintf(stderr, "M5 query feeding a loop-exit phi was removed\n");
+      exit(1);
+   }
+   printf("M5_DEAD_RAY_QUERY_LOOP_EXIT_PASS\n");
+}
+
 /* Native instance completion is a byte read, not a word read and shift. */
 static void
 instance_completion_byte(void)
@@ -562,6 +609,7 @@ int main(int argc,char **argv)
  standard_ray_query(1, false, MESA_SHADER_TESS_CTRL);
  dead_ray_query(false);
  dead_ray_query(true);
+ dead_ray_query_loop_exit();
  standard_ray_query(1, false, MESA_SHADER_TESS_EVAL);
  standard_ray_query(1, false, MESA_SHADER_GEOMETRY);
  standard_ray_query(1, false, MESA_SHADER_VERTEX);

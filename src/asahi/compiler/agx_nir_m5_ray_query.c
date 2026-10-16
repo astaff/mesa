@@ -2190,6 +2190,13 @@ m5_rq_taint_list(struct exec_list *list, bool region, bool *jump,
             _mesa_set_add(t->loops, loop);
             t->progress = true;
          }
+         /* So does which break left it: the phis after the loop merge one
+          * value per break, and those values may be defined before it. */
+         if (_mesa_set_search(t->loops, loop)) {
+            nir_block *after = nir_cf_node_as_block(nir_cf_node_next(node));
+            nir_foreach_phi(phi, after)
+               m5_rq_taint_instr(&phi->instr, t);
+         }
          break;
       }
       default:
