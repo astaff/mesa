@@ -5214,6 +5214,17 @@ hk_m5_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
    return true;
 }
 
+/* The native three-thread passthrough object program of an M5 mesh-only
+ * draw is composed directly (agx3_mesh_passthrough_object), so the compiler
+ * reports no staging size for it; its program declares compiler word d = 1.
+ * Applied when the program is built and when it is deserialized. */
+static void
+hk_m5_mesh_passthrough_linked(struct hk_shader *object)
+{
+   object->only_linked->b.g17p_compiler_d_valid = true;
+   object->only_linked->b.g17p_compiler_d = 1;
+}
+
 static VkResult
 hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *info,
                   const struct vk_graphics_pipeline_state *state,
@@ -5663,8 +5674,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, result);
       }
-      object->only_linked->b.g17p_compiler_d_valid = true;
-      object->only_linked->b.g17p_compiler_d = 1;
+      hk_m5_mesh_passthrough_linked(object);
       object->compiled = true;
       }
       struct hk_shader *predicated =
@@ -6615,7 +6625,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool has_mono = variant_flags & 4;
    const bool has_border_source = variant_flags & 8;
    const bool border_emulating = variant_flags & 16;
-   if (blob->overrun || stage >= MESA_SHADER_STAGES || variant_flags > 63 ||
+   /* Graphics, compute, task and mesh stages. */
+   if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES || variant_flags > 63 ||
        (has_source && !sample_variants) ||
        (m5_sample_variants &&
         (!sample_variants || !agx_chip_g17_m5(dev->dev.chip))) ||
@@ -6663,6 +6674,13 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
       }
+   }
+
+   /* Restore what the compile set on the composed passthrough object. */
+   if (stage == MESA_SHADER_MESH && agx_chip_g17_m5(dev->dev.chip)) {
+      struct hk_shader *object = &obj->variants[HK_MESH_VARIANT_RAST];
+      if (object->compiled && object->only_linked)
+         hk_m5_mesh_passthrough_linked(object);
    }
 
    if (has_source) {
