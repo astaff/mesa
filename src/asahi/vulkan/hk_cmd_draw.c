@@ -8469,12 +8469,16 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       }
       const struct agx_ppp_hal300_graphics_fields fields = {
          /* A vertex-stage draw selects its provoking vertex through the VDM
-          * vertex program template (hk_agx3_publish_vertex_state). A
-          * native mesh draw has no such template; the PPP flat-shading
-          * vertex selects it (hardware: EDS last-vertex mesh draws pass
-          * with the PPP selector and fail with the VDM mesh-state word). */
-         .flat_shading_vertex =
-            gfx->shaders[MESA_SHADER_MESH] ? gfx->provoking : 0,
+          * vertex program template (hk_agx3_publish_vertex_state), but
+          * the PPP flat-shading vertex must match it too. With it left at
+          * vertex 0, the EDS tests' oversized last-vertex triangles shaded
+          * from the wrong vertex on hardware while in-viewport ones were
+          * right; presumably clipping takes the flat inputs of the vertices
+          * it generates from the PPP selector. A native mesh draw has no VDM
+          * template; the PPP selector alone selects it (hardware: EDS
+          * last-vertex mesh draws pass with it and fail with the VDM
+          * mesh-state word). */
+         .flat_shading_vertex = gfx->provoking,
          .viewport_count = hk_effective_viewport_count(cmd),
          .general_varyings = general_varyings,
          .cf_register_count = cf->nr_cf,
