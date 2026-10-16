@@ -1275,6 +1275,19 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
       samples > 1 &&
       (mask == 0xff || util_bitcount(mask & BITFIELD_MASK(samples)) == 1);
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       samples > 1 && write_z && write_s && !dynamic_mask &&
+       (mask & BITFIELD_MASK(samples)) == BITFIELD_MASK(samples)) {
+      /* Native M5 whole-pixel depth and stencil (native G17G compiler
+       * zs_depth_stencil_{2,4}x) is one DEPTHF naming every covered sample. */
+      agx_index sr39 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_get_sr_coverage_to(b, sr39, AGX_SR_INPUT_SAMPLE_MASK);
+      agx_index covered =
+         agx_and(b, sr39, agx_immediate(BITFIELD_MASK(samples)));
+      agx_index api = agx_and(b, sr39, agx_immediate(0xff00));
+      return agx_emit_zs_word_agx3(b, instr, z, s, base,
+                                  agx_or(b, api, covered), agx_null());
+   }
+   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        samples > 1) {
       /* G17G keeps SR39's API mask in the high byte and the changing
        * coverage in the low byte. Native multisample DEPTHF loops preserve

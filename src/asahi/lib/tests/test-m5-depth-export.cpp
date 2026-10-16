@@ -3,6 +3,7 @@
  *
  * M5 fragment epilog depth/stencil export forms, against native
  * Native G17G compiler fragments:
+ *  - depth and stencil together, whole pixel: one DEPTHF word;
  *  - alpha-to-coverage: one DEPTHF per sample with the alpha coverage folded
  *    into its word, and no separate MOVMSK.
  */
@@ -154,6 +155,25 @@ compile_m5(nir_shader *s, unsigned samples, agx_shader_part *part)
 }
 
 } /* namespace */
+
+/* Native zs_depth_stencil_{2,4}x. */
+TEST_F(M5DepthExport, DepthAndStencilIsOneWord)
+{
+   for (unsigned samples : {2u, 4u}) {
+      SCOPED_TRACE(::testing::Message() << samples << " samples");
+      nir_shader *s = build_epilog({AGX_CHIP_G17S, samples, true, true, false});
+      counts c = count_nir(s);
+      EXPECT_EQ(c.store_zs, 1u);
+      agx_shader_part part = {};
+      ASSERT_TRUE(compile_m5(s, samples, &part)) << agx_last_compile_refusal();
+      std::vector<std::string> m = mnemonics(part);
+      EXPECT_EQ(count_of(m, "depthf"), 1u);
+      EXPECT_EQ(count_of(m, "cndlt"), 0u);
+      EXPECT_EQ(count_of(m, "movmsk"), 0u);
+      free(part.binary);
+      ralloc_free(s);
+   }
+}
 
 /* Native zs_depth_{2,4}x_a2c, zs_cdepth_4x_a2c, zs_stencil_4x_a2c and
  * zs_depth_stencil_4x_a2c. */
