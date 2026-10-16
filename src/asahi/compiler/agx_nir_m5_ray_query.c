@@ -701,12 +701,13 @@ struct m5_rq_state {
    unsigned allocation_index;
 };
 
-/* Opt-in shared-edge/vertex candidate filtering, see m5_boundary_duplicate.
- * Off by default: it costs code and, in some shaders, occupancy. */
+/* Shared-edge/vertex candidate filtering, see m5_boundary_duplicate. On by
+ * default (Vulkan requires watertight single hits); ASAHI_M5_RQ_WATERTIGHT=0
+ * disables it for diagnostics. */
 static bool
 m5_rq_watertight(void)
 {
-   return debug_get_bool_option("ASAHI_M5_RQ_WATERTIGHT", false);
+   return debug_get_bool_option("ASAHI_M5_RQ_WATERTIGHT", true);
 }
 
 /* The candidate cursor indexes a queue of at most 15 entries (a four-bit
@@ -1022,8 +1023,8 @@ agx_nir_m5_should_resume_batch(nir_builder *b, nir_def *status,
  * The key lives in the candidate cursor's spare bits: the cursor never
  * exceeds the four-bit queue count. No memory access; it runs only for
  * admitted triangles. It still adds about 35 instructions per proceed site
- * and can cost occupancy, so it is opt-in (ASAHI_M5_RQ_WATERTIGHT, see
- * m5_rq_watertight). */
+ * and can cost occupancy in some shaders; it is on by default
+ * (ASAHI_M5_RQ_WATERTIGHT=0 disables it, see m5_rq_watertight). */
 static nir_def *
 m5_boundary_duplicate(nir_builder *b, nir_def *bary, nir_def *distance,
                       nir_def *is_aabb, nir_deref_instr *cursor)
