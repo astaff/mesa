@@ -56,42 +56,87 @@ mark_src_live(const nir_src *src, BITSET_WORD *defs_live)
    }
 }
 
-static bool
-mark_live_cb(nir_src *src, void *defs_live)
-{
-   mark_src_live(src, defs_live);
-   return true;
-}
+struct loop_state {
+   bool header_phis_changed;
+   nir_block *preheader;
+};
 
 static bool
-is_live(BITSET_WORD *defs_live, nir_instr *instr)
+is_live_and_mark_sources(BITSET_WORD *defs_live, nir_instr *instr,
+                         struct loop_state *loop, bool *phis_changed)
 {
    switch (instr->type) {
-   case nir_instr_type_call:
-   case nir_instr_type_cmat_call:
-   case nir_instr_type_jump:
+   case nir_instr_type_call: {
+      nir_call_instr *call = nir_instr_as_call(instr);
+      if (call->indirect_callee.ssa)
+         mark_src_live(&call->indirect_callee, defs_live);
+      for (unsigned i = 0; i < call->num_params; ++i)
+         mark_src_live(&call->params[i], defs_live);
       return true;
+   }
+   case nir_instr_type_cmat_call: {
+      nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+      for (unsigned i = 0; i < call->num_params; ++i)
+         mark_src_live(&call->params[i], defs_live);
+      return true;
+   }
+   case nir_instr_type_jump: {
+      nir_jump_instr *jump = nir_instr_as_jump(instr);
+      if (jump->type == nir_jump_goto_if)
+         mark_src_live(&jump->condition, defs_live);
+      return true;
+   }
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
-      return is_def_live(&alu->def, defs_live);
+      bool live = is_def_live(&alu->def, defs_live);
+      if (live) {
+         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+            mark_src_live(&alu->src[i].src, defs_live);
+      }
+      return live;
    }
    case nir_instr_type_deref: {
       nir_deref_instr *deref = nir_instr_as_deref(instr);
-      return is_def_live(&deref->def, defs_live);
+      bool live = is_def_live(&deref->def, defs_live);
+      if (live) {
+         if (deref->deref_type != nir_deref_type_var)
+            mark_src_live(&deref->parent, defs_live);
+         if (deref->deref_type == nir_deref_type_array ||
+             deref->deref_type == nir_deref_type_ptr_as_array)
+            mark_src_live(&deref->arr.index, defs_live);
+      }
+      return live;
    }
    case nir_instr_type_intrinsic: {
       nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
       const nir_intrinsic_info *info = &nir_intrinsic_infos[intrin->intrinsic];
-      return !(info->flags & NIR_INTRINSIC_CAN_ELIMINATE) ||
-             (info->has_dest && is_def_live(&intrin->def, defs_live));
+      bool live = !(info->flags & NIR_INTRINSIC_CAN_ELIMINATE) ||
+                  (info->has_dest && is_def_live(&intrin->def, defs_live));
+      if (live) {
+         for (unsigned i = 0; i < info->num_srcs; ++i)
+            mark_src_live(&intrin->src[i], defs_live);
+      }
+      return live;
    }
    case nir_instr_type_tex: {
       nir_tex_instr *tex = nir_instr_as_tex(instr);
-      return is_def_live(&tex->def, defs_live);
+      bool live = is_def_live(&tex->def, defs_live);
+      if (live) {
+         for (unsigned i = 0; i < tex->num_srcs; ++i)
+            mark_src_live(&tex->src[i].src, defs_live);
+      }
+      return live;
    }
    case nir_instr_type_phi: {
       nir_phi_instr *phi = nir_instr_as_phi(instr);
-      return is_def_live(&phi->def, defs_live);
+      bool live = is_def_live(&phi->def, defs_live);
+      if (live) {
+         nir_foreach_phi_src(src, phi) {
+            *phis_changed |= mark_src_live(&src->src, defs_live) &&
+                             src->pred != loop->preheader;
+         }
+      }
+      return live;
    }
    case nir_instr_type_load_const: {
       nir_load_const_instr *lc = nir_instr_as_load_const(instr);
@@ -105,11 +150,6 @@ is_live(BITSET_WORD *defs_live, nir_instr *instr)
       UNREACHABLE("unexpected instr type");
    }
 }
-
-struct loop_state {
-   bool header_phis_changed;
-   nir_block *preheader;
-};
 
 static void
 remove_instr(nir_instr *instr, struct exec_list *dead_instrs)
@@ -136,17 +176,8 @@ dce_block(nir_block *block, BITSET_WORD *defs_live, struct loop_state *loop,
    bool progress = false;
    bool phis_changed = false;
    nir_foreach_instr_reverse_safe(instr, block) {
-      bool live = is_live(defs_live, instr);
-      if (live) {
-         if (instr->type == nir_instr_type_phi) {
-            nir_foreach_phi_src(src, nir_instr_as_phi(instr)) {
-               phis_changed |= mark_src_live(&src->src, defs_live) &&
-                               src->pred != loop->preheader;
-            }
-         } else {
-            nir_foreach_src(instr, mark_live_cb, defs_live);
-         }
-      }
+      bool live = is_live_and_mark_sources(defs_live, instr, loop,
+                                           &phis_changed);
 
       /* If we're not in a loop, remove it now if it's dead. If we are in a
        * loop, leave instructions to be removed later if they're still dead.

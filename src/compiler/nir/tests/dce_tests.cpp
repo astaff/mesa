@@ -22,6 +22,8 @@
  */
 
 #include "nir_test.h"
+#include <set>
+#include <vector>
 
 class nir_opt_dce_test : public nir_test {
 protected:
@@ -38,6 +40,140 @@ protected:
    {
    }
 };
+
+static bool
+dce_collect_source(nir_src *src, void *data)
+{
+   static_cast<std::vector<nir_instr *> *>(data)->push_back(nir_def_instr(src->ssa));
+   return true;
+}
+
+static void
+dce_collect_conditions(struct exec_list *list, std::vector<nir_instr *> &roots)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         roots.push_back(nir_def_instr(nif->condition.ssa));
+         dce_collect_conditions(&nif->then_list, roots);
+         dce_collect_conditions(&nif->else_list, roots);
+      } else if (node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         dce_collect_conditions(&loop->body, roots);
+      }
+   }
+}
+
+static void
+dce_expect_source_closure(nir_builder *build)
+{
+   std::vector<nir_instr *> pending;
+   std::set<nir_instr *> original, expected, actual;
+   nir_foreach_block(block, build->impl) {
+      nir_foreach_instr(instr, block) {
+         original.insert(instr);
+         if (instr->type == nir_instr_type_call ||
+             instr->type == nir_instr_type_cmat_call ||
+             instr->type == nir_instr_type_jump ||
+             (instr->type == nir_instr_type_intrinsic &&
+              !(nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].flags &
+                NIR_INTRINSIC_CAN_ELIMINATE)))
+            pending.push_back(instr);
+      }
+   }
+   dce_collect_conditions(&build->impl->body, pending);
+   while (!pending.empty()) {
+      nir_instr *instr = pending.back();
+      pending.pop_back();
+      if (expected.insert(instr).second)
+         nir_foreach_src(instr, dce_collect_source, &pending);
+   }
+   ASSERT_LT(expected.size(), original.size());
+   nir_validate_shader(build->shader, "before DCE source closure");
+   ASSERT_TRUE(nir_opt_dce_impl(build->impl));
+   nir_foreach_block(block, build->impl) {
+      nir_foreach_instr(instr, block)
+         actual.insert(instr);
+   }
+   ASSERT_EQ(actual, expected);
+   nir_validate_shader(build->shader, "after DCE source closure");
+   EXPECT_FALSE(nir_opt_dce_impl(build->impl));
+}
+
+TEST_F(nir_opt_dce_test, typed_sources_match_generic_reachability)
+{
+   nir_def *index = nir_iand(b, nir_load_local_invocation_index(b), nir_imm_int(b, 15));
+   nir_variable *array = nir_local_variable_create(
+      b->impl, glsl_array_type(glsl_uint_type(), 16, 0), "array");
+   nir_def *array_index = nir_iand(b, nir_load_local_invocation_index(b), nir_imm_int(b, 15));
+   nir_deref_instr *element = nir_build_deref_array(b, nir_build_deref_var(b, array), array_index);
+   nir_store_deref(b, element, nir_iadd(b, index, nir_imm_int(b, 3)), 1);
+   nir_def *loaded = nir_load_deref(b, element);
+
+   nir_tex_instr *tex = nir_tex_instr_create(b->shader, 2);
+   tex->op = nir_texop_txf;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->coord_components = 2;
+   tex->dest_type = nir_type_uint32;
+   tex->src[0].src_type = nir_tex_src_coord;
+   tex->src[0].src = nir_src_for_ssa(nir_vec2(b, index, loaded));
+   tex->src[1].src_type = nir_tex_src_lod;
+   tex->src[1].src = nir_src_for_ssa(nir_imm_int(b, 0));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(b, &tex->instr);
+   nir_variable *out = nir_variable_create(
+      b->shader, nir_var_shader_out, glsl_vector_type(GLSL_TYPE_UINT, 4), "out");
+   nir_store_var(b, out, &tex->def, 15);
+
+   nir_function *callee = nir_function_create(b->shader, "callee");
+   callee->num_params = 1;
+   callee->params = rzalloc_array(callee, nir_parameter, 1);
+   callee->params[0].num_components = 1;
+   callee->params[0].bit_size = 32;
+   callee->params[0].type = glsl_uint_type();
+   nir_call_instr *call = nir_call_instr_create(b->shader, callee);
+   call->indirect_callee = nir_src_for_ssa(nir_imm_int64(b, 4096));
+   call->params[0] = nir_src_for_ssa(nir_iadd(b, index, nir_imm_int(b, 5)));
+   nir_builder_instr_insert(b, &call->instr);
+   nir_cmat_call_instr *cmat = nir_cmat_call_instr_create(
+      b->shader, nir_cmat_call_op_per_element_op, callee);
+   cmat->params[0] = nir_src_for_ssa(nir_iadd(b, nir_undef(b, 1, 32), nir_imm_int(b, 7)));
+   nir_builder_instr_insert(b, &cmat->instr);
+   nir_undef(b, 4, 32);
+   nir_iadd(b, index, nir_imm_int(b, 99));
+   nir_jump(b, nir_jump_return);
+   dce_expect_source_closure(b);
+}
+
+TEST_F(nir_opt_dce_test, live_and_dead_loop_phi_cycles_match_reachability)
+{
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *one = nir_imm_int(b, 1);
+   nir_loop *loop = nir_push_loop(b);
+   nir_block *header = nir_loop_first_block(loop);
+   nir_phi_instr *live = nir_phi_instr_create(b->shader);
+   nir_phi_instr *dead = nir_phi_instr_create(b->shader);
+   nir_def_init(&live->instr, &live->def, 1, 32);
+   nir_def_init(&dead->instr, &dead->def, 1, 32);
+   nir_phi_instr_add_src(live, nir_def_block(zero), zero);
+   nir_phi_instr_add_src(dead, nir_def_block(zero), zero);
+   nir_if *nif = nir_push_if(b, nir_ige(b, &live->def, nir_imm_int(b, 4)));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, nif);
+   nir_def *next_live = nir_iadd(b, &live->def, one);
+   nir_def *next_dead = nir_iadd(b, &dead->def, one);
+   nir_phi_instr_add_src(live, nir_def_block(next_live), next_live);
+   nir_phi_instr_add_src(dead, nir_def_block(next_dead), next_dead);
+   nir_pop_loop(b, loop);
+   nir_variable *out = nir_variable_create(b->shader, nir_var_shader_out, glsl_int_type(), "out");
+   nir_store_var(b, out, &live->def, 1);
+   nir_cursor end = b->cursor;
+   b->cursor = nir_before_block(header);
+   nir_builder_instr_insert(b, &live->instr);
+   nir_builder_instr_insert(b, &dead->instr);
+   b->cursor = end;
+   dce_expect_source_closure(b);
+}
 
 nir_phi_instr *create_one_source_phi(nir_shader *shader, nir_block *pred,
                                      nir_def *def)
