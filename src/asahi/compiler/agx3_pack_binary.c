@@ -11099,9 +11099,21 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ctx->agx3_colour_link.entry_offset = emission->size - entry_len - initial_size;
                g17p_colour_open = true;
             }
+            /* The class-1 release closing a covered-sample loop, recorded
+             * for agx_fast_link when it is the plain form. */
+            const bool zs_loop_release =
+               zs_sample_loop && I->op == AGX_OPCODE_SIGNAL_PIX &&
+               I->writeout == 1 && wait == 0 && g17p_zs_writes > 0 &&
+               I != g17p_final_release && !ctx->agx3_colour_link.zs_loop_release;
+            const size_t release_at = emission->size;
             if (!agx3_emit_pixel(emission, enc, I, wait,
                                  I == g17p_final_release, g17p_lone_pair, &ctx->agx3_colour_link, initial_size))
                AGX3_REFUSE(I);
+            if (zs_loop_release && emission->size - release_at == AGX3_PIXEL_MAX_LENGTH) {
+               ctx->agx3_colour_link.zs_loop_release = true;
+               ctx->agx3_colour_link.zs_loop_release_offset =
+                  release_at - initial_size;
+            }
             continue;
          }
 

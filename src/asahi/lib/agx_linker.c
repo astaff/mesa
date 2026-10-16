@@ -298,6 +298,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
     * part keeps its size, so every branch offset stays valid. */
    bool nop_entry[ARRAY_SIZE(parts)] = {false};
    bool entry_seen = false;
+   int kept_entry = -1;
    if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip)) &&
        fragment && !nr_samples_shaded && !colour_fused) {
       for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
@@ -313,6 +314,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
                drop_entry[i] = true;
          } else {
             entry_seen = true;
+            kept_entry = i;
          }
       }
 
@@ -454,8 +456,12 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       offset = sizeof(fused_colour);
    }
 
+   /* Where each part starts in the linked program. */
+   size_t part_offset[ARRAY_SIZE(parts)] = {0};
+
    /* FS prolog happens per-pixel, outside the sample loop */
    if (prolog) {
+      part_offset[0] = offset;
       size_t sz = prolog->info.main_size;
       memcpy(linked_map + offset, prolog->binary, sz);
       if (agx_chip_native_agx3(dev->chip) && fragment &&
@@ -479,6 +485,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
       if (!part)
          continue;
 
+      part_offset[i] = offset;
       size_t sz = part->info.main_size;
       const uint8_t *part_code = (const uint8_t *)part->binary + part->info.main_offset;
       if (drop_entry[i]) {
@@ -560,6 +567,52 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    }
 
    assert(offset == size);
+
+   /* Native M5 fragments writing depth or stencil alone at several samples
+    * (native G17G compiler zs_depth_{2,4,8}x, zs_stencil_{2,4}x, and
+    * zs_depth_discard_4x after its kill) open with the f34 entry gate and
+    * never release the depth/coverage class explicitly. Where a part ends
+    * such a covered-sample loop, take that form for the program: mark its
+    * entry gate and drop that release. If either instruction is not the plain
+    * one recorded, keep both. */
+   if (agx_chip_g17_m5(dev->chip) && fragment && kept_entry >= 0 &&
+       !colour_fused) {
+      const struct agx_shader_part *kept = parts[kept_entry];
+      for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
+         const struct agx_shader_part *part = parts[i];
+         if (!part || !part->info.agx3_colour_link.zs_loop_release ||
+             (int)i < kept_entry)
+            continue;
+         size_t release_at = part->info.agx3_colour_link.zs_loop_release_offset;
+         if (drop_entry[i] &&
+             release_at > part->info.agx3_colour_link.entry_offset)
+            release_at -= AGX3_PIXEL_MAX_LENGTH;
+         release_at += part_offset[i];
+         const size_t gate_at =
+            part_offset[kept_entry] + kept->info.agx3_colour_link.entry_offset;
+         uint8_t gate[AGX3_PIXEL_MAX_LENGTH], unreleased[AGX3_PIXEL_MAX_LENGTH];
+         uint8_t release[AGX3_PIXEL_MAX_LENGTH];
+         uint8_t gate_len, unreleased_len, release_len;
+         if (release_at > gate_at && release_at + AGX3_PIXEL_MAX_LENGTH <= size &&
+             agx3_pixel_colour_entry(AGX_ISA_ENCODING_AGX3C, gate, &gate_len) &&
+             agx3_pixel_colour_entry_zs_unreleased(AGX_ISA_ENCODING_AGX3C,
+                                                   unreleased, &unreleased_len) &&
+             agx3_pixel_release(AGX_ISA_ENCODING_AGX3C, 1, false, 0, release,
+                                &release_len) &&
+             gate_len == AGX3_PIXEL_MAX_LENGTH &&
+             unreleased_len == AGX3_PIXEL_MAX_LENGTH &&
+             release_len == AGX3_PIXEL_MAX_LENGTH &&
+             !memcmp(linked_map + gate_at, gate, gate_len) &&
+             !memcmp(linked_map + release_at, release, release_len)) {
+            memcpy(linked_map + gate_at, unreleased, unreleased_len);
+            for (unsigned h = 0; h < AGX3_PIXEL_MAX_LENGTH; h += 2) {
+               linked_map[release_at + h] = 0x06;
+               linked_map[release_at + h + 1] = 0x00;
+            }
+         }
+         break;
+      }
+   }
 
    linked->scratch_size = scratch_size;
    linked->agx3_spectpr_scratch_size = agx3_spectpr_scratch_size;

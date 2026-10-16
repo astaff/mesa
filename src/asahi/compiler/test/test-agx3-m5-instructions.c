@@ -1010,6 +1010,16 @@ int main(void)
    const unsigned char fragment_entry[] = {0x07,0x30,0x00,0x05,0x00,0x00};
    if (!agx3_pixel_colour_entry(AGX_ISA_ENCODING_AGX3C,out,&len) ||
        len!=sizeof(fragment_entry) || memcmp(out,fragment_entry,len)) return 1;
+   /* Native zs_depth_4x / zs_stencil_4x entry gate (f34), AGX3c only. */
+   const unsigned char zs_unreleased_entry[] = {0x07,0x70,0x00,0x05,0x00,0x00};
+   if (!agx3_pixel_colour_entry_zs_unreleased(AGX_ISA_ENCODING_AGX3C,out,&len) ||
+       len!=sizeof(zs_unreleased_entry) ||
+       memcmp(out,zs_unreleased_entry,len)) return 1;
+   if (agx3_pixel_colour_entry_zs_unreleased(AGX_ISA_ENCODING_AGX3B,out,&len))
+      return 1;
+   const unsigned char zs_release[] = {0x0f,0x00,0x00,0x04,0x00,0x00};
+   if (!agx3_pixel_release(AGX_ISA_ENCODING_AGX3C,1,false,0,out,&len) ||
+       len!=sizeof(zs_release) || memcmp(out,zs_release,len)) return 1;
    const unsigned char clear[]={0x13,0,0,0};
    if (!agx3_clr(AGX_ISA_ENCODING_AGX3C,2,true,false,out,&len) ||
        len!=4 || memcmp(out,clear,4)) return 3;

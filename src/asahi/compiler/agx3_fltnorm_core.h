@@ -252,6 +252,12 @@ struct agx3_colour_link_info {
    bool straight_line;
    bool entry_unspanned;
    uint32_t entry_offset;
+   /* M5: this part ends a covered-sample depth/stencil loop with a plain
+    * class-1 release at zs_loop_release_offset. When this part's entry is
+    * the linked program's, agx_fast_link drops that release and marks the
+    * entry with f34, the native form. */
+   bool zs_loop_release;
+   uint32_t zs_loop_release_offset;
 
    /* Colour pixel classes consumed by this part: bit n is the class of the
     * tile partitions n, n + 3, ...  The linked fragment state loader must keep

@@ -90,6 +90,29 @@ agx3_pixel_colour_entry(enum agx_isa_encoding enc,
    return true;
 }
 
+bool
+agx3_pixel_colour_entry_zs_unreleased(enum agx_isa_encoding enc,
+                                      uint8_t out[AGX3_PIXEL_MAX_LENGTH],
+                                      uint8_t *len)
+{
+   if (out == NULL || len == NULL)
+      return false;
+   memset(out, 0, AGX3_PIXEL_MAX_LENGTH);
+   *len = 0;
+   if (enc != AGX_ISA_ENCODING_AGX3C)
+      return false;
+
+   const struct agx3_field_kv fields[] = {KV(14, 512), KV(15, 1), KV(34, 1)};
+   const struct agx3_field_kv base_c[] = {KV(16, 3), KV(17, 122)};
+   if (!agx3_bind_compose(enc, "pixwait", 0, fields, NELEM(fields), base_c,
+                          NELEM(base_c), out, len)) {
+      memset(out, 0, AGX3_PIXEL_MAX_LENGTH);
+      *len = 0;
+      return false;
+   }
+   return true;
+}
+
 /* metal-nt -arch applegpu_g17p, a fragment function with no colour writes
  * storing the result of atomic_fetch_add_explicit():
  *
