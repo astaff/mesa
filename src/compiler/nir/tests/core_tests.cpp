@@ -24,9 +24,11 @@
 #include "nir_test.h"
 extern "C" {
 #include "nir_instr_set.h"
+#include "nir_worklist.h"
 #include "nir_control_flow.h"
 }
 #include <vector>
+#include <deque>
 #include <algorithm>
 #include <string>
 
@@ -122,6 +124,55 @@ TEST_F(nir_core_test, nir_instr_free_and_dce_multiple_src_test)
    ASSERT_TRUE(nir_cursors_equal(c, nir_before_impl(b->impl)));
 
    nir_validate_shader(b->shader, "after remove_and_dce");
+}
+
+TEST_F(nir_core_test, instruction_worklist_preserves_fifo_across_growth_and_wrap)
+{
+   std::vector<nir_instr *> values;
+   for (unsigned i = 0; i < 17; ++i)
+      values.push_back(nir_def_instr(nir_imm_int(b, i)));
+
+   for (bool near_overflow : {false, true}) {
+      SCOPED_TRACE(near_overflow);
+      nir_instr_worklist worklist;
+      ASSERT_TRUE(nir_instr_worklist_init(&worklist));
+      const uint32_t start = near_overflow ? 0u - worklist.instr_vec.size : 0u;
+      worklist.instr_vec.head = worklist.instr_vec.tail = start;
+      std::deque<nir_instr *> expected;
+      unsigned next_value = 0;
+      auto push = [&]() {
+         nir_instr *value = values[next_value++ % values.size()];
+         nir_instr_worklist_push_tail(&worklist, value);
+         expected.push_back(value);
+         EXPECT_EQ(nir_instr_worklist_length(&worklist), expected.size());
+      };
+      auto pop = [&]() {
+         ASSERT_FALSE(expected.empty());
+         EXPECT_EQ(nir_instr_worklist_pop_head(&worklist), expected.front());
+         expected.pop_front();
+         EXPECT_EQ(nir_instr_worklist_length(&worklist), expected.size());
+      };
+      EXPECT_EQ(nir_instr_worklist_pop_head(&worklist), nullptr);
+      for (unsigned i = 0; i < 9; ++i)
+         push();
+      for (unsigned i = 0; i < 9; ++i)
+         pop();
+      EXPECT_EQ(nir_instr_worklist_pop_head(&worklist), nullptr);
+      for (unsigned phase = 0; phase < 4; ++phase) {
+         for (unsigned i = 0; i < 17 + 13 * phase; ++i)
+            push();
+         for (unsigned i = 0; i < 9; ++i)
+            pop();
+         for (unsigned i = 0; i < 61 + 7 * phase; ++i)
+            push();
+         while (!expected.empty())
+            pop();
+         EXPECT_TRUE(nir_instr_worklist_is_empty(&worklist));
+         EXPECT_EQ(nir_instr_worklist_pop_head(&worklist), nullptr);
+      }
+      nir_instr_worklist_fini(&worklist);
+   }
+   nir_validate_shader(b->shader, "worklist FIFO");
 }
 
 static nir_alu_instr *

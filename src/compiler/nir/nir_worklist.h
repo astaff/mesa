@@ -108,19 +108,30 @@ nir_instr_worklist_fini(nir_instr_worklist *wl)
 static inline void
 nir_instr_worklist_push_tail(nir_instr_worklist *wl, nir_instr *instr)
 {
-   nir_instr **vec_instr = (nir_instr **)u_vector_add(&wl->instr_vec);
+   struct u_vector *vec = &wl->instr_vec;
+   nir_instr **vec_instr;
+   if (vec->head - vec->tail == vec->size) {
+      vec_instr = (nir_instr **)u_vector_add(vec);
+   } else {
+      assert(vec->head - vec->tail < vec->size);
+      uint32_t offset = vec->head & (vec->size - 1);
+      vec->head += vec->element_size;
+      vec_instr = (nir_instr **)((char *)vec->data + offset);
+   }
    *vec_instr = instr;
 }
 
 static inline nir_instr *
 nir_instr_worklist_pop_head(nir_instr_worklist *wl)
 {
-   nir_instr **vec_instr = (nir_instr **)u_vector_remove(&wl->instr_vec);
-
-   if (vec_instr == NULL)
+   struct u_vector *vec = &wl->instr_vec;
+   if (vec->head == vec->tail)
       return NULL;
 
-   return *vec_instr;
+   assert(vec->head - vec->tail <= vec->size);
+   uint32_t offset = vec->tail & (vec->size - 1);
+   vec->tail += vec->element_size;
+   return *(nir_instr **)((char *)vec->data + offset);
 }
 
 void
