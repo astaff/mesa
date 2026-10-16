@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <set>
 #include <string>
+#include <vector>
 #include <gtest/gtest.h>
 #include "agx3_binder.h"
 #include "agx3_alu_core.h"
@@ -14,6 +15,80 @@
 #include "agx3_tex_core.h"
 #include "agx_test.h"
 #include "util/u_debug.h"
+
+static uint32_t
+uniform_difference_zero_bits(bool relax)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   agx_index input = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index multiplier = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index difference = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *sub = agx_fadd_to(b, difference, agx_uniform(12, AGX_SIZE_32),
+                               agx_neg(input));
+   sub->no_signed_zero = relax;
+   agx_index product = agx_fmul(b, difference, multiplier);
+   agx_lower_uniform_sources(b->shader);
+
+   std::vector<float> values(b->shader->alloc, 0.0f);
+   values[input.value] = values[multiplier.value] = 1.0f;
+   auto read = [&](agx_index x) {
+      float f = x.type == AGX_INDEX_UNIFORM ? 1.0f : values[x.value];
+      uint32_t bits;
+      std::memcpy(&bits, &f, sizeof(bits));
+      if (x.abs) bits &= 0x7fffffff;
+      if (x.neg) bits ^= 0x80000000;
+      std::memcpy(&f, &bits, sizeof(f));
+      return f;
+   };
+   agx_foreach_instr_global(b->shader, I) {
+      volatile float a = read(I->src[0]);
+      volatile float result;
+      if (I->op == AGX_OPCODE_MOV) {
+         result = a;
+      } else {
+         volatile float c = read(I->src[1]);
+         assert(I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL);
+         result = I->op == AGX_OPCODE_FADD ? a + c : a * c;
+      }
+      values[I->dest[0].value] = result;
+   }
+   uint32_t bits;
+   std::memcpy(&bits, &values[product.value], sizeof(bits));
+   ralloc_free(mem);
+   return bits;
+}
+
+TEST(AGX3UniformALU, UniformDifferencePreservesPositiveZero)
+{
+   EXPECT_EQ(uniform_difference_zero_bits(false), 0u);
+}
+
+TEST(AGX3UniformALU, UniformDifferenceMayNegateRelaxedZero)
+{
+   EXPECT_EQ(uniform_difference_zero_bits(true), 0x80000000u);
+}
+
+TEST(AGX3UniformALU, CSEKeepsDifferentSignedZeroContracts)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_index input = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index strict = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index relaxed = agx_temp(b->shader, AGX_SIZE_32);
+   agx_fadd_to(b, strict, agx_uniform(12, AGX_SIZE_32), agx_neg(input));
+   agx_fadd_to(b, relaxed, agx_uniform(12, AGX_SIZE_32),
+               agx_neg(input))->no_signed_zero = true;
+   agx_instr *use = agx_fmul_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                               strict, relaxed);
+   agx_opt_cse(b->shader);
+   EXPECT_NE(use->src[0].value, use->src[1].value);
+   ralloc_free(mem);
+}
 
 TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
 {

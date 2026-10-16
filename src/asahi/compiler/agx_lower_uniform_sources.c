@@ -449,16 +449,17 @@ agx3_m5_float_accepts_uniform(const agx_context *ctx, const agx_instr *I,
  * the register: u - r has no native form and would copy u into a GPR. When
  * every use of u - r is a float operation reading it as a plain register
  * operand, compute r - u instead (a native R + -U) and negate it at each use,
- * which is exact. Minecraft's fog mixes the fragment colour toward the fog
- * colour as (fog - c) * t + c, three times per fragment.
+ * only when NIR permits a zero result of either sign. Equal finite operands
+ * otherwise change from +0 to -0. Minecraft's fog mixes the fragment colour
+ * toward the fog colour as (fog - c) * t + c, three times per fragment.
  */
 static bool
 agx3_m5_negate_uniform_difference(agx_context *ctx, agx_instr *I)
 {
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble ||
        I->op != AGX_OPCODE_FADD || I->nr_dests != 1 || I->nr_srcs != 2 ||
-       I->saturate || I->dest[0].type != AGX_INDEX_NORMAL ||
-       I->dest[0].size != AGX_SIZE_32)
+       I->saturate || !I->no_signed_zero ||
+       I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].size != AGX_SIZE_32)
       return false;
    unsigned u = I->src[0].type == AGX_INDEX_UNIFORM ? 0 : 1;
    const agx_index uni = I->src[u], reg = I->src[!u];

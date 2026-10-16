@@ -5654,3 +5654,37 @@ TEST(NativeForms, M5MeshFragmentReadsPrimitiveWordsFlat)
    EXPECT_FALSE(agx_nir_lower_m5_mesh_fragment(b.shader));
    ralloc_free(b.shader);
 }
+
+TEST(NativeForms, M5UniformDifferenceHonorsNIRSignedZero)
+{
+   std::vector<uint8_t> programs[2];
+   for (unsigned strict = 0; strict < 2; ++strict) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "uniform difference zero");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+      b.fp_math_ctrl = nir_fp_exact |
+         (strict ? nir_fp_preserve_signed_zero : 0);
+      nir_def *u = agx_test_load_preamble(&b, 1, 32, 12);
+      nir_def *r = nir_u2f32(&b, nir_load_local_invocation_index(&b));
+      nir_def *difference = nir_fsub(&b, u, r);
+      nir_def *scale = agx_test_load_preamble(&b, 1, 32, 14);
+      nir_def *product = nir_fmul(&b, difference, scale);
+      nir_store_global(&b, product, nir_imm_int64(&b, 0x2000000),
+                       .write_mask = 1, .align_mul = 4);
+      agx_preprocess_nir_m5(b.shader);
+      agx_shader_key key = {};
+      key.dev.chip = AGX_CHIP_G17S;
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.no_preamble = true;
+      key.reserved_preamble = 16;
+      agx_shader_part part = {};
+      ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx_last_compile_refusal();
+      const uint8_t *bytes = static_cast<const uint8_t *>(part.binary);
+      programs[strict].assign(bytes, bytes + part.info.main_size);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+   EXPECT_NE(programs[1], programs[0]);
+}

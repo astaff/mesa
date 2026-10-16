@@ -473,6 +473,9 @@ typedef struct {
     * scoreboarding (everything but memory load/store and texturing). */
    unsigned scoreboard : 1;
 
+   /* NIR permits either sign for a zero result of this floating add. */
+   bool no_signed_zero : 1;
+
    /* Output modifiers */
    bool saturate : 1;
    unsigned mask : 4;

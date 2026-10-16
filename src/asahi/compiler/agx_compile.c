@@ -6420,9 +6420,12 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       if (instr->def.bit_size == 16)
          return agx_hadd_to(b, dst, agx_coerce_f16_src(b, s0),
                             agx_coerce_f16_src(b, s1));
-      else
-         return agx_fadd_to(b, dst, agx_g17p_coerce_f32_src(b, s0),
-                            agx_g17p_coerce_f32_src(b, s1));
+      else {
+         agx_instr *add = agx_fadd_to(b, dst, agx_g17p_coerce_f32_src(b, s0),
+                                     agx_g17p_coerce_f32_src(b, s1));
+         add->no_signed_zero = !nir_alu_instr_is_signed_zero_preserve(instr);
+         return add;
+      }
 
    case nir_op_fmul:
       if (instr->def.bit_size == 16)
