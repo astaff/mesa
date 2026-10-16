@@ -4384,6 +4384,60 @@ agx_lower_agx3_mixed_width_unary(agx_context *ctx)
       }
    }
 }
+
+/* M5 legalization widens a half operand with a float move, fadd(x, -0.0),
+ * where an f32 operation cannot read it. agx_opt_compact_constants made
+ * such an operand a half constant (1/256 in Minecraft's terrain vertex
+ * shader), so the vertex shader materialized the half and then moved it to
+ * f32 twice for every vertex. A float move of a known finite, normal
+ * constant is that constant exactly (f16 -> f32 is exact; x + -0.0 == x
+ * for every non-NaN x, including +-0), so materialize the f32 bits once
+ * instead. NaNs, infinities and f32 denormals keep their moves. */
+static void
+agx3_fold_constant_fmovs(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
+      return;
+
+   agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
+   if (!defs)
+      return;
+
+   agx_foreach_instr_global_safe(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         defs[I->dest[d].value] = I;
+
+      if (I->op != AGX_OPCODE_FADD || I->nr_dests != 1 || I->saturate ||
+          I->dest[0].size != AGX_SIZE_32 || agx_channels(I->dest[0]) != 1 ||
+          I->src[0].type != AGX_INDEX_NORMAL || I->src[0].abs ||
+          I->src[0].neg || I->src[0].memory ||
+          !agx_is_equiv(I->src[1], agx_negzero()) || I->src[1].abs ||
+          I->src[1].neg)
+         continue;
+
+      const agx_instr *def = defs[I->src[0].value];
+      if (!def || def->op != AGX_OPCODE_MOV_IMM || def->nr_dests != 1 ||
+          agx_channels(def->dest[0]) != 1 ||
+          (def->dest[0].size != AGX_SIZE_16 &&
+           def->dest[0].size != AGX_SIZE_32))
+         continue;
+
+      const float value = def->dest[0].size == AGX_SIZE_16
+                             ? _mesa_half_to_float((uint16_t)def->imm)
+                             : uif((uint32_t)def->imm);
+      const int cls = fpclassify(value);
+      if (cls != FP_NORMAL && cls != FP_ZERO)
+         continue;
+
+      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+      agx_instr *mov = agx_mov_imm_to(&b, I->dest[0], fui(value));
+      defs[I->dest[0].value] = mov;
+      agx_remove_instruction(I);
+   }
+
+   free(defs);
+}
+
 void
 agx_lower_agx3_fma_sources(agx_context *ctx)
 {
@@ -10109,6 +10163,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
 
    /* Constant materialization can introduce mixed-width FADD operands. */
    agx_lower_agx3_fma_sources(ctx);
+   agx3_fold_constant_fmovs(ctx);
 
    AGX_PASS(ctx, agx_lower_agx3_cf_constants);
    AGX_PASS(ctx, agx_lower_agx3_half_iadd_constants);
