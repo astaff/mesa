@@ -3029,6 +3029,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
         nir->info.stage == MESA_SHADER_TESS_EVAL))
       NIR_PASS(_, nir, nir_lower_tess_level_array_vars_to_vec);
 
+   /* Mesh outputs are per-vertex/per-primitive arrays, so a component
+    * write such as gl_MeshVerticesEXT[i].gl_Position.y reaches here as an
+    * array deref of a vector, which nir_lower_io would store to component
+    * 0. Turn those into masked vector accesses first. */
+   if (nir->info.stage == MESA_SHADER_MESH)
+      NIR_PASS(_, nir, nir_lower_array_deref_of_vec, nir_var_shader_out, NULL,
+               nir_lower_direct_array_deref_of_vec_load |
+               nir_lower_indirect_array_deref_of_vec_load |
+               nir_lower_direct_array_deref_of_vec_store |
+               nir_lower_indirect_array_deref_of_vec_store);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             glsl_type_size,
             nir_lower_io_lower_64bit_to_32 |
