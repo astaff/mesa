@@ -8044,10 +8044,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    progress = false;
    if (byte_indices)
       NIR_PASS(progress, nir, agx_nir_scalarize_int64);
-   /* G17P: normalized 64-bit division instead of nir_lower_int64's fully
-    * unrolled 64-step division (agx_nir_lower_divmod64.c). */
-   if (g17p)
-      NIR_PASS(progress, nir, agx_nir_lower_divmod64);
+   /* G17P and M5: normalized 64-bit division instead of nir_lower_int64's
+    * fully unrolled 64-step division (agx_nir_lower_divmod64.c). M5 keeps
+    * the loop's 64-bit add and subtract native. */
+   if (g17p || m5)
+      NIR_PASS(progress, nir, agx_nir_lower_divmod64, m5);
    NIR_PASS(progress, nir, nir_lower_int64);
 
    /* If we lowered actual int64 arithmetic (not folded into the address
