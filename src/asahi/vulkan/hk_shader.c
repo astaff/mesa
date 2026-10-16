@@ -5154,6 +5154,25 @@ hk_lower_mesh_queries(nir_shader *nir)
    return nir_progress(true, impl, nir_metadata_none);
 }
 
+/* A mesh shader used with an opt-in task stage reads its child grid
+ * (gl_NumWorkGroups) from the native object->mesh record, not the API grid in
+ * the draw root. Run before hk_lower_nir, which would lower it to the root.
+ * Without the record (no kernel mesh rendering buffer) there is no source for
+ * it: returns false. */
+static bool
+hk_m5_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
+                     VkShaderCreateFlagsEXT flags)
+{
+   if (nir->info.stage != MESA_SHADER_MESH || !hk_m5_task_opt_in() ||
+       (flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) ||
+       !hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups))
+      return true;
+   if (!hk_m5_task_record(dev->dev.params.features))
+      return false;
+   NIR_PASS(_, nir, agx_nir_lower_m5_mesh_task_record);
+   return true;
+}
+
 static VkResult
 hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *info,
                   const struct vk_graphics_pipeline_state *state,
@@ -5203,20 +5222,11 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       (nir->info.io_lowered ||
        hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups));
 
-   /* A mesh shader used with an opt-in task stage reads its child grid
-    * (gl_NumWorkGroups) from the native object->mesh record, not the API
-    * grid in the draw root. Without the record (no kernel mesh rendering
-    * buffer) there is no source for it. */
-   if (nir->info.stage == MESA_SHADER_MESH && hk_m5_task_opt_in() &&
-       !(info->flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) &&
-       !nir->info.io_lowered &&
-       hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups)) {
-      if (!hk_m5_task_record(dev->dev.params.features)) {
-         ralloc_free(nir);
-         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                          "mesh gl_NumWorkGroups under a task stage needs the task record");
-      }
-      NIR_PASS(_, nir, agx_nir_lower_m5_mesh_task_record);
+   if (!nir->info.io_lowered &&
+       !hk_m5_mesh_task_grid(dev, nir, info->flags)) {
+      ralloc_free(nir);
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "mesh gl_NumWorkGroups under a task stage needs the task record");
    }
    if (!nir->info.io_lowered) {
        hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
@@ -6189,6 +6199,13 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       vs_covers[i] = dev->dev.chip == AGX_CHIP_G17P &&
                      nir->info.stage == MESA_SHADER_VERTEX &&
                      hk_vs_covers_clip_square(nir);
+      if (!hk_m5_mesh_task_grid(dev, nir, info->flags)) {
+         for (uint32_t j = 0; j < shader_count; j++)
+            ralloc_free(infos[j].nir);
+         memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "mesh gl_NumWorkGroups under a task stage needs the task record");
+      }
       hk_lower_nir(dev, nir, info->robustness, is_multiview,
                    info->next_stage_mask, info->set_layout_count,
                     info->set_layouts, hk_features);
