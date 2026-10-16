@@ -387,6 +387,8 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
 #define MESH_VERTEX_VARYINGS \
    (USER_VARYINGS | VARYING_BIT_CLIP_DIST0 | VARYING_BIT_CLIP_DIST1 | \
     BITFIELD64_RANGE(VARYING_SLOT_CULL_PRIMITIVE, 2))
+/* Per-primitive outputs exported as user words of private vertices. */
+#define MESH_PRIMITIVE_WORDS (USER_VARYINGS | VARYING_BIT_PRIMITIVE_ID)
 
 bool
 agx_m5_mesh_gather_varyings(const nir_shader *s,
@@ -437,6 +439,12 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
                      return false;
                   varyings->primitive_comps[slot] = 1;
                   varyings->lv = true;
+               } else if (slot == VARYING_SLOT_PRIMITIVE_ID) {
+                  /* A flat user word of the primitive's private vertices,
+                   * which the fragment shader's gl_PrimitiveID links to. */
+                  if (end != 1)
+                     return false;
+                  varyings->primitive_comps[slot] = 1;
                } else {
                   return false;
                }
@@ -463,8 +471,9 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
          }
       }
    }
-   for (unsigned slot = VARYING_SLOT_VAR0; slot < 64; ++slot) {
-      if (!varyings->primitive_comps[slot])
+   for (unsigned slot = 0; slot < 64; ++slot) {
+      if (!(MESH_PRIMITIVE_WORDS & BITFIELD64_BIT(slot)) ||
+          !varyings->primitive_comps[slot])
          continue;
       /* A location is either per-vertex or per-primitive. */
       if (varyings->components[slot])
@@ -531,10 +540,12 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
          if (v->components[slot] != 1 ||
              (slot == VARYING_SLOT_VIEWPORT && !v->primitive_comps[slot]))
             return false;
-      } else if (!((MESH_VERTEX_VARYINGS | VARYING_BIT_PSIZ) &
-                   BITFIELD64_BIT(slot)) ||
+      } else if (!((MESH_VERTEX_VARYINGS | VARYING_BIT_PSIZ |
+                    VARYING_BIT_PRIMITIVE_ID) & BITFIELD64_BIT(slot)) ||
+                 (slot == VARYING_SLOT_PRIMITIVE_ID &&
+                  !v->primitive_comps[slot]) ||
                  (v->primitive_comps[slot] &&
-                  (!(USER_VARYINGS & BITFIELD64_BIT(slot)) ||
+                  (!(MESH_PRIMITIVE_WORDS & BITFIELD64_BIT(slot)) ||
                    v->primitive_comps[slot] != v->components[slot]))) {
          return false;
       }
@@ -596,7 +607,8 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       (primitive_outputs&~(unweld ? ~UINT64_C(0) : primitive_slots)) ||
       s->info.outputs_written & ~(VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES|MESH_VERTEX_VARYINGS|
                                   (primitive_slots & (VARYING_BIT_LAYER|VARYING_BIT_VIEWPORT|
-                                                      VARYING_BIT_CULL_PRIMITIVE)) |
+                                                      VARYING_BIT_CULL_PRIMITIVE|
+                                                      VARYING_BIT_PRIMITIVE_ID)) |
                                   VARYING_BIT_PSIZ) ||
       /* Every primitive gets private vertices within the native
        * 256-vertex output limit. */
@@ -964,7 +976,8 @@ lower_m5_primitive_input(nir_builder *b, nir_intrinsic_instr *i, void *data)
    nir_io_semantics sem = nir_intrinsic_io_semantics(i);
    const unsigned location = sem.location;
    if (!((location >= VARYING_SLOT_VAR0 && location < VARYING_SLOT_VAR0 + 32) ||
-         location == VARYING_SLOT_LAYER || location == VARYING_SLOT_VIEWPORT) ||
+         location == VARYING_SLOT_LAYER || location == VARYING_SLOT_VIEWPORT ||
+         location == VARYING_SLOT_PRIMITIVE_ID) ||
        (i->def.bit_size != 32 && i->def.bit_size != 16))
       return false;
    b->cursor = nir_before_instr(&i->instr);

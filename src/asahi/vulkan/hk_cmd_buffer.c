@@ -1714,8 +1714,16 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
           * generate_primitive_id. Admit it as a system coefficient beside
           * FragCoord Z and 1/W -- scalar, flat, and indexing no vertex
           * output. A VS-written gl_PrimitiveID would take the ordinary user
-          * word path instead and stays refused, having no witness. */
-         if (b->slot == VARYING_SLOT_PRIMITIVE_ID) {
+          * word path instead and stays refused, having no witness. A mesh
+          * shader's per-primitive gl_PrimitiveID is a flat user word of the
+          * primitive's private vertices (agx_m5_mesh_gather_varyings) and
+          * links like any other user word below. */
+         const bool mesh_primitive_id =
+            mesh && vs->info.stage == MESA_SHADER_MESH &&
+            b->slot == VARYING_SLOT_PRIMITIVE_ID &&
+            gfx->linked_varyings.slots[VARYING_SLOT_PRIMITIVE_ID] &&
+            b->count == 1 && b->offset == 0 && !b->smooth && !b->perspective;
+         if (b->slot == VARYING_SLOT_PRIMITIVE_ID && !mesh_primitive_id) {
             if (gfx->linked_varyings.slots[VARYING_SLOT_PRIMITIVE_ID] ||
                 b->count != 1 || b->offset != 0 || b->smooth || b->perspective)
                return false;
@@ -1759,7 +1767,8 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
             b->count == vs->info.uvs.components[AGX_MESH_PRIMITIVE_PAGE_SLOT] &&
             b->count >= 1 && b->count <= 2 &&
             b->offset == 0 && !b->smooth && !b->perspective;
-         const bool user_slot = primitive_page || (b->slot >= VARYING_SLOT_VAR0 &&
+         const bool user_slot = primitive_page || mesh_primitive_id ||
+                                (b->slot >= VARYING_SLOT_VAR0 &&
                                  b->slot <= VARYING_SLOT_VAR31) ||
                                 b->slot == VARYING_SLOT_LAYER ||
                                 b->slot == VARYING_SLOT_VIEWPORT || clip_slot ||

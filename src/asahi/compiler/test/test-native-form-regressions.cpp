@@ -5497,11 +5497,9 @@ TEST(NativeForms, M5MeshCullPrimitiveCompacts)
 
 TEST(NativeForms, M5MeshPerPrimitiveRefusalsLeaveShaderUntouched)
 {
-   /* No private-vertex form beyond the native 256 output vertices, and no
-    * mapping yet for mesh-written primitive IDs. */
+   /* No private-vertex form beyond the native 256 output vertices. */
    const struct { unsigned primitives; gl_varying_slot extra; bool gather; } rows[] = {
       {86, VARYING_SLOT_POS, true},
-      {2, VARYING_SLOT_PRIMITIVE_ID, false},
    };
    for (const auto &r : rows) {
       nir_shader *s=m5_mesh_per_primitive_shader(false,r.primitives,r.extra);
@@ -5519,6 +5517,22 @@ TEST(NativeForms, M5MeshPerPrimitiveRefusalsLeaveShaderUntouched)
    ASSERT_TRUE(agx_nir_lower_m5_mesh(s,&v));
    EXPECT_EQ(s->info.mesh.max_vertices_out,255u);
    nir_validate_shader(s,"mesh 85 primitives");ralloc_free(s);
+}
+
+TEST(NativeForms, M5MeshPrimitiveIdIsAPrimitiveWord)
+{
+   /* A mesh-written gl_PrimitiveID is a flat user word of the primitive's
+    * private vertices, which the fragment shader's gl_PrimitiveID links to. */
+   nir_shader *s=m5_mesh_per_primitive_shader(false,2,VARYING_SLOT_PRIMITIVE_ID);
+   s->info.outputs_written|=VARYING_BIT_PRIMITIVE_ID;
+   s->info.per_primitive_outputs|=VARYING_BIT_PRIMITIVE_ID;
+   struct agx_m5_mesh_varyings v;
+   ASSERT_TRUE(agx_m5_mesh_gather_varyings(s,&v));
+   EXPECT_EQ(v.primitive_comps[VARYING_SLOT_PRIMITIVE_ID],1u);
+   EXPECT_EQ(v.components[VARYING_SLOT_PRIMITIVE_ID],1u);
+   ASSERT_TRUE(agx_nir_lower_m5_mesh(s,&v));
+   EXPECT_EQ(s->info.mesh.max_vertices_out,6u);
+   nir_validate_shader(s,"mesh primitive id");ralloc_free(s);
 }
 
 TEST(NativeForms, M5MeshFragmentReadsPrimitiveWordsFlat)
@@ -5543,10 +5557,8 @@ TEST(NativeForms, M5MeshFragmentReadsPrimitiveWordsFlat)
       if(in->type==nir_instr_type_alu&&nir_instr_as_alu(in)->op==nir_op_f2f16)narrowed++;
       if(in->type!=nir_instr_type_intrinsic)continue;
       nir_intrinsic_instr *i=nir_instr_as_intrinsic(in);
-      if(i->intrinsic==nir_intrinsic_load_per_primitive_input) {
+      if(i->intrinsic==nir_intrinsic_load_per_primitive_input)
          primitive++;
-         EXPECT_EQ(nir_intrinsic_io_semantics(i).location,VARYING_SLOT_PRIMITIVE_ID);
-      }
       if(i->intrinsic==nir_intrinsic_load_input) {
          flat++;EXPECT_EQ(i->def.bit_size,32u);
          EXPECT_EQ(nir_alu_type_get_type_size(nir_intrinsic_dest_type(i)),32u);
@@ -5554,8 +5566,8 @@ TEST(NativeForms, M5MeshFragmentReadsPrimitiveWordsFlat)
             EXPECT_EQ(nir_intrinsic_component(i),1u);
       }
    }
-   EXPECT_EQ(flat,3u);EXPECT_EQ(primitive,1u);EXPECT_EQ(narrowed,1u);
-   EXPECT_EQ(b.shader->info.per_primitive_inputs,VARYING_BIT_PRIMITIVE_ID);
+   EXPECT_EQ(flat,4u);EXPECT_EQ(primitive,0u);EXPECT_EQ(narrowed,1u);
+   EXPECT_EQ(b.shader->info.per_primitive_inputs,0u);
    nir_validate_shader(b.shader,"fs per-primitive inputs");
    EXPECT_FALSE(agx_nir_lower_m5_mesh_fragment(b.shader));
    ralloc_free(b.shader);
