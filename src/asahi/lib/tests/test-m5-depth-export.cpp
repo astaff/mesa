@@ -35,6 +35,7 @@ struct epilog_shape {
    enum agx_chip chip;
    unsigned samples;
    bool z, s, a2c;
+   bool sample_shading = false;
 };
 
 static nir_shader *
@@ -50,6 +51,7 @@ build_epilog(const epilog_shape &shape)
    fs.link.colour_comps = BITFIELD_MASK(4);
    fs.link.write_z = shape.z;
    fs.link.write_s = shape.s;
+   fs.link.sample_shading = shape.sample_shading;
    fs.blend.alpha_to_coverage = shape.a2c;
    agx_fs_epilog_apply_device_policy(shape.chip, &fs);
    fs.rt_formats[0] = PIPE_FORMAT_R8G8B8A8_UNORM;
@@ -63,7 +65,11 @@ build_epilog(const epilog_shape &shape)
 
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 depth export epilog");
-   agx_nir_fs_epilog(&b, &fs);
+   /* As hk selects the builder for M5. */
+   if (shape.sample_shading)
+      agx_nir_fs_epilog_g17p(&b, &fs);
+   else
+      agx_nir_fs_epilog(&b, &fs);
    return b.shader;
 }
 
@@ -162,9 +168,11 @@ index_of(const std::vector<std::string> &m, const char *name)
 }
 
 static bool
-compile_m5(nir_shader *s, unsigned samples, agx_shader_part *part)
+compile_m5(nir_shader *s, unsigned samples, agx_shader_part *part,
+           bool preprocessed = false)
 {
-   agx_preprocess_nir(s);
+   if (!preprocessed)
+      agx_preprocess_nir(s);
    if (samples > 1)
       agx_nir_lower_g17p_tile_samples(s, samples);
    agx_shader_key key = {};
@@ -295,4 +303,32 @@ TEST_F(M5DepthExport, OtherShapesUnchanged)
    EXPECT_EQ(c.transactions, 0u);
    EXPECT_GT(c.demotes + c.coverage_updates, 0u);
    ralloc_free(s);
+}
+
+/* pipeline.*.multisample.sample_rate_a2c: a sample-rate epilog updates each
+ * sample's coverage on its own. Each update is split into a testing MOVMSK
+ * for a live sample and a killing one for a dead sample. A whole-pixel
+ * update stays one testing MOVMSK. */
+TEST_F(M5DepthExport, SampleRateCoverageUpdatesSplit)
+{
+   for (bool sample_shading : {false, true}) {
+      for (unsigned samples : {2u, 4u}) {
+         SCOPED_TRACE(::testing::Message() << samples << " samples"
+                      << (sample_shading ? ", sample shaded" : ""));
+         epilog_shape shape = {AGX_CHIP_G17S, samples, false, false, true};
+         shape.sample_shading = sample_shading;
+         nir_shader *s = build_epilog(shape);
+         agx_preprocess_nir(s);
+         counts c = count_nir(s);
+         EXPECT_EQ(c.coverage_updates, sample_shading ? samples : 1u);
+
+         agx_shader_part part = {};
+         ASSERT_TRUE(compile_m5(s, samples, &part, true))
+            << agx_last_compile_refusal();
+         std::vector<std::string> m = mnemonics(part);
+         EXPECT_EQ(count_of(m, "movmsk"), sample_shading ? 2 * samples : 1u);
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
 }

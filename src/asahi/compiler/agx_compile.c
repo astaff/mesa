@@ -12268,17 +12268,31 @@ agx_max_vertex_attribs(const struct agx_device_key *dev)
    return MIN2(attribs, AGX_MAX_ATTRIBS);
 }
 
+struct agx_split_sample_tests {
+   unsigned samples;
+   bool m5;
+};
+
 /* Separate pure kills from testing updates before lowering their different
- * pixel-class lifetimes. The testing arm needs a real empty-EXEC skip. */
+ * pixel-class lifetimes. The testing arm needs a real empty-EXEC skip.
+ *
+ * M5 keeps a whole-pixel update as one unconditional testing MOVMSK, as
+ * native G17G does (agx_nir_lower_sample_mask_m5). An update naming only some
+ * samples (one per sample in a sample-rate epilog) is still split.
+ */
 static bool
 agx_nir_split_g17p_sample_tests(nir_builder *b, nir_intrinsic_instr *intr,
                                 void *data)
 {
+   const struct agx_split_sample_tests *split = data;
    if (intr->intrinsic != nir_intrinsic_sample_mask_agx ||
        nir_src_is_const(intr->src[1]))
       return false;
 
-   unsigned all = BITFIELD_MASK(*(unsigned *)data);
+   unsigned all = BITFIELD_MASK(split->samples);
+   if (split->m5 && nir_src_is_const(intr->src[0]) &&
+       (nir_src_as_uint(intr->src[0]) & all) == all)
+      return false;
    nir_def *target = intr->src[0].ssa;
    nir_def *live = intr->src[1].ssa;
    b->cursor = nir_before_instr(&intr->instr);
@@ -12506,14 +12520,15 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                nir_metadata_none, NULL);
    }
 
-   /* M5 issues one unconditional testing update instead
-    * (agx_nir_lower_sample_mask_deferred_m5, the native G17G form). */
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+   if (agx_isa_is_agx3(key->dev.encoding) &&
        nir->info.stage == MESA_SHADER_FRAGMENT &&
        key->fs.nr_samples > 1 && !key->fs.inside_sample_loop) {
-      unsigned samples = key->fs.nr_samples;
+      struct agx_split_sample_tests split = {
+         .samples = key->fs.nr_samples,
+         .m5 = key->dev.encoding == AGX_ISA_ENCODING_AGX3C,
+      };
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_nir_split_g17p_sample_tests,
-               nir_metadata_none, &samples);
+               nir_metadata_none, &split);
    }
 
    NIR_PASS(_, nir, nir_lower_frag_coord_to_pixel_coord);
