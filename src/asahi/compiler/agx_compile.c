@@ -3034,6 +3034,26 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                agx_index word = agx_temp(b->shader, AGX_SIZE_32);
                agx_emit_collect_to(b, word, 2,
                                   (agx_index[]){coverage, high});
+               if (!(constant_target && nir_src_is_const(instr->src[1]))) {
+                  /* The testing word carries the whole SR39 coverage, so it
+                   * tests every covered sample, and naming a targeted sample
+                   * dead in its live byte does not keep that sample from
+                   * being tested and written. A per-sample alpha-to-coverage
+                   * epilog at alpha 0 wrote depth on M5
+                   * (pipeline.*.multisample.alpha_to_coverage.samples_N.
+                   * alpha_invisible_check_depth) once the per-lane split no
+                   * longer routed such updates to its kill arm. When no
+                   * targeted sample is live, publish the killed byte without
+                   * testing instead, as that arm and a constant kill do. */
+                  agx_index dead = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_mov_to(b, dead, agx_and(b, live_in, affected));
+                  agx_index killed = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_mov_to(b, killed, affected);
+                  agx_index tested = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_icmpsel_to(b, tested, dead, agx_zero(), killed, word,
+                                 AGX_ICOND_UEQ);
+                  word = tested;
+               }
                if (constant_target) {
                   agx_mov_to(b, selected, word);
                } else {
