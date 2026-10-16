@@ -186,6 +186,7 @@ static const struct drm_asahi_params_global params_g17s = {
 static const struct drm_asahi_params_global params_g17s_task = {
    .features = DRM_ASAHI_FEATURE_SOFT_FAULTS | DRM_ASAHI_FEATURE_RENDER_RESOURCES |
                DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 |
+               DRM_ASAHI_FEATURE_COMPUTE_RESOURCES |
                DRM_ASAHI_FEATURE_TASK_MESH_STORAGE,
    .gpu_generation = 17, .gpu_variant = 'S', .gpu_revision = 0,
    .chip_id = 0x6050, .num_dies = 1, .num_clusters_total = 2,

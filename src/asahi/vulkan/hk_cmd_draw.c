@@ -11620,27 +11620,42 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    const struct hk_mesh_info *mesh_info =
       &hk_main_mesh_variant(gfx->shaders[MESA_SHADER_MESH])->info.mesh;
    const struct hk_shader *task = task_api ? &task_api->variants[0] : NULL;
+   /* A task draw whose grid, draw count or predicate lives in GPU memory is
+    * recorded with one object workgroup; libagx_m5_task_dispatch patches the
+    * object thread counts before the render and publishes whether the draw
+    * executes (hk_m5_task_predicate). */
+   const bool task_gpu_dispatch = task_api &&
+      (!cpu_grid || count_address || conditional);
+   uint64_t task_flag = 0;
    if (task) {
-      /* The object dispatch is sized from the API task grid on the CPU.
-       * Indirect task grids, draw counts and predication need an object-side
-       * grid source; refuse those shapes. Task scratch needs a reservation
-       * this path does not make. Known gap: the child grid is not published
-       * to the mesh stage, so a mesh shader's gl_NumWorkGroups reads the API
-       * task grid (reads_num_workgroups is conservative for pre-lowered NIR,
-       * so it cannot gate this). */
-      if (!cpu_grid || count_address || conditional || !task->only_linked ||
-          task->only_linked->b.scratch_size ||
+      /* Task scratch needs a reservation this path does not make. */
+      if (!task->only_linked || task->only_linked->b.scratch_size ||
           task->only_linked->b.agx3_spectpr_scratch_size) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
-      memcpy(gfx->mesh.task_grid, cpu_grid, sizeof(gfx->mesh.task_grid));
+      if (task_gpu_dispatch) {
+         struct agx_ptr flag = hk_pool_alloc(cmd, 4, 4);
+         if (!flag.cpu) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            return;
+         }
+         task_flag = flag.gpu;
+         for (unsigned i = 0; i < 3; ++i)
+            gfx->mesh.task_grid[i] = 1;
+      } else {
+         memcpy(gfx->mesh.task_grid, cpu_grid, sizeof(gfx->mesh.task_grid));
+      }
    }
    gfx->mesh.grid = grid;
    /* Only a stage that reads gl_DrawID or gl_NumWorkGroups needs the root
     * republished per draw; others keep the bound root. With a task stage,
     * the API grid belongs to the task shader. */
    struct hk_descriptor_state *desc = &gfx->descriptors;
+   if (task && desc->root.mesh_task_flag != task_flag) {
+      desc->root.mesh_task_flag = task_flag;
+      desc->root_dirty = true;
+   }
    if ((mesh_info->reads_num_workgroups ||
         (task && task->info.mesh.reads_num_workgroups)) &&
        desc->root.mesh_grid_addr != grid) {
@@ -11697,11 +11712,23 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
          dispatch.local_size[i] = task->b.info.workgroup_size[i];
       }
    }
+   /* The record's object thread counts follow its header word. */
+   const uint64_t dispatch_threads = hk_cs_current_addr(cs) + 4;
    if (!agx_vdm_mesh_dispatch_pack(dev->dev.chip, &dispatch, cs->current)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    cs->current += AGX_VDM_MESH_DISPATCH_LENGTH;
+   if (task_gpu_dispatch) {
+      libagx_m5_task_dispatch(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_PREGFX,
+                              dispatch_threads, task_flag, grid, count_address,
+                              conditional ? cmd->state.conditional.address : 0,
+                              draw_id,
+                              conditional && cmd->state.conditional.inverted,
+                              task->b.info.workgroup_size[0],
+                              task->b.info.workgroup_size[1],
+                              task->b.info.workgroup_size[2]);
+   }
    hk_m5_note_render_resources(cmd, cs);
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);

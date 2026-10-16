@@ -57,6 +57,32 @@ libagx_draw_indirect_byte_count(global VkDrawIndirectCommand *out,
  * requires a 32-bit load (D3D12 uses 64-bit predication), permits inversion,
  * and compute dispatch records contain three rather than four/five words.
  */
+/*
+ * M5 task (object) draws whose grid, draw count or predicate live in GPU
+ * memory. The VDM mesh dispatch record of such a draw is recorded with one
+ * object workgroup; patch its object thread counts before the render runs and
+ * publish whether the draw executes, which the task shader checks on entry
+ * (a disabled draw keeps one workgroup, which launches no mesh children).
+ */
+KERNEL(1)
+libagx_m5_task_dispatch(global uint32_t *record, global uint32_t *flag,
+                        constant uint32_t *grid, constant uint32_t *draw_count,
+                        constant uint32_t *predicate, uint32_t draw_index,
+                        uint32_t inverted, uint32_t local_x, uint32_t local_y,
+                        uint32_t local_z)
+{
+   bool enabled = grid[0] != 0 && grid[1] != 0 && grid[2] != 0;
+   if (draw_count)
+      enabled = enabled && draw_index < *draw_count;
+   if (predicate)
+      enabled = enabled && ((*predicate != 0) != (inverted != 0));
+
+   record[0] = enabled ? grid[0] * local_x : local_x;
+   record[1] = enabled ? grid[1] * local_y : local_y;
+   record[2] = enabled ? grid[2] * local_z : local_z;
+   *flag = enabled ? 1 : 0;
+}
+
 KERNEL(1)
 libagx_conditional_render(global uint32_t *out, constant uint32_t *in,
                           constant uint32_t *predicate, uint32_t words,

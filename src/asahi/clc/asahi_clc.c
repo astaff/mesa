@@ -346,6 +346,11 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_trace_rays_select_launch") ||
           !strcmp(func->name, "libagx_draw_indirect_byte_count") ||
           !strcmp(func->name, "libagx_conditional_render") ||
+          /* M5 task draws with a GPU-side grid, count or predicate: one
+           * invocation of constant loads, compares and four global stores
+           * into the mesh dispatch record and the draw's execute word. */
+          (!strcmp(target, "g17g") &&
+           !strcmp(func->name, "libagx_m5_task_dispatch")) ||
           !strcmp(func->name, "libagx_draw_robust_index") ||
           !strcmp(func->name, "libagx_draw_robust_index_batch") ||
           !strcmp(func->name, "libagx_unroll_restart") ||

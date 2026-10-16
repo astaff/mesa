@@ -5159,6 +5159,34 @@ hk_lower_mesh_queries(nir_shader *nir)
  * the draw root. Run before hk_lower_nir, which would lower it to the root.
  * Without the record (no kernel mesh rendering buffer) there is no source for
  * it: returns false. */
+/* Opt-in M5 task draws whose grid, draw count or predicate live in GPU memory
+ * (hk_draw_mesh_native) record one object workgroup and let
+ * libagx_m5_task_dispatch publish whether the draw executes. A task shader
+ * checks that word on entry: a disabled draw launches no mesh children. The
+ * root word is zero for every other draw, so only those loads the flag. */
+static void
+hk_m5_task_predicate(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *flag = nir_load_global_constant(&b, 1, 64,
+      nir_iadd_imm(&b, nir_load_root_agx(&b),
+                   hk_root_descriptor_offset(mesh_task_flag)),
+      .align_mul = 8, .access = ACCESS_CAN_SPECULATE);
+   nir_push_if(&b, nir_ine_imm(&b, flag, 0));
+   {
+      nir_def *execute = nir_load_global(&b, 1, 32, flag, .align_mul = 4);
+      nir_push_if(&b, nir_ieq_imm(&b, execute, 0));
+      {
+         nir_launch_mesh_workgroups(&b, nir_imm_ivec3(&b, 0, 0, 0));
+         nir_jump(&b, nir_jump_halt);
+      }
+      nir_pop_if(&b, NULL);
+   }
+   nir_pop_if(&b, NULL);
+   nir_progress(true, impl, nir_metadata_none);
+}
+
 static bool
 hk_m5_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
                      VkShaderCreateFlagsEXT flags)
@@ -5643,6 +5671,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * addressing and child-grid UVSW, never as a CDM mesh producer.
        * Runtime task advertisement and payload binding remain gated until
        * the native register/allocation contract is hardware qualified. */
+      if (hk_m5_task_opt_in())
+         hk_m5_task_predicate(nir);
       if (dev->dev.chip != AGX_CHIP_G17S ||
           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE ||
           !(hk_m5_task_opt_in()

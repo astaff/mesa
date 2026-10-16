@@ -253,6 +253,10 @@ struct hk_root_descriptor_table {
     * agx3b layout. */
    uint32_t ppp_multisamplectl_hi;
 
+   /* Opt-in M5 task draws whose grid, count or predicate live in GPU memory:
+    * address of the word libagx_m5_task_dispatch writes (nonzero = execute);
+    * zero for every other draw. Appended after every agx3b field. */
+   uint64_t mesh_task_flag;
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
