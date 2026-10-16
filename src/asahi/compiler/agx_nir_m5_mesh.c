@@ -1229,6 +1229,9 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
                    nir_channel(&b, value, 2)));
       nir_store_object_childcount_agx(&b, count);
       nir_pop_if(&b, NULL);
+      /* Object threadgroup memory is allocated in 64-byte units. */
+      if (s->info.shared_size)
+         s->info.shared_size = ALIGN_POT(s->info.shared_size, 64);
       nir_progress(true, entry, nir_metadata_none);
       NIR_PASS(_, s, nir_lower_vars_to_ssa);
       return true;
