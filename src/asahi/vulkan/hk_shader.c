@@ -5735,9 +5735,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_gen1_ray_query_layout(dev, nir, 0);
       /* The raster replay is always a hardware vertex shader. */
       rq_layout.graphics_stage = dev->gen1_native_graphics_rq;
+      /* On M5 the main kernel performs the invocation's API stores and
+       * atomics; the count and raster variants drop them, together with any
+       * native ray query that only fed them. */
+      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
       if (!hk_nir_lower_gs(nir, &count, &rast, &pre_gs,
                            &count_variant->info.gs,
-                           dev->gen1_native_rq ? &rq_layout : NULL)) {
+                           dev->gen1_native_rq ? &rq_layout : NULL, m5,
+                           m5 && dev->m5_native_rq
+                              ? agx_nir_m5_remove_dead_ray_queries
+                              : NULL)) {
          ralloc_free(nir);
          ralloc_free(count);
          ralloc_free(rast);
@@ -5747,24 +5754,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                           "Gen1 native GS ray query lowering failed");
       }
 
-      /* The main kernel has the API stores stripped; a native query whose
-       * results only fed them is dead there and runs in the raster vertex
-       * program instead. The count kernel keeps the API stores, so its query
-       * is removed only if it is dead there too. */
-      if (dev->m5_native_rq) {
-         bool removed = false;
-         NIR_PASS(removed, nir, agx_nir_m5_remove_dead_ray_queries);
-         /* The query kept alive the API atomic whose result selected it,
-          * e.g. atomicCompSwap(flag, 0, 1) == 0 guarding a query and an
-          * atomicAdd. The atomicAdd had no uses and was stripped, but the
-          * swap stayed in the main kernel and claimed the flag, so the
-          * raster program's copy of the invocation found it taken and
-          * skipped the add. Strip what the removed query exposes. */
-         if (removed)
-            NIR_PASS(_, nir, poly_nir_strip_gs_main_atomics);
-         if (count)
-            NIR_PASS(_, count, agx_nir_m5_remove_dead_ray_queries);
-      }
+      /* A main-kernel query whose results feed nothing is dead too. */
+      if (dev->m5_native_rq)
+         NIR_PASS(_, nir, agx_nir_m5_remove_dead_ray_queries);
 
       agx_preprocess_nir(count);
       agx_preprocess_nir(rast);
