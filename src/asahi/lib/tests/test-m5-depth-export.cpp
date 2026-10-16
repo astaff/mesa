@@ -7,7 +7,9 @@
  *    covered samples, with class 1 taken once ahead of it;
  *  - depth and stencil together, whole pixel: one DEPTHF word;
  *  - alpha-to-coverage: one DEPTHF per sample with the alpha coverage folded
- *    into its word, and no separate MOVMSK.
+ *    into its word, and no separate MOVMSK;
+ *  - blended alpha-to-coverage without a depth write: one MOVMSK per pixel,
+ *    ahead of the per-sample blend.
  */
 #include <gtest/gtest.h>
 #include <stdio.h>
@@ -35,7 +37,7 @@ struct epilog_shape {
    enum agx_chip chip;
    unsigned samples;
    bool z, s, a2c;
-   bool sample_shading = false;
+   bool blend = false, sample_shading = false;
 };
 
 static nir_shader *
@@ -59,9 +61,15 @@ build_epilog(const epilog_shape &shape)
    for (unsigned rt = 1; rt < ARRAY_SIZE(fs.remap); ++rt)
       fs.remap[rt] = -1;
    fs.blend.rt[0].colormask = 0xf;
-   fs.blend.rt[0].mode = agx_pack_blend_standard(
-      PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
-      PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+   fs.blend.rt[0].mode =
+      shape.blend
+         ? agx_pack_blend_standard(PIPE_BLEND_ADD, PIPE_BLENDFACTOR_SRC_ALPHA,
+                                   PIPE_BLENDFACTOR_INV_SRC_ALPHA,
+                                   PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE,
+                                   PIPE_BLENDFACTOR_INV_SRC_ALPHA)
+         : agx_pack_blend_standard(PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE,
+                                   PIPE_BLENDFACTOR_ZERO, PIPE_BLEND_ADD,
+                                   PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
 
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 depth export epilog");
@@ -327,6 +335,41 @@ TEST_F(M5DepthExport, SampleRateCoverageUpdatesSplit)
             << agx_last_compile_refusal();
          std::vector<std::string> m = mnemonics(part);
          EXPECT_EQ(count_of(m, "movmsk"), sample_shading ? 2 * samples : 1u);
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+}
+
+/* Native a2cb_pure_{2,4,8}x: a blended alpha-to-coverage fragment tests once
+ * per pixel, then blends each sample. Native a2cb_ss_{2,4}x, which read
+ * [[sample_id]], keep one update per sample; ours splits each in two (see
+ * SampleRateCoverageUpdatesSplit). */
+TEST_F(M5DepthExport, BlendedAlphaCoverageTestsOncePerPixel)
+{
+   for (bool sample_shading : {false, true}) {
+      for (unsigned samples : {2u, 4u, 8u}) {
+         if (sample_shading && samples == 8)
+            continue;
+         SCOPED_TRACE(::testing::Message() << samples << " samples"
+                      << (sample_shading ? ", sample shaded" : ""));
+         epilog_shape shape = {AGX_CHIP_G17S, samples, false, false, true};
+         shape.blend = true;
+         shape.sample_shading = sample_shading;
+         nir_shader *s = build_epilog(shape);
+         agx_preprocess_nir(s);
+         counts c = count_nir(s);
+         EXPECT_EQ(c.coverage_updates, sample_shading ? samples : 1u);
+
+         agx_shader_part part = {};
+         ASSERT_TRUE(compile_m5(s, samples, &part, true))
+            << agx_last_compile_refusal();
+         std::vector<std::string> m = mnemonics(part);
+         EXPECT_EQ(count_of(m, "lldcol"), samples);
+         EXPECT_EQ(count_of(m, "movmsk"), sample_shading ? 2 * samples : 1u);
+         if (!sample_shading) {
+            EXPECT_LT(index_of(m, "movmsk"), index_of(m, "lldcol"));
+         }
          free(part.binary);
          ralloc_free(s);
       }

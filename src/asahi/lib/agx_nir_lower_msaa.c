@@ -774,6 +774,83 @@ agx_nir_lower_m5_zs_sample_loop(nir_shader *shader, unsigned nr_samples)
    return true;
 }
 
+/* Whether an instruction may run once per pixel ahead of the sample loop:
+ * the coverage update and the pixel-rate values it is computed from. */
+static bool
+m5_pixel_rate_instr(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return instr->type == nir_instr_type_alu ||
+             instr->type == nir_instr_type_load_const ||
+             instr->type == nir_instr_type_undef;
+
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_sample_mask_agx:
+   case nir_intrinsic_load_exported_agx:
+   case nir_intrinsic_load_shader_part_tests_zs_agx:
+   /* The coverage dither is per pixel. */
+   case nir_intrinsic_load_frag_coord:
+   case nir_intrinsic_load_pixel_coord:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * The leading top-level control flow of a pixel-shaded M5 epilog that holds
+ * all of its coverage updates, or NULL when there is none or it holds more.
+ *
+ * Native G17G blended alpha-to-coverage fragments (native G17G compiler
+ * a2cb_pure_{2,4,8}x, with and without a depth attachment) issue one testing
+ * MOVMSK at pixel rate, then blend each covered sample. Wrapping the update
+ * in the sample loop instead issues one per sample, each naming its own
+ * sample. A testing word tests every covered sample, not only the ones it
+ * names: that is how a2c at alpha 0 wrote depth before 911fc231107. So the
+ * first live sample's update would also test, and write depth for, samples
+ * that a later sample's update kills (expected from that result).
+ */
+static nir_cf_node *
+m5_pixel_rate_coverage_prefix(nir_shader *shader)
+{
+   if (shader->info.fs.early_fragment_tests)
+      return NULL;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_cf_node *last = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+         if (op == nir_intrinsic_store_zs_agx)
+            return NULL;
+         if (op != nir_intrinsic_sample_mask_agx)
+            continue;
+         nir_cf_node *node = &block->cf_node;
+         while (node->parent != &impl->cf_node)
+            node = node->parent;
+         last = node;
+      }
+   }
+   if (!last)
+      return NULL;
+
+   foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+      if (node->type == nir_cf_node_loop)
+         return NULL;
+      nir_foreach_block_in_cf_node(block, node) {
+         nir_foreach_instr(instr, block) {
+            if (!m5_pixel_rate_instr(instr))
+               return NULL;
+         }
+      }
+      if (node == last)
+         return last;
+   }
+   UNREACHABLE("prefix node is top-level");
+}
+
 /*
  * Lower a fragment shader into a monolithic pixel shader, with static sample
  * count, blend state, and tilebuffer formats in the shader key. For dynamic,
@@ -799,8 +876,24 @@ lower_monolithic_msaa(nir_shader *shader, uint8_t nr_samples, bool m5)
       };
       nir_lower_single_sampled(shader, &lss_opts);
    } else if (shader->info.fs.uses_sample_shading) {
+      /* M5 keeps a pixel-rate coverage update ahead of the sample loop:
+       * set it aside while the rest becomes per-sample, then put it back in
+       * front of the loop. */
+      nir_cf_node *prefix_end = m5 ? m5_pixel_rate_coverage_prefix(shader)
+                                   : NULL;
+      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+      nir_cf_list prefix;
+      if (prefix_end)
+         nir_cf_extract(&prefix, nir_before_impl(impl),
+                        nir_after_cf_node(prefix_end));
+
       agx_nir_lower_to_per_sample(shader);
       agx_nir_wrap_per_sample_loop(shader, nr_samples);
+
+      if (prefix_end) {
+         nir_cf_reinsert(&prefix, nir_before_impl(impl));
+         nir_progress(true, impl, nir_metadata_none);
+      }
    }
 
    return true;
