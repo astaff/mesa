@@ -311,6 +311,24 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
    libagx_write_u32(cmd, agx_1d(1), AGX_BARRIER_ALL, address, value);
 }
 
+/* Publish @value after the pre-graphics helpers already recorded for the
+ * current render, in the same stream. */
+static void
+hk_queue_write_pre_gfx(struct hk_cmd_buffer *cmd, uint64_t address,
+                       uint32_t value)
+{
+   struct hk_cs *cs =
+      hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+   if (!cs)
+      return;
+
+   /* Make the producers' counters visible before the availability word, as
+    * hk_queue_write() does. */
+   hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cs);
+   libagx_write_u32(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_PREGFX, address,
+                    value);
+}
+
 static void
 emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                        uint32_t first_index, uint32_t num_queries,
@@ -699,7 +717,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                        VkQueryControlFlags flags, bool end)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   bool graphics = false;
+   bool graphics = false, pre_gfx = false;
 
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_OCCLUSION: {
@@ -723,6 +741,20 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT: {
       uint64_t addr = hk_query_report_addr(dev, pool, query);
       cmd->state.gfx.xfb_query[index] = end ? 0 : addr;
+
+      /* The counters are written by the geometry helpers in the
+       * pre-graphics stream of the render that draws. The general compute
+       * stream is not ordered after that stream: it stays open across
+       * render begins and need not wait on later pre-graphics work. On M5,
+       * publish availability after the helpers in the same pre-graphics
+       * stream, or after the graphics work when the current render has no
+       * such stream (or there is no current render). */
+      if (agx_chip_g17_m5(dev->dev.chip)) {
+         if (cmd->current_cs.gfx && cmd->current_cs.pre_gfx)
+            pre_gfx = true;
+         else
+            graphics = true;
+      }
       break;
    }
 
@@ -772,7 +804,10 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    /* We need to set available=1 after the graphics work finishes. */
    if (end) {
       perf_debug(cmd, "Query ending, type %u", pool->vk.query_type);
-      hk_queue_write(cmd, hk_query_available_addr(pool, query), 1, graphics);
+      if (pre_gfx)
+         hk_queue_write_pre_gfx(cmd, hk_query_available_addr(pool, query), 1);
+      else
+         hk_queue_write(cmd, hk_query_available_addr(pool, query), 1, graphics);
    }
 }
 
