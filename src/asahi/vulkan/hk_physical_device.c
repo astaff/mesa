@@ -776,10 +776,15 @@ hk_get_device_features(
       .primitiveTopologyListRestart = true,
       .primitiveTopologyPatchListRestart = false,
 
-      /* VK_EXT_primitives_generated_query */
-      .primitivesGeneratedQuery = false,
-      .primitivesGeneratedQueryWithNonZeroStreams = false,
-      .primitivesGeneratedQueryWithRasterizerDiscard = false,
+      /* VK_EXT_primitives_generated_query: counted in the pre-graphics
+       * helpers (assembled, tessellated or geometry-shader primitives per
+       * stream), independent of rasterizer discard. */
+      .primitivesGeneratedQuery =
+         supported_extensions->EXT_primitives_generated_query,
+      .primitivesGeneratedQueryWithNonZeroStreams =
+         supported_extensions->EXT_primitives_generated_query,
+      .primitivesGeneratedQueryWithRasterizerDiscard =
+         supported_extensions->EXT_primitives_generated_query,
 
       /* VK_EXT_provoking_vertex */
       .provokingVertexLast = true,
@@ -1874,6 +1879,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.KHR_shader_bfloat16 =
       supported_extensions.KHR_cooperative_matrix &&
       debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
+
+   /* Hardware-qualified on M5 only. */
+   supported_extensions.EXT_primitives_generated_query =
+      agx_chip_g17_m5(pdev->dev.chip);
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
       hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&

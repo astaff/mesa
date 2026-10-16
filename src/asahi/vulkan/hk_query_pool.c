@@ -726,6 +726,17 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       break;
    }
 
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT: {
+      /* Counted like the transform feedback query's primitives-needed
+       * report: in the pre-graphics helpers of each draw. */
+      uint64_t addr = hk_query_report_addr(dev, pool, query);
+      cmd->state.gfx.prims_generated_query[index] = end ? 0 : addr;
+      /* As for the pipeline statistics written by the same helpers, publish
+       * availability after the graphics work. */
+      graphics = true;
+      break;
+   }
+
    case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT: {
       cmd->state.gfx.descriptors.root_dirty = true;
       cmd->state.gfx.descriptors.root.mesh_prims_query =

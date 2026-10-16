@@ -181,6 +181,24 @@ hk_rast_discard(struct hk_cmd_buffer *cmd)
    return false;
 }
 
+/* Report address of an active VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT query
+ * on @stream, or 0. Meta draws are not counted. */
+static uint64_t
+hk_prims_generated_addr(struct hk_cmd_buffer *cmd, unsigned stream)
+{
+   return cmd->in_meta ? 0 : cmd->state.gfx.prims_generated_query[stream];
+}
+
+static bool
+hk_prims_generated_active(struct hk_cmd_buffer *cmd)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(cmd->state.gfx.prims_generated_query); ++i) {
+      if (hk_prims_generated_addr(cmd, i))
+         return true;
+   }
+   return false;
+}
+
 static bool
 hk_g17p_xfb_vertex_side_effects(struct hk_cmd_buffer *cmd,
                                 struct hk_shader *hw_vs)
@@ -5062,6 +5080,10 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
          params.prims_generated_counter[i] = AGX_SCRATCH_PAGE_ADDRESS;
       }
 
+      const uint64_t generated = hk_prims_generated_addr(cmd, i);
+      params.query_prims_generated_counter[i] =
+         generated ? generated : AGX_SCRATCH_PAGE_ADDRESS;
+
       /* TODO: Optimize out? */
       params.xfb_overflow[i] = AGX_SCRATCH_PAGE_ADDRESS;
    }
@@ -5432,7 +5454,8 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    struct hk_root_descriptor_table *root = &cmd->state.gfx.descriptors.root;
    bool xfb_or_queries =
-      main->info.gs.xfb || (root->draw.pipeline_stats_flags & gs_queries);
+      main->info.gs.xfb || (root->draw.pipeline_stats_flags & gs_queries) ||
+      hk_prims_generated_active(cmd);
 
    if (xfb_or_queries) {
       /* If we need counts, launch the count shader and prefix sum the results. */
@@ -5516,7 +5539,8 @@ hk_tes_direct_query_threads(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 
 static __attribute__((hot)) struct agx_draw
 hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
-               struct agx_draw draw, uint64_t c_prims, uint64_t c_inv)
+               struct agx_draw draw, uint64_t c_prims, uint64_t c_inv,
+               uint64_t prims_generated)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -5604,7 +5628,8 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      info.mode, POLY_TESS_MODE_COUNT, state);
    libagx_prefix_sum_tess(cmd, agx_1d(1024),
                           AGX_BARRIER_ALL | AGX_PREGFX, state, c_prims,
-                          c_inv, c_prims || c_inv);
+                          c_inv, prims_generated,
+                          c_prims || c_inv || prims_generated);
    libagx_tessellate(cmd, grid_tess, AGX_BARRIER_ALL | AGX_PREGFX,
                      info.mode, POLY_TESS_MODE_WITH_COUNTS, state);
 
@@ -11407,11 +11432,22 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                       stat_c_prims, stat_c_inv);
       }
 
+      /* Without geometry or tessellation the primitives generated are the
+       * assembled primitives, counted like the clipper statistic; the
+       * tessellator and the geometry pipeline count their own outputs. */
+      const uint64_t prims_generated = hk_prims_generated_addr(cmd, 0);
+      if (prims_generated && !geom && !tess) {
+         hk_ia_update(cmd, draw, AGX_SCRATCH_PAGE_ADDRESS,
+                      AGX_SCRATCH_PAGE_ADDRESS, AGX_SCRATCH_PAGE_ADDRESS,
+                      AGX_SCRATCH_PAGE_ADDRESS, prims_generated);
+      }
+
       if (tess) {
          cmd->state.gfx.tess.tes_direct_threads =
             hk_tes_direct_query_threads(cmd, draw);
          draw = hk_launch_tess(cmd, ccs, draw, geom ? 0 : stat_c_prims,
-                               geom ? 0 : stat_c_inv);
+                               geom ? 0 : stat_c_inv,
+                               geom ? 0 : prims_generated);
       }
 
       if (geom)

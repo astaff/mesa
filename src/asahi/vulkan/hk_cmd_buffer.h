@@ -662,6 +662,8 @@ struct hk_graphics_state {
     * per-stream. Zero if no query is bound.
     */
    uint64_t xfb_query[4];
+   /* Active VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT reports, per stream. */
+   uint64_t prims_generated_query[4];
 
    struct hk_index_buffer_state index;
    enum agx_primitive topology;
