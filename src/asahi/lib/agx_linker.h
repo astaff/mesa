@@ -338,6 +338,9 @@ struct agx_fs_epilog_key {
    uint16_t max_samples_per_tile;
    bool force_small_tile;
    bool preserve_zero_mask;
+   /* M5: the epilog's coverage update is the single native testing form
+    * (agx_nir_lower_sample_mask_m5). */
+   bool m5_coverage;
    /* G17P tile storage: sRGB as U8NORM bytes converted by the native packs,
     * R11G11B10/RGB9E5 as one raw 32-bit word. */
    bool g17p_tile_formats;

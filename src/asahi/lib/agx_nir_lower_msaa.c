@@ -697,13 +697,16 @@ agx_nir_hoist_g17p_zs_writes(nir_shader *shader)
  * count, blend state, and tilebuffer formats in the shader key. For dynamic,
  * epilogs must be used, which have separate lowerings.
  */
-bool
-agx_nir_lower_monolithic_msaa(nir_shader *shader, uint8_t nr_samples)
+static bool
+lower_monolithic_msaa(nir_shader *shader, uint8_t nr_samples, bool m5)
 {
    assert(shader->info.stage == MESA_SHADER_FRAGMENT);
    assert(nr_samples == 1 || nr_samples == 2 || nr_samples == 4 || nr_samples == 8);
 
-   agx_nir_lower_sample_mask(shader);
+   if (m5)
+      agx_nir_lower_sample_mask_m5(shader);
+   else
+      agx_nir_lower_sample_mask(shader);
 
    /* In single sampled programs, interpolateAtSample needs to return the
     * center pixel.
@@ -748,4 +751,16 @@ agx_nir_lower_monolithic_msaa_agx2(nir_shader *shader, uint8_t nr_samples)
    }
 
    return true;
+}
+
+bool
+agx_nir_lower_monolithic_msaa(nir_shader *shader, uint8_t nr_samples)
+{
+   return lower_monolithic_msaa(shader, nr_samples, false);
+}
+
+bool
+agx_nir_lower_monolithic_msaa_m5(nir_shader *shader, uint8_t nr_samples)
+{
+   return lower_monolithic_msaa(shader, nr_samples, true);
 }

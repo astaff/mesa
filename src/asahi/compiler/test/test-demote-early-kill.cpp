@@ -309,3 +309,60 @@ TEST_F(DemoteEarlyKill, LoweredLaneOperationsKeepDeferredKill)
       ralloc_free(nir);
    }
 }
+
+/* M5 final coverage update: the testing form (all samples targeted, the
+ * surviving set live) runs in the then-arm of an if on the shader part's
+ * tests_zs uniform, and the pure kill in its else-arm. No coverage update
+ * takes its target from tests_zs | killed, which the per-lane test split
+ * would otherwise turn into a divergent testing arm. */
+static void
+expect_m5_final_update(nir_shader *s)
+{
+   unsigned testing = 0, fused = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_cf_node *parent = block->cf_node.parent;
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_sample_mask_agx)
+            continue;
+         const bool live_zero = nir_src_is_const(intr->src[1]) &&
+                                nir_src_as_uint(intr->src[1]) == 0;
+         if (!nir_src_is_const(intr->src[0])) {
+            nir_instr *t = nir_def_instr(intr->src[0].ssa);
+            if (t->type == nir_instr_type_alu &&
+                nir_instr_as_alu(t)->op == nir_op_ior)
+               fused++;
+         }
+         if (live_zero)
+            continue;
+         testing++;
+         EXPECT_TRUE(nir_src_is_const(intr->src[0]) &&
+                     (nir_src_as_uint(intr->src[0]) & 0xff) == 0xff);
+         ASSERT_EQ(parent->type, nir_cf_node_if);
+         nir_if *nif = nir_cf_node_as_if(parent);
+         nir_def *cond = nif->condition.ssa;
+         nir_instr *ci = nir_def_instr(cond);
+         ASSERT_EQ(ci->type, nir_instr_type_alu);
+         nir_instr *src = nir_def_instr(nir_instr_as_alu(ci)->src[0].src.ssa);
+         ASSERT_EQ(src->type, nir_instr_type_intrinsic);
+         EXPECT_EQ(nir_instr_as_intrinsic(src)->intrinsic,
+                   nir_intrinsic_load_shader_part_tests_zs_agx);
+      }
+   }
+   EXPECT_EQ(testing, 1u);
+   EXPECT_EQ(fused, 0u);
+}
+
+TEST_F(DemoteEarlyKill, M5FinalCoverageUpdateIsUniform)
+{
+   for (enum shape s : {UNGUARDED, GUARDED_NOT, QUAD_IN_LOOP}) {
+      nir_shader *nir = build(s);
+      agx_nir_lower_discard_zs_emit(nir);
+      agx_nir_lower_sample_mask_deferred_m5(nir);
+      nir_validate_shader(nir, "M5 coverage update");
+      expect_m5_final_update(nir);
+      ralloc_free(nir);
+   }
+}

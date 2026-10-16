@@ -151,6 +151,8 @@ bool agx_nir_lower_to_per_sample(struct nir_shader *shader);
 
 bool agx_nir_lower_monolithic_msaa(struct nir_shader *shader,
                                    uint8_t nr_samples);
+bool agx_nir_lower_monolithic_msaa_m5(struct nir_shader *shader,
+                                      uint8_t nr_samples);
 
 /* Export registers of one sample's colours in a G17P fragment unrolled per
  * sample: eight halves for each location up to the last one written. */

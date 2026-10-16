@@ -12434,7 +12434,9 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                nir_metadata_none, NULL);
    }
 
-   if (agx_isa_is_agx3(key->dev.encoding) &&
+   /* M5 issues one unconditional testing update instead
+    * (agx_nir_lower_sample_mask_deferred_m5, the native G17G form). */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        nir->info.stage == MESA_SHADER_FRAGMENT &&
        key->fs.nr_samples > 1 && !key->fs.inside_sample_loop) {
       unsigned samples = key->fs.nr_samples;

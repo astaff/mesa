@@ -602,7 +602,9 @@ bool agx3_nir_lower_scratch_words(nir_shader *nir);
 void agx_preprocess_nir_m5(nir_shader *nir);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
+bool agx_nir_lower_sample_mask_m5(nir_shader *s);
 bool agx_nir_lower_sample_mask_deferred(nir_shader *s);
+bool agx_nir_lower_sample_mask_deferred_m5(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s, bool layer_as_varying);
 
 bool agx_nir_lower_cull_distance_vs(struct nir_shader *s);

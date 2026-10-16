@@ -9827,6 +9827,45 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       g17p_mrt_acquired = true;
    }
 
+   /* Native G17G fragments enter their pixel transaction once, in uniform
+    * control flow ahead of the first kill (native G17G compiler discard and
+    * alpha-to-coverage fragments: pixwait 512, then each kill in its own
+    * cndst). When the first coverage update is nested, open the entry before
+    * the top-level IF that leads to it, so no path skips it; agx_fast_link
+    * relies on this part's entry having run when it removes a later part's.
+    */
+   const agx_instr *m5_coverage_entry_before = NULL;
+   if (enc == AGX_ISA_ENCODING_AGX3C && ctx->stage == MESA_SHADER_FRAGMENT &&
+       has_coverage_write) {
+      int depth = 0;
+      const agx_instr *top_if = NULL;
+      bool done = false;
+      agx_foreach_block(ctx, scan_block) {
+         agx_foreach_instr_in_block(scan_block, scan_I) {
+            if (done)
+               break;
+            if (scan_I->op == AGX_OPCODE_IF_ICMP ||
+                scan_I->op == AGX_OPCODE_IF_FCMP) {
+               if (depth == 0)
+                  top_if = scan_I;
+               depth += scan_I->nest;
+            } else if (scan_I->op == AGX_OPCODE_POP_EXEC) {
+               depth = MAX2(depth - (int)scan_I->nest, 0);
+            } else if (scan_I->op == AGX_OPCODE_WHILE_ICMP ||
+                       scan_I->op == AGX_OPCODE_WHILE_FCMP ||
+                       scan_I->op == AGX_OPCODE_BREAK_IF_ICMP ||
+                       scan_I->op == AGX_OPCODE_BREAK_IF_FCMP) {
+               done = true; /* loops keep the lazy entry */
+            } else if (scan_I->op == AGX_OPCODE_SAMPLE_MASK_AGX3 ||
+                       scan_I->op == AGX_OPCODE_ZS_EMIT_AGX3) {
+               if (depth > 0)
+                  m5_coverage_entry_before = top_if;
+               done = true;
+            }
+         }
+      }
+   }
+
    /* Native G17G side-effecting fragments read their initial coefficients
     * without the implicit entry marker, then acquire before the conditional
     * side effect. Preserve the coverage read preceding that acquisition. */
@@ -9962,6 +10001,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              (I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP ||
               I->op == AGX_OPCODE_ATOMIC || I->op == AGX_OPCODE_DEVICE_STORE ||
               I->op == AGX_OPCODE_IMAGE_WRITE)) {
+            uint8_t entry[AGX3_PIXEL_MAX_LENGTH], entry_len;
+            if (!agx3_pixel_colour_entry(enc, entry, &entry_len) ||
+                !agx3_append(emission, entry, entry_len))
+               AGX3_REFUSE(I);
+            ctx->agx3_colour_link.entry_emitted = true;
+            ctx->agx3_colour_link.entry_offset = emission->size - entry_len - initial_size;
+            g17p_colour_open = true;
+         }
+         if (I == m5_coverage_entry_before && !g17p_colour_open) {
             uint8_t entry[AGX3_PIXEL_MAX_LENGTH], entry_len;
             if (!agx3_pixel_colour_entry(enc, entry, &entry_len) ||
                 !agx3_append(emission, entry, entry_len))

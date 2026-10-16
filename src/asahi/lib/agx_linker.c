@@ -47,6 +47,7 @@ agx_fs_epilog_apply_device_policy(enum agx_chip chip,
 
    const bool g17p = agx_chip_native_agx3(chip);
    key->preserve_zero_mask = g17p;
+   key->m5_coverage = agx_chip_g17_m5(chip);
    key->g17p_tile_formats = g17p || agx_chip_g17_m5(chip);
 }
 

@@ -999,7 +999,10 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
        * to avoid duplicating tests.
        */
       if (b->shader->info.fs.uses_discard) {
-         NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
+         if (key->m5_coverage)
+            NIR_PASS(_, b->shader, agx_nir_lower_sample_mask_m5);
+         else
+            NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
       }
 
       NIR_PASS(_, b->shader, agx_nir_lower_to_per_sample);
@@ -1012,14 +1015,20 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
       b->cursor = nir_after_impl(b->impl);
       nir_export_agx(b, sample_id, .base = AGX_ABI_FIN_SAMPLE_MASK);
    } else if (!key->defer_monolithic_msaa) {
-      NIR_PASS(_, b->shader, agx_nir_lower_monolithic_msaa, key->nr_samples);
+      if (key->m5_coverage)
+         NIR_PASS(_, b->shader, agx_nir_lower_monolithic_msaa_m5, key->nr_samples);
+      else
+         NIR_PASS(_, b->shader, agx_nir_lower_monolithic_msaa, key->nr_samples);
    } else if (b->shader->info.fs.uses_discard) {
       /* G17P can keep a pixel-shaded multisample blend as one tile
        * load/store pair carrying the live coverage register. Lower the
        * alpha discard while the epilog's test intrinsics are still available;
        * doing it after this function leaves a newly introduced test query
        * past divergence analysis. */
-      NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
+      if (key->m5_coverage)
+         NIR_PASS(_, b->shader, agx_nir_lower_sample_mask_m5);
+      else
+         NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
    }
 
    if (native_spills) {
