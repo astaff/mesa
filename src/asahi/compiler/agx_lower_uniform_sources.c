@@ -547,6 +547,12 @@ agx_lower_uniform_sources(agx_context *ctx)
        * GPR per use; prefer the selects when both kinds are present, since
        * a uniform comparand is only witnessed beside register selects. */
       bool keep_isel_uniform[4] = {false};
+      unsigned m5_fsel_cond;
+      bool m5_fsel_swap;
+      const bool m5_fsel_uniform =
+         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+         !ctx->is_preamble &&
+         agx3_m5_fcmpsel_uniform_cmp0(I, &m5_fsel_cond, &m5_fsel_swap);
       if (m5_native_isel_uniform(ctx, I)) {
          for (unsigned i = 0; i < 4; ++i)
             keep_isel_uniform[i] = I->src[i].type == AGX_INDEX_UNIFORM;
@@ -766,6 +772,7 @@ agx_lower_uniform_sources(agx_context *ctx)
               !(native_integer || native_m5_float || uniform_imm_compare ||
                 (s < 4 && keep_isel_uniform[s]) ||
                 (m5_tex_uniform_pair && (s == 3 || s == 4)) ||
+                (m5_fsel_uniform && s == 0) ||
                 agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s,
                                          I->src[s].value, I->src[s].size)))) {
             agx_index idx = I->src[s];

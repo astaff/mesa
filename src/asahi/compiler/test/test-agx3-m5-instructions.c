@@ -1431,6 +1431,54 @@ int main(void)
       }
    }
 
+   /* Native G17G Minecraft fragments: a select whose first
+    * comparand is a 32-bit uniform (f19, f25 = 3) beside a register,
+    * choosing a minifloat or a register (fself32). Every distinct one. */
+   {
+      static const struct {
+         uint16_t dest; bool dest_cache; uint16_t uniform, cmp1;
+         enum agx3_alu_hint cmp1_hint; uint16_t imm, sel1;
+         enum agx3_alu_hint sel1_hint; unsigned condition;
+         unsigned char bytes[16]; unsigned length;
+      } sel_cases[] = {
+      {8, true, 10, 6, AGX3_ALU_HINT_CACHE, 0, 8, AGX3_ALU_HINT_DISCARD, 6, {0x42,0x0b,0x23,0x87,0x25,0x80,0x83,0x00}, 8},
+      {20, true, 42, 16, AGX3_ALU_HINT_CACHE, 48, 20, AGX3_ALU_HINT_DISCARD, 6, {0xa2,0x2b,0x23,0x91,0x25,0xb0,0x83,0x00}, 8},
+      {20, false, 40, 16, AGX3_ALU_HINT_DISCARD, 0, 20, AGX3_ALU_HINT_DISCARD, 5, {0xa2,0x29,0x13,0x11,0x25,0x80,0x82,0x00}, 8},
+      {22, true, 46, 18, AGX3_ALU_HINT_CACHE, 48, 22, AGX3_ALU_HINT_DISCARD, 6, {0xb2,0x2f,0x23,0x93,0x25,0xb0,0x83,0x00}, 8},
+      {18, true, 44, 18, AGX3_ALU_HINT_DISCARD, 0, 22, AGX3_ALU_HINT_DISCARD, 5, {0x92,0x2d,0x33,0x13,0x26,0x80,0x82,0x00,0x80,0x16}, 10},
+      {12, true, 18, 10, AGX3_ALU_HINT_CACHE, 48, 8, AGX3_ALU_HINT_DISCARD, 6, {0x62,0x13,0x23,0x8b,0x26,0xb0,0x83,0x00,0x80,0x08}, 10},
+      {30, false, 16, 10, AGX3_ALU_HINT_DISCARD, 0, 12, AGX3_ALU_HINT_DISCARD, 5, {0xf2,0x11,0x13,0x0b,0x26,0x80,0x82,0x00,0x80,0x0c}, 10},
+      {16, true, 22, 8, AGX3_ALU_HINT_CACHE, 48, 10, AGX3_ALU_HINT_DISCARD, 6, {0x82,0x17,0x23,0x89,0x26,0xb0,0x83,0x00,0x80,0x0a}, 10},
+      {8, false, 20, 8, AGX3_ALU_HINT_DISCARD, 0, 16, AGX3_ALU_HINT_DISCARD, 5, {0x42,0x15,0x13,0x09,0x26,0x80,0x82,0x00,0x80,0x10}, 10},
+      {20, true, 42, 18, AGX3_ALU_HINT_CACHE, 48, 14, AGX3_ALU_HINT_DISCARD, 6, {0xa2,0x2b,0x23,0x93,0x26,0xb0,0x83,0x00,0x80,0x0e}, 10},
+      {20, false, 40, 18, AGX3_ALU_HINT_DISCARD, 0, 20, AGX3_ALU_HINT_DISCARD, 5, {0xa2,0x29,0x13,0x13,0x25,0x80,0x82,0x00}, 8},
+      {22, false, 46, 12, AGX3_ALU_HINT_NONE, 48, 16, AGX3_ALU_HINT_DISCARD, 6, {0xb2,0x2f,0x03,0x0d,0x26,0xb0,0x83,0x00,0x80,0x10}, 10},
+      {12, true, 44, 12, AGX3_ALU_HINT_DISCARD, 0, 22, AGX3_ALU_HINT_DISCARD, 5, {0x62,0x2d,0x33,0x0d,0x26,0x80,0x82,0x00,0x80,0x16}, 10},
+      {6, true, 20, 2, AGX3_ALU_HINT_CACHE, 48, 6, AGX3_ALU_HINT_DISCARD, 6, {0x32,0x15,0x23,0x83,0x25,0xb0,0x83,0x00}, 8},
+      {4, true, 20, 0, AGX3_ALU_HINT_CACHE, 48, 4, AGX3_ALU_HINT_DISCARD, 6, {0x22,0x15,0x23,0x81,0x25,0xb0,0x83,0x00}, 8},
+      {0, true, 20, 0, AGX3_ALU_HINT_DISCARD, 0, 4, AGX3_ALU_HINT_DISCARD, 5, {0x02,0x15,0x33,0x01,0x26,0x80,0x82,0x00,0x80,0x04}, 10},
+      };
+      for (unsigned i = 0; i < sizeof(sel_cases) / sizeof(sel_cases[0]); ++i) {
+         const struct agx3_fsel32_gpu1_desc d = {
+            .dest = sel_cases[i].dest, .dest_cache = sel_cases[i].dest_cache,
+            .cmp0 = sel_cases[i].uniform, .cmp0_uniform = true,
+            .cmp1 = sel_cases[i].cmp1, .cmp1_hint = sel_cases[i].cmp1_hint,
+            .sel_immediate = {true, false},
+            .sel = {sel_cases[i].imm, sel_cases[i].sel1},
+            .sel_hint = {AGX3_ALU_HINT_NONE, sel_cases[i].sel1_hint},
+            .condition = sel_cases[i].condition,
+         };
+         if (!agx3_alu_fcmp_select32_gpu1(&d, native, &len) ||
+             len != sel_cases[i].length ||
+             memcmp(native, sel_cases[i].bytes, len)) {
+            fprintf(stderr, "uniform select witness %u: len %u ", i, len);
+            for (unsigned b = 0; b < len; ++b) fprintf(stderr, "%02x", native[b]);
+            fprintf(stderr, "\n");
+            return 142;
+         }
+      }
+   }
+
    const struct agx3_falu_runtime fma2_runtime = {.discard={true},.wait_mask=128};
    const unsigned char fma2_expected[] = {
       0x29,0x00,0x07,0x0a,0x20,0x20,0xa3,0x02,0x30,0x8d,0x59,0x00,0x14,0x06,0x00,0x80,

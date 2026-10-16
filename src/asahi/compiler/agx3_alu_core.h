@@ -1063,6 +1063,8 @@ struct agx3_fsel32_gpu1_desc {
    uint16_t cmp0;
    bool cmp0_16;
    enum agx3_alu_hint cmp0_hint;
+   /* cmp0 names an aligned 32-bit uniform (fself32 only, see the encoder). */
+   bool cmp0_uniform;
 
    bool cmp1_immediate;
    uint16_t cmp1;

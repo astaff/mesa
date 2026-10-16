@@ -1308,6 +1308,50 @@ agx_is_float_src(const agx_instr *I, unsigned s)
    return info.is_float || (s < 2 && fcmp);
 }
 
+/* The M5 select with a uniform first comparand that native G17G
+ * fragments use (agx3_alu_fcmp_select32_gpu1 cmp0_uniform): a 32-bit
+ * result choosing a zero immediate or a 32-bit register after comparing an
+ * aligned 32-bit uniform with a 32-bit register, by GE or LE once the
+ * NaN-ignoring conditions are normalized as the packer does. Returns the
+ * normalized condition and whether the selected operands are exchanged. */
+static inline bool
+agx3_m5_fcmpsel_uniform_cmp0(const agx_instr *I, unsigned *condition,
+                             bool *swap)
+{
+   if (I->op != AGX_OPCODE_FCMPSEL || I->nr_dests != 1 || I->nr_srcs != 4 ||
+       I->saturate || I->dest[0].size != AGX_SIZE_32 ||
+       agx_channels(I->dest[0]) != 1)
+      return false;
+   const agx_index u = I->src[0], r = I->src[1];
+   if (u.type != AGX_INDEX_UNIFORM || u.size != AGX_SIZE_32 || (u.value & 1) ||
+       u.value >= 256 || u.abs || u.neg || u.memory ||
+       r.type == AGX_INDEX_UNIFORM || r.type == AGX_INDEX_IMMEDIATE ||
+       r.size != AGX_SIZE_32 || agx_channels(r) != 1 || r.abs || r.neg ||
+       r.memory)
+      return false;
+   unsigned cond = I->fcond;
+   bool exchanged = I->invert_cond;
+   if (cond == AGX_FCOND_LTN) {
+      cond = AGX_FCOND_GE;
+      exchanged = !exchanged;
+   } else if (cond == AGX_FCOND_GTN) {
+      cond = AGX_FCOND_LE;
+      exchanged = !exchanged;
+   }
+   if (cond != AGX_FCOND_GE && cond != AGX_FCOND_LE)
+      return false;
+   const agx_index imm = I->src[exchanged ? 3 : 2];
+   const agx_index reg = I->src[exchanged ? 2 : 3];
+   if (imm.type != AGX_INDEX_IMMEDIATE || imm.value != 0 || imm.abs ||
+       imm.neg || reg.type == AGX_INDEX_UNIFORM ||
+       reg.type == AGX_INDEX_IMMEDIATE || reg.size != AGX_SIZE_32 ||
+       agx_channels(reg) != 1 || reg.abs || reg.neg || reg.memory)
+      return false;
+   *condition = cond;
+   *swap = exchanged;
+   return true;
+}
+
 struct agx_copy {
    /* Base register destination of the copy */
    unsigned dest;

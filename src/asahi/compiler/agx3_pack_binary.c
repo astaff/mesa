@@ -12812,6 +12812,33 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             }
          }
 
+         /* A uniform first comparand (agx3_m5_fcmpsel_uniform_cmp0). */
+         unsigned m5_fsel_cond;
+         bool m5_fsel_swap;
+         if (enc == AGX_ISA_ENCODING_AGX3C &&
+             agx3_m5_fcmpsel_uniform_cmp0(I, &m5_fsel_cond, &m5_fsel_swap)) {
+            const agx_index cmp1 = I->src[1];
+            const agx_index sel1 = I->src[m5_fsel_swap ? 2 : 3];
+            if (!agx3_vary_reg32(I->dest[0]) || !agx3_vary_reg32(cmp1) ||
+                !agx3_vary_reg32(sel1) || cmp1.kill || sel1.kill ||
+                (cmp1.cache && cmp1.discard) || (sel1.cache && sel1.discard))
+               AGX3_REFUSE(I);
+            const struct agx3_fsel32_gpu1_desc d = {
+               .dest = I->dest[0].value, .dest_cache = I->dest[0].cache,
+               .cmp0 = I->src[0].value, .cmp0_uniform = true,
+               .cmp1 = cmp1.value, .cmp1_hint = agx3_post_ra_hint(cmp1),
+               .sel_immediate = {true, false},
+               .sel = {0, sel1.value},
+               .sel_hint = {AGX3_ALU_HINT_NONE, agx3_post_ra_hint(sel1)},
+               .condition = m5_fsel_cond, .wait_mask = wait,
+            };
+            uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+            if (!agx3_alu_fcmp_select32_gpu1(&d, bytes, &len) ||
+                !agx3_append(emission, bytes, len))
+               AGX3_REFUSE(I);
+            continue;
+         }
+
          /* Keep the uniform half of a native tied min/max in the uniform file.
           * Canonicalize just as the register/minifloat path below does. */
          if (enc == AGX_ISA_ENCODING_AGX3C && I->op == AGX_OPCODE_FCMPSEL &&

@@ -5265,6 +5265,18 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
    if (d->sel_immediate[0] && d->sel_immediate[1] && !d->sel_integer)
       return false;
 
+   /* Native G17G fragments compare a uniform against a register
+    * and select a minifloat or a register: fself32 with f19 = the uniform
+    * half and f25 = 3, conditions 5 and 6, no lifetime hints on the
+    * uniform (16 Minecraft terrain/entity witnesses, asserted in the M5
+    * instruction test). Only that shape is admitted. */
+   if (d->cmp0_uniform &&
+       (d->cmp0_16 || (d->cmp0 & 1) || d->cmp0 >= 256 ||
+        d->cmp0_hint != AGX3_ALU_HINT_NONE || d->cmp1_immediate ||
+        d->cmp1_16 || d->sel_integer || !d->sel_immediate[0] ||
+        d->sel_immediate[1] || (d->condition != 5 && d->condition != 6)))
+      return false;
+
    const uint16_t src[4] = {d->cmp0, d->cmp1, d->sel[0], d->sel[1]};
    const bool imm[4] = {false, d->cmp1_immediate, d->sel_immediate[0],
                         d->sel_immediate[1]};
@@ -5284,14 +5296,16 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
    const unsigned o5 = fself ? 5 : 0;
    const unsigned o8 = fself ? 8 : 0;
    const struct agx3_field_kv base[] = {
-      {9, 2}, {10, 2}, {23 + o2, 2}, {24 + o2, d->cmp0_16 ? 1 : 2},
+      {9, 2}, {10, 2}, {23 + o2, d->cmp0_uniform ? 3 : 2},
+      {24 + o2, d->cmp0_16 ? 1 : 2},
       {40 + o2, imm[1] ? 1 : 2}, {41 + o2, d->cmp1_16 ? 1 : 2},
       {57 + o2, imm[2] ? 1 : 2}, {58 + o2, 2},
       {71 + o5, imm[3] ? 1 : 2}, {72 + o5, 2},
       {76 + o8, 3}, {77 + o8, fself ? 74 : 76},
    };
    struct agx3_field_kv fields[23] = {
-      {2, d->dest}, {11, d->dest_cache}, {16 + o2, src[0]},
+      {2, d->dest}, {11, d->dest_cache},
+      {(d->cmp0_uniform ? 17 : 16) + o2, src[0]},
       {(imm[1] ? 32 : 33) + o2, src[1]},
       {(imm[2] ? 49 : 50) + o2, src[2]},
       {(imm[3] ? 63 : 64) + o5, src[3]},
@@ -5316,6 +5330,25 @@ agx3_alu_fcmp_select32_gpu1(const struct agx3_fsel32_gpu1_desc *d,
        agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fseli32", 0, base, 12,
                         fields, n, out, len))
       return true;
+   /* The uniform-comparand witnesses use the compact fself32 endpoints
+    * (8 and 10 bytes): take the shortest that holds the fields. */
+   if (d->cmp0_uniform) {
+      uint8_t best[AGX3_ALU_MAX_LENGTH], best_len = 0;
+      for (unsigned ep = 0; ep < 8; ++ep) {
+         uint8_t bytes[AGX3_ALU_MAX_LENGTH], size;
+         if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "fself32", ep, base,
+                               12, fields, n, bytes, &size) &&
+             (!best_len || size < best_len)) {
+            memcpy(best, bytes, size);
+            best_len = size;
+         }
+      }
+      if (!best_len)
+         return false;
+      memcpy(out, best, best_len);
+      *len = best_len;
+      return true;
+   }
    return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
                             fself ? "fself32" : "fseli32", 4, base, 12,
                             fields, n, out, len);
@@ -5392,6 +5425,7 @@ agx3_alu_fcmp_select16_gpu1(const struct agx3_fsel32_gpu1_desc *d,
                             uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    if (!d || !out || !len || d->dest >= 256 || (d->wait_mask & ~0xffu) ||
+       d->cmp0_uniform ||
        (d->condition != 0 && d->condition != 1 && d->condition != 2 &&
         d->condition != 5 && d->condition != 6 &&
         !agx3_gpu1_tied_minmax(d, true)))

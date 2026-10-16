@@ -952,6 +952,36 @@ TEST(AGX3UniformALU, M5LoweringRetainsWitnessedFloatUniforms)
    ralloc_free(mem);
 }
 
+TEST(AGX3UniformALU, M5SelectKeepsWitnessedUniformComparand)
+{
+   for (unsigned cond : {(unsigned)AGX_FCOND_GE, (unsigned)AGX_FCOND_LTN,
+                         (unsigned)AGX_FCOND_EQ}) {
+      for (bool zero : {true, false}) {
+         void *mem = ralloc_context(NULL);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         agx_builder *b = agx_test_builder(mem);
+         b->shader->key = &key;
+         b->shader->stage = MESA_SHADER_FRAGMENT;
+         agx_index x = agx_mov(b, agx_register(0, AGX_SIZE_32));
+         agx_index y = agx_mov(b, agx_register(2, AGX_SIZE_32));
+         /* LTN normalizes to GE with the selected operands exchanged, so
+          * its zero belongs in the other slot. */
+         const bool exchanged = cond == AGX_FCOND_LTN;
+         agx_index imm = agx_immediate(zero ? 0 : 1);
+         agx_instr *I = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                       agx_uniform(40, AGX_SIZE_32), x,
+                                       exchanged ? y : imm,
+                                       exchanged ? imm : y,
+                                       (enum agx_fcond)cond);
+         agx_lower_uniform_sources(b->shader);
+         EXPECT_EQ(I->src[0].type == AGX_INDEX_UNIFORM,
+                   zero && cond != AGX_FCOND_EQ);
+         ralloc_free(mem);
+      }
+   }
+}
+
 TEST(AGX3UniformALU, M5FloatUniformEightCompletionSlots)
 {
    const agx3_uniform_float_src src[3] = {
