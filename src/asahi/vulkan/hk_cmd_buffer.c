@@ -2431,7 +2431,8 @@ hk_g17p_graphics_uniform_ranges(
       if ((s->b.info.stage != MESA_SHADER_FRAGMENT &&
            s->b.info.stage != MESA_SHADER_VERTEX &&
            !(agx_chip_g17_m5(dev->dev.chip) &&
-             s->b.info.stage == MESA_SHADER_MESH)) ||
+             (s->b.info.stage == MESA_SHADER_MESH ||
+              s->b.info.stage == MESA_SHADER_TASK))) ||
           !dev->sampled_images.base_va || !dev->samplers.table.bo ||
           !dev->rodata.indexed_heap_pointers)
          return hk_g17p_graphics_ranges_refused(range_count, count);

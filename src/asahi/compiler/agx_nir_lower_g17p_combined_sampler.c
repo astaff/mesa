@@ -26,6 +26,14 @@ g17p_explicit_lod_stage(mesa_shader_stage stage)
           stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL;
 }
 
+/* M5 TA programs (API mesh and object/task) have no fragment derivatives and
+ * take the same heap-indexed texture/image operands as compute. */
+static bool
+m5_ta_stage(mesa_shader_stage stage)
+{
+   return stage == MESA_SHADER_MESH || stage == MESA_SHADER_TASK;
+}
+
 /* agx_nir_lower_g17p_indexed_samplers() is all-or-nothing per shader: one
  * unadmitted texture or image instruction and NOTHING in that shader gets a
  * heap index, so every texture instruction in it then reaches the packer with
@@ -788,7 +796,7 @@ lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
    if (!shader || (!g17p_explicit_lod_stage(shader->info.stage) &&
                    shader->info.stage != MESA_SHADER_FRAGMENT &&
                    shader->info.stage != MESA_SHADER_COMPUTE &&
-                   !(m5 && shader->info.stage == MESA_SHADER_MESH)))
+                   !(m5 && m5_ta_stage(shader->info.stage))))
       return false;
 
    unsigned samples = 0, image_reads = 0;
@@ -818,7 +826,7 @@ lower_indexed_samplers(nir_shader *shader, int native32_set, bool m5)
              * Gather uses the packer's existing non-fragment level-zero form.
              * Ordinary implicit samples and biases still remain closed. */
             if (!fetch && (g17p_explicit_lod_stage(shader->info.stage) ||
-                           (m5 && shader->info.stage == MESA_SHADER_MESH)) &&
+                           (m5 && m5_ta_stage(shader->info.stage))) &&
                 tex->op != nir_texop_txl && tex->op != nir_texop_txd &&
                 tex->op != nir_texop_tg4)
                return g17p_decline("vertex_implicit_sample", tex, NULL,
@@ -1006,7 +1014,7 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
    if (!shader || (!g17p_explicit_lod_stage(shader->info.stage) &&
                    shader->info.stage != MESA_SHADER_FRAGMENT &&
                    shader->info.stage != MESA_SHADER_COMPUTE &&
-                   shader->info.stage != MESA_SHADER_MESH))
+                   !m5_ta_stage(shader->info.stage)))
       return false;
 
    unsigned reads = 0;
