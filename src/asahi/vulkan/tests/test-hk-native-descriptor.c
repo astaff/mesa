@@ -506,6 +506,22 @@ check_captured_rgba8_lossless_pbe(void)
    };
    assert(hk_pack_native_pbe(10, &actual, &p));
    assert(memcmp(&actual, expected10, sizeof(expected10)) == 0);
+   /* Pinned native Gen10 PBE encoder (offline execution, compression-oracle
+    * native_pbe.py): RGBA8 UNORM 64x64, level 2 of 5, compressed. */
+   {
+      struct AGX_PBE m = p;
+      m.width = m.height = 64;
+      m.buffer = UINT64_C(0x12345000);
+      m.acceleration_buffer = UINT64_C(0x45678000);
+      m.level = 2;
+      m.levels = 5;
+      const uint64_t native_mip10[4] = {
+         UINT64_C(0x30001f803fe40a22), UINT64_C(0x8000000001234500),
+         UINT64_C(0x0004200004567800), 0,
+      };
+      assert(hk_pack_native_pbe(10, &actual, &m));
+      assert(memcmp(&actual, native_mip10, sizeof(native_mip10)) == 0);
+   }
    const struct AGX_PBE original = p;
 #define REJECT_COMPRESSED(change) do { p = original; change; \
    assert(!hk_pack_native_pbe(9, &actual, &p)); } while (0)
@@ -812,6 +828,28 @@ main(void)
    assert(hk_pack_native_texture(10, &native_packed, &semantic));
    assert(memcmp(&native_packed, m5_texture, sizeof(m5_texture)) == 0);
 
+   /* Pinned native texture encoder (offline execution, compression-oracle
+    * native_read.py): a compressed 64x64 RGBA8 mip chain viewed from level 2
+    * with 5 levels takes the level-0 data and metadata addresses (the
+    * metadata address query passes level 0), word0 bit60 and
+    * first/last level 2/6 in word2. */
+   {
+      struct AGX_TEXTURE mip = semantic;
+      mip.width = mip.height = 64;
+      mip.address = UINT64_C(0x12345000);
+      mip.acceleration_buffer = UINT64_C(0x45678000);
+      mip.unk_mipmapped = true;
+      mip.first_level = 2;
+      mip.last_level = 6;
+      const uint64_t native_mip_texture[4] = {
+         UINT64_C(0x3001f803f6880a22), UINT64_C(0x8000000001234500),
+         UINT64_C(0x0006200004567800), 0,
+      };
+      assert(hk_pack_native_texture(10, &native_packed, &mip));
+      assert(memcmp(&native_packed, native_mip_texture,
+                    sizeof(native_mip_texture)) == 0);
+   }
+
    enum agx_sample_count samples;
    assert(hk_translate_native_texture_sample_count(9, 2, &samples));
    assert(samples == AGX_SAMPLE_COUNT_2);
@@ -987,8 +1025,19 @@ main(void)
       assert(memcmp(&native_pbe, compressed_color_targets[i].words,
                     sizeof(native_pbe)) == 0);
    }
+   /* The same atlas on Gen10, from the pinned native PBE encoder (offline
+    * execution, compression-oracle native_pbe.py, levels = 5 at stack +0x48,
+    * level at +0x44): the compressed single-level words plus the chain. */
+   for (unsigned level = 0; level < 5; ++level) {
+      const uint64_t gen10_atlas[4] = {
+         0x3003ff87ffe40a22ull, 0x8000001000000000ull,
+         0x000400100000a000ull | ((uint64_t)level << 44), 0,
+      };
+      compressed_atlas.level = level;
+      assert(hk_pack_native_pbe(10, &native_pbe, &compressed_atlas));
+      assert(memcmp(&native_pbe, gen10_atlas, sizeof(gen10_atlas)) == 0);
+   }
    compressed_atlas.level = 0;
-   assert(!hk_pack_native_pbe(10, &native_pbe, &compressed_atlas));
    compressed_atlas.acceleration_buffer = 0;
    assert(!hk_pack_native_pbe(9, &native_pbe, &compressed_atlas));
    compressed_atlas.acceleration_buffer = 0x100000a0001ull;

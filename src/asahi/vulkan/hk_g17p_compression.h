@@ -268,10 +268,30 @@ hk_g17p_shared_compression_eligible(enum agx_chip chip, unsigned plane,
  * take for a compressed destination (the raw tiled copiers refuse one).
  *
  * Admitted: the G17P colour formats (1-8 byte texels, so a single-sample
- * tilebuffer never spills a compressed target), one layer, one mip, one
- * sample, a colour attachment, and otherwise only sampled, input-attachment
- * and transfer usages. Shared images (external memory, WSI) stay plain.
+ * tilebuffer never spills a compressed target), one layer, any mip count
+ * (one level for one-byte texels, see hk_m5_compression_one_byte()),
+ * one sample, a colour attachment, and otherwise only sampled,
+ * input-attachment and transfer usages. Shared images (external memory,
+ * WSI) stay plain.
+ *
+ * Every level of a compressed mip chain is described by the level-0 surface
+ * and metadata addresses plus the level fields, in the PBE and
+ * texture packets alike, as native does; the hardware finds the
+ * level, so AIL_LAYOUT_POLICY_M5's per-level metadata placement must be the
+ * hardware's.
  */
+/* One-byte texels. The M5 hardware places a compressed level after a 32x32
+ * one-byte level 2 KiB on, where AIL_LAYOUT_POLICY_M5 puts it 1 KiB on: the
+ * end-of-tile store and texture reads use the hardware's offset, AIL-addressed
+ * writes (fast clears, copies) the other. Two- to eight-byte texels agree with
+ * the hardware at every level tested (64x64 to 2976x1872, odd sizes). */
+static inline bool
+hk_m5_compression_one_byte(VkFormat format)
+{
+   return format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_SNORM ||
+          format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT;
+}
+
 static inline bool
 hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                  const VkImageCreateInfo *info)
@@ -299,7 +319,8 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
    return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
-          info->arrayLayers == 1 && info->mipLevels == 1 &&
+          info->arrayLayers == 1 &&
+          (info->mipLevels == 1 || !hk_m5_compression_one_byte(info->format)) &&
           info->samples == VK_SAMPLE_COUNT_1_BIT &&
           info->tiling == VK_IMAGE_TILING_OPTIMAL &&
           !(info->flags & ~allowed_flags) &&

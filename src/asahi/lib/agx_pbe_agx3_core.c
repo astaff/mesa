@@ -356,10 +356,17 @@ agx_pbe_agx3_2d_mip_pack(
 {
    if (out)
       memset(out, 0, sizeof(*out));
+   /* A compressed Gen10 level keeps the compressed single-level packet
+    * (word0 bit61, word1 bit63, word2[43:0] = metadata >> 4) and takes the
+    * same chain fields as an uncompressed one: the pinned native PBE encoder
+    * (level and level count passed as arguments) gives
+    * 0x30001f803fe40a22 / 0x8000000001234500 / 0x0004200004567800 for an
+    * RGBA8 UNORM 64x64 level 2 of 5 with metadata 0x45678000. The metadata
+    * address stays the level-0 one: the native framebuffer PBE setup asks
+    * for the GPU address of level 0 of both the surface and the metadata
+    * (two calls on the same path). */
    if ((generation != AGX_PBE_AGX3_GENERATION_9 &&
         generation != AGX_PBE_AGX3_GENERATION_10) || !levels || levels > 16 ||
-       (generation == AGX_PBE_AGX3_GENERATION_10 && fields &&
-        fields->compressed && (level || levels != 1)) ||
        (fields && fields->layout == AGX_PBE_LAYOUT_LINEAR &&
         (level || levels != 1)) ||
        level >= levels || !agx_pbe_agx3_2d_pack(generation, fields, out))

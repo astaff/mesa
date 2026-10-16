@@ -520,6 +520,51 @@ check_m5_depth(void)
    }
 }
 
+static void
+check_m5_color(void)
+{
+   const VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   /* Minecraft's blocks atlas: RGBA8, 2048x2048, five mips; zink gives its
+    * sampled textures colour-attachment usage. */
+   VkImageCreateInfo i = image(VK_FORMAT_R8G8B8A8_UNORM, 2048, 2048, 5, usage);
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+      CHECK(hk_m5_color_compression_eligible((enum agx_chip)chip, 0, &i) ==
+            agx_chip_g17_m5((enum agx_chip)chip));
+   i.mipLevels = 1;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
+   i.mipLevels = 12;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
+   VkImageCreateInfo c = i;
+   c.arrayLayers = 2;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i;
+   c.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i;
+   c.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   c = i;
+   c.samples = VK_SAMPLE_COUNT_4_BIT;
+   c.mipLevels = 1;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   /* One-byte texels compress only as a single level. */
+   static const VkFormat one_byte[] = {
+      VK_FORMAT_R8_UNORM, VK_FORMAT_R8_SNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R8_SINT,
+   };
+   for (unsigned f = 0; f < sizeof(one_byte) / sizeof(one_byte[0]); ++f) {
+      c = i;
+      c.format = one_byte[f];
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c.mipLevels = 1;
+      CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   }
+   c = i;
+   c.format = VK_FORMAT_R8G8_UNORM;
+   CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
+}
+
 int
 main(void)
 {
@@ -535,6 +580,7 @@ main(void)
    check_zink();
    check_shared();
    check_m5_depth();
+   check_m5_color();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }
