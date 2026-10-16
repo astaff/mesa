@@ -844,10 +844,20 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s,
                                   def->src[0].value, def->src[0].size);
 
+      /* An M5 fragment SMP reads its texture and sampler handles from a
+       * pair of aligned 64-bit uniforms (native G17G compiler
+       * argument-buffer samples); forwarded below only as a whole pair. */
+      const bool m5_sample_uniform =
+         ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+         ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble &&
+         I->op == AGX_OPCODE_TEXTURE_SAMPLE && (s == 3 || s == 4) &&
+         def->src[0].type == AGX_INDEX_UNIFORM;
+
       /* ALU instructions cannot take 64-bit. G17P SMP's texture/sampler index
        * operands can (agx_lower_uniform_sources
        * copies back any placement the native form cannot encode). */
       if (def->src[0].size == AGX_SIZE_64 && !m5_texture_uniform &&
+          !m5_sample_uniform &&
           !(I->op == AGX_OPCODE_DEVICE_LOAD && s == 0) &&
           !(I->op == AGX_OPCODE_DEVICE_STORE && s == 1) &&
           !(I->op == AGX_OPCODE_ATOMIC && s == 1) &&
@@ -877,6 +887,16 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
          }
          if (agx3_tex_uniform_pair_unwitnessed(ctx, I, pair[0], pair[1]))
             continue;
+         if (m5_sample_uniform) {
+            bool both = true;
+            for (unsigned j = 0; j < 2; ++j) {
+               both &= pair[j].type == AGX_INDEX_UNIFORM &&
+                       pair[j].size == AGX_SIZE_64 && !(pair[j].value & 3) &&
+                       pair[j].value <= 252 && !pair[j].abs && !pair[j].neg;
+            }
+            if (!both)
+               continue;
+         }
       }
 
       agx_replace_src(I, s, def->src[0]);

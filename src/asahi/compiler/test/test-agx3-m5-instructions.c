@@ -1407,6 +1407,30 @@ int main(void)
       }
    }
 
+   /* With the native G17G compiler, a fragment sampling an argument-buffer
+    * texture with an argument-buffer sampler at an explicit register LOD:
+    * both handles are aligned 64-bit uniforms (f97/f103 = u20/3,
+    * f126/f132 = u16/3), otherwise the driver-ABI register sample. */
+   {
+      const struct agx3_tex_sample_desc uniform_handles = {
+         .dest = 16, .coord = 0, .width = AGX3_TEX_W32, .mask = 15,
+         .lod = AGX3_TEX_LOD_REGISTER, .slot = 2, .wait_mask = 2,
+         .coord_kill = true, .sample_group_nonterminal = true,
+         .texture_kind = AGX3_TEX_OPERAND_UNIFORM, .texture_value = 20,
+         .sampler_kind = AGX3_TEX_OPERAND_UNIFORM, .sampler_value = 16,
+         .sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER,
+      };
+      const unsigned char expected[] = {0x8f,0x07,0x12,0x00,0x8d,0x20,0x60,0x48,0x89,0x18,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x00,0x00,0x00,0x00};
+      if (!agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3C, &uniform_handles,
+                                  native, &len) ||
+          len != sizeof(expected) || memcmp(native, expected, len)) {
+         fprintf(stderr, "uniform-handle smp: len %u ", len);
+         for (unsigned b = 0; b < len; ++b) fprintf(stderr, "%02x", native[b]);
+         fprintf(stderr, "\n");
+         return 141;
+      }
+   }
+
    const struct agx3_falu_runtime fma2_runtime = {.discard={true},.wait_mask=128};
    const unsigned char fma2_expected[] = {
       0x29,0x00,0x07,0x0a,0x20,0x20,0xa3,0x02,0x30,0x8d,0x59,0x00,0x14,0x06,0x00,0x80,

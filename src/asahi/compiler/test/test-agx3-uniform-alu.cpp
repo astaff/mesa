@@ -17,7 +17,9 @@
 TEST(AGX3UniformALU, VertexTextureUniformQualification)
 {
    /* Both operands name the same aligned uniform, a witnessed
-    * uniform/uniform pair, so every stage keeps them in the uniform file. */
+    * uniform/uniform pair, so every G17P stage keeps them in the uniform
+    * file; M5 keeps a 64-bit pair in fragment main programs (the witnessed
+    * argument-buffer sample). */
    for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
       for (auto stage : {MESA_SHADER_VERTEX, MESA_SHADER_FRAGMENT}) {
          for (bool preamble : {false, true}) {
@@ -42,8 +44,11 @@ TEST(AGX3UniformALU, VertexTextureUniformQualification)
                   agx_optimizer_forward(b->shader);
                   agx_lower_uniform_sources(b->shader);
                   const bool keep =
-                     encoding == AGX_ISA_ENCODING_AGX3B &&
-                     value <= 252 && !(value & 3) && size != AGX_SIZE_16;
+                     value <= 252 && !(value & 3) &&
+                     (encoding == AGX_ISA_ENCODING_AGX3B
+                         ? size != AGX_SIZE_16
+                         : size == AGX_SIZE_64 &&
+                              stage == MESA_SHADER_FRAGMENT && !preamble);
                   EXPECT_EQ(I->src[3].type == AGX_INDEX_UNIFORM, keep);
                   EXPECT_EQ(I->src[4].type == AGX_INDEX_UNIFORM, keep);
                   EXPECT_NE(I->src[1].type, AGX_INDEX_UNIFORM);
