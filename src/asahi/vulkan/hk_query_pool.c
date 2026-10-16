@@ -13,6 +13,7 @@
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_pipeline_statistics_core.h"
+#include "hk_queue.h"
 #include "hk_shader.h"
 #include "hk_acceleration_structure.h"
 
@@ -874,12 +875,50 @@ hk_query_is_available(struct hk_device *dev, struct hk_query_pool *pool,
 
 #define HK_QUERY_TIMEOUT 2000000000ull
 
+/* Whether every queue has completed all the work submitted to it: nothing
+ * waits in a submit thread and each queue timeline reached its last point. */
+static bool
+hk_queues_idle(struct hk_device *dev)
+{
+   vk_foreach_queue(vk_queue, &dev->vk) {
+      struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+
+      mtx_lock(&vk_queue->submit.mutex);
+      const bool queued = !list_is_empty(&vk_queue->submit.submits);
+      mtx_unlock(&vk_queue->submit.mutex);
+      if (queued)
+         return false;
+
+      const uint64_t submitted = p_atomic_read(&queue->drm.timeline_value);
+      uint64_t point = 0;
+      if (!queue->drm.syncobj ||
+          drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) ||
+          point < submitted)
+         return false;
+   }
+   return true;
+}
+
+/* Wait until query becomes available. *never is set, with VK_SUCCESS, for a
+ * query that no submitted work will make available.
+ *
+ * On M5 the kernel fails a command caught in another command's GPU recovery
+ * as a victim: its fence completes with an error, the VM stays usable (its
+ * status word stays zero; hk_check_status() loses the device otherwise),
+ * and the command does not write the queries it would have ended or
+ * timestamped. Vulkan only says a query that never becomes available "may"
+ * lose the device (vkGetQueryPoolResults, VK_QUERY_RESULT_WAIT_BIT); losing
+ * it here would turn the survivable victim into a device loss. So once
+ * every queue is idle with the device intact, report the query unavailable
+ * instead of waiting for the timeout. */
 static VkResult
 hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
-                            uint32_t query)
+                            uint32_t query, bool *never)
 {
    uint64_t abs_timeout_ns = os_time_get_absolute_timeout(HK_QUERY_TIMEOUT);
+   const bool victims = agx_chip_g17_m5(dev->dev.chip);
 
+   *never = false;
    while (os_time_get_nano() < abs_timeout_ns) {
       if (hk_query_is_available(dev, pool, query))
          return VK_SUCCESS;
@@ -887,6 +926,21 @@ hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
       VkResult status = vk_device_check_status(&dev->vk);
       if (status != VK_SUCCESS)
          return status;
+
+      if (victims && hk_queues_idle(dev)) {
+         /* The last producer may have retired after the check above. */
+         if (hk_query_is_available(dev, pool, query))
+            return VK_SUCCESS;
+         status = vk_device_check_status(&dev->vk);
+         if (status != VK_SUCCESS)
+            return status;
+
+         mesa_logw_once("query %u became unavailable for good: all submitted "
+                        "work completed without writing it (a command the "
+                        "kernel failed as a recovery victim)", query);
+         *never = true;
+         return VK_SUCCESS;
+      }
    }
 
    return vk_device_set_lost(&dev->vk, "query timeout");
@@ -910,12 +964,13 @@ hk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
 
       bool available = hk_query_is_available(dev, pool, query);
 
+      bool never = false;
       if (!available && (flags & VK_QUERY_RESULT_WAIT_BIT)) {
-         status = hk_query_wait_for_available(dev, pool, query);
+         status = hk_query_wait_for_available(dev, pool, query, &never);
          if (status != VK_SUCCESS)
             return status;
 
-         available = true;
+         available = !never;
       }
 
       const struct hk_query_report *src = hk_query_report_map(dev, pool, query);
@@ -923,6 +978,14 @@ hk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
       void *dst = (char *)pData + i * stride;
 
       uint32_t reports = hk_reports_per_query(pool);
+      if (never) {
+         /* Zero results, reported unavailable: nothing was written. */
+         uint64_t zero[32] = {0};
+         assert(reports <= ARRAY_SIZE(zero));
+         hk_query_write_cpu_result(dst, zero, reports, false,
+                                   flags | VK_QUERY_RESULT_PARTIAL_BIT);
+         continue;
+      }
       if (!hk_query_write_cpu_result(dst, &src[0].value, reports, available,
                                      flags))
          status = VK_NOT_READY;
