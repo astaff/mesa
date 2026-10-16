@@ -308,13 +308,38 @@ hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
     *    buffers."
     *
     * We need to reset everything EXCEPT the render pass state.
+    *
+    * Active queries are not bound state either: a query begun in the primary
+    * stays active across vkCmdExecuteCommands and must also count the
+    * primary's later commands, so keep every active query binding.
     */
-   struct hk_rendering_state render_save = cmd->state.gfx.render;
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_rendering_state render_save = gfx->render;
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
-   memcpy(push, cmd->state.gfx.descriptors.push, sizeof(push));
-   memset(&cmd->state.gfx, 0, sizeof(cmd->state.gfx));
-   cmd->state.gfx.render = render_save;
-   memcpy(cmd->state.gfx.descriptors.push, push, sizeof(push));
+   memcpy(push, gfx->descriptors.push, sizeof(push));
+   const uint64_t pipeline_stats = gfx->descriptors.root.draw.pipeline_stats;
+   const VkQueryPipelineStatisticFlags pipeline_stats_flags =
+      gfx->descriptors.root.draw.pipeline_stats_flags;
+   const uint64_t mesh_prims_query = gfx->descriptors.root.mesh_prims_query;
+   uint64_t xfb_query[ARRAY_SIZE(gfx->xfb_query)];
+   uint64_t prims_generated_query[ARRAY_SIZE(gfx->prims_generated_query)];
+   memcpy(xfb_query, gfx->xfb_query, sizeof(xfb_query));
+   memcpy(prims_generated_query, gfx->prims_generated_query,
+          sizeof(prims_generated_query));
+   const enum agx_visibility_mode occlusion_mode = gfx->occlusion.mode;
+   const uint16_t occlusion_index = gfx->occlusion.index;
+
+   memset(gfx, 0, sizeof(*gfx));
+   gfx->render = render_save;
+   memcpy(gfx->descriptors.push, push, sizeof(push));
+   gfx->descriptors.root.draw.pipeline_stats = pipeline_stats;
+   gfx->descriptors.root.draw.pipeline_stats_flags = pipeline_stats_flags;
+   gfx->descriptors.root.mesh_prims_query = mesh_prims_query;
+   memcpy(gfx->xfb_query, xfb_query, sizeof(xfb_query));
+   memcpy(gfx->prims_generated_query, prims_generated_query,
+          sizeof(prims_generated_query));
+   gfx->occlusion.mode = occlusion_mode;
+   gfx->occlusion.index = occlusion_index;
 
    /* Every bound stage is gone, so vk_graphics_pipeline_cmd_bind() must not
     * elide the application's rebind of the pipeline it last saw (often the
