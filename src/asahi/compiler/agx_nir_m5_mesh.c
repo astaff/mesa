@@ -992,6 +992,25 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B)
    if (!launches || grid + 16 > 32768 ||
        !agx_nir_lower_m5_task_payload(s, max_payload_B))
       return false;
+   /* SPIR-V EmitMeshTasksEXT terminates the invocation: vtn follows the
+    * launch with a halt, which would skip the child-count epilogue appended
+    * below (EmitMeshTasks inside an if/else left both branches halting and
+    * published undefined counts). A task shader has no other halt source, so
+    * the launch ends main instead. */
+   {
+      bool halts = false;
+      nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+         nir_foreach_instr(in, block) {
+            if (in->type == nir_instr_type_jump &&
+                nir_instr_as_jump(in)->type == nir_jump_halt) {
+               nir_instr_as_jump(in)->type = nir_jump_return;
+               halts = true;
+            }
+         }
+      }
+      if (halts)
+         NIR_PASS(_, s, nir_lower_returns);
+   }
    /* A payload-free object publishes the grid of invocation 0 from
     * registers, like Apple's mesh-only passthrough object: no threadgroup
     * memory and no rendezvous. Only payload-carrying objects need the
