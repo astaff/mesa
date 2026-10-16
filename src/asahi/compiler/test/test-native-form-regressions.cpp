@@ -4149,17 +4149,54 @@ TEST(NativeForms, M5MeshUserSharedBarrierCompile)
    }
 }
 
-TEST(NativeForms, M5MeshPaddedUserBarrierRefusesWithoutMutation)
+/* A padded mesh workgroup keeps its API body under the exact invocation
+ * mask; a top-level execution barrier splits that body and is passed by every
+ * physical lane. */
+TEST(NativeForms, M5MeshPaddedTopLevelBarrierStaysUnmasked)
 {
-   nir_builder b=nir_builder_init_simple_shader(MESA_SHADER_MESH,&agx_nir_options,"padded barrier refusal");
+   nir_builder b=nir_builder_init_simple_shader(MESA_SHADER_MESH,&agx_nir_options,"padded top-level barrier");
+   b.shader->info.workgroup_size[0]=b.shader->info.workgroup_size[1]=b.shader->info.workgroup_size[2]=1;
+   b.shader->info.mesh.max_vertices_out=3;b.shader->info.mesh.max_primitives_out=1;
+   b.shader->info.mesh.primitive_type=MESA_PRIM_TRIANGLES;b.shader->info.shared_size=4;
+   b.shader->info.outputs_written=VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES;
+   b.shader->info.per_primitive_outputs=VARYING_BIT_PRIMITIVE_INDICES;
+   nir_def *index=nir_load_local_invocation_index(&b);
+   nir_store_shared(&b,index,nir_imm_int(&b,0),.align_mul=4);
+   nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
+      .memory_semantics=NIR_MEMORY_ACQ_REL,.memory_modes=nir_var_mem_shared);
+   nir_set_vertex_and_primitive_count(&b,nir_iadd_imm(&b,index,3),nir_imm_int(&b,1),nir_imm_int(&b,0));
+   ASSERT_TRUE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
+   EXPECT_GT(b.shader->info.workgroup_size[0],1u);
+   nir_validate_shader(b.shader,"padded top-level barrier");
+   unsigned user_barriers=0;
+   nir_foreach_block(block,nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(in,block) {
+         if(in->type!=nir_instr_type_intrinsic)continue;
+         nir_intrinsic_instr *i=nir_instr_as_intrinsic(in);
+         if(i->intrinsic==nir_intrinsic_barrier &&
+            nir_intrinsic_execution_scope(i)!=SCOPE_NONE) {
+            EXPECT_EQ(block->cf_node.parent->type,nir_cf_node_function);
+            user_barriers++;
+         }
+      }
+   }
+   EXPECT_GE(user_barriers,1u);
+   ralloc_free(b.shader);
+}
+
+TEST(NativeForms, M5MeshPaddedNestedBarrierRefusesWithoutMutation)
+{
+   nir_builder b=nir_builder_init_simple_shader(MESA_SHADER_MESH,&agx_nir_options,"padded nested barrier refusal");
    b.shader->info.workgroup_size[0]=b.shader->info.workgroup_size[1]=b.shader->info.workgroup_size[2]=1;
    b.shader->info.mesh.max_vertices_out=3;b.shader->info.mesh.max_primitives_out=1;
    b.shader->info.mesh.primitive_type=MESA_PRIM_TRIANGLES;b.shader->info.shared_size=4;
    b.shader->info.outputs_written=VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES;
    b.shader->info.per_primitive_outputs=VARYING_BIT_PRIMITIVE_INDICES;
    nir_set_vertex_and_primitive_count(&b,nir_imm_int(&b,3),nir_imm_int(&b,1),nir_imm_int(&b,0));
+   nir_push_if(&b,nir_ieq_imm(&b,nir_load_local_invocation_index(&b),0));
    nir_barrier(&b,.execution_scope=SCOPE_WORKGROUP,.memory_scope=SCOPE_WORKGROUP,
       .memory_semantics=NIR_MEMORY_ACQ_REL,.memory_modes=nir_var_mem_shared);
+   nir_pop_if(&b,NULL);
    EXPECT_FALSE(agx_nir_lower_m5_mesh_triangle_probe(b.shader));
    EXPECT_EQ(b.shader->info.shared_size,4u);EXPECT_EQ(b.shader->info.workgroup_size[0],1u);
    ralloc_free(b.shader);

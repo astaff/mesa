@@ -7,6 +7,60 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* An execution barrier is admitted in a padded workgroup only at the top
+ * level of main, where every physical lane can pass it. */
+static bool
+m5_padded_barrier_ok(const nir_block *block, const nir_intrinsic_instr *i)
+{
+   return nir_intrinsic_execution_scope(i) == SCOPE_NONE ||
+          block->cf_node.parent->type == nir_cf_node_function;
+}
+
+/* Run the API body of a padded workgroup under its exact invocation mask
+ * (local index < threads). Top-level execution barriers split the body and
+ * stay outside the masked segments, so every physical lane passes them, as
+ * Apple passes barriers with all lanes enabled; values that cross a barrier
+ * are only consumed by the API lanes. */
+static void
+m5_mask_padded_body(nir_function_impl *entry, unsigned threads)
+{
+   nir_intrinsic_instr **barriers = NULL;
+   unsigned count = 0;
+   nir_foreach_block(block, entry) {
+      if (block->cf_node.parent->type != nir_cf_node_function)
+         continue;
+      nir_foreach_instr(in, block) {
+         if (in->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+         if (i->intrinsic == nir_intrinsic_barrier &&
+             nir_intrinsic_execution_scope(i) != SCOPE_NONE) {
+            barriers = realloc(barriers, (count + 1) * sizeof(*barriers));
+            barriers[count++] = i;
+         }
+      }
+   }
+   nir_cursor start = nir_before_cf_list(&entry->body);
+   for (unsigned k = 0; k <= count; ++k) {
+      nir_cf_list segment;
+      nir_cf_extract(&segment, start,
+                     k < count ? nir_before_instr(&barriers[k]->instr)
+                               : nir_after_cf_list(&entry->body));
+      nir_builder b = nir_builder_at(
+         k < count ? nir_before_instr(&barriers[k]->instr)
+                   : nir_after_cf_list(&entry->body));
+      nir_if *active = nir_push_if(&b, nir_ult_imm(&b,
+                          nir_load_local_invocation_index(&b), threads));
+      b.cursor = nir_cf_reinsert(&segment, b.cursor);
+      nir_pop_if(&b, active);
+      if (k < count)
+         start = nir_after_instr(&barriers[k]->instr);
+   }
+   free(barriers);
+   if (count)
+      nir_repair_ssa_impl(entry);
+}
+
 bool
 agx_nir_m5_canonicalize_empty_mesh(nir_shader *s)
 {
@@ -537,11 +591,10 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
             switch(i->intrinsic) {
             case nir_intrinsic_set_vertex_and_primitive_count:counts=true;break;
             case nir_intrinsic_barrier:
-               /* Padding moves the API body under its exact active mask.
-                * A user execution barrier needs a separate reconvergence
-                * lowering; do not silently change its participating set. */
+               /* Padding moves the API body under its exact active mask;
+                * see m5_mask_padded_body. */
                if (physical_threads != threads &&
-                   nir_intrinsic_execution_scope(i) != SCOPE_NONE)
+                   !m5_padded_barrier_ok(block, i))
                   return false;
                break;
             case nir_intrinsic_store_per_vertex_output: {
@@ -644,16 +697,11 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
             entry_barrier = true;
          }
       }
-      nir_cf_list body;
-      nir_cf_extract(&body,nir_before_cf_list(&entry->body),
-                            nir_after_cf_list(&entry->body));
-      nir_builder b=nir_builder_at(nir_before_impl(entry));
-      if (entry_barrier)
+      m5_mask_padded_body(entry, threads);
+      if (entry_barrier) {
+         nir_builder b=nir_builder_at(nir_before_impl(entry));
          nir_mesh_payload_entry_barrier_agx(&b);
-      nir_if *active=nir_push_if(&b,nir_ult_imm(&b,
-                                  nir_load_local_invocation_index(&b),threads));
-      b.cursor=nir_cf_reinsert(&body,b.cursor);
-      nir_pop_if(&b,active);
+      }
       s->info.workgroup_size[0]=physical_threads;
       s->info.workgroup_size[1]=s->info.workgroup_size[2]=1;
    }
@@ -1021,10 +1069,9 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
                payload_access = true;
                break;
             case nir_intrinsic_barrier:
-               /* As for padded mesh workgroups: do not change the set of
-                * invocations that participates in an execution barrier. */
+               /* As for padded mesh workgroups. */
                if (physical_threads != threads &&
-                   nir_intrinsic_execution_scope(i) != SCOPE_NONE)
+                   !m5_padded_barrier_ok(block, i))
                   return false;
                break;
             default:
@@ -1139,14 +1186,7 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
             }
          }
       }
-      nir_cf_list body;
-      nir_cf_extract(&body, nir_before_cf_list(&entry->body),
-                     nir_after_cf_list(&entry->body));
-      nir_builder b = nir_builder_at(nir_before_impl(entry));
-      nir_if *active = nir_push_if(&b, nir_ult_imm(&b,
-                          nir_load_local_invocation_index(&b), threads));
-      b.cursor = nir_cf_reinsert(&body, b.cursor);
-      nir_pop_if(&b, active);
+      m5_mask_padded_body(entry, threads);
       s->info.workgroup_size[0] = physical_threads;
       s->info.workgroup_size[1] = s->info.workgroup_size[2] = 1;
    }
