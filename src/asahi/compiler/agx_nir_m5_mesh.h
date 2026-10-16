@@ -41,6 +41,8 @@ struct agx_m5_mesh_varyings {
    uint8_t components[64];
    uint8_t primitive_first[64];
    uint8_t primitive_comps[64];
+   /* gl_CullPrimitiveEXT is written (M5: dropped before the export). */
+   bool cull_primitive;
 };
 
 

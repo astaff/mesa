@@ -5476,14 +5476,32 @@ TEST(NativeForms, M5MeshPerPrimitiveWordsUsePrivateVertices)
    }
 }
 
+/* gl_CullPrimitiveEXT: one byte per primitive, cleared before the body and
+ * compacted away before the export. */
+TEST(NativeForms, M5MeshCullPrimitiveCompacts)
+{
+   for (unsigned primitives : {2u, 85u}) {
+      nir_shader *s=m5_mesh_per_primitive_shader(false,primitives,VARYING_SLOT_CULL_PRIMITIVE);
+      s->info.outputs_written|=VARYING_BIT_CULL_PRIMITIVE;
+      s->info.per_primitive_outputs|=VARYING_BIT_CULL_PRIMITIVE;
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_m5_mesh_gather_varyings(s,&v));
+      EXPECT_TRUE(v.cull_primitive);
+      EXPECT_EQ(v.components[VARYING_SLOT_CULL_PRIMITIVE],0u);
+      ASSERT_TRUE(agx_nir_lower_m5_mesh(s,&v));
+      nir_validate_shader(s,"cull primitive");
+      EXPECT_LE(s->info.shared_size,32768u);
+      ralloc_free(s);
+   }
+}
+
 TEST(NativeForms, M5MeshPerPrimitiveRefusalsLeaveShaderUntouched)
 {
    /* No private-vertex form beyond the native 256 output vertices, and no
-    * mapping yet for mesh-written primitive IDs or primitive culling. */
+    * mapping yet for mesh-written primitive IDs. */
    const struct { unsigned primitives; gl_varying_slot extra; bool gather; } rows[] = {
       {86, VARYING_SLOT_POS, true},
       {2, VARYING_SLOT_PRIMITIVE_ID, false},
-      {2, VARYING_SLOT_CULL_PRIMITIVE, false},
    };
    for (const auto &r : rows) {
       nir_shader *s=m5_mesh_per_primitive_shader(false,r.primitives,r.extra);
