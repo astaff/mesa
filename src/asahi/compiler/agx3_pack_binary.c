@@ -5563,6 +5563,28 @@ agx3_retire_slots_noop(struct util_dynarray *emission, enum agx_isa_encoding enc
           agx3_append(emission, bytes, len);
 }
 
+/* Carry `mask` on an identity of `reg`, which must be ready once `mask` has
+ * retired: every pending producer of it is in the mask. Only touch one half
+ * for a half register: its adjacent half may still belong to an independent
+ * asynchronous load. Keep the existing slot-6 carrier contract; changing that
+ * protocol requires separate hardware qualification. */
+static bool
+agx3_retire_wait_on(struct util_dynarray *emission, enum agx_isa_encoding enc,
+                    agx_index reg, uint16_t mask)
+{
+   uint8_t bytes[AGX3_ALU_MAX_LENGTH], len = 0;
+   /* The immediate halfword form also reaches high registers unavailable to
+    * the word bitop form. The full register wait covers this subset too. */
+   const bool half = reg.size == AGX_SIZE_16 || reg.value >= 192;
+   const bool ok = half
+      ? agx3_alu_bit_imm(enc, AGX3_ALU_BOR, true, reg.value, reg.value, 0,
+                          AGX3_ALU_HINT_NONE,
+                          mask | (1u << (enc == AGX_ISA_ENCODING_AGX3C ? 7 : 5)),
+                          bytes, &len)
+      : agx3_alu_band_identity_wait(enc, reg.value, mask, bytes, &len);
+   return ok && agx3_append(emission, bytes, len);
+}
+
 /* Carry a result-producing instruction's complete logical wait on its own
  * destination. The slot pass already includes WAW producers and outstanding
  * payload readers of that footprint, in addition to the instruction's RAW
@@ -5572,10 +5594,6 @@ agx3_retire_slots_noop(struct util_dynarray *emission, enum agx_isa_encoding enc
  * full wait without issuing any new readers/writers of the destination. The
  * latter permits resource-only waits during operand staging, when the result
  * footprint is already ready. A partial mask alone is not sufficient.
- *
- * Only touch one half for a half result: its adjacent half may still belong
- * to an independent asynchronous load. Keep the existing slot-6 carrier
- * contract; changing that protocol requires separate hardware qualification.
  */
 static bool
 agx3_retire_result_wait(struct util_dynarray *emission,
@@ -5590,18 +5608,7 @@ agx3_retire_result_wait(struct util_dynarray *emission,
        I->dest[0].memory)
       return false;
 
-   const agx_index dest = I->dest[0];
-   uint8_t bytes[AGX3_ALU_MAX_LENGTH], len = 0;
-   /* The immediate halfword form also reaches high registers unavailable to
-    * the word bitop form. The full destination wait covers this subset too. */
-   const bool half = dest.size == AGX_SIZE_16 || dest.value >= 192;
-   const bool ok = half
-      ? agx3_alu_bit_imm(enc, AGX3_ALU_BOR, true, dest.value, dest.value, 0,
-                          AGX3_ALU_HINT_NONE,
-                          mask | (1u << (enc == AGX_ISA_ENCODING_AGX3C ? 7 : 5)),
-                          bytes, &len)
-      : agx3_alu_band_identity_wait(enc, dest.value, mask, bytes, &len);
-   return ok && agx3_append(emission, bytes, len);
+   return agx3_retire_wait_on(emission, enc, I->dest[0], mask);
 }
 
 /* The compact register+minifloat ALU forms (agx3_alu_fadd_minifloat(),
@@ -10503,8 +10510,31 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                /* The first COPY's own wait retires the conflicts it already
                 * waits on; only the others need a carrier before it. */
                const uint16_t carried = staging_conflicts & (uint16_t)~stage_wait;
+               /* The r0 carrier reads and rewrites r0: sound only when r0
+                * is ready or its producer is in the mask. In M5 vertex
+                * shaders of texturelodoffset_pcoffset *shadow_vertex the
+                * position load into r0 was outstanding when the first
+                * output's COPY needed the sample's operand staging retired,
+                * and the carrier waited for the sample alone (misplaced
+                * vertices, intermittently, under concurrent load). Carry the
+                * conflict on the stored register with this store's producer
+                * wait, which covers every pending write of it (the COPY
+                * waits for those producers anyway). */
+               agx_index carrier = agx_null();
+               if (enc == AGX_ISA_ENCODING_AGX3C) {
+                  for (unsigned s = 1; s < I->nr_srcs; ++s) {
+                     if (agx3_src_is_register(I->src[s]) &&
+                         !I->src[s].memory && I->src[s].value < 256) {
+                        carrier = I->src[s];
+                        break;
+                     }
+                  }
+               }
                if (carried &&
-                   !agx3_retire_slots_noop(emission, enc, carried))
+                   !(carrier.type == AGX_INDEX_REGISTER
+                        ? agx3_retire_wait_on(emission, enc, carrier,
+                                              carried | wait)
+                        : agx3_retire_slots_noop(emission, enc, carried)))
                   AGX3_REFUSE(I);
                outstanding &= (uint16_t)~carried;
                agx3_staging_forget(&staging_banks, staging_conflicts);

@@ -1160,6 +1160,88 @@ TEST(NativeForms, TexturePublicationWaitPreservesUnrelatedResult)
    ralloc_free(mem);
 }
 
+/* A vertex output whose staging COPY reuses the operand staging of a sample
+ * still in flight retires that sample first. The r0 carrier used for that
+ * rewrites r0, so it must not run while a load is still writing r0 (the
+ * texturelodoffset_pcoffset *shadow_vertex position load): the retirement
+ * must also wait for the stored value's own producer. */
+TEST(NativeForms, M5VertexOutputStagingWaitCoversStoredLoad)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_VERTEX;
+   b->shader->max_reg = 63;
+
+   /* Earlier loads occupy the first slots, so the sample's slot is not the
+    * one the first output's staging COPY takes. */
+   for (unsigned i = 0; i < 3; ++i) {
+      agx_index value = agx_register(80 + 8 * i, AGX_SIZE_32);
+      value.channels_m1 = 3;
+      agx_device_load_to(b, value, agx_register(8, AGX_SIZE_64),
+                         agx_immediate(i), AGX_FORMAT_I32, 15, 0, false);
+   }
+
+   /* The CTS vertex shader's sample, as register allocation left it: the
+    * reference and the packed level/offset word in r14..r15. */
+   agx_index coords = agx_register(20, AGX_SIZE_32);
+   coords.channels_m1 = 1;
+   coords.discard = true;
+   agx_index level = agx_register(3, AGX_SIZE_16);
+   level.discard = true;
+   agx_index texture = agx_register(12, AGX_SIZE_64);
+   texture.discard = true;
+   agx_index sampler = agx_register(24, AGX_SIZE_64);
+   sampler.discard = true;
+   agx_index compare = agx_register(28, AGX_SIZE_32);
+   compare.channels_m1 = 1;
+   compare.discard = true;
+   agx_index result = agx_register(32, AGX_SIZE_32);
+   result.channels_m1 = 3;
+   agx_texture_sample_to(b, result, coords, level, agx_zero(), texture,
+                         sampler, compare, AGX_DIM_2D,
+                         AGX_LOD_MODE_LOD_MIN, 1, true, true, false,
+                         AGX_GATHER_NONE, false);
+   /* The position load into r0..r3 while the sample is in flight. */
+   agx_index position = agx_register(0, AGX_SIZE_32);
+   position.channels_m1 = 3;
+   agx_device_load_to(b, position, agx_register(8, AGX_SIZE_64),
+                      agx_register(6, AGX_SIZE_32), AGX_FORMAT_I32, 15, 0,
+                      false);
+   for (unsigned i = 0; i < 4; ++i)
+      agx_st_vary(b, agx_immediate(i), agx_register(2 * i, AGX_SIZE_32));
+   agx_st_vary(b, agx_immediate(4), agx_register(32, AGX_SIZE_32));
+   for (unsigned i = 0; i < 3; ++i)
+      agx_st_vary(b, agx_immediate(5 + i), agx_register(80 + 8 * i, AGX_SIZE_32));
+   agx_stop(b);
+
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+
+   /* The one identity carrier, found by its wait mask, waits for both the
+    * sample (staging) and the load (r0). */
+   const uint8_t *bytes = (const uint8_t *)binary.data;
+   unsigned carriers = 0;
+   for (unsigned mask = 1; mask < 0x80; ++mask) {
+      uint8_t carrier[AGX3_ALU_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_alu_band_identity_wait(AGX_ISA_ENCODING_AGX3C, 0,
+                                              mask, carrier, &len));
+      for (unsigned i = 0; i + len <= binary.size; ++i) {
+         if (memcmp(bytes + i, carrier, len) != 0)
+            continue;
+         ++carriers;
+         EXPECT_EQ(util_bitcount(mask), 2u) << "mask " << mask;
+      }
+   }
+   EXPECT_EQ(carriers, 1u);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
 TEST(NativeForms, MinmaxReusesUniformCopiedForComparison)
 {
    for (agx_fcond cond : {AGX_FCOND_LTN, AGX_FCOND_GTN}) {
