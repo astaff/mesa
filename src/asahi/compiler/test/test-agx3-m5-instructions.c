@@ -1381,6 +1381,32 @@ int main(void)
           &fma2_no_wait,native,&len) || len != sizeof(fma2_short) ||
        memcmp(native,fma2_short,len)) return 102;
 
+   /* Native G17G Minecraft terrain fragments: fma.sat(a, b, 0.5)
+    * keeps its minifloat addend (f51 = 32, f14 = 1) beside two discarded
+    * GPR multipliers and a cached result. */
+   {
+      const struct agx3_falu_mods sat = {.saturate = true};
+      const struct agx3_falu_runtime sat_runtime = {
+         .discard = {true, true}, .dest_cache = true,
+      };
+      const struct { uint16_t dest, src0, src1; unsigned char bytes[10]; } sat_cases[] = {
+         {88, 96, 88, {0xc9,0x59,0xbe,0x61,0x22,0xa0,0x02,0x00,0x00,0x02}},
+         {90, 92, 90, {0xd9,0x5b,0xbe,0x5d,0x22,0xa0,0x02,0x00,0x00,0x02}},
+         {18, 22, 18, {0x99,0x13,0x3e,0x17,0x22,0xa0,0x02,0x00,0x00,0x02}},
+      };
+      for (unsigned i = 0; i < 3; ++i) {
+         if (!agx3_falu_fma_addend_imm_width_mod(AGX_ISA_ENCODING_AGX3C,
+                sat_cases[i].dest, sat_cases[i].src0, sat_cases[i].src1, 32,
+                &sat, &sat_runtime, native, &len) ||
+             len != 10 || memcmp(native, sat_cases[i].bytes, len)) {
+            fprintf(stderr, "fma.sat addend witness %u: len %u\n", i, len);
+            for (unsigned b = 0; b < len; ++b) fprintf(stderr, "%02x", native[b]);
+            fprintf(stderr, "\n");
+            return 140;
+         }
+      }
+   }
+
    const struct agx3_falu_runtime fma2_runtime = {.discard={true},.wait_mask=128};
    const unsigned char fma2_expected[] = {
       0x29,0x00,0x07,0x0a,0x20,0x20,0xa3,0x02,0x30,0x8d,0x59,0x00,0x14,0x06,0x00,0x80,

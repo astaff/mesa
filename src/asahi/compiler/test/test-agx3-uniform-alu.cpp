@@ -669,7 +669,8 @@ TEST(AGX3UniformALU, M5NativeMultiplyAndFmaUniformWitnesses)
 /* Native G17G Minecraft 26.3 terrain, entity, cloud and
  * sky pipelines: every distinct f32 ADD/MUL/FMA with a uniform operand or a
  * uniform-file result in their mains and constant programs whose fields the
- * encoder names, re-encoded from the decoded operands. */
+ * encoder names, re-encoded from the decoded operands; plus the R*R+U FMAs of
+ * the agx3-diff-corpus native G17G r_heavy_loop fragment. */
 TEST(AGX3UniformALU, M5NativeUniformOperandAndResultShapes)
 {
    const struct {
@@ -821,6 +822,11 @@ TEST(AGX3UniformALU, M5NativeUniformOperandAndResultShapes)
       {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 54, false, false, false, false, false}}, 8, {0x79,0x1f,0x36,0x13,0x21,0x36,0x82,0x00}},
       {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x69,0x01,0x26,0x27,0xa0,0x0e}},
 
+      /* agx3-diff-corpus native G17G r_heavy_loop fragment: R*R+U. */
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 4, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x19,0x03,0x2e,0x85,0x21,0x06,0x02,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x29,0x05,0x2e,0x81,0x21,0x06,0x02,0x00}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 10, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x09,0x01,0x2e,0x8b,0x21,0x06,0x02,0x00}},
+      {AGX3_UNIFORM_FMA, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x59,0x0b,0x3e,0x0d,0x21,0x06,0x02,0x00}},
    };
    unsigned failed = 0;
    for (const auto &c : cases) {

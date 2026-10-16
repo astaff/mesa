@@ -290,6 +290,23 @@ agx3_lower_m5_modified_fma_immediates(agx_context *ctx, agx_instr *I)
    if (!modified)
       return;
 
+   /* Native G17G terrain fragments saturate a*b + 0.5 with the
+    * minifloat addend in place (f51 = 32, f14 = 1, both multipliers plain
+    * GPRs): agx3_falu_fma_addend_imm_width_mod encodes exactly that, so
+    * keep the literal instead of rematerializing it before every use. */
+   if (I->saturate && I->dest[0].size == AGX_SIZE_32 &&
+       I->src[2].type == AGX_INDEX_IMMEDIATE && !I->src[2].abs &&
+       !I->src[2].neg) {
+      bool plain = true;
+      for (unsigned s = 0; s < 2; ++s) {
+         const agx_index x = I->src[s];
+         plain &= x.type == AGX_INDEX_NORMAL && x.size == AGX_SIZE_32 &&
+                  agx_channels(x) == 1 && !x.abs && !x.neg && !x.memory;
+      }
+      if (plain)
+         return;
+   }
+
    agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
    agx_foreach_src(I, s) {
       const agx_index literal = I->src[s];

@@ -22,6 +22,7 @@ uniform_float_encode(enum agx_isa_encoding encoding,
     *   ADD R+U and U+R, the uniform optionally negated;
     *   FMA R*U+R, R*U+U and U*R+U, and R*U+imm, the uniform multiplicand
     *   optionally negated and a register multiplicand negated in U*R+U;
+    *   FMA R*R+U with nothing negated (the agx3-diff-corpus fragments);
     * and for a uniform result in a constant program:
     *   FMA R*R+R and MUL imm*R.
     * Native Minecraft terrain/entity/sky pipelines compiled natively for
@@ -69,6 +70,14 @@ uniform_float_encode(enum agx_isa_encoding encoding,
                                   src[i].kind != AGX3_FLOAT_UNIFORM))
                   return false;
             }
+         } else if (!u0 && !u1) {
+            /* R*R+U: register multiplicands and a plain uniform addend
+             * (agx3-diff-corpus native G17G r_heavy_loop fragment). */
+            if (src[0].kind != AGX3_FLOAT_REGISTER ||
+                src[1].kind != AGX3_FLOAT_REGISTER ||
+                src[2].kind != AGX3_FLOAT_UNIFORM || src[0].neg ||
+                src[1].neg || src[2].neg)
+               return false;
          } else {
             /* Exactly one uniform multiplicand and one register one. */
             if (u0 == u1 || (src[0].kind != AGX3_FLOAT_REGISTER &&
