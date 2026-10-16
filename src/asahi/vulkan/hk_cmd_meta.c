@@ -4092,9 +4092,16 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    hk_meta_begin(cmd, &save, bind_point);
 
    if (gfx) {
+      /* M5 reaches this graphics upload only for a destination the raw
+       * upload above refuses, such as a compressed depth plane. A split
+       * depth/stencil destination needs the per-plane aspect views here as
+       * well: the interleaved R32G32_UINT alias is a view of plane 0 alone. */
+      const bool m5_split_zs = agx_chip_g17_m5(dev->dev.chip) &&
+                               hk_split_depth_stencil(dst_image->vk.format);
       struct vk_meta_copy_image_properties dst_props =
-         hk_meta_copy_get_image_properties(dst_image, dev,
-                                           agx_native_graphics(&dev->dev), false);
+         hk_meta_copy_get_image_properties(
+            dst_image, dev, agx_native_graphics(&dev->dev) || m5_split_zs,
+            m5_split_zs);
 
       if (agx_native_graphics(&dev->dev)) {
          /* Native single-slice EOT views already select the mip and array

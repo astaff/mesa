@@ -451,6 +451,75 @@ check_shared(void)
    CHECK(SHARED(kopper));
 }
 
+static void
+check_m5_depth(void)
+{
+   /* Minecraft under zink: a D32 depth buffer with zink's usages and the
+    * sample-location flag zink sets on depth attachments. */
+   const VkImageUsageFlags ds = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   static const VkFormat formats[] = {
+      VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT,
+   };
+   for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
+      VkImageCreateInfo i = image(formats[f], 2976, 1872, 1, ds);
+      i.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+      for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+         CHECK(hk_m5_depth_compression_eligible((enum agx_chip)chip, 0, &i) ==
+               agx_chip_g17_m5((enum agx_chip)chip));
+      /* The stencil plane stays plain. */
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 1, &i));
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, NULL));
+      /* Neither policy admits a depth image as colour, nor colour as depth. */
+      CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
+
+      VkImageCreateInfo c = i;
+      c.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.usage &= ~VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.samples = VK_SAMPLE_COUNT_4_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.mipLevels = 2;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.arrayLayers = 2;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      c.extent.width = 15;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+      c = i;
+      VkExternalMemoryImageCreateInfo external = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+      };
+      c.pNext = &external;
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &c));
+   }
+
+   /* No stencil-only or other depth/stencil formats. */
+   static const VkFormat rejected[] = {
+      VK_FORMAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
+      VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_X8_D24_UNORM_PACK32,
+      VK_FORMAT_R32_SFLOAT,
+   };
+   for (unsigned r = 0; r < sizeof(rejected) / sizeof(rejected[0]); ++r) {
+      VkImageCreateInfo i = image(rejected[r], 64, 64, 1, ds);
+      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, &i));
+   }
+}
+
 int
 main(void)
 {
@@ -465,6 +534,7 @@ main(void)
    check_minecraft();
    check_zink();
    check_shared();
+   check_m5_depth();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }

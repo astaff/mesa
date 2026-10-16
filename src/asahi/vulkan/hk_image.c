@@ -445,15 +445,16 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
     * Feedback loops are problematic with compression. The GL driver bans them.
     * Interestingly, the relevant CTS tests pass on G13G and G14C, but not on
     * G13D. Keep that restriction except for depth images already admitted by
-    * the G17P policy. Rejecting those here contradicts the depth policy and
+    * the G17P or M5 policy. Rejecting those here contradicts the depth policy and
     * makes the host-copy performance query report a plain device layout;
     * Zink then retains HOST_TRANSFER and never compresses its depth images.
     */
    /* Decided on the API format: the stencil plane of D32_SFLOAT_S8_UINT is
     * S8_UINT here, and zink gives its depth/stencil images feedback-loop
     * usage. */
-   const bool depth_feedback = dev->chip == AGX_CHIP_G17P && allow_agx3 &&
-                               hk_g17p_compression_depth_format(api_format);
+   const bool depth_feedback =
+      (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip)) &&
+      allow_agx3 && hk_g17p_compression_depth_format(api_format);
    if ((usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
                  VK_IMAGE_USAGE_STORAGE_BIT)) ||
        ((usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) &&
@@ -1190,7 +1191,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
    bool allow_agx3 =
       m5_storage || hk_g17p_compression_eligible(dev->chip, plane, info) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
-      hk_m5_color_compression_eligible(dev->chip, plane, info);
+      hk_m5_color_compression_eligible(dev->chip, plane, info) ||
+      hk_m5_depth_compression_eligible(dev->chip, plane, info);
 
    if (allow_agx3 && !vk_format_is_depth_or_stencil(info->format) &&
        !hk_g17p_store_class_matches(dev, info->format))

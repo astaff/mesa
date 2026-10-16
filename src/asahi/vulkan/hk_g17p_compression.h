@@ -308,3 +308,60 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
           info->extent.height >= 16 &&
           hk_g17p_compression_color_format(info->format);
 }
+
+/* M5 lossless compression of depth attachments.
+ *
+ * The native HAL300 framebuffer setup sets ZLS control bits 2 and
+ * 6 exactly when the attached depth level has compression metadata, bits 4
+ * and 8 for stencil metadata and bit 26 for Depth16Unorm, and programs the
+ * metadata address and its cache-line layer stride beside the surface: the
+ * encoding agx_pack_zls_control() and hk's render setup already produce.
+ * Depth is read through the same Gen10 texture descriptor as colour, and the
+ * copy paths write it through its R16/R32_UINT colour alias with the
+ * compressed PBE.
+ *
+ * Admitted: D16_UNORM, D32_SFLOAT and the depth plane of
+ * D32_SFLOAT_S8_UINT (stencil stays plain), one layer, one mip, one sample,
+ * a depth attachment, and otherwise only sampled, input-attachment,
+ * feedback-loop and transfer usages. Zink marks its depth attachments
+ * sample-location compatible and feedback-loop capable, which changes
+ * neither. Shared images (external memory, WSI) stay plain.
+ */
+static inline bool
+hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
+                                 const VkImageCreateInfo *info)
+{
+   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
+      return false;
+
+   for (const void *next = info->pNext; next;) {
+      VkBaseInStructure ext;
+      memcpy(&ext, next, sizeof(ext));
+      if (ext.sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+          ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
+         return false;
+      if (ext.sType == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+         return false;
+      next = ext.pNext;
+   }
+
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+      VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+
+   return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
+          info->arrayLayers == 1 && info->mipLevels == 1 &&
+          info->samples == VK_SAMPLE_COUNT_1_BIT &&
+          info->tiling == VK_IMAGE_TILING_OPTIMAL &&
+          !(info->flags & ~allowed_flags) &&
+          (info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+          !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
+          info->extent.height >= 16 &&
+          hk_g17p_compression_depth_format(info->format);
+}
