@@ -4097,7 +4097,9 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
          ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
          : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-   if (!agx_chip_native_agx3(dev->dev.chip) || cmd->in_meta ||
+   if ((!agx_chip_native_agx3(dev->dev.chip) &&
+        !agx_chip_g17_m5(dev->dev.chip)) ||
+       cmd->in_meta ||
        cmd->vk.pool->queue_family_index >= pdev->queue_family_count ||
        !(pdev->queue_families[cmd->vk.pool->queue_family_index].queue_flags &
          VK_QUEUE_GRAPHICS_BIT) ||
