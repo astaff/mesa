@@ -444,6 +444,53 @@ agx3_m5_float_accepts_uniform(const agx_context *ctx, const agx_instr *I,
    return m5_native_float_uniform(ctx, &candidate);
 }
 
+/*
+ * M5 adds a uniform to a register with the uniform optionally negated, not
+ * the register: u - r has no native form and would copy u into a GPR. When
+ * every use of u - r is a float operation reading it as a plain register
+ * operand, compute r - u instead (a native R + -U) and negate it at each use,
+ * which is exact. Minecraft's fog mixes the fragment colour toward the fog
+ * colour as (fog - c) * t + c, three times per fragment.
+ */
+static bool
+agx3_m5_negate_uniform_difference(agx_context *ctx, agx_instr *I)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble ||
+       I->op != AGX_OPCODE_FADD || I->nr_dests != 1 || I->nr_srcs != 2 ||
+       I->saturate || I->dest[0].type != AGX_INDEX_NORMAL ||
+       I->dest[0].size != AGX_SIZE_32)
+      return false;
+   unsigned u = I->src[0].type == AGX_INDEX_UNIFORM ? 0 : 1;
+   const agx_index uni = I->src[u], reg = I->src[!u];
+   if (uni.type != AGX_INDEX_UNIFORM || uni.neg || uni.abs ||
+       reg.type != AGX_INDEX_NORMAL || !reg.neg || reg.abs)
+      return false;
+
+   const unsigned value = I->dest[0].value;
+   agx_foreach_instr_global(ctx, J) {
+      agx_foreach_ssa_src(J, s) {
+         if (J->src[s].value != value)
+            continue;
+         if ((J->op != AGX_OPCODE_FADD && J->op != AGX_OPCODE_FMUL &&
+              J->op != AGX_OPCODE_FFMA) || J->src[s].abs)
+            return false;
+      }
+   }
+
+   agx_index r = reg, n = uni;
+   r.neg = false;
+   n.neg = true;
+   I->src[0] = r;
+   I->src[1] = n;
+   agx_foreach_instr_global(ctx, J) {
+      agx_foreach_ssa_src(J, s) {
+         if (J->src[s].value == value)
+            J->src[s].neg = !J->src[s].neg;
+      }
+   }
+   return true;
+}
+
 /* Native M5 bounded-buffer code uses uniform compare/select operands.
  * Query the encoder's full32 contract before retaining any of them. */
 static bool
@@ -503,6 +550,8 @@ agx_lower_uniform_sources(agx_context *ctx)
       const bool native_integer =
          agx3_uniform_integer_for_encoding(ctx->key->dev.encoding,
                                            I, false, &integer_desc);
+      if (!m5_native_float_uniform(ctx, I))
+         agx3_m5_negate_uniform_difference(ctx, I);
       const bool native_m5_float = m5_native_float_uniform(ctx, I);
       bool copy_float_uniforms = false;
       unsigned first_uniform = UINT_MAX;
