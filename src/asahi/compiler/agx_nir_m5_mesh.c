@@ -427,8 +427,9 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
             }
             if (slot == VARYING_SLOT_POS)
                continue;
-            if (slot == VARYING_SLOT_PSIZ &&
-                s->info.mesh.primitive_type == MESA_PRIM_POINTS) {
+            /* Point size also reaches the raster state of triangle and line
+             * meshes (a shader object's polygon mode can be POINT). */
+            if (slot == VARYING_SLOT_PSIZ) {
                if (nir_intrinsic_component(i) != 0 ||
                    nir_intrinsic_write_mask(i) != 1)
                   return false;
@@ -564,19 +565,19 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       s->info.mesh.max_vertices_out==0 || s->info.mesh.max_vertices_out>256 ||
       s->info.mesh.max_primitives_out==0 || s->info.mesh.max_primitives_out>256 ||
       prim_vertices(s)==0 ||
-      /* Points carry their size in the word after the user words. */
+      /* Points carry their size; a point size word follows the user words. */
       (s->info.mesh.primitive_type==MESA_PRIM_POINTS &&
-       (!varyings->components[VARYING_SLOT_PSIZ] ||
-        varyings->first[VARYING_SLOT_PSIZ] + 1 !=
-           varyings->size - varyings->clip_distance_count -
-           (varyings->lv ? 1 : 0))) ||
+       !varyings->components[VARYING_SLOT_PSIZ]) ||
+      (varyings->components[VARYING_SLOT_PSIZ] &&
+       varyings->first[VARYING_SLOT_PSIZ] + 1 !=
+          varyings->size - varyings->clip_distance_count -
+          (varyings->lv ? 1 : 0)) ||
       /* Interstage compaction can leave per_primitive_outputs stale; with
        * per-primitive words every store is checked against them below. */
       (primitive_outputs&~(unweld ? ~UINT64_C(0) : primitive_slots)) ||
       s->info.outputs_written & ~(VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES|MESH_VERTEX_VARYINGS|
                                   (primitive_slots & (VARYING_BIT_LAYER|VARYING_BIT_VIEWPORT)) |
-                                  (s->info.mesh.primitive_type==MESA_PRIM_POINTS ?
-                                   VARYING_BIT_PSIZ : 0)) ||
+                                  VARYING_BIT_PSIZ) ||
       /* Every primitive gets private vertices within the native
        * 256-vertex output limit. */
       (unweld && prim_vertices(s) * s->info.mesh.max_primitives_out > 256) ||
