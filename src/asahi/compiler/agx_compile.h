@@ -603,6 +603,11 @@ void agx_preprocess_nir_m5(nir_shader *nir);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 bool agx_nir_lower_sample_mask_m5(nir_shader *s);
+
+/* store_zs_agx base bit: the sample mask names exactly one covered sample,
+ * and the store sits in a covered-sample loop that zs_transaction_agx
+ * brackets (M5 only). The backend stages one DEPTHF word for it. */
+#define AGX_ZS_COVERED_SAMPLE (4)
 bool agx_nir_lower_sample_mask_deferred(nir_shader *s);
 bool agx_nir_lower_sample_mask_deferred_m5(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s, bool layer_as_varying);

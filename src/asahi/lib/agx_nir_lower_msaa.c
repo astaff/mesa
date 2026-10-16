@@ -693,6 +693,88 @@ agx_nir_hoist_g17p_zs_writes(nir_shader *shader)
 }
 
 /*
+ * M5 pixel-rate depth-only or stencil-only writes at several samples.
+ *
+ * Native G17G fragments (native G17G compiler zs_depth_{2,4,8}x,
+ * zs_cdepth_4x, zs_depth_only_4x, zs_stencil_{2,4}x) take the depth/coverage
+ * class once, then loop over the covered samples with a single DEPTHF, each
+ * iteration naming one sample. The code is identical at every sample count.
+ * Rewrite a whole-pixel store_zs_agx of that shape, executed once at the top
+ * level, into the same loop; the backend stages one word per iteration
+ * (AGX_ZS_COVERED_SAMPLE). The loop runs at least once, so a lane whose
+ * coverage is already empty still balances the transaction with an empty
+ * word, as the native loop's bottom test does. Whole-pixel depth and stencil
+ * together stay one word, and masked writes stay one word per sample.
+ */
+bool
+agx_nir_lower_m5_zs_sample_loop(nir_shader *shader, unsigned nr_samples)
+{
+   assert(shader->info.stage == MESA_SHADER_FRAGMENT);
+   if (nr_samples < 2)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   nir_intrinsic_instr *store = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_zs_agx)
+            continue;
+         /* Exactly one write, of a supported shape, or none rewritten. */
+         if (store)
+            return false;
+         store = intr;
+      }
+   }
+
+   if (!store || !agx_block_runs_once(impl, store->instr.block))
+      return false;
+
+   const unsigned base = nir_intrinsic_base(store);
+   const unsigned all = BITFIELD_MASK(nr_samples);
+   if ((base != 1 && base != 2) || !nir_src_is_const(store->src[0]) ||
+       (nir_src_as_uint(store->src[0]) & all) != all)
+      return false;
+
+   nir_builder b = nir_builder_at(nir_before_instr(&store->instr));
+
+   /* Native clamps the depth once, ahead of the loop. The backend does not
+    * clamp a covered-sample word again. */
+   nir_def *depth = store->src[1].ssa;
+   if (base == 1)
+      depth = nir_fmin(&b, nir_fmax(&b, depth, nir_imm_float(&b, 0.0f)),
+                       nir_imm_float(&b, 1.0f));
+   nir_zs_transaction_agx(&b, .flags = 0);
+
+   nir_variable *left =
+      nir_local_variable_create(impl, glsl_uint16_t_type(), "zs_samples");
+   nir_store_var(&b, left,
+                 nir_iand_imm(&b, nir_u2u16(&b, nir_load_sample_mask(&b)), all),
+                 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *samples = nir_load_var(&b, left);
+      nir_def *sample = nir_iand(&b, samples, nir_ineg(&b, samples));
+      nir_store_zs_agx(&b, sample, depth, store->src[2].ssa,
+                       .base = base | AGX_ZS_COVERED_SAMPLE);
+      nir_def *rest = nir_iand(&b, samples, nir_inot(&b, sample));
+      nir_store_var(&b, left, rest, 1);
+      nir_break_if(&b, nir_ieq_imm(&b, rest, 0));
+   }
+   nir_pop_loop(&b, loop);
+
+   nir_zs_transaction_agx(&b, .flags = 1);
+   nir_instr_remove(&store->instr);
+
+   nir_progress(true, impl, nir_metadata_none);
+   nir_lower_vars_to_ssa(shader);
+   return true;
+}
+
+/*
  * Lower a fragment shader into a monolithic pixel shader, with static sample
  * count, blend state, and tilebuffer formats in the shader key. For dynamic,
  * epilogs must be used, which have separate lowerings.

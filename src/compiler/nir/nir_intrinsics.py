@@ -2609,6 +2609,10 @@ store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TAR
 # src[] = { sample mask, depth, stencil }
 intrinsic("store_zs_agx", [1, 1, 1], indices=[BASE], flags=[])
 
+# M5: open (FLAGS = 0) or close (FLAGS = 1) the depth/coverage pixel
+# transaction around a loop of store_zs_agx carrying AGX_ZS_COVERED_SAMPLE.
+intrinsic("zs_transaction_agx", indices=[FLAGS])
+
 # Store a block from local memory into a bound image. Used to write out render
 # targets within the end-of-tile shader, although it is valid in general compute
 # kernels.

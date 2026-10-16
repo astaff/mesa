@@ -8839,7 +8839,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    /* The last pixel release of a program-ending fragment part, when no
     * colour store, coverage update, acquisition or branch follows it. */
    const agx_instr *g17p_final_release = NULL;
-   bool has_zs_emit = false;
+   bool has_zs_emit = false, zs_sample_loop = false;
    unsigned zs_staging_halfs = 0;
    bool g17p_fragment_helper_protocol =
       (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
@@ -8921,6 +8921,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             has_zs_emit = true;
          if (scan_I->op == AGX_OPCODE_ZS_EMIT_AGX3)
             zs_staging_halfs += (scan_I->zs & 1) ? 4 : 2;
+         if (scan_I->op == AGX_OPCODE_ZS_EMIT_AGX3 && (scan_I->zs & 4))
+            zs_sample_loop = true;
          if (scan_I->op == AGX_OPCODE_ATOMIC ||
              scan_I->op == AGX_OPCODE_DEVICE_STORE ||
              scan_I->op == AGX_OPCODE_IMAGE_WRITE)
@@ -11015,7 +11017,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * pass-through Z value before acquiring class 1 in Apple's fresh
              * G17P atomic fragment. Hold this wait until ZS_EMIT can reproduce
              * that ordering; SIGNAL_PIX remains in its original position. */
-            if (has_zs_emit && I->op == AGX_OPCODE_WAIT_PIX &&
+            /* Native M5 covered-sample loops (zs_depth_4x and kin) take
+             * class 1 once, ahead of the loop and its staging, instead. */
+            if (has_zs_emit && !zs_sample_loop && I->op == AGX_OPCODE_WAIT_PIX &&
                 I->writeout == 1) {
                if (interleaved_zs && g17p_zs_writes > 0) {
                   if (!agx3_retire_slots_noop(emission, enc, wait))
@@ -11433,6 +11437,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          if (I->op == AGX_OPCODE_ZS_EMIT_AGX3) {
             const bool depth = I->zs & 1, stencil = I->zs & 2;
+            /* One word of a covered-sample loop, its class-1 wait already
+             * emitted before the loop. */
+            const bool sample_loop = I->zs & 4;
             /* Apple's 2x/4x per-sample depth/stencil writes stage each word,
              * and its depth, after the previous sample's, all under the one
              * class-1 wait taken before the first DEPTHF (msaa/native/zexp2
@@ -11440,10 +11447,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             const unsigned staging = g17p_zs_staging;
             if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
                 ctx->stage != MESA_SHADER_FRAGMENT || I->nr_dests ||
-                I->nr_srcs != 1 || I->zs < 1 || I->zs > 3 ||
+                I->nr_srcs != 1 || !(I->zs & 3) || I->zs > 7 ||
+                (sample_loop && ((I->zs & 3) == 3 || !zs_sample_loop ||
+                                 enc != AGX_ISA_ENCODING_AGX3C ||
+                                 g17p_deferred_zs_wait)) ||
                 !agx3_vary_reg32(I->src[0]) ||
                 agx_channels(I->src[0]) != (depth ? 2 : 1) ||
-                (g17p_zs_writes == 0) != (g17p_deferred_zs_wait != NULL) ||
+                (!sample_loop &&
+                 (g17p_zs_writes == 0) != (g17p_deferred_zs_wait != NULL)) ||
                 g17p_zs_writes >=
                    (enc == AGX_ISA_ENCODING_AGX3C ? 8 : 4))
                AGX3_REFUSE(I);
@@ -11481,9 +11492,11 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                AGX3_REFUSE(I);
             g17p_deferred_zs_wait = NULL;
 
+            /* The loop restages the word each iteration; native keeps f13
+             * clear on that DEPTHF. */
             const struct agx3_zs_desc zs = {
                .value = staging,
-               .value_kill = true,
+               .value_kill = !sample_loop,
                .slot = slot,
                .wait_mask = (uint16_t)(1u << (slot - 1)),
             };

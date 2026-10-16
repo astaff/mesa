@@ -3,6 +3,8 @@
  *
  * M5 fragment epilog depth/stencil export forms, against native
  * Native G17G compiler fragments:
+ *  - depth or stencil alone, whole pixel: one DEPTHF in a loop over the
+ *    covered samples, with class 1 taken once ahead of it;
  *  - depth and stencil together, whole pixel: one DEPTHF word;
  *  - alpha-to-coverage: one DEPTHF per sample with the alpha coverage folded
  *    into its word, and no separate MOVMSK.
@@ -66,7 +68,9 @@ build_epilog(const epilog_shape &shape)
 }
 
 struct counts {
-   unsigned store_zs = 0, demotes = 0, coverage_updates = 0;
+   unsigned store_zs = 0, covered_sample = 0, transactions = 0, demotes = 0;
+   unsigned coverage_updates = 0;
+   unsigned stores_in_loop = 0;
 };
 
 static counts
@@ -74,11 +78,20 @@ count_nir(nir_shader *s)
 {
    counts c;
    nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      bool in_loop = false;
+      for (nir_cf_node *n = block->cf_node.parent; n; n = n->parent)
+         in_loop |= n->type == nir_cf_node_loop;
       nir_foreach_instr(instr, block) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         c.store_zs += intr->intrinsic == nir_intrinsic_store_zs_agx;
+         if (intr->intrinsic == nir_intrinsic_store_zs_agx) {
+            c.store_zs++;
+            c.covered_sample +=
+               !!(nir_intrinsic_base(intr) & AGX_ZS_COVERED_SAMPLE);
+            c.stores_in_loop += in_loop;
+         }
+         c.transactions += intr->intrinsic == nir_intrinsic_zs_transaction_agx;
          c.demotes += intr->intrinsic == nir_intrinsic_demote_samples;
          c.coverage_updates += intr->intrinsic == nir_intrinsic_sample_mask_agx;
       }
@@ -138,6 +151,16 @@ count_of(const std::vector<std::string> &m, const char *name)
    return n;
 }
 
+static int
+index_of(const std::vector<std::string> &m, const char *name)
+{
+   for (unsigned i = 0; i < m.size(); ++i) {
+      if (m[i] == name)
+         return i;
+   }
+   return -1;
+}
+
 static bool
 compile_m5(nir_shader *s, unsigned samples, agx_shader_part *part)
 {
@@ -156,6 +179,49 @@ compile_m5(nir_shader *s, unsigned samples, agx_shader_part *part)
 
 } /* namespace */
 
+/* Native zs_depth_{2,4,8}x, zs_cdepth_4x and zs_stencil_{2,4}x. */
+TEST_F(M5DepthExport, SingleAttachmentLoopsOverCoveredSamples)
+{
+   for (unsigned samples : {2u, 4u, 8u}) {
+      for (bool stencil : {false, true}) {
+         SCOPED_TRACE(::testing::Message() << samples << " samples, "
+                      << (stencil ? "stencil" : "depth"));
+         nir_shader *s = build_epilog({AGX_CHIP_G17S, samples, !stencil,
+                                       stencil, false});
+         counts c = count_nir(s);
+         EXPECT_EQ(c.store_zs, 1u);
+         EXPECT_EQ(c.covered_sample, 1u);
+         EXPECT_EQ(c.stores_in_loop, 1u);
+         EXPECT_EQ(c.transactions, 2u);
+
+         agx_shader_part part = {};
+         ASSERT_TRUE(compile_m5(s, samples, &part)) << agx_last_compile_refusal();
+         std::vector<std::string> m = mnemonics(part);
+         EXPECT_EQ(count_of(m, "depthf"), 1u);
+         EXPECT_EQ(count_of(m, "cndlt"), 1u);
+         /* One class-1 acquire, ahead of the loop and its DEPTHF. */
+         int depthf = index_of(m, "depthf"), loop = index_of(m, "cndlt");
+         int last_wait = -1;
+         unsigned waits_before_depthf = 0;
+         for (int i = 0; i < depthf; ++i) {
+            if (m[i] == "pixwait") {
+               last_wait = i;
+               waits_before_depthf++;
+            }
+         }
+         EXPECT_EQ(waits_before_depthf, 2u); /* entry gate, then class 1 */
+         EXPECT_LT(last_wait, depthf);
+         EXPECT_LT(depthf, loop);
+         bool cf_between = false;
+         for (int i = last_wait + 1; i < depthf; ++i)
+            cf_between |= m[i] == "cndst";
+         EXPECT_TRUE(cf_between) << "class-1 wait must precede the loop";
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+}
+
 /* Native zs_depth_stencil_{2,4}x. */
 TEST_F(M5DepthExport, DepthAndStencilIsOneWord)
 {
@@ -164,6 +230,8 @@ TEST_F(M5DepthExport, DepthAndStencilIsOneWord)
       nir_shader *s = build_epilog({AGX_CHIP_G17S, samples, true, true, false});
       counts c = count_nir(s);
       EXPECT_EQ(c.store_zs, 1u);
+      EXPECT_EQ(c.covered_sample, 0u);
+      EXPECT_EQ(c.transactions, 0u);
       agx_shader_part part = {};
       ASSERT_TRUE(compile_m5(s, samples, &part)) << agx_last_compile_refusal();
       std::vector<std::string> m = mnemonics(part);
@@ -187,6 +255,7 @@ TEST_F(M5DepthExport, AlphaToCoverageFoldsIntoSampleWords)
          counts c = count_nir(s);
          EXPECT_EQ(c.demotes, 0u);
          EXPECT_EQ(c.coverage_updates, 0u);
+         EXPECT_EQ(c.covered_sample, 0u);
          EXPECT_FALSE(s->info.fs.uses_discard);
          agx_shader_part part = {};
          ASSERT_TRUE(compile_m5(s, samples, &part)) << agx_last_compile_refusal();
@@ -200,18 +269,30 @@ TEST_F(M5DepthExport, AlphaToCoverageFoldsIntoSampleWords)
    }
 }
 
-/* Without a depth or stencil write, alpha-to-coverage keeps its kill; off
- * M5 it stays a separate coverage update. */
+/* Without a depth or stencil write, alpha-to-coverage keeps its kill, and a
+ * single sample keeps its one word. */
 TEST_F(M5DepthExport, OtherShapesUnchanged)
 {
    nir_shader *s = build_epilog({AGX_CHIP_G17S, 4, false, false, true});
    counts c = count_nir(s);
    EXPECT_EQ(c.store_zs, 0u);
+   EXPECT_EQ(c.transactions, 0u);
    EXPECT_TRUE(s->info.fs.uses_discard);
    ralloc_free(s);
 
+   s = build_epilog({AGX_CHIP_G17S, 1, true, false, false});
+   c = count_nir(s);
+   EXPECT_EQ(c.store_zs, 1u);
+   EXPECT_EQ(c.covered_sample, 0u);
+   EXPECT_EQ(c.transactions, 0u);
+   ralloc_free(s);
+
+   /* Not M5: no covered-sample loop, and alpha coverage stays a separate
+    * coverage update. */
    s = build_epilog({AGX_CHIP_G17P, 4, true, false, true});
    c = count_nir(s);
+   EXPECT_EQ(c.covered_sample, 0u);
+   EXPECT_EQ(c.transactions, 0u);
    EXPECT_GT(c.demotes + c.coverage_updates, 0u);
    ralloc_free(s);
 }

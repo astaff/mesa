@@ -1158,7 +1158,8 @@ agx_emit_local_store_pixel(agx_builder *b, nir_intrinsic_instr *instr)
 static agx_instr *
 agx_emit_zs_word_agx3(agx_builder *b, nir_intrinsic_instr *instr,
                       agx_index z, agx_index s, unsigned base,
-                      agx_index coverage, agx_index prepared_depth)
+                      agx_index coverage, agx_index prepared_depth,
+                      bool bracketed)
 {
    const bool write_z = base & 1;
    const bool write_s = base & 2;
@@ -1204,6 +1205,10 @@ agx_emit_zs_word_agx3(agx_builder *b, nir_intrinsic_instr *instr,
    }
 
    b->shader->out->writes_sample_mask = true;
+   /* A covered-sample loop's transaction is opened and closed around the
+    * loop by zs_transaction_agx. */
+   if (bracketed)
+      return agx_zs_emit_agx3(b, word, base);
    agx_wait_pixel_mask(b, 0x1);
    agx_instr *I = agx_zs_emit_agx3(b, word, base);
    assert(b->shader->zs_writes_left > 0);
@@ -1274,18 +1279,40 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
    const bool sample_words =
       samples > 1 &&
       (mask == 0xff || util_bitcount(mask & BITFIELD_MASK(samples)) == 1);
+   if (base & AGX_ZS_COVERED_SAMPLE) {
+      /* Native M5 multisample fragments writing only depth or only stencil
+       * (native G17G compiler zs_depth_{2,4,8}x, zs_cdepth_4x,
+       * zs_depth_only_4x, zs_stencil_{2,4}x) issue one DEPTHF in a loop over
+       * the covered samples, rereading SR39 on each iteration: its API mask
+       * byte above that iteration's one sample. The loop and its transaction
+       * come from agx_nir_lower_m5_zs_sample_loop. */
+      if (b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+          samples < 2 || (base & 3) == 3) {
+         b->shader->unsupported_instruction = true;
+         return NULL;
+      }
+      agx_index sr39 = agx_temp(b->shader, AGX_SIZE_16);
+      agx_get_sr_coverage_to(b, sr39, AGX_SR_INPUT_SAMPLE_MASK);
+      agx_index covered = agx_and(b, sr39, agx_src_index(&instr->src[0]));
+      agx_index api = agx_and(b, sr39, agx_immediate(0xff00));
+      /* agx_nir_lower_m5_zs_sample_loop clamps the depth before the loop. */
+      return agx_emit_zs_word_agx3(b, instr, z, s, base & 7,
+                                  agx_or(b, api, covered),
+                                  write_z ? z : agx_null(), true);
+   }
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        samples > 1 && write_z && write_s && !dynamic_mask &&
        (mask & BITFIELD_MASK(samples)) == BITFIELD_MASK(samples)) {
       /* Native M5 whole-pixel depth and stencil (native G17G compiler
-       * zs_depth_stencil_{2,4}x) is one DEPTHF naming every covered sample. */
+       * zs_depth_stencil_{2,4}x) is one DEPTHF naming every covered sample,
+       * where depth or stencil alone loops over them. */
       agx_index sr39 = agx_temp(b->shader, AGX_SIZE_16);
       agx_get_sr_coverage_to(b, sr39, AGX_SR_INPUT_SAMPLE_MASK);
       agx_index covered =
          agx_and(b, sr39, agx_immediate(BITFIELD_MASK(samples)));
       agx_index api = agx_and(b, sr39, agx_immediate(0xff00));
       return agx_emit_zs_word_agx3(b, instr, z, s, base,
-                                  agx_or(b, api, covered), agx_null());
+                                  agx_or(b, api, covered), agx_null(), false);
    }
    if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        samples > 1) {
@@ -1315,7 +1342,7 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
             covered = agx_zero();
          agx_index api = agx_and(b, sr39, agx_immediate(0xff00));
          last = agx_emit_zs_word_agx3(b, instr, z, s, base,
-                                     agx_or(b, api, covered), agx_null());
+                                     agx_or(b, api, covered), agx_null(), false);
       }
       return last;
    }
@@ -1355,7 +1382,7 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
             b, instr, z, s, base,
             agx_iadd(b, agx_immediate(15),
                      agx_iadd(b, upper, covered, 4), 4),
-            agx_null());
+            agx_null(), false);
       }
       return last;
    }
@@ -1370,7 +1397,8 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
       agx_index coverage = b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C
          ? agx_iadd(b, sr2, agx_iadd(b, agx_zero(), sr2, 4), 4)
          : agx_iadd(b, agx_immediate(15), agx_iadd(b, sr2, sr2, 4), 4);
-      return agx_emit_zs_word_agx3(b, instr, z, s, base, coverage, agx_null());
+      return agx_emit_zs_word_agx3(b, instr, z, s, base, coverage, agx_null(),
+                                   false);
    } else if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
       /* Apple's 2x/4x fragments writing [[depth(any)]] or [[stencil]] per
        * [[sample_id]] write one DEPTHF per sample, each word built from SR39:
@@ -1400,7 +1428,7 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
             b, instr, z, s, base,
             agx_iadd(b, agx_immediate(15),
                      agx_iadd(b, upper, covered, 4), 4),
-            agx_null());
+            agx_null(), false);
       }
       return last;
    }
@@ -2894,6 +2922,15 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_store_zs_agx:
       assert(stage == MESA_SHADER_FRAGMENT);
       return agx_emit_store_zs(b, instr);
+
+   case nir_intrinsic_zs_transaction_agx:
+      assert(stage == MESA_SHADER_FRAGMENT);
+      if (nir_intrinsic_flags(instr) == 0) {
+         b->shader->out->writes_sample_mask = true;
+         agx_wait_pixel_mask(b, 0x1);
+         return NULL;
+      }
+      return agx_signal_pix(b, 0x1);
 
    case nir_intrinsic_store_local_pixel_agx:
       return agx_emit_local_store_pixel(b, instr);
@@ -9948,7 +9985,9 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
             ctx->zs_writes_left +=
                instr->type == nir_instr_type_intrinsic &&
                nir_instr_as_intrinsic(instr)->intrinsic ==
-                  nir_intrinsic_store_zs_agx;
+                  nir_intrinsic_store_zs_agx &&
+               !(nir_intrinsic_base(nir_instr_as_intrinsic(instr)) &
+                 AGX_ZS_COVERED_SAMPLE);
          }
       }
    }

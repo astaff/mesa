@@ -1062,6 +1062,13 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
          NIR_PASS(_, b->shader, agx_nir_lower_sample_mask);
    }
 
+   /* M5 writes whole-pixel depth or stencil alone in one covered-sample
+    * DEPTHF loop, as native G17G does. A sample-rate epilog writes its own
+    * sample instead. */
+   if (key->m5_coverage && !key->link.sample_shading &&
+       !key->defer_monolithic_msaa && !b->shader->info.fs.uses_sample_shading)
+      NIR_PASS(_, b->shader, agx_nir_lower_m5_zs_sample_loop, key->nr_samples);
+
    if (native_spills) {
       /* The generated loop has exactly two or four iterations. G17P's MRT
        * transaction is specialized for those sample groups; do not let the
