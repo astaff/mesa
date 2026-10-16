@@ -701,6 +701,40 @@ struct m5_rq_state {
    unsigned allocation_index;
 };
 
+/* Opt-in shared-edge/vertex candidate filtering, see m5_boundary_duplicate.
+ * Off by default: it costs code and, in some shaders, occupancy. */
+static bool
+m5_rq_watertight(void)
+{
+   return debug_get_bool_option("ASAHI_M5_RQ_WATERTIGHT", false);
+}
+
+/* The candidate cursor indexes a queue of at most 15 entries (a four-bit
+ * count). With m5_rq_watertight its upper bits carry the boundary distance
+ * key; otherwise they stay zero and the cursor is used unmasked. */
+#define M5_CURSOR_INDEX 0xfu
+/* Boundary distance key: distance bits 8..31. Partners compute t from their
+ * own planes; on hardware they differ by up to one ulp in probes but by more
+ * than 31 ulps on the CTS random-height mesh, all inside one 256-ulp step. */
+#define M5_BOUNDARY_KEY_LOW 0xffu
+
+static nir_def *
+m5_cursor_index(nir_builder *b, nir_deref_instr *cursor)
+{
+   nir_def *packed = nir_load_deref(b, cursor);
+   return m5_rq_watertight() ? nir_iand_imm(b, packed, M5_CURSOR_INDEX)
+                             : packed;
+}
+
+static void
+m5_cursor_set_index(nir_builder *b, nir_deref_instr *cursor, nir_def *index)
+{
+   if (m5_rq_watertight())
+      index = nir_ior(b, index,
+         nir_iand_imm(b, nir_load_deref(b, cursor), ~M5_CURSOR_INDEX));
+   nir_store_deref(b, cursor, index, 1);
+}
+
 /* Private opt-in bounded owner recorder. 64 lanes, 8 lexical queries,
  * 64 events/query, 32 bytes/event = 1 MiB. The host reserves the device-address
  * range and supplies its address before compiling the query shader. No atomics,
@@ -740,7 +774,7 @@ m5_model_capture(nir_builder *b, struct m5_rq_state *state,
       nir_load_deref(b, owner), id, control), address,
       .align_mul = 16, .write_mask = 15);
    nir_store_global(b, nir_vec4(b, nir_channel(b, status, 0),
-      nir_channel(b, status, 1), nir_load_deref(b, cursor),
+      nir_channel(b, status, 1), m5_cursor_index(b, cursor),
       nir_ior(b, nir_iand_imm(b, nir_channel(b, nir_load_deref(b, result), 2),
          ~1u), nir_b2i32(b, nir_load_deref(b, active)))),
       nir_iadd_imm(b, address, 16), .align_mul = 16, .write_mask = 15);
@@ -965,6 +999,51 @@ agx_nir_m5_should_resume_batch(nir_builder *b, nir_def *status,
       nir_ior(b, nir_test_mask(b, status, 64), nir_test_mask(b, control, 1)));
 }
 
+/* Vulkan watertightness: a ray through an edge shared by two triangles, or
+ * through the shared vertex of a closed fan, must not report a double hit.
+ *
+ * M5's triangle test is inclusive. When its edge function is exactly zero it
+ * returns every triangle at that edge or vertex, each with a zero
+ * barycentric there, up to the hardware's barycentric rounding (~2^-24
+ * observed; diagonal edges can come back as a tiny nonzero u or v, and
+ * u + v as 1 +- an ulp). Its arithmetic is not exact:
+ * hardware probes of the closed-fan rays report both spoke neighbours for
+ * rays that exact arithmetic places strictly inside one triangle. The shader
+ * therefore cannot predict which candidates the hardware returns, and the
+ * native runtime's query.next does not filter them either.
+ *
+ * Observe instead: remember the distance of the last boundary triangle this
+ * query let through, and drop a later boundary triangle at the same distance
+ * (see M5_BOUNDARY_KEY_LOW). Both are then at the same point of the shared
+ * edge or vertex, so the ray still hits there exactly once. A drop only
+ * happens after its partner was delivered, so it never turns a hit into a
+ * miss.
+ *
+ * The key lives in the candidate cursor's spare bits: the cursor never
+ * exceeds the four-bit queue count. No memory access; it runs only for
+ * admitted triangles. It still adds about 35 instructions per proceed site
+ * and can cost occupancy, so it is opt-in (ASAHI_M5_RQ_WATERTIGHT, see
+ * m5_rq_watertight). */
+static nir_def *
+m5_boundary_duplicate(nir_builder *b, nir_def *bary, nir_def *distance,
+                      nir_def *is_aabb, nir_deref_instr *cursor)
+{
+   nir_def *u = nir_channel(b, bary, 0), *v = nir_channel(b, bary, 1);
+   nir_def *boundary = nir_iand(b, nir_inot(b, is_aabb), nir_fle_imm(b,
+      nir_fmin(b, nir_fmin(b, u, v), nir_fsub_imm(b, 1.0f, nir_fadd(b, u, v))),
+      0x1p-22f));
+   nir_def *packed = nir_load_deref(b, cursor);
+   nir_def *key = nir_iand_imm(b, distance, ~M5_BOUNDARY_KEY_LOW);
+   /* Equal or adjacent keys, |key - last| <= one key step. */
+   nir_def *same_point = nir_ule_imm(b, nir_iadd_imm(b, nir_isub(b, key,
+      nir_iand_imm(b, packed, ~M5_BOUNDARY_KEY_LOW)),
+      M5_BOUNDARY_KEY_LOW + 1), 2 * (M5_BOUNDARY_KEY_LOW + 1));
+   nir_store_deref(b, cursor, nir_bcsel(b,
+      nir_iand(b, boundary, nir_inot(b, same_point)),
+      nir_ior(b, key, nir_iand_imm(b, packed, M5_CURSOR_INDEX)), packed), 1);
+   return nir_iand(b, boundary, same_point);
+}
+
 static void
 m5_candidate_next(nir_builder *b, nir_deref_instr *active,
                   nir_deref_instr *saved_id, nir_deref_instr *cursor,
@@ -1025,7 +1104,7 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
          nir_pop_if(b, NULL);
       }
    }
-   nir_def *index = nir_load_deref(b, cursor);
+   nir_def *index = m5_cursor_index(b, cursor);
    nir_def *control = nir_load_scs_indexed_agx(b, 1, 32, driver, lane,
       .base = 1728, .component = 2);
    nir_def *count = nir_iand_imm(b, nir_ushr_imm(b, control, 21), 15);
@@ -1065,7 +1144,7 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
       nir_store_deref(b, prune_t, old.distance, 1);
       nir_pop_if(b, NULL);
       nir_store_deref(b, replay, nir_iadd_imm(b, nir_load_deref(b, replay), -1), 1);
-      nir_store_deref(b, cursor, nir_iadd_imm(b, index, 1), 1);
+      m5_cursor_set_index(b, cursor, nir_iadd_imm(b, index, 1));
       nir_push_else(b, NULL);
       nir_store_deref(b, processed, nir_iadd_imm(b, nir_load_deref(b, processed), 1), 1);
    }
@@ -1074,7 +1153,7 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
    nir_def *opaque, *is_aabb;
    m5_candidate_packet(b, driver, id, index, packet, ray_flags, &opaque,
                        &is_aabb);
-   nir_store_deref(b, cursor, nir_iadd_imm(b, index, 1), 1);
+   m5_cursor_set_index(b, cursor, nir_iadd_imm(b, index, 1));
    nir_def *distance = nir_channel(b, packet[1], 2);
    nir_def *best_t = nir_channel(b, nir_load_deref(b, result[1]), 2);
    /* A procedural candidate is always handed to the application: the
@@ -1100,6 +1179,10 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
    culled = nir_ior(b, culled, nir_bcsel(b, is_aabb,
       nir_test_mask(b, ray_flags, 0x200), nir_test_mask(b, ray_flags, 0x100)));
    nir_push_if(b, nir_iand(b, in_interval, nir_inot(b, culled)));
+   const bool watertight = m5_rq_watertight();
+   if (watertight)
+      nir_push_if(b, nir_inot(b, m5_boundary_duplicate(b,
+         nir_channels(b, packet[3], 6), distance, is_aabb, cursor)));
    /* Opaque triangles commit without application involvement; an opaque
     * AABB is still a candidate (rayQueryGetIntersectionCandidateAABBOpaqueEXT). */
    nir_push_if(b, nir_iand(b, opaque, nir_inot(b, is_aabb)));
@@ -1116,6 +1199,8 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
    nir_store_var(b, more, nir_imm_true(b), 1);
    nir_jump(b, nir_jump_break);
    nir_pop_if(b, NULL);
+   if (watertight)
+      nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    if (replay)
       nir_pop_if(b, NULL);
@@ -1151,7 +1236,7 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
          .base = 7, .format = PIPE_FORMAT_R8_UINT,
          .component = 4, .flags = 8);
    }
-   nir_store_deref(b, cursor, nir_imm_int(b, 0), 1);
+   m5_cursor_set_index(b, cursor, nir_imm_int(b, 0));
    nir_pop_if(b, NULL);
    nir_pop_loop(b, NULL);
 }
@@ -1627,7 +1712,10 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
                nir_store_deref(&b, batch_completed, nir_imm_false(&b), 1);
             if (state->capture_event)
                nir_store_var(&b, state->capture_event, nir_imm_int(&b, 0), 1);
-            nir_store_deref(&b, cursor, nir_imm_int(&b, 0), 1);
+            /* Cursor index 0; with m5_rq_watertight also a NaN boundary
+             * distance key, which matches no candidate distance. */
+            nir_store_deref(&b, cursor,
+               nir_imm_int(&b, m5_rq_watertight() ? 0x7ffffff0 : 0), 1);
             if (processed) {
                nir_store_deref(&b, processed, nir_imm_int(&b, 0), 1);
                nir_store_deref(&b, replay, nir_imm_int(&b, 0), 1);
@@ -1802,7 +1890,7 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
                   m5_defer_completion(&b) ? nir_imm_true(&b) : native_opaque_eligible, 1);
             nir_store_deref(&b, resident_id, id, 1);
             nir_store_deref(&b, started, nir_imm_true(&b), 1);
-            nir_store_deref(&b, cursor, nir_imm_int(&b, 0), 1);
+            m5_cursor_set_index(&b, cursor, nir_imm_int(&b, 0));
             nir_pop_if(&b, NULL);
             m5_candidate_next(&b, active, resident_id, cursor, result,
                               tmin, flags, candidate, initial_completion, batch_completed, state->queue_first, more, processed, replay, history, prune_t);
