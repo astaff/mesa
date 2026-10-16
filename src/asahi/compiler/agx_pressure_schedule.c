@@ -1299,9 +1299,15 @@ agx_ilp_schedule(agx_context *ctx)
       }
    }
 
+   /* M5 fragments: the same occupancy-capped growth as M5 compute where it
+    * exceeds the G17P fragment slack below. */
+   const bool m5_fragment = m5 && !ctx->is_preamble &&
+      ctx->stage == MESA_SHADER_FRAGMENT &&
+      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
+
    uint8_t *size16 = NULL;
    signed m5_occupancy_cap = 0;
-   if ((m5_samples && !m5_full) || m5_copy) {
+   if ((m5_samples && !m5_full) || m5_copy || m5_fragment) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
          ralloc_free(memctx);
@@ -1383,8 +1389,13 @@ agx_ilp_schedule(agx_context *ctx)
           * Apple's fragment programs issue independent samples back to back
           * and consume the results afterwards: move each sample and what it
           * depends on up, and keep the pressure order for everything else. */
+         signed slack = AGX_ILP_FS_SAMPLE_SLACK;
+         if (m5_fragment) {
+            const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+            slack = MAX2(slack, m5_occupancy_cap - peak);
+         }
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                            16 * alu_latency, AGX_ILP_FS_SAMPLE_SLACK, 0, false,
+                            16 * alu_latency, slack, 0, false,
                             true, AGX_ILP_FS_SAMPLE_HALVES,
                             AGX_ILP_FS_HOIST_SAMPLES, false, &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
