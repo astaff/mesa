@@ -6,6 +6,7 @@
 #include <string>
 #include <gtest/gtest.h>
 #include "agx3_binder.h"
+#include "agx3_alu_core.h"
 #include "agx3_cf_core.h"
 #include "agx3_uniform_alu.h"
 #include "agx3_stage_core.h"
@@ -13,6 +14,44 @@
 #include "agx3_tex_core.h"
 #include "agx_test.h"
 #include "util/u_debug.h"
+
+TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 95;
+   const unsigned destinations[] = {8, 0, 16, 24, 32};
+   for (unsigned i = 0; i < 5; ++i) {
+      agx_index coords = agx_register(64 + 6 * i, AGX_SIZE_32);
+      coords.channels_m1 = 2;
+      agx_index dest = agx_register(destinations[i], AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_texture_load_to(b, dest, coords, agx_immediate(0), agx_immediate(0),
+                         agx_immediate(i), agx_immediate(0), agx_null(),
+                         AGX_DIM_2D_MS, AGX_LOD_MODE_AUTO_LOD, 15, false, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
+   for (unsigned carrier : {0u, 88u}) {
+      uint8_t expected[AGX3_ALU_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_alu_band_identity_wait(AGX_ISA_ENCODING_AGX3C,
+                                            carrier, 1, expected, &length));
+      unsigned matches = 0;
+      for (unsigned i = 0; i + length <= binary.size; ++i)
+         matches += std::memcmp(bytes + i, expected, length) == 0;
+      EXPECT_EQ(matches, carrier == 88 ? 1u : 0u);
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
 
 TEST(AGX3UniformALU, VertexTextureUniformQualification)
 {

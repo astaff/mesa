@@ -1358,6 +1358,10 @@ agx3_retire_slots_noop(struct util_dynarray *emission,
                        enum agx_isa_encoding enc, uint16_t mask);
 
 static bool
+agx3_retire_wait_on(struct util_dynarray *emission, enum agx_isa_encoding enc,
+                    agx_index reg, uint16_t mask);
+
+static bool
 agx3_retire_result_wait(struct util_dynarray *emission,
                         enum agx_isa_encoding enc, const agx_instr *I,
                         uint16_t mask);
@@ -1565,8 +1569,11 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
          return false;
       staging_coord = group->coord;
       /* Other sources and destination hazards still belong to this fetch;
-       * only the already-completed coordinate publication is shared. */
-      if (wait_mask && !agx3_retire_slots_noop(emission, enc, wait_mask))
+       * only the already-completed coordinate publication is shared. The
+       * coordinates are ready once this fetch's wait retires, so they carry
+       * it instead of r0, whose producer may be outside the mask. */
+      if (wait_mask && !agx3_retire_wait_on(emission, enc, I->src[0],
+                                            wait_mask))
          return false;
       wait_mask = 0;
    } else if (stage_coordinates && banks) {
@@ -1592,7 +1599,20 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       else
          agx3_staging_forget(banks, bank_retire);
    }
-   if (bank_retire && !agx3_retire_slots_noop(emission, enc, bank_retire))
+   /* The r0 carrier reads and rewrites r0, so it is sound only while r0 is
+    * ready or its producer is in the mask. When M5 multisample reads fill
+    * all four operand banks, the next one retires the first bank's read,
+    * and r0 may be the destination of a later read still in flight: in the
+    * stencil resolve of dEQP-VK.renderpasses.renderpass2.
+    * depth_stencil_resolve.*.stencil_min, five texel fetches were in
+    * flight, the second writing r0..r3, and the carrier waited for the
+    * first alone. Carry the retirement on this fetch's coordinates with
+    * the fetch's own wait, which covers every pending write of them; the
+    * staging COPYs right after it wait for the same producers. */
+   if (bank_retire &&
+       !(m5 ? agx3_retire_wait_on(emission, enc, I->src[0],
+                                  bank_retire | wait_mask)
+            : agx3_retire_slots_noop(emission, enc, bank_retire)))
       return false;
    if (staged_end)
       *staged_end = banked_read ? staging_coord + bank_span : bank_span;
