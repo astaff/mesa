@@ -11469,11 +11469,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             /* A G17P tessellation-control program is a compute dispatch
              * (hk_launch_tess(); hk_shader.c gives it the compute
              * texture/sampler heaps), so SR34/SR36 read the same subgroup
-             * state as in compute. */
+             * state as in compute. So is the main geometry kernel
+             * (hk_launch_gs_prerast()), which runs one GS invocation per
+             * thread. */
             const bool subgroup_stage =
                ctx->stage == MESA_SHADER_COMPUTE ||
                ctx->stage == MESA_SHADER_VERTEX ||
                ctx->stage == MESA_SHADER_TESS_CTRL ||
+               ctx->stage == MESA_SHADER_GEOMETRY ||
                ctx->stage == MESA_SHADER_FRAGMENT ||
                (enc == AGX_ISA_ENCODING_AGX3C &&
                 ctx->stage == MESA_SHADER_MESH);
