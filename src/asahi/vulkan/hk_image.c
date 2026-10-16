@@ -97,8 +97,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
       return 0;
 
    enum pipe_format padded = hk_padded_image_format(p_format);
-   if ((agx_native_graphics(&pdev->dev) ||
-        (agx_chip_g17_m5(pdev->dev.chip) && util_format_is_srgb(p_format))) &&
+   if ((agx_native_graphics(&pdev->dev) || agx_chip_g17_m5(pdev->dev.chip)) &&
        padded != p_format) {
       /* Linear and external modifier layouts must retain the API's packed
        * texel stride. This path is restricted to driver-owned optimal images. */
