@@ -292,6 +292,10 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
     * require the compiler's proof that no relative branch spans the bytes. */
    struct agx_shader_part *parts[] = {prolog, main, epilog};
    bool drop_entry[ARRAY_SIZE(parts)] = {false};
+   /* A later entry that a relative branch spans (the empty-EXEC skip over a
+    * testing coverage update can) is overwritten with NOPs instead: the
+    * part keeps its size, so every branch offset stays valid. */
+   bool nop_entry[ARRAY_SIZE(parts)] = {false};
    bool entry_seen = false;
    if ((agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip)) &&
        fragment && !nr_samples_shaded && !colour_fused) {
@@ -302,18 +306,17 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
 
          const uint32_t off = part->info.agx3_colour_link.entry_offset;
          if (entry_seen) {
-            if (off != 0 && !part->info.agx3_colour_link.entry_unspanned) {
-               fprintf(stderr, "agx_fast_link: part %u entry offset %u spans control flow\n", i, off);
-               return false;
-            }
-            drop_entry[i] = true;
+            if (off != 0 && !part->info.agx3_colour_link.entry_unspanned)
+               nop_entry[i] = true;
+            else
+               drop_entry[i] = true;
          } else {
             entry_seen = true;
          }
       }
 
       for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
-         if (!drop_entry[i])
+         if (!drop_entry[i] && !nop_entry[i])
             continue;
          struct agx_shader_part *part = parts[i];
          const uint32_t off = part->info.agx3_colour_link.entry_offset;
@@ -485,6 +488,14 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
          sz -= AGX3_PIXEL_MAX_LENGTH;
       } else {
          memcpy(linked_map + offset, part_code, sz);
+         if (nop_entry[i]) {
+            uint8_t *gate = linked_map + offset +
+                            part->info.agx3_colour_link.entry_offset;
+            for (unsigned h = 0; h < AGX3_PIXEL_MAX_LENGTH; h += 2) {
+               gate[h] = 0x06;
+               gate[h + 1] = 0x00;
+            }
+         }
       }
       if (i == 2 && main && main->info.agx3_colour_link.rt_query_write_acquired) {
          const struct agx3_colour_link_info *link = &part->info.agx3_colour_link;
