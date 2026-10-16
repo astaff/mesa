@@ -632,10 +632,24 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
             }
          }
       }
+      /* The payload-entry barrier stays outside the API body mask: native
+       * mesh main functions pass it with every lane before the thread-index
+       * branch (lane-mesh nwit mpay, nwit2 mtpg). */
+      bool entry_barrier = false;
+      nir_foreach_instr_safe(in, nir_start_block(entry)) {
+         if (in->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(in)->intrinsic ==
+                nir_intrinsic_mesh_payload_entry_barrier_agx) {
+            nir_instr_remove(in);
+            entry_barrier = true;
+         }
+      }
       nir_cf_list body;
       nir_cf_extract(&body,nir_before_cf_list(&entry->body),
                             nir_after_cf_list(&entry->body));
       nir_builder b=nir_builder_at(nir_before_impl(entry));
+      if (entry_barrier)
+         nir_mesh_payload_entry_barrier_agx(&b);
       nir_if *active=nir_push_if(&b,nir_ult_imm(&b,
                                   nir_load_local_invocation_index(&b),threads));
       b.cursor=nir_cf_reinsert(&body,b.cursor);
