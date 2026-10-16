@@ -11611,7 +11611,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * texture/sampler heaps), so SR34/SR36 read the same subgroup
              * state as in compute. So is the main geometry kernel
              * (hk_launch_gs_prerast()), which runs one GS invocation per
-             * thread. */
+             * thread. M5 object (task) and mesh programs read SR34 the same
+             * way: a native G17G first-thread election in an object
+             * shader reads SR34 into a half register. */
             const bool subgroup_stage =
                ctx->stage == MESA_SHADER_COMPUTE ||
                ctx->stage == MESA_SHADER_VERTEX ||
@@ -11619,7 +11621,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ctx->stage == MESA_SHADER_GEOMETRY ||
                ctx->stage == MESA_SHADER_FRAGMENT ||
                (enc == AGX_ISA_ENCODING_AGX3C &&
-                ctx->stage == MESA_SHADER_MESH);
+                (ctx->stage == MESA_SHADER_MESH ||
+                 ctx->stage == MESA_SHADER_TASK));
             const bool active_index =
                I->sr == AGX_SR_ACTIVE_THREAD_INDEX_IN_SUBGROUP &&
                subgroup_stage;
