@@ -2882,6 +2882,10 @@ hk_compile_ray_tracing_stages(
    return VK_SUCCESS;
 }
 
+/* Lowest address a capture/replay handle pointer may hold: the smallest page
+ * size, below which no process memory can be mapped. */
+#define HK_RT_MIN_REPLAY_HANDLE_ADDRESS 4096
+
 static VkResult
 hk_init_ray_tracing_groups(
    struct hk_device *dev, struct hk_ray_tracing_pipeline *pipeline,
@@ -2922,9 +2926,29 @@ hk_init_ray_tracing_groups(
       if ((vk_rt_pipeline_create_flags(create_info) &
            VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR) &&
           group_info->pShaderGroupCaptureReplayHandle) {
+         /* A replay handle points at the 4-byte value that
+          * vkGetRayTracingCaptureReplayShaderGroupHandlesKHR returned. No
+          * application memory lives in the zero page; a pointer there is a
+          * tool's offset from a NULL base (gfxreconstruct replays a 0-byte
+          * captured handle set as NULL + 4 * group). Report that the handle
+          * cannot be reused instead of faulting on it. */
+         if ((uintptr_t)group_info->pShaderGroupCaptureReplayHandle <
+             HK_RT_MIN_REPLAY_HANDLE_ADDRESS) {
+            return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                             "ray tracing group %u: capture/replay handle "
+                             "pointer %p is in the zero page",
+                             i, group_info->pShaderGroupCaptureReplayHandle);
+         }
          uint32_t replay;
          memcpy(&replay, group_info->pShaderGroupCaptureReplayHandle,
                 sizeof(replay));
+         /* Handles start at 1 (p_atomic_inc_return below), so 0 was never
+          * returned by vkGetRayTracingCaptureReplayShaderGroupHandlesKHR. */
+         if (!replay) {
+            return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                             "ray tracing group %u: capture/replay handle 0 "
+                             "was never issued", i);
+         }
          pipeline->groups[i].handle.index = replay;
          uint32_t current = p_atomic_read(&dev->rt_group_handle_alloc);
          while (current < replay) {
