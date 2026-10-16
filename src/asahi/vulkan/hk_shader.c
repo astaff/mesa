@@ -5742,7 +5742,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * program instead. The count kernel keeps the API stores, so its query
        * is removed only if it is dead there too. */
       if (dev->m5_native_rq) {
-         NIR_PASS(_, nir, agx_nir_m5_remove_dead_ray_queries);
+         bool removed = false;
+         NIR_PASS(removed, nir, agx_nir_m5_remove_dead_ray_queries);
+         /* The query kept alive the API atomic whose result selected it,
+          * e.g. atomicCompSwap(flag, 0, 1) == 0 guarding a query and an
+          * atomicAdd. The atomicAdd had no uses and was stripped, but the
+          * swap stayed in the main kernel and claimed the flag, so the
+          * raster program's copy of the invocation found it taken and
+          * skipped the add. Strip what the removed query exposes. */
+         if (removed)
+            NIR_PASS(_, nir, poly_nir_strip_gs_main_atomics);
          if (count)
             NIR_PASS(_, count, agx_nir_m5_remove_dead_ray_queries);
       }

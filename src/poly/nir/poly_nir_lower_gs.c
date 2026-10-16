@@ -652,6 +652,31 @@ strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
    }
 }
 
+static bool
+poly_nir_strip_gs_main_atomics_options(nir_shader *gs,
+                                       bool eliminate_local_ray_queries)
+{
+   bool any = false, progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
+               strip_side_effect_from_main, nir_metadata_control_flow,
+               (void *)false);
+
+      NIR_PASS(progress, gs, nir_opt_dce);
+      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
+               eliminate_local_ray_queries);
+      any |= progress;
+   } while (progress);
+   return any;
+}
+
+bool
+poly_nir_strip_gs_main_atomics(nir_shader *gs)
+{
+   return poly_nir_strip_gs_main_atomics_options(gs, false);
+}
+
 /*
  * The stream # is encoded into the lower bits of an index. The stream
  * multiplier is the factor to multiply vertex IDs before adding the stream #.
@@ -1393,16 +1418,7 @@ poly_nir_lower_gs_with_options(nir_shader *gs, nir_shader **gs_count,
    } while (progress);
 
    /* Strip remaining atomics, but not stores - since those are from us */
-   do {
-      progress = false;
-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
-               strip_side_effect_from_main, nir_metadata_control_flow,
-               (void *)false);
-
-      NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
-               eliminate_local_ray_queries);
-   } while (progress);
+   poly_nir_strip_gs_main_atomics_options(gs, eliminate_local_ray_queries);
 
    /* All those variables we created should've gone away by now */
    NIR_PASS(_, gs, nir_remove_dead_variables, nir_var_function_temp, NULL);

@@ -59,6 +59,12 @@ bool poly_nir_lower_gs_with_options(struct nir_shader *gs,
                                     struct nir_shader **pre_gs,
                                     struct poly_gs_info *info,
                                     bool eliminate_local_ray_queries);
+/* Strip the API atomics whose results are unused from the main geometry
+ * kernel of poly_nir_lower_gs, with the cleanup that exposes more of them.
+ * poly_nir_lower_gs ends with this; a driver that removes further dead work
+ * from the main kernel afterwards runs it again. The raster shader keeps the
+ * API side effects. */
+bool poly_nir_strip_gs_main_atomics(struct nir_shader *gs);
 
 bool poly_nir_lower_tcs(struct nir_shader *tcs,
                         bool can_ignore_shader_out_barriers);
