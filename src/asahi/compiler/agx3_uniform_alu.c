@@ -22,6 +22,8 @@ uniform_float_encode(enum agx_isa_encoding encoding,
     *   ADD R+U and U+R, the uniform optionally negated;
     *   FMA R*U+R, R*U+U and U*R+U, and R*U+imm, the uniform multiplicand
     *   optionally negated and a register multiplicand negated in U*R+U;
+    *   FMA R*U-R with plain multiplicands (a native compiler probe of
+    *   fma(x, u, -y): 0993060511a00202);
     *   FMA R*R+U with nothing negated (the agx3-diff-corpus fragments);
     * and for a uniform result in a constant program:
     *   FMA R*R+R and MUL imm*R.
@@ -85,7 +87,9 @@ uniform_float_encode(enum agx_isa_encoding encoding,
                return false;
             switch (src[2].kind) {
             case AGX3_FLOAT_REGISTER:
-               if (src[2].neg)
+               /* A negated register addend is witnessed beside a plain
+                * register and a plain uniform multiplicand (R*U-R). */
+               if (src[2].neg && (src[0].neg || src[1].neg))
                   return false;
                break;
             case AGX3_FLOAT_UNIFORM:

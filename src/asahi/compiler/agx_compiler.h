@@ -1169,6 +1169,12 @@ agx_builder_insert(agx_cursor *cursor, agx_instr *I)
 bool agx3_tex_uniform_pair_unwitnessed(const agx_context *ctx,
                                        const agx_instr *I, agx_index texture,
                                        agx_index sampler);
+/* Whether replacing source s of an M5 main-program FADD/FMUL/FFMA with
+ * `uniform` gives a native uniform-operand form (agx3_uniform_float_encode). */
+bool agx3_m5_float_accepts_uniform(const agx_context *ctx, const agx_instr *I,
+                                   unsigned s, unsigned uniform,
+                                   enum agx_size size);
+
 bool agx_instr_accepts_uniform(enum agx_isa_encoding encoding,
                                enum agx_opcode op, unsigned src_index,
                                unsigned value, enum agx_size size);
@@ -1199,6 +1205,7 @@ bool agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I);
 bool agx_has_uniform_store(const agx_context *ctx);
 void agx_opt_compact_constants(agx_context *ctx);
 void agx_opt_promote_constants(agx_context *ctx);
+void agx_opt_promote_m5_float_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);

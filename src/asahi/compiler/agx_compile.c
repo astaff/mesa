@@ -10192,6 +10192,13 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
 
    AGX_PASS(ctx, agx_lower_uniform_sources);
 
+   /* Source legalization materializes the M5 float immediates no native form
+    * reads in place; read them from constant uniforms where one does. */
+   if (key->promote_constants && !key->secondary &&
+       !(agx_compiler_debug & AGX_DBG_NOPROMOTE) &&
+       likely(!(agx_compiler_debug & AGX_DBG_NOOPT)))
+      AGX_PASS(ctx, agx_opt_promote_m5_float_constants);
+
    /* Legalization can introduce repeated half-to-float conversions and
     * uniform-source copies after the main CSE pass. Merge them before vertex
     * register allocation, retaining the legalized operand types. The existing

@@ -429,6 +429,21 @@ m5_native_float_uniform(const agx_context *ctx, const agx_instr *I)
       0, src, I->saturate, false, 0, out, &length);
 }
 
+bool
+agx3_m5_float_accepts_uniform(const agx_context *ctx, const agx_instr *I,
+                              unsigned s, unsigned uniform,
+                              enum agx_size size)
+{
+   if (s >= I->nr_srcs || I->nr_srcs > 3 || uniform >= 512)
+      return false;
+   agx_instr candidate = *I;
+   agx_index sources[3];
+   memcpy(sources, I->src, I->nr_srcs * sizeof(*sources));
+   candidate.src = sources;
+   sources[s] = agx_replace_index(sources[s], agx_uniform(uniform, size));
+   return m5_native_float_uniform(ctx, &candidate);
+}
+
 /* Native M5 bounded-buffer code uses uniform compare/select operands.
  * Query the encoder's full32 contract before retaining any of them. */
 static bool
