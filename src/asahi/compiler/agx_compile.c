@@ -3123,24 +3123,37 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
              * publishes its kill bits directly. Mask1 and a variable mask
              * duplicate SR2 into the low two bytes and publish the live mask
              * in byte3 (metal-mask209); DEPTHF uses the same byte layout. */
-            agx_index affected = agx_and(b, target_in, agx_immediate(1));
+            /* agx_m5_discard_word() gives LIVE as the high half (bit 0
+             * at bit 8) beside a constant target naming the sample. */
+            const bool high_live =
+               nir_intrinsic_flags(instr) & BITFIELD_BIT(2);
+            const bool whole_target = nir_src_is_const(instr->src[0]) &&
+               (nir_src_as_uint(instr->src[0]) & 1);
+            agx_index affected = whole_target
+               ? agx_mov_imm(b, 16, 1)
+               : agx_and(b, target_in, agx_immediate(1));
             agx_index selected = agx_temp(b->shader, AGX_SIZE_32);
             if (no_tests) {
                agx_mov_to(b, selected, affected);
             } else {
-               agx_index live = agx_and(b, live_in, agx_immediate(1));
                agx_index sr2 = agx_temp(b->shader, AGX_SIZE_16);
                agx_get_coverage_1x_agx3_to(b, sr2);
                agx_index repeated = agx_iadd(b, sr2,
                   agx_iadd(b, agx_zero(), sr2, 4), 4);
-               agx_index high = agx_iadd(b, agx_zero(),
-                  agx_iadd(b, agx_zero(), live, 4), 4);
+               agx_index high = high_live ? live_in : agx_iadd(b, agx_zero(),
+                  agx_iadd(b, agx_zero(),
+                           agx_and(b, live_in, agx_immediate(1)), 4), 4);
                agx_index word = agx_temp(b->shader, AGX_SIZE_32);
                agx_emit_collect_to(b, word, 2, (agx_index[]){repeated, high});
-               agx_index gate = agx_temp(b->shader, AGX_SIZE_32);
-               agx_mov_to(b, gate, affected);
-               agx_icmpsel_to(b, selected, gate, agx_zero(), word,
-                              agx_zero(), AGX_ICOND_UGT);
+               if (whole_target) {
+                  /* The selector below is constant: it picks the word. */
+                  agx_mov_to(b, selected, word);
+               } else {
+                  agx_index gate = agx_temp(b->shader, AGX_SIZE_32);
+                  agx_mov_to(b, gate, affected);
+                  agx_icmpsel_to(b, selected, gate, agx_zero(), word,
+                                 agx_zero(), AGX_ICOND_UGT);
+               }
             }
             return agx_sample_mask_agx3(b, affected, selected,
                (!no_tests ? 2 : 0) | (force_early ? 1 : 0));
@@ -7859,6 +7872,7 @@ set_speculate(nir_builder *b, nir_instr *instr, UNUSED void *_)
 }
 
 static bool agx_g17p_discard_word(nir_shader *nir);
+static bool agx_m5_discard_word(nir_shader *nir);
 
 /* Drop a constant program left without instructions. */
 static void
@@ -8207,7 +8221,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * AND per fragment). */
    if (discard_word) {
       bool word = false;
-      NIR_PASS(word, nir, agx_g17p_discard_word);
+      if (m5)
+         NIR_PASS(word, nir, agx_m5_discard_word);
+      else
+         NIR_PASS(word, nir, agx_g17p_discard_word);
       if (word) {
          NIR_PASS(_, nir, nir_opt_constant_folding);
          NIR_PASS(_, nir, nir_opt_dce);
@@ -12311,6 +12328,54 @@ agx_g17p_discard_word(nir_shader *nir)
                                      nir_metadata_control_flow, NULL);
 }
 
+/* AGX_M5_DISCARD_WORD.
+ *
+ * M5 keeps a whole-pixel coverage update as one testing MOVMSK whose word is
+ * SR2 repeated in the low two bytes and the live bit in byte 3 (the
+ * sample_mask_agx case). For Minecraft's `if (color.a < 0.5) discard;` the
+ * backend received sample_mask_agx(0xff, bcsel(c, 0, 0xff)) and spent an AND,
+ * two shifting IADDs and a select per fragment on the live byte, plus an AND
+ * and a select on the constant target. Apple's native conditional discard
+ * selects byte 3's half directly (one FSEL). With a constant target naming
+ * the one sample, rebuild LIVE as its bit 0 shifted to bit 8 of the high half
+ * -- selects of constants keep one select, now of shifted constants -- and
+ * record that in FLAGS bit 2, so the backend collects it as the high half
+ * unchanged. Bit 0 is the only bit the one-sample word reads, so the update
+ * is unchanged by construction.
+ */
+static bool
+agx_m5_discard_word_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                          void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_sample_mask_agx ||
+       nir_intrinsic_flags(intr) || !nir_src_is_const(intr->src[0]) ||
+       !(nir_src_as_uint(intr->src[0]) & 1) || nir_src_is_const(intr->src[1]))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *bit0 = agx_g17p_bit0(b, nir_get_scalar(intr->src[1].ssa, 0), 0);
+   unsigned v, x, y;
+   nir_def *c;
+   /* A live mask that reduces to a constant keeps its original form; the
+    * no-tests decision reads constant sources. */
+   if (agx_g17p_bit0_const(bit0, &v))
+      return false;
+   nir_def *high = agx_g17p_bit0_const_select(bit0, &c, &x, &y)
+      ? nir_bcsel(b, c, nir_imm_intN_t(b, x << 8, 16),
+                  nir_imm_intN_t(b, y << 8, 16))
+      : nir_ishl_imm(b, bit0, 8);
+   nir_src_rewrite(&intr->src[1], high);
+   nir_intrinsic_set_flags(intr, BITFIELD_BIT(2));
+   return true;
+}
+
+static bool
+agx_m5_discard_word(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, agx_m5_discard_word_instr,
+                                     nir_metadata_control_flow, NULL);
+}
+
 unsigned
 agx_max_vertex_attribs(const struct agx_device_key *dev)
 {
@@ -12756,7 +12821,8 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    /* Only the one-sample AGX3B coverage path reads
     * bit 0 alone; sample loops and multisampled variants keep whole masks. */
    const bool discard_word =
-      is_g17p && key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      ((is_g17p && key->dev.encoding == AGX_ISA_ENCODING_AGX3B) ||
+       key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 
