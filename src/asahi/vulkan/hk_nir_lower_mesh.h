@@ -16,18 +16,18 @@ static inline enum hk_mesh_mode hk_mesh_mode(void) {
                                                : HK_MESH_MODE_OFF;
 }
 
-/* Opt-in M5 task (object) shaders. ASAHI_M5_TASK=1 advertises taskShader on
- * G17S in native-probe mesh mode. The native object->mesh record (child grid
- * and payload at the SR62/SR63 payload address) needs the kernel to bind the
- * TA mesh rendering buffer (0x1ca48) to task kicks, which it reports with
- * DRM_ASAHI_FEATURE_TASK_MESH_STORAGE. Without it only payload-free
- * task shaders are accepted. */
-static inline bool hk_m5_task_opt_in(void) {
-   const char *task=getenv("ASAHI_M5_TASK");
-   return hk_mesh_mode()==HK_MESH_MODE_NATIVE_PROBE && task && !strcmp(task,"1");
+/* M5 task (object) shaders, in native-probe mesh mode on G17S. taskShader is
+ * a required feature of VK_EXT_mesh_shader. The native object->mesh record
+ * (child grid and payload at the SR62/SR63 payload address) needs the kernel
+ * to bind the TA mesh rendering buffer (0x1ca48) to task kicks, which it
+ * reports with DRM_ASAHI_FEATURE_TASK_MESH_STORAGE; taskShader is
+ * advertised only then. Without it only payload-free task shaders are
+ * accepted. */
+static inline bool hk_m5_task_enabled(void) {
+   return hk_mesh_mode()==HK_MESH_MODE_NATIVE_PROBE;
 }
 static inline bool hk_m5_task_record(uint64_t kernel_features) {
-   return hk_m5_task_opt_in() &&
+   return hk_m5_task_enabled() &&
           (kernel_features & DRM_ASAHI_FEATURE_TASK_MESH_STORAGE);
 }
 static inline unsigned hk_m5_task_payload_limit(uint64_t kernel_features) {

@@ -11668,7 +11668,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
    if (!gfx->shaders[MESA_SHADER_MESH] ||
-       (task_api && (dev->dev.chip != AGX_CHIP_G17S || !hk_m5_task_opt_in())) ||
+       (task_api && (dev->dev.chip != AGX_CHIP_G17S || !hk_m5_task_enabled())) ||
        (dev->dev.chip == AGX_CHIP_G17P
           ? hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE
           : (dev->dev.chip != AGX_CHIP_G17S ||

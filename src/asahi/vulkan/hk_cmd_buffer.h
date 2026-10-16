@@ -253,7 +253,7 @@ struct hk_root_descriptor_table {
     * agx3b layout. */
    uint32_t ppp_multisamplectl_hi;
 
-   /* Opt-in M5 task draws whose grid, count or predicate live in GPU memory:
+   /* M5 task draws whose grid, count or predicate live in GPU memory:
     * address of the word libagx_m5_task_dispatch writes (nonzero = execute);
     * zero for every other draw. Appended after every agx3b field. */
    uint64_t mesh_task_flag;
@@ -767,7 +767,7 @@ struct hk_graphics_state {
       struct agx_ptr params;
       uint64_t grid, object_program, object_params;
       /* Direct-draw API task grid, used for the object dispatch when an
-       * opt-in task shader is bound. */
+       * task shader is bound. */
       uint32_t task_grid[3];
    } mesh;
 

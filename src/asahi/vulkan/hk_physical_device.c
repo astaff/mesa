@@ -336,7 +336,7 @@ hk_get_device_features(
       
       .taskShader = dev->chip == AGX_CHIP_G17S &&
                     supported_extensions->EXT_mesh_shader &&
-                    hk_m5_task_opt_in(),
+                    hk_m5_task_record(dev->params.features),
       .meshShader = supported_extensions->EXT_mesh_shader,
       .multiviewMeshShader = false,
       .primitiveFragmentShadingRateMeshShader = false,
