@@ -1189,7 +1189,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
    const bool m5_storage = hk_m5_storage_compression_eligible(dev, plane, info);
    bool allow_agx3 =
       m5_storage || hk_g17p_compression_eligible(dev->chip, plane, info) ||
-      hk_g17p_shared_compression_eligible(dev->chip, plane, info);
+      hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
+      hk_m5_color_compression_eligible(dev->chip, plane, info);
 
    if (allow_agx3 && !vk_format_is_depth_or_stencil(info->format) &&
        !hk_g17p_store_class_matches(dev, info->format))

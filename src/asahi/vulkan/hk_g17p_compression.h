@@ -256,3 +256,55 @@ hk_g17p_shared_compression_eligible(enum agx_chip chip, unsigned plane,
           info->arrayLayers == 1 && info->samples == VK_SAMPLE_COUNT_1_BIT &&
           info->extent.width >= 16 && info->extent.height >= 16;
 }
+
+/* M5 lossless compression of colour render targets.
+ *
+ * The Gen10 compressed PBE (write) packet and texture (read) descriptor are
+ * native-verified for GPU-tiled one-layer 2D images (byte-identical to
+ * the native M5 PBE and texture descriptor encoders), and the allocation is
+ * the measured M5 layout with its metadata (AIL_LAYOUT_POLICY_M5). Every
+ * write of such an image then goes through the PBE: end-of-tile stores,
+ * and the graphics meta paths hk_xfer_copyimage2() and the buffer uploads
+ * take for a compressed destination (the raw tiled copiers refuse one).
+ *
+ * Admitted: the G17P colour formats (1-8 byte texels, so a single-sample
+ * tilebuffer never spills a compressed target), one layer, one mip, one
+ * sample, a colour attachment, and otherwise only sampled, input-attachment
+ * and transfer usages. Shared images (external memory, WSI) stay plain.
+ */
+static inline bool
+hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
+                                 const VkImageCreateInfo *info)
+{
+   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
+      return false;
+
+   for (const void *next = info->pNext; next;) {
+      VkBaseInStructure ext;
+      memcpy(&ext, next, sizeof(ext));
+      if (ext.sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+          ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
+         return false;
+      if (ext.sType == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+         return false;
+      next = ext.pNext;
+   }
+
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+
+   return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
+          info->arrayLayers == 1 && info->mipLevels == 1 &&
+          info->samples == VK_SAMPLE_COUNT_1_BIT &&
+          info->tiling == VK_IMAGE_TILING_OPTIMAL &&
+          !(info->flags & ~allowed_flags) &&
+          (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+          !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
+          info->extent.height >= 16 &&
+          hk_g17p_compression_color_format(info->format);
+}
