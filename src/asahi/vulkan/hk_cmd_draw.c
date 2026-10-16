@@ -1817,6 +1817,14 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    const size_t count = mesh ? 3 : 2;
    const void *values = v2 ? (const void *)programs : (const void *)legacy;
    const size_t bytes = v2 ? count * sizeof(programs[0]) : sizeof(legacy);
+   static_assert(sizeof(cs->m5_render_resources_last) >= sizeof(programs),
+                 "the last entry fits");
+   /* Consecutive draws mostly repeat the previous entry. */
+   if (cs->m5_render_resources_last_size == bytes &&
+       !memcmp(cs->m5_render_resources_last, values, bytes))
+      return;
+   memcpy(cs->m5_render_resources_last, values, bytes);
+   cs->m5_render_resources_last_size = bytes;
    for (size_t off = 0; off + bytes <= cs->render_resources.size; off += v2 ? sizeof(programs[0]) : sizeof(legacy[0])) {
       if (!memcmp((char *)cs->render_resources.data + off, values, bytes))
          return;

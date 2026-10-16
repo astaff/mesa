@@ -940,6 +940,10 @@ struct hk_cs {
    /* Native private-memory profiles for every dispatch in this stream. */
    struct util_dynarray compute_resources;
    struct util_dynarray render_resources;
+   /* The render_resources entry the last draw matched or appended, see
+    * hk_m5_note_render_resources(). */
+   uint8_t m5_render_resources_last[3 * sizeof(struct drm_asahi_render_program_v2)];
+   size_t m5_render_resources_last_size;
    struct drm_asahi_render_program tile_resources;
 
    /* Number of successfully emitted draws whose last raster producer is
