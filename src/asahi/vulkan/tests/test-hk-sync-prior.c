@@ -9,27 +9,27 @@
 #include "hk_cmd_buffer.h"
 #include "hk_drm_prior_core.h"
 #include "hk_queue.h"
-_Static_assert(sizeof(struct drm_asahi_cmd_render) == 256, "legacy render");
-_Static_assert(sizeof(struct drm_asahi_cmd_compute) == 64,
+_Static_assert(sizeof(struct drm_asahi_cmd_render) == 320, "legacy render");
+_Static_assert(sizeof(struct drm_asahi_cmd_compute) == 128,
                "legacy Mesa compute");
-_Static_assert(sizeof(struct drm_asahi_cmd_render_with_prior) == 272,
+_Static_assert(sizeof(struct drm_asahi_cmd_render_with_prior) == 336,
                "render wire");
 _Static_assert(offsetof(struct drm_asahi_cmd_render_with_prior, prior_vdm) ==
-                  256,
+                  320,
                "render prior vdm");
 _Static_assert(offsetof(struct drm_asahi_cmd_render_with_prior, prior_cdm) ==
-                  264,
+                  328,
                "render prior cdm");
-_Static_assert(sizeof(struct drm_asahi_cmd_compute_with_prior) == 88,
+_Static_assert(sizeof(struct drm_asahi_cmd_compute_with_prior) == 200,
                "compute wire");
 _Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior, scs_layout) ==
-                  64,
+                  128,
                "kernel scs_layout gap");
 _Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior, prior_vdm) ==
-                  72,
+                  136,
                "compute prior vdm");
 _Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior, prior_cdm) ==
-                  80,
+                  144,
                "compute prior cdm");
 static unsigned tests, failures;
 static void *test_context;
