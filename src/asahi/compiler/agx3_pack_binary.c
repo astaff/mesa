@@ -5650,15 +5650,15 @@ agx3_allocate_staging(struct util_dynarray *emission,
                       enum agx_isa_encoding enc, const agx_instr *I,
                       struct agx3_staging_banks *banks,
                       uint16_t *outstanding, uint8_t slot,
-                      unsigned span, uint16_t *base)
+                      unsigned span, unsigned avoid_end, uint16_t *base)
 {
    uint16_t waits;
    /* C's packed per-lane LOD occupies bank+6 in an eight-half group.
     * Ordinary coordinates keep their native four-half alignment. */
    const unsigned alignment =
       enc == AGX_ISA_ENCODING_AGX3C && span == 8 ? 8 : 4;
-   if (!agx3_staging_plan(banks, span, alignment, AGX3_STAGING_HALFS,
-                           base, &waits))
+   if (!agx3_staging_plan_above(banks, span, alignment, AGX3_STAGING_HALFS,
+                                avoid_end, base, &waits))
       return false;
 
    if (waits) {
@@ -9888,6 +9888,23 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       bool after_loop_backedge = false;
       bool after_loop_exit_test = false;
       struct agx3_fetch_group fetch_group = {0};
+      /* An M5 fragment gradient sample stages at fixed banks from 0 (its
+       * coordinates, then the interleaved derivatives up to
+       * AGX3_TEX_GRADIENT_BANK_DDY_Y or _DDY_Z). Samples placed ahead of it
+       * in the same block take free banks above that range first, so it need
+       * not wait for them: Apple's RGSS terrain fragment puts its eight
+       * explicit-LOD samples at banks 16..79 and the gradient sample at 0. */
+      unsigned fixed_gradient_staging = 0;
+      if (enc == AGX_ISA_ENCODING_AGX3C && ctx->stage == MESA_SHADER_FRAGMENT) {
+         agx_foreach_instr_in_block(block, J) {
+            if (J->op == AGX_OPCODE_TEXTURE_SAMPLE && !agx_texture_resource(J) &&
+                J->lod_mode == AGX_LOD_MODE_LOD_GRAD) {
+               fixed_gradient_staging = MAX2(fixed_gradient_staging,
+                  (J->dim == AGX_DIM_3D ? AGX3_TEX_GRADIENT_BANK_DDY_Z
+                                        : AGX3_TEX_GRADIENT_BANK_DDY_Y) + 2);
+            }
+         }
+      }
       agx_foreach_instr_in_block(block, I) {
          block->last_offset = emission->size;
 
@@ -10904,6 +10921,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   assert(staged_sample);
                   if (!agx3_allocate_staging(emission, enc, I, &staging_banks,
                                              &outstanding, slot, sample_span,
+                                             fixed_gradient_staging,
                                              &bank_base))
                      AGX3_REFUSE(I);
                } else {
