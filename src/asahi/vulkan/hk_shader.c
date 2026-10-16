@@ -5187,11 +5187,13 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
     * num_workgroups); NIR that arrives already lowered keeps the
     * conservative answer. */
    const bool mesh_reads_draw_id =
-      nir->info.stage == MESA_SHADER_MESH &&
+      (nir->info.stage == MESA_SHADER_MESH ||
+       nir->info.stage == MESA_SHADER_TASK) &&
       (nir->info.io_lowered ||
        hk_nir_reads_intrinsic(nir, nir_intrinsic_load_draw_id));
    const bool mesh_reads_num_workgroups =
-      nir->info.stage == MESA_SHADER_MESH &&
+      (nir->info.stage == MESA_SHADER_MESH ||
+       nir->info.stage == MESA_SHADER_TASK) &&
       (nir->info.io_lowered ||
        hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups));
 
@@ -5512,7 +5514,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       layout_ok &= !m5_mesh || !varyings.lv ||
          varyings.lv_first == shader->info.uvs.group_offs[UVS_LAYER_VIEWPORT];
       if (!layout_ok ||
-          !(m5_mesh ? agx_nir_lower_m5_task_payload_probe(nir)
+          !(m5_mesh ? (hk_m5_task_opt_in()
+                          ? agx_nir_lower_m5_task_payload(nir,
+                               hk_m5_task_payload_limit())
+                          : agx_nir_lower_m5_task_payload_probe(nir))
                     : agx_nir_lower_gen1_task_payload_probe(nir)) ||
           !(m5_mesh ? agx_nir_lower_m5_mesh(nir, &varyings)
                     : agx_nir_lower_gen1_mesh(nir, &varyings))) {
@@ -5608,7 +5613,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * the native register/allocation contract is hardware qualified. */
       if (dev->dev.chip != AGX_CHIP_G17S ||
           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE ||
-          !agx_nir_lower_m5_task_probe(nir)) {
+          !(hk_m5_task_opt_in()
+               ? agx_nir_lower_m5_task(nir, hk_m5_task_payload_limit())
+               : agx_nir_lower_m5_task_probe(nir))) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
@@ -5622,6 +5629,13 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                              info->robustness, NULL, features, &obj->variants[0],
                              sw_stage, true, NULL, info->set_layout_count,
                              static_set_mask);
+      if (result == VK_SUCCESS) {
+         /* hk_draw_mesh_native publishes the API grid and draw index to the
+          * object stage's draw root only when it reads them. */
+         obj->variants[0].info.mesh.reads_draw_id = mesh_reads_draw_id;
+         obj->variants[0].info.mesh.reads_num_workgroups =
+            mesh_reads_num_workgroups;
+      }
    } else if (sw_stage == MESA_SHADER_GEOMETRY) {
       struct hk_shader *main_variant = hk_main_gs_variant(obj);
       struct hk_shader *count_variant = hk_count_gs_variant(obj);

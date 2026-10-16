@@ -2285,9 +2285,10 @@ hk_g17p_graphics_uniform_ranges(
          };
       }
 
-   } else if (s->info.stage == MESA_SHADER_MESH) {
-      /* Native TA mesh body has the same driver-root/descriptor ranges,
-       * without vertex attribute or base-instance ABI ranges. */
+   } else if (s->info.stage == MESA_SHADER_MESH ||
+              s->info.stage == MESA_SHADER_TASK) {
+      /* Native TA mesh and object bodies have the same driver-root/descriptor
+       * ranges, without vertex attribute or base-instance ABI ranges. */
    } else if ((s->info.stage == MESA_SHADER_GEOMETRY ||
                s->info.stage == MESA_SHADER_TESS_EVAL) &&
               s->b.info.stage == MESA_SHADER_VERTEX) {
@@ -2321,7 +2322,8 @@ hk_g17p_graphics_uniform_ranges(
          sources[count] = HK_G17P_RANGE_SOURCE_ROOT;
          count++;
       }
-   } else if (s->info.stage != MESA_SHADER_MESH) {
+   } else if (s->info.stage != MESA_SHADER_MESH &&
+              s->info.stage != MESA_SHADER_TASK) {
       return hk_g17p_graphics_ranges_refused(range_count, count);
    }
 
@@ -3088,7 +3090,8 @@ hk_g17p_graphics_program_desc_init(
 
 uint64_t
 hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
-                              struct hk_linked_shader *linked, bool object)
+                              struct hk_linked_shader *linked, bool object,
+                              bool task)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (!linked ||
@@ -3099,7 +3102,14 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       goto refused;
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
-   if (object) {
+   /* An API task shader is a compiled object program with the ordinary
+    * driver-root/descriptor ranges and its own threadgroup memory. */
+   const bool task_object = object && task && dev->dev.chip == AGX_CHIP_G17S &&
+                            s->info.stage == MESA_SHADER_TASK;
+   if (task_object) {
+      if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked, ranges, &count, NULL))
+         goto refused;
+   } else if (object) {
       const uint64_t grid = cmd->state.gfx.mesh.object_params ?: cmd->state.gfx.mesh.grid;
       if (!grid)
          goto refused;

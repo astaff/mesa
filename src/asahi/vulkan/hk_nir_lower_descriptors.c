@@ -617,7 +617,8 @@ lower_uvs_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
       /* Mesh programs have no vertex uniform ABI; the draw root carries
        * the draw index of each vkCmdDrawMeshTasks* draw. */
-      if (args->sw_stage == MESA_SHADER_MESH &&
+      if ((args->sw_stage == MESA_SHADER_MESH ||
+           args->sw_stage == MESA_SHADER_TASK) &&
           intrin->intrinsic == nir_intrinsic_load_draw_id) {
          unsigned offset = hk_root_descriptor_offset(mesh_draw_id);
          nir_def *val = load_root(b, 1, 32, nir_imm_int(b, offset), 4);
@@ -777,9 +778,11 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_load_num_workgroups: {
       b->cursor = nir_instr_remove(&intrin->instr);
 
-      /* A mesh shader runs under the graphics root, whose cs arm overlays
-       * the draw arm: read the draw's own grid instead. */
-      if (b->shader->info.stage == MESA_SHADER_MESH) {
+      /* Mesh and task shaders run under the graphics root, whose cs arm
+       * overlays the draw arm: read the draw's own grid instead. With a task
+       * stage this is the API task grid, which only the task stage reads. */
+      if (b->shader->info.stage == MESA_SHADER_MESH ||
+          b->shader->info.stage == MESA_SHADER_TASK) {
          unsigned offset = hk_root_descriptor_offset(mesh_grid_addr);
          nir_def *ptr = load_root(b, 1, 64, nir_imm_int(b, offset), 8);
          nir_def_rewrite_uses(&intrin->def, load_speculatable(b, 3, 32, ptr, 4));

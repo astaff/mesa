@@ -109,7 +109,8 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
       .plane_stride = stride, .planes = varyings->size,
       .bytes = ALIGN_POT(position + varyings->size * stride, 64),
       .storage_probe = getenv("ASAHI_MESH_PP_PROBE") != NULL &&
-                       !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1"),
+                       (!strcmp(getenv("ASAHI_MESH_PP_PROBE"), "1") ||
+                        !strcmp(getenv("ASAHI_MESH_PP_PROBE"), "payload")),
       .varyings = varyings,
       .unweld = unweld,
       .export_vertices = export_vertices,
@@ -212,7 +213,22 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
           * native per-primitive record base SR64/SR65 and the workgroup index
           * through the flat VAR0 planes instead of the API colour. No pointer
           * is dereferenced; the fragment dumps the raw bits as pixels. */
-         nir_def *storage=nir_load_mesh_primitive_storage_agx(b);
+         const char *pe = getenv("ASAHI_MESH_PP_PROBE");
+         const bool payload_probe = pe && !strcmp(pe, "payload");
+         nir_def *storage = payload_probe
+            ? nir_load_mesh_payload_address_agx(b)
+            : nir_load_mesh_primitive_storage_agx(b);
+         if (payload_probe) {
+            /* Bytes of SR62 (even workgroups) or SR63 (odd) as UNORM8. */
+            nir_def *odd = nir_i2b(b, nir_iand_imm(b, nir_channel(b, nir_load_workgroup_id(b), 0), 1));
+            nir_def *word = nir_bcsel(b, odd, nir_channel(b, storage, 1), nir_channel(b, storage, 0));
+            nir_def *bytes[4];
+            for (unsigned k = 0; k < 4; ++k)
+               bytes[k] = nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, word, 8 * k), 0xff)), 1.0 / 255.0);
+            storage = NULL;
+            probe = nir_vec(b, bytes, 4);
+         }
+         if (storage)
          probe=nir_vec4(b,nir_channel(b,storage,0),nir_channel(b,storage,1),
                         nir_channel(b,nir_load_workgroup_id(b),0),
                         nir_load_local_invocation_index(b));
@@ -805,7 +821,13 @@ lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
 bool
 agx_nir_lower_m5_task_payload_probe(nir_shader *s)
 {
-   if (s->info.task_payload_size>4) return false;
+   return agx_nir_lower_m5_task_payload(s, 4);
+}
+
+bool
+agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B)
+{
+   if (s->info.task_payload_size>max_payload_B) return false;
    bool reads=false;
    nir_foreach_function_impl(impl,s) {
       nir_foreach_block(block,impl) {
@@ -876,5 +898,168 @@ agx_nir_lower_m5_task_probe(nir_shader *s)
    nir_pop_if(&b,NULL);
    s->info.shared_size=64;
    nir_progress(true,b.impl,nir_metadata_none);
+   return true;
+}
+
+/* The opt-in API task (object) stage. The child grid is published with UVSW
+ * from lanes 0..2 of SIMD group 0. Payload-carrying Apple object shaders
+ * store the EmitMeshTasks grid in threadgroup memory, rendezvous and pass
+ * the object payload-exit barrier first (_agc.object.write_childcount);
+ * payload-free objects take the grid of invocation 0 from registers, like
+ * the mesh-only passthrough object. Workgroups of fewer than three
+ * invocations run on three physical lanes with the API body under its exact
+ * invocation mask. Payload accesses use the native SR62/SR63 payload
+ * address; callers bound max_payload_B to what the running kernel backs
+ * (zero refuses every payload access).
+ */
+bool
+agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B)
+{
+   const unsigned threads = s->info.workgroup_size[0] *
+                            s->info.workgroup_size[1] *
+                            s->info.workgroup_size[2];
+   if (s->info.stage != MESA_SHADER_TASK || s->info.workgroup_size_variable ||
+       threads == 0 || threads > 1024)
+      return false;
+   const unsigned physical_threads = MAX2(threads, 3);
+   unsigned launches = 0;
+   bool payload_access = false;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            switch (i->intrinsic) {
+            case nir_intrinsic_launch_mesh_workgroups:
+               launches++;
+               break;
+            case nir_intrinsic_load_task_payload:
+            case nir_intrinsic_store_task_payload:
+               if (!max_payload_B)
+                  return false;
+               payload_access = true;
+               break;
+            case nir_intrinsic_barrier:
+               /* As for padded mesh workgroups: do not change the set of
+                * invocations that participates in an execution barrier. */
+               if (physical_threads != threads &&
+                   nir_intrinsic_execution_scope(i) != SCOPE_NONE)
+                  return false;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   const unsigned grid = ALIGN_POT(s->info.shared_size, 16);
+   if (!launches || grid + 16 > 32768 ||
+       !agx_nir_lower_m5_task_payload(s, max_payload_B))
+      return false;
+   /* A payload-free object publishes the grid of invocation 0 from
+    * registers, like Apple's mesh-only passthrough object: no threadgroup
+    * memory and no rendezvous. Only payload-carrying objects need the
+    * threadgroup grid, the rendezvous and the payload-exit barrier of
+    * _agc.object.write_childcount. (The latter shape faulted once on R239
+    * with no 0x1ca48 mesh rendering buffer bound; it stays behind the
+    * payload limit.) */
+   const bool direct = !s->info.task_payload_size && !payload_access;
+   nir_function_impl *entry = nir_shader_get_entrypoint(s);
+   nir_variable *grid_var = NULL;
+   if (direct) {
+      grid_var = nir_local_variable_create(entry, glsl_uvec_type(3), "task_grid");
+      nir_foreach_block(block, entry) {
+         nir_foreach_instr_safe(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            if (i->intrinsic != nir_intrinsic_launch_mesh_workgroups)
+               continue;
+            nir_builder b = nir_builder_at(nir_before_instr(in));
+            nir_store_var(&b, grid_var, i->src[0].ssa, 7);
+            nir_instr_remove(in);
+         }
+      }
+      nir_builder b = nir_builder_at(nir_before_impl(entry));
+      nir_store_var(&b, grid_var, nir_imm_ivec3(&b, 0, 0, 0), 7);
+   } else {
+      unsigned grid_offset = grid;
+      nir_shader_intrinsics_pass(s, lower_launch, nir_metadata_none, &grid_offset);
+   }
+   if (physical_threads != threads) {
+      nir_foreach_block(block, entry) {
+         nir_foreach_instr_safe(in, block) {
+            if (in->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+            nir_builder b = nir_builder_at(nir_before_instr(in));
+            nir_def *replacement = NULL;
+            if (i->intrinsic == nir_intrinsic_load_workgroup_size) {
+               replacement = nir_imm_ivec3(&b, s->info.workgroup_size[0],
+                  s->info.workgroup_size[1], s->info.workgroup_size[2]);
+            } else if (i->intrinsic == nir_intrinsic_load_local_invocation_id ||
+                       i->intrinsic == nir_intrinsic_load_global_invocation_id) {
+               nir_def *index = nir_load_local_invocation_index(&b);
+               const unsigned x = s->info.workgroup_size[0];
+               const unsigned y = s->info.workgroup_size[1];
+               replacement = nir_vec3(&b, nir_umod_imm(&b, index, x),
+                  nir_umod_imm(&b, nir_udiv_imm(&b, index, x), y),
+                  nir_udiv_imm(&b, index, x * y));
+               if (i->intrinsic == nir_intrinsic_load_global_invocation_id) {
+                  nir_def *size = nir_imm_ivec3(&b, s->info.workgroup_size[0],
+                     s->info.workgroup_size[1], s->info.workgroup_size[2]);
+                  replacement = nir_iadd(&b,
+                     nir_imul(&b, nir_load_workgroup_id(&b), size), replacement);
+                  replacement = nir_u2uN(&b, replacement, i->def.bit_size);
+               }
+            }
+            if (replacement) {
+               nir_def_rewrite_uses(&i->def, replacement);
+               nir_instr_remove(in);
+            }
+         }
+      }
+      nir_cf_list body;
+      nir_cf_extract(&body, nir_before_cf_list(&entry->body),
+                     nir_after_cf_list(&entry->body));
+      nir_builder b = nir_builder_at(nir_before_impl(entry));
+      nir_if *active = nir_push_if(&b, nir_ult_imm(&b,
+                          nir_load_local_invocation_index(&b), threads));
+      b.cursor = nir_cf_reinsert(&body, b.cursor);
+      nir_pop_if(&b, active);
+      s->info.workgroup_size[0] = physical_threads;
+      s->info.workgroup_size[1] = s->info.workgroup_size[2] = 1;
+   }
+   nir_builder b = nir_builder_at(nir_after_cf_list(&entry->body));
+   if (direct) {
+      nir_def *value = nir_read_invocation(&b, nir_load_var(&b, grid_var),
+                                           nir_imm_int(&b, 0));
+      nir_def *lane = nir_load_subgroup_invocation(&b);
+      nir_push_if(&b, nir_iand(&b, nir_ieq_imm(&b, nir_load_subgroup_id(&b), 0),
+                               nir_ult_imm(&b, lane, 3)));
+      nir_def *count = nir_bcsel(&b, nir_ieq_imm(&b, lane, 0),
+         nir_channel(&b, value, 0),
+         nir_bcsel(&b, nir_ieq_imm(&b, lane, 1), nir_channel(&b, value, 1),
+                   nir_channel(&b, value, 2)));
+      nir_store_object_childcount_agx(&b, count);
+      nir_pop_if(&b, NULL);
+      nir_progress(true, entry, nir_metadata_none);
+      NIR_PASS(_, s, nir_lower_vars_to_ssa);
+      return true;
+   }
+   nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = nir_var_mem_shared);
+   nir_object_payload_exit_barrier_agx(&b);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_push_if(&b, nir_ult_imm(&b, lane, 3));
+   nir_def *value = nir_load_shared(&b, 1, 32,
+      nir_iadd_imm(&b, nir_imul_imm(&b, lane, 4), grid), .align_mul = 4);
+   nir_store_object_childcount_agx(&b, value);
+   nir_pop_if(&b, NULL);
+   s->info.shared_size = ALIGN_POT(grid + 16, 64);
+   nir_progress(true, entry, nir_metadata_none);
    return true;
 }

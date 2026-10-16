@@ -760,6 +760,9 @@ struct hk_graphics_state {
    struct {
       struct agx_ptr params;
       uint64_t grid, object_program, object_params;
+      /* Direct-draw API task grid, used for the object dispatch when an
+       * opt-in task shader is bound. */
+      uint32_t task_grid[3];
    } mesh;
 
    /* Needed by vk_command_buffer::dynamic_graphics_state */
@@ -2145,7 +2148,8 @@ uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
 
 uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       struct hk_shader *s,
-                                      struct hk_linked_shader *linked, bool object);
+                                      struct hk_linked_shader *linked, bool object,
+                                      bool task);
 uint64_t hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked);
 

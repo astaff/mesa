@@ -334,7 +334,9 @@ hk_get_device_features(
       .tessellationShader = true,
 
       
-      .taskShader = false,
+      .taskShader = dev->chip == AGX_CHIP_G17S &&
+                    supported_extensions->EXT_mesh_shader &&
+                    hk_m5_task_opt_in(),
       .meshShader = supported_extensions->EXT_mesh_shader,
       .multiviewMeshShader = false,
       .primitiveFragmentShadingRateMeshShader = false,
