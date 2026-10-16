@@ -3170,24 +3170,48 @@ static uint64_t
 hk_m5_upload_graphics_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                               struct hk_linked_shader *linked)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const unsigned stage = s->info.stage == MESA_SHADER_FRAGMENT ? 1 : 0;
+   struct hk_g17p_graphics_ioto_cache_entry *cached =
+      &cmd->state.gfx.g17p_ioto[stage];
+
+   /* As on HAL200: a launch recorded for the same program and draw state
+    * already passed admission, and replays the ranges the collector below
+    * would build, so the same loader publishes the same program. */
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct hk_shader *hw_vs =
+      gfx->shaders[MESA_SHADER_VERTEX] ? hk_bound_hw_vs(gfx) : NULL;
+   const uint8_t flags = hk_g17p_launch_flags(cmd, s);
+   struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, stage, linked);
+   if (!s->info.agx3_gen1_fragment_rq &&
+       hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
+      const uint64_t published =
+         hk_g17p_launch_replay(cmd, launch, linked, cached);
+      if (published)
+         return published;
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return 0;
+   }
+
    if (!hk_g17p_basic_graphics_program_supported(cmd, s, linked))
       goto refused;
 
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint8_t sources[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
-   if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked, ranges, &count, NULL))
+   if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked, ranges, &count,
+                                        sources))
       goto refused;
 
    /* Linked shader-owned loader templates use the same range shape and
     * relocation plan as HAL200. Each recording publishes immutable bytes
     * with its own addresses; executable lifetime follows the linked shader. */
-   const uint64_t program = hk_g17p_publish_gfx_loader(
-      cmd, s, linked,
-      &cmd->state.gfx.g17p_ioto[s->info.stage == MESA_SHADER_FRAGMENT],
-      ranges, count);
+   const uint64_t program =
+      hk_g17p_publish_gfx_loader(cmd, s, linked, cached, ranges, count);
    if (!program && !vk_command_buffer_has_error(&cmd->vk))
       goto refused;
+   if (program)
+      hk_g17p_launch_record(cmd, launch, s, linked, cached->loader, flags,
+                            hw_vs, ranges, count, sources);
    return program;
 
 refused:
