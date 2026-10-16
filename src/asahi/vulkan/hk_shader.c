@@ -5560,9 +5560,11 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                           nir->info.perspective_varyings),
                         nir->info.linear_varyings);
          for (unsigned slot = 0; slot < 64; ++slot) {
-            if (varyings.components[slot])
+            if (varyings.components[slot] && slot != VARYING_SLOT_PSIZ)
                varyings.first[slot] = linked.slots[slot];
          }
+         if (varyings.components[VARYING_SLOT_PSIZ])
+            varyings.first[VARYING_SLOT_PSIZ] = shader->info.uvs.group_offs[UVS_PSIZ];
          if (varyings.lv)
             varyings.lv_first = shader->info.uvs.group_offs[UVS_LAYER_VIEWPORT];
          varyings.dynamic = false;

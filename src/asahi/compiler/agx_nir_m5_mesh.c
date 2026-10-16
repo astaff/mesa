@@ -120,8 +120,8 @@ struct mesh_layout {
 
    /* Per-primitive outputs (see agx_m5_mesh_unwelds): the API body writes
     * vertex planes to vertex_source and per-primitive planes to
-    * primitive_source; the export region at position then holds three
-    * private vertices per primitive. */
+    * primitive_source; the export region at position then holds one
+    * private vertex per primitive corner (prim_vertices). */
    bool unweld;
    unsigned export_vertices;
    unsigned vertex_source, vertex_stride;
@@ -170,7 +170,8 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
    const unsigned position = count + 16;
    const bool unweld = agx_m5_mesh_unwelds(varyings);
    const unsigned export_vertices = unweld
-      ? 3 * s->info.mesh.max_primitives_out : s->info.mesh.max_vertices_out;
+      ? prim_vertices(s) * s->info.mesh.max_primitives_out
+      : s->info.mesh.max_vertices_out;
    const unsigned stride = ALIGN_POT(export_vertices, 4) * 4;
    struct mesh_layout layout = {
       .output_base = base, .primitive_count = base + count,
@@ -327,7 +328,7 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
       b->cursor=nir_before_instr(&i->instr);
       const unsigned slot = vertex_output_slot(i);
       if (slot != VARYING_SLOT_PRIMITIVE_INDICES) {
-         /* A primitive word: the export below replicates it to the three
+         /* A primitive word: the export below replicates it to the
           * private vertices of its primitive. */
          nir_def *element = nir_imul_imm(b, i->src[1].ssa, 4);
          nir_def *value = widen_output(b, i, i->src[0].ssa);
@@ -466,14 +467,18 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
     * that follow are layer/viewport, then clip distances. */
    unsigned next = 4, slots = 0;
    for (unsigned slot = 0; slot < 64; ++slot) {
-      if (!varyings->components[slot])
+      if (!varyings->components[slot] || slot == VARYING_SLOT_PSIZ)
          continue;
-      /* Point size is the native plane after the position (cwit-meshtopo
-       * mpt): the size-only point interface keeps it at plane 4. */
       varyings->first[slot] = next;
       next += varyings->components[slot];
       slots++;
    }
+   /* Point size follows the user words, in the UVS group order of
+    * agx_nir_lower_uvs that programs the raster state; with no user words
+    * it is the plane after the position, as in native size-only points
+    * (cwit-meshtopo mpt). */
+   if (varyings->components[VARYING_SLOT_PSIZ])
+      varyings->first[VARYING_SLOT_PSIZ] = next++;
    if (varyings->lv)
       varyings->lv_first = next++;
    varyings->clip_distance_first = next;
@@ -559,12 +564,12 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       s->info.mesh.max_vertices_out==0 || s->info.mesh.max_vertices_out>256 ||
       s->info.mesh.max_primitives_out==0 || s->info.mesh.max_primitives_out>256 ||
       prim_vertices(s)==0 ||
-      /* Private per-primitive vertices are triangle-only. */
-      (unweld && s->info.mesh.primitive_type!=MESA_PRIM_TRIANGLES) ||
-      /* Native points carry their size in the plane after the position. */
+      /* Points carry their size in the word after the user words. */
       (s->info.mesh.primitive_type==MESA_PRIM_POINTS &&
        (!varyings->components[VARYING_SLOT_PSIZ] ||
-        varyings->first[VARYING_SLOT_PSIZ]!=4 || varyings->size!=5)) ||
+        varyings->first[VARYING_SLOT_PSIZ] + 1 !=
+           varyings->size - varyings->clip_distance_count -
+           (varyings->lv ? 1 : 0))) ||
       /* Interstage compaction can leave per_primitive_outputs stale; with
        * per-primitive words every store is checked against them below. */
       (primitive_outputs&~(unweld ? ~UINT64_C(0) : primitive_slots)) ||
@@ -572,9 +577,9 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
                                   (primitive_slots & (VARYING_BIT_LAYER|VARYING_BIT_VIEWPORT)) |
                                   (s->info.mesh.primitive_type==MESA_PRIM_POINTS ?
                                    VARYING_BIT_PSIZ : 0)) ||
-      /* Every primitive gets three private vertices within the native
+      /* Every primitive gets private vertices within the native
        * 256-vertex output limit. */
-      (unweld && 3 * s->info.mesh.max_primitives_out > 256) ||
+      (unweld && prim_vertices(s) * s->info.mesh.max_primitives_out > 256) ||
       varyings->clip_distance_count != s->info.clip_distance_array_size ||
       !varyings_valid(varyings))
       return false;
@@ -714,7 +719,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    const unsigned max_primitives = s->info.mesh.max_primitives_out;
    if (layout.unweld) {
       /* Per-primitive words have no native vertex form here. Give every
-       * primitive three private vertices: copy each referenced vertex's
+       * primitive private vertices: copy each referenced vertex's
        * words, replicate the primitive's words (flat on every corner, so
        * any provoking vertex selects them), and rewrite the index list to
        * the identity. Primitive order, winding and the interpolated values
@@ -730,16 +735,17 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       nir_def *primitives = nir_umin(&b, nir_u2u32(&b, nir_load_shared(&b, 1, 16,
          nir_imm_int(&b, layout.primitive_count), .align_mul = 2)),
          nir_imm_int(&b, max_primitives));
-      nir_def *vertices = nir_imul_imm(&b, primitives, 3);
+      const unsigned corners = prim_vertices(s);
+      nir_def *vertices = nir_imul_imm(&b, primitives, corners);
       nir_def *lane = nir_load_subgroup_invocation(&b);
-      for (unsigned base = 0; base < 3 * max_primitives; base += 32) {
+      for (unsigned base = 0; base < corners * max_primitives; base += 32) {
          nir_def *j = nir_iadd_imm(&b, lane, base);
          nir_push_if(&b, nir_ult(&b, j, vertices));
          nir_def *index = nir_u2u32(&b, nir_load_shared(&b, 1, 8,
             nir_iadd_imm(&b, j, layout.output_base), .align_mul = 1));
          nir_def *source = nir_imul_imm(&b,
             nir_umin(&b, index, nir_imm_int(&b, s->info.mesh.max_vertices_out - 1)), 4);
-         nir_def *primitive = nir_imul_imm(&b, nir_udiv_imm(&b, j, 3), 4);
+         nir_def *primitive = nir_imul_imm(&b, nir_udiv_imm(&b, j, corners), 4);
          nir_def *target = nir_imul_imm(&b, j, 4);
          for (unsigned plane = 0; plane < layout.planes; ++plane) {
             nir_def *value;
@@ -788,7 +794,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    nir_def *v=nir_load_shared(&b,1,16,nir_imm_int(&b,layout.vertex_count),.align_mul=2);
    if (layout.unweld) {
       p = nir_umin(&b, p, nir_imm_intN_t(&b, max_primitives, 16));
-      v = nir_imul_imm(&b, p, 3);
+      v = nir_imul_imm(&b, p, prim_vertices(s));
    }
    nir_allocate_mesh_uvb_agx(&b,p,v);
    nir_def *lane=nir_load_subgroup_invocation(&b);

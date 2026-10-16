@@ -4352,6 +4352,47 @@ m5_mesh_multi_varying_shader(void)
    return b.shader;
 }
 
+/* Point and line meshes with user and per-primitive words: the point size
+ * word follows the user words (agx_nir_lower_uvs group order) and every
+ * primitive gets one private vertex per corner for its flat words. */
+TEST(NativeForms, M5PointLineMeshPerPrimitiveWords)
+{
+   for (auto primitive : {MESA_PRIM_POINTS, MESA_PRIM_LINES}) {
+      const unsigned corners = primitive == MESA_PRIM_POINTS ? 1 : 2;
+      nir_builder b=nir_builder_init_simple_shader(MESA_SHADER_MESH,&agx_nir_options,"point/line per-primitive");
+      b.shader->info.workgroup_size[0]=2;b.shader->info.workgroup_size[1]=b.shader->info.workgroup_size[2]=1;
+      b.shader->info.mesh.max_vertices_out=2;b.shader->info.mesh.max_primitives_out=2;
+      b.shader->info.mesh.primitive_type=primitive;b.shader->info.io_lowered=true;
+      b.shader->info.outputs_written=VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES|VARYING_BIT_VAR(0)|
+         (primitive==MESA_PRIM_POINTS ? VARYING_BIT_PSIZ : 0);
+      b.shader->info.per_primitive_outputs=VARYING_BIT_PRIMITIVE_INDICES|VARYING_BIT_VAR(0);
+      nir_def *lane=nir_load_local_invocation_index(&b);
+      nir_set_vertex_and_primitive_count(&b,nir_imm_int(&b,2),nir_imm_int(&b,2),nir_imm_int(&b,0));
+      nir_store_per_vertex_output(&b,nir_imm_vec4(&b,0,0,.25,1),lane,nir_imm_int(&b,0),
+         .write_mask=15,.src_type=nir_type_float32,.io_semantics={.location=VARYING_SLOT_POS,.num_slots=1});
+      if (primitive==MESA_PRIM_POINTS)
+         nir_store_per_vertex_output(&b,nir_imm_float(&b,1),lane,nir_imm_int(&b,0),
+            .write_mask=1,.src_type=nir_type_float32,.io_semantics={.location=VARYING_SLOT_PSIZ,.num_slots=1});
+      nir_store_per_primitive_output(&b,nir_imm_vec4(&b,0,0,1,1),lane,nir_imm_int(&b,0),
+         .write_mask=15,.src_type=nir_type_float32,.io_semantics={.location=VARYING_SLOT_VAR0,.num_slots=1});
+      nir_store_per_primitive_output(&b,primitive==MESA_PRIM_POINTS ? lane : nir_vec2(&b,lane,lane),
+         lane,nir_imm_int(&b,0),.write_mask=BITFIELD_MASK(corners),.src_type=nir_type_uint32,
+         .io_semantics={.location=VARYING_SLOT_PRIMITIVE_INDICES,.num_slots=1});
+      struct agx_m5_mesh_varyings v;
+      ASSERT_TRUE(agx_m5_mesh_gather_varyings(b.shader,&v));
+      EXPECT_EQ(v.first[VARYING_SLOT_VAR0],4u);EXPECT_FALSE(v.dynamic);
+      if (primitive==MESA_PRIM_POINTS) {
+         EXPECT_EQ(v.first[VARYING_SLOT_PSIZ],8u);EXPECT_EQ(v.size,9u);
+      } else {
+         EXPECT_EQ(v.size,8u);
+      }
+      ASSERT_TRUE(agx_nir_lower_m5_mesh(b.shader,&v));
+      EXPECT_EQ(b.shader->info.mesh.max_vertices_out,2u*corners);
+      nir_validate_shader(b.shader,"point/line per-primitive");
+      ralloc_free(b.shader);
+   }
+}
+
 TEST(NativeForms, M5MeshMultiVaryingPlanesFollowLinkedUVS)
 {
    nir_shader *s=m5_mesh_multi_varying_shader();
