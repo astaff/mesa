@@ -4092,6 +4092,29 @@ TEST(NativeForms, M5ObjectChildcountSSACompiles)
    ralloc_free(b.shader);
 }
 
+/* The record task's child grid takes 16 bytes past the body's threadgroup
+ * memory; a body using all 32 KiB aliases word 0 after a rendezvous. */
+TEST(NativeForms, M5TaskGridFitsFullThreadgroupMemory)
+{
+   for (unsigned shared : {64u, 32768u}) {
+      for (bool payload : {false, true}) {
+         nir_builder b=nir_builder_init_simple_shader(MESA_SHADER_TASK,&agx_nir_options,"task grid");
+         b.shader->info.workgroup_size[0]=32;
+         b.shader->info.workgroup_size[1]=b.shader->info.workgroup_size[2]=1;
+         b.shader->info.shared_size=shared;b.shader->info.task_payload_size=payload ? 4 : 0;
+         if (payload)
+            nir_store_task_payload(&b,nir_imm_int(&b,7),nir_imm_int(&b,0),.align_mul=4);
+         nir_launch_mesh_workgroups(&b,nir_imm_ivec3(&b,2,1,1));
+         ASSERT_TRUE(agx_nir_lower_m5_task(b.shader,payload ? 16384 : 0,payload));
+         nir_validate_shader(b.shader,"task grid");
+         EXPECT_LE(b.shader->info.shared_size,32768u);
+         if (payload)
+            EXPECT_EQ(b.shader->info.shared_size,shared==64 ? 128u : 32768u);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
 TEST(NativeForms, M5MeshUserSharedBarrierCompile)
 {
    for (unsigned shared : {0u,4u,64u,128u}) {

@@ -1087,7 +1087,10 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
       }
    }
    const unsigned grid = ALIGN_POT(s->info.shared_size, 16);
-   if (!launches || grid + 16 > 32768 ||
+   /* A body that uses all 32 KiB of threadgroup memory leaves no room for
+    * the grid words; they then alias word 0 once the body is done. */
+   const bool alias_grid = grid + 16 > 32768;
+   if (!launches || s->info.shared_size > 32768 ||
        !agx_nir_lower_m5_task_payload(s, max_payload_B,
                                       record ? M5_TASK_RECORD_PAYLOAD : 0))
       return false;
@@ -1156,8 +1159,25 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
             }
          }
       }
-      unsigned grid_offset = grid;
-      nir_shader_intrinsics_pass(s, lower_launch, nir_metadata_none, &grid_offset);
+      if (alias_grid) {
+         grid_var = nir_local_variable_create(entry, glsl_uvec_type(3), "task_grid");
+         nir_foreach_block(block, entry) {
+            nir_foreach_instr_safe(in, block) {
+               if (in->type != nir_instr_type_intrinsic ||
+                   nir_instr_as_intrinsic(in)->intrinsic !=
+                      nir_intrinsic_launch_mesh_workgroups)
+                  continue;
+               nir_builder b = nir_builder_at(nir_before_instr(in));
+               nir_store_var(&b, grid_var, nir_instr_as_intrinsic(in)->src[0].ssa, 7);
+               nir_instr_remove(in);
+            }
+         }
+         nir_builder b = nir_builder_at(nir_before_impl(entry));
+         nir_store_var(&b, grid_var, nir_imm_ivec3(&b, 0, 0, 0), 7);
+      } else {
+         unsigned grid_offset = grid;
+         nir_shader_intrinsics_pass(s, lower_launch, nir_metadata_none, &grid_offset);
+      }
    }
    if (physical_threads != threads) {
       nir_foreach_block(block, entry) {
@@ -1217,14 +1237,29 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
                .memory_scope = SCOPE_WORKGROUP,
                .memory_semantics = NIR_MEMORY_ACQ_REL,
                .memory_modes = nir_var_mem_shared);
+   if (alias_grid) {
+      /* Every invocation has finished with the body's shared memory. */
+      nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
+      nir_store_shared(&b, nir_load_var(&b, grid_var), nir_imm_int(&b, 0),
+                       .write_mask = 7, .align_mul = 4);
+      nir_pop_if(&b, NULL);
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                  .memory_scope = SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = nir_var_mem_shared);
+   }
    nir_object_payload_exit_barrier_agx(&b);
    nir_def *lane = nir_load_local_invocation_index(&b);
    nir_push_if(&b, nir_ult_imm(&b, lane, 3));
    nir_def *value = nir_load_shared(&b, 1, 32,
-      nir_iadd_imm(&b, nir_imul_imm(&b, lane, 4), grid), .align_mul = 4);
+      nir_iadd_imm(&b, nir_imul_imm(&b, lane, 4), alias_grid ? 0 : grid),
+      .align_mul = 4);
    nir_store_object_childcount_agx(&b, value);
    nir_pop_if(&b, NULL);
-   s->info.shared_size = ALIGN_POT(grid + 16, 64);
+   s->info.shared_size = alias_grid ? ALIGN_POT(s->info.shared_size, 64)
+                                    : ALIGN_POT(grid + 16, 64);
    nir_progress(true, entry, nir_metadata_none);
+   if (alias_grid)
+      NIR_PASS(_, s, nir_lower_vars_to_ssa);
    return true;
 }
