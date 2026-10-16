@@ -8521,98 +8521,105 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          front_face_ccw ^= dyn->ts.domain_origin ==
                            VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
       }
-      const struct agx_ppp_hal300_graphics_fields fields = {
-         /* A vertex-stage draw selects its provoking vertex through the VDM
-          * vertex program template (hk_agx3_publish_vertex_state), but
-          * the PPP flat-shading vertex must match it too. With it left at
-          * vertex 0, the EDS tests' oversized last-vertex triangles shaded
-          * from the wrong vertex on hardware while in-viewport ones were
-          * right; presumably clipping takes the flat inputs of the vertices
-          * it generates from the PPP selector. A native mesh draw has no VDM
-          * template; the PPP selector alone selects it (hardware: EDS
-          * last-vertex mesh draws pass with it and fail with the VDM
-          * mesh-state word). */
-         .flat_shading_vertex = gfx->provoking,
-         .viewport_count = hk_effective_viewport_count(cmd),
-         .general_varyings = general_varyings,
-         .cf_register_count = cf->nr_cf,
-         .varying_counts_32 = gfx->linked_varyings.counts_32.opaque[0],
-         .varying_counts_16 = gfx->linked_varyings.counts_16.opaque[0],
-         .output_select = uvs->osel.opaque[0] | linked->b.osel.opaque[0],
-         .uvs_words = uvs->size,
-         .fragment_program = hk_upload_usc_words(cmd, fs, linked),
-         .varying_table = gfx->varyings,
-         .cf_binding_count = cf->nr_bindings,
-         .fragment_ti_spill_B = fs->b.info.has_preamble
-            ? fs->b.info.preamble_scratch_size : 0,
-         .fragment_ti_staging_B = fs->b.info.has_preamble
-            ? fs->b.info.agx3_preamble_staging_halfs * 2u : 0,
-         .no_color_attachment = !hk_m5_has_color(&render->tilebuffer),
-         /* An attached target can have no colour transaction when the
-          * shader omits it or its write mask is zero (stencil-only draws). */
-         .no_color_writes = linked->b.g17p_colour_classes == 0,
-         .scissor_enable = !discard,
-         .depth_bias_enable = !discard && dyn->rs.depth_bias.enable &&
+      struct agx_ppp_hal300_graphics_fields fields;
+      /* Zeroed padding lets m5_ppp_pack_memo compare it bytewise. */
+      memset(&fields, 0, sizeof(fields));
+      /* A vertex-stage draw selects its provoking vertex through the VDM
+       * vertex program template (hk_agx3_publish_vertex_state), but
+       * the PPP flat-shading vertex must match it too. With it left at
+       * vertex 0, the EDS tests' oversized last-vertex triangles shaded
+       * from the wrong vertex on hardware while in-viewport ones were
+       * right; presumably clipping takes the flat inputs of the vertices
+       * it generates from the PPP selector. A native mesh draw has no VDM
+       * template; the PPP selector alone selects it (hardware: EDS
+       * last-vertex mesh draws pass with it and fail with the VDM
+       * mesh-state word). */
+      fields.flat_shading_vertex = gfx->provoking;
+      fields.viewport_count = hk_effective_viewport_count(cmd);
+      fields.general_varyings = general_varyings;
+      fields.cf_register_count = cf->nr_cf;
+      fields.varying_counts_32 = gfx->linked_varyings.counts_32.opaque[0];
+      fields.varying_counts_16 = gfx->linked_varyings.counts_16.opaque[0];
+      fields.output_select = uvs->osel.opaque[0] | linked->b.osel.opaque[0];
+      fields.uvs_words = uvs->size;
+      fields.fragment_program = hk_upload_usc_words(cmd, fs, linked);
+      fields.varying_table = gfx->varyings;
+      fields.cf_binding_count = cf->nr_bindings;
+      fields.fragment_ti_spill_B = fs->b.info.has_preamble
+            ? fs->b.info.preamble_scratch_size : 0;
+      fields.fragment_ti_staging_B = fs->b.info.has_preamble
+            ? fs->b.info.agx3_preamble_staging_halfs * 2u : 0;
+      fields.no_color_attachment = !hk_m5_has_color(&render->tilebuffer);
+      /* An attached target can have no colour transaction when the
+       * shader omits it or its write mask is zero (stencil-only draws). */
+      fields.no_color_writes = linked->b.g17p_colour_classes == 0;
+      fields.scissor_enable = !discard;
+      fields.depth_bias_enable = !discard && dyn->rs.depth_bias.enable &&
             gfx->object_type == AGX_OBJECT_TYPE_TRIANGLE &&
             (dyn->rs.depth_bias.constant_factor != 0.0f ||
-             dyn->rs.depth_bias.slope_factor != 0.0f),
-         .depth_clip_disable = !vk_rasterization_state_depth_clip_enable(&dyn->rs),
-         .polygon_mode = translate_polygon_mode(dyn->rs.polygon_mode),
-         .primitive_msaa = gfx->object_type == AGX_OBJECT_TYPE_LINE &&
-            dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR,
-         .line_width = agx_pack_line_width(dyn->rs.line.width),
-         .rasterizer_discard = discard,
-         .cull_mode = dyn->rs.cull_mode,
-         .front_face_ccw = front_face_ccw,
-         .point_size_output = psiz,
-         .layer_output = layer_word,
-         .clip_distance_words = clip_words,
-         .needs_primitive_id = gfx->generate_primitive_id,
-         .object_type = gfx->object_type == AGX_OBJECT_TYPE_POINT_SPRITE_UV01
+             dyn->rs.depth_bias.slope_factor != 0.0f);
+      fields.depth_clip_disable = !vk_rasterization_state_depth_clip_enable(&dyn->rs);
+      fields.polygon_mode = translate_polygon_mode(dyn->rs.polygon_mode);
+      fields.primitive_msaa = gfx->object_type == AGX_OBJECT_TYPE_LINE &&
+            dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR;
+      fields.line_width = agx_pack_line_width(dyn->rs.line.width);
+      fields.rasterizer_discard = discard;
+      fields.cull_mode = dyn->rs.cull_mode;
+      fields.front_face_ccw = front_face_ccw;
+      fields.point_size_output = psiz;
+      fields.layer_output = layer_word;
+      fields.clip_distance_words = clip_words;
+      fields.needs_primitive_id = gfx->generate_primitive_id;
+      fields.object_type = gfx->object_type == AGX_OBJECT_TYPE_POINT_SPRITE_UV01
                            ? AGX_PPP_HAL300_POINTS
                            : gfx->object_type == AGX_OBJECT_TYPE_LINE
                                 ? AGX_PPP_HAL300_LINES
-                                : AGX_PPP_HAL300_TRIANGLES,
-         .vertex_varying_components = components,
-         .fragment_varying_components = color_varying ? components : 0,
-         .interpolation = !color_varying || color->perspective
+                                : AGX_PPP_HAL300_TRIANGLES;
+      fields.vertex_varying_components = components;
+      fields.fragment_varying_components = color_varying ? components : 0;
+      fields.interpolation = !color_varying || color->perspective
                              ? AGX_PPP_HAL300_SMOOTH
                              : color->smooth ? AGX_PPP_HAL300_LINEAR
-                                             : AGX_PPP_HAL300_FLAT,
-         .fragment_pass = fragment_pass,
-         /* AGX2 merges the linked FRAGMENT_CONTROL into its secondary word;
-          * HAL300 needs the tag-write disable carried explicitly, or a
-          * fragment that stores nothing (every channel of its format masked)
-          * hides the tile beneath it. */
-         .tag_write_disable =
-            (linked->b.fragment_control.opaque[0] & BITFIELD_BIT(21)) != 0,
-         .disable_tri_merging =
-            (linked->b.fragment_control.opaque[0] & BITFIELD_BIT(26)) != 0,
-         .fragment_writes_depth = fs->info.fs.epilog_key.write_z,
-         .fragment_depth_mode = agx_ppp_fragment_depth_mode(
+                                             : AGX_PPP_HAL300_FLAT;
+      fields.fragment_pass = fragment_pass;
+      /* AGX2 merges the linked FRAGMENT_CONTROL into its secondary word;
+       * HAL300 needs the tag-write disable carried explicitly, or a
+       * fragment that stores nothing (every channel of its format masked)
+       * hides the tile beneath it. */
+      fields.tag_write_disable =
+            (linked->b.fragment_control.opaque[0] & BITFIELD_BIT(21)) != 0;
+      fields.disable_tri_merging =
+            (linked->b.fragment_control.opaque[0] & BITFIELD_BIT(26)) != 0;
+      fields.fragment_writes_depth = fs->info.fs.epilog_key.write_z;
+      fields.fragment_depth_mode = agx_ppp_fragment_depth_mode(
             agx_translate_depth_layout(fs->b.info.depth_layout),
-            fs->b.info.early_fragment_tests, fs->info.fs.writes_memory),
-         .fragment_reads_depth = cf->reads_z,
-         .fragment_reads_reciprocal_w = reads_rhw,
-
-         .depth_active = depth_active,
-         .depth_compare = depth_active ? depth_compare : 0,
-         .depth_write = depth_active && dyn->ds.depth.write_enable,
-         .stencil_active = stencil_active,
-         .front_stencil_reference = stencil_active
-            ? dyn->ds.stencil.front.reference & 0xffu : 0,
-         .back_stencil_reference = stencil_active
-            ? dyn->ds.stencil.back.reference & 0xffu : 0,
-         .front_stencil = front_stencil.opaque[0],
-         .back_stencil = back_stencil.opaque[0],
-         .visibility_mode = gfx->occlusion.mode,
-         .visibility_index = gfx->occlusion.index,
-      };
-      struct agx_ppp_hal300_graphics_core state;
-      if (!agx_ppp_hal300_graphics_core_pack(dev->dev.chip, &fields, &state)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
+            fs->b.info.early_fragment_tests, fs->info.fs.writes_memory);
+      fields.fragment_reads_depth = cf->reads_z;
+      fields.fragment_reads_reciprocal_w = reads_rhw;
+      fields.depth_active = depth_active;
+      fields.depth_compare = depth_active ? depth_compare : 0;
+      fields.depth_write = depth_active && dyn->ds.depth.write_enable;
+      fields.stencil_active = stencil_active;
+      fields.front_stencil_reference = stencil_active
+            ? dyn->ds.stencil.front.reference & 0xffu : 0;
+      fields.back_stencil_reference = stencil_active
+            ? dyn->ds.stencil.back.reference & 0xffu : 0;
+      fields.front_stencil = front_stencil.opaque[0];
+      fields.back_stencil = back_stencil.opaque[0];
+      fields.visibility_mode = gfx->occlusion.mode;
+      fields.visibility_index = gfx->occlusion.index;
+      __typeof__(gfx->m5_ppp_pack_memo) *pack = &gfx->m5_ppp_pack_memo;
+      if (!pack->valid || memcmp(&pack->fields, &fields, sizeof(fields))) {
+         pack->valid = false;
+         if (!agx_ppp_hal300_graphics_core_pack(dev->dev.chip, &fields,
+                                                &pack->state)) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         pack->fields = fields;
+         pack->valid = true;
       }
+      const struct agx_ppp_hal300_graphics_core state = pack->state;
 
       struct agx_ptr upload = hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
       if (!upload.cpu)

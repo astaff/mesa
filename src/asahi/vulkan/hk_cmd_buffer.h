@@ -25,6 +25,7 @@
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx3_compute_program_core.h"
 #include "asahi/lib/agx_ppp_hal200_graphics_core.h"
+#include "asahi/lib/agx_ppp_hal300_graphics_core.h"
 #include "asahi/lib/agx_ppp_viewport_payload_core.h"
 #include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
 #include "asahi/lib/agx_va_runtime_hole.h"
@@ -635,6 +636,15 @@ struct hk_graphics_state {
       struct agx_vdm_state_update encoded;
       bool valid;
    } g17p_vdm_update_memo;
+
+   /* The last M5 HAL300 graphics core agx_ppp_hal300_graphics_core_pack()
+    * packed, a pure function of its fields (zero-initialised, so they compare
+    * bytewise); see hk_flush_ppp_state(). */
+   struct {
+      struct agx_ppp_hal300_graphics_fields fields;
+      struct agx_ppp_hal300_graphics_core state;
+      bool valid;
+   } m5_ppp_pack_memo;
 
    uint32_t shaders_dirty;
    struct hk_api_shader *shaders[MESA_SHADER_MESH + 1];
