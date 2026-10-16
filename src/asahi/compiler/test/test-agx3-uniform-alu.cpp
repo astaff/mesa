@@ -8,6 +8,7 @@
 #include "agx3_binder.h"
 #include "agx3_cf_core.h"
 #include "agx3_uniform_alu.h"
+#include "agx3_stage_core.h"
 #include "agx3_isel_core.h"
 #include "agx3_tex_core.h"
 #include "agx_test.h"
@@ -835,6 +836,67 @@ TEST(AGX3UniformALU, M5NativeUniformOperandAndResultShapes)
          ++failed;
          fprintf(stderr, "mismatch op=%u ud=%u dest=%u ok=%u len=%u/%u got=",
                  (unsigned)c.op, c.uniform_dest, c.dest, ok, length, c.length);
+         for (unsigned i = 0; i < length; ++i)
+            fprintf(stderr, "%02x", bytes[i]);
+         fprintf(stderr, " want=");
+         for (unsigned i = 0; i < c.length; ++i)
+            fprintf(stderr, "%02x", c.expected[i]);
+         fprintf(stderr, "\n");
+      }
+   }
+   EXPECT_EQ(failed, 0u);
+}
+
+/* The same native M5 vertex mains write their outputs' final FMUL/FMA
+ * straight into the staging file (f9=5) that UVSW reads. Every distinct
+ * staged R*R MUL, U*R+R FMA and R*R+R FMA whose fields the encoder names,
+ * with sources in agx3_stage_vertex_alu order (src[0] is the second
+ * hardware operand, the uniform of U*R+R). */
+TEST(AGX3UniformALU, M5NativeStagedVertexOutputALU)
+{
+   const struct {
+      bool fma; uint16_t dest; uint8_t slot; uint16_t src[3]; bool uniform0;
+      bool live[3], discard[3]; uint8_t wait; uint8_t length;
+      uint8_t expected[16];
+   } cases[] = {
+      {true, 8, 1, {40, 20, 40}, true, {false, true, false}, {false, false, true}, 0, 8, {0x49,0x95,0x26,0x29,0x81,0x28,0x42,0x02}},
+      {true, 10, 2, {42, 20, 22}, true, {false, true, false}, {false, false, true}, 0, 10, {0x59,0x95,0x26,0x2b,0x82,0x16,0x42,0x02,0x00,0x04}},
+      {true, 12, 2, {44, 20, 46}, true, {false, true, false}, {false, false, true}, 0, 10, {0x69,0x95,0x26,0x2d,0x82,0x2e,0x42,0x02,0x00,0x04}},
+      {true, 14, 2, {46, 20, 16}, true, {false, true, false}, {false, false, true}, 0, 10, {0x79,0x95,0x26,0x2f,0x82,0x10,0x42,0x02,0x00,0x04}},
+      {false, 16, 8, {40, 38, 0}, false, {false, false, false}, {true, true, false}, 0, 14, {0xa1,0x02,0x05,0x30,0x22,0x70,0xa0,0x02,0x1c,0x0a,0x20,0x00,0x02,0x10}},
+      {false, 18, 8, {32, 36, 0}, false, {true, true, false}, {false, false, false}, 0, 14, {0xb1,0x80,0x05,0x30,0x22,0x70,0xa0,0x02,0x18,0x08,0x10,0x00,0x02,0x10}},
+      {false, 20, 8, {34, 36, 0}, false, {true, true, false}, {false, false, false}, 0, 14, {0xa1,0x80,0x05,0x30,0x22,0x70,0xa0,0x0a,0x98,0x08,0x10,0x00,0x02,0x10}},
+      {false, 22, 6, {32, 18, 0}, false, {false, true, false}, {true, false, false}, 0, 8, {0xb9,0x93,0x35,0x21,0x41,0x00,0x00,0x14}},
+      {false, 24, 6, {34, 18, 0}, false, {false, true, false}, {true, false, false}, 0, 8, {0xc9,0x93,0x35,0x23,0x41,0x00,0x00,0x14}},
+      {false, 26, 6, {28, 36, 0}, false, {true, false, false}, {false, true, false}, 0, 8, {0xd9,0x25,0x2d,0x9d,0x41,0x00,0x00,0x14}},
+      {false, 28, 3, {28, 18, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0xe9,0x13,0x3d,0x1d,0x41,0x00,0x00,0x08}},
+      {false, 0, 2, {14, 18, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x09,0x13,0x3d,0x0f,0x41,0x00,0x00,0x04}},
+      {true, 2, 3, {20, 10, 18}, true, {false, true, false}, {false, false, true}, 0, 10, {0x19,0x8b,0x26,0x15,0x82,0x12,0x42,0x02,0x00,0x08}},
+      {true, 4, 4, {22, 10, 14}, true, {false, true, false}, {false, false, true}, 0, 10, {0x29,0x8b,0x26,0x17,0x82,0x0e,0x42,0x02,0x00,0x0c}},
+      {true, 6, 5, {24, 10, 14}, true, {false, true, false}, {false, false, true}, 0, 10, {0x39,0x8b,0x26,0x19,0x82,0x0e,0x42,0x02,0x00,0x10}},
+      {true, 8, 6, {26, 10, 12}, true, {false, false, false}, {false, true, true}, 0, 10, {0x49,0x0b,0x2e,0x1b,0x82,0x0c,0x42,0x02,0x00,0x14}},
+      {true, 4, 2, {40, 16, 32}, true, {false, true, false}, {false, false, true}, 0, 10, {0x29,0x91,0x26,0x29,0x82,0x20,0x42,0x02,0x00,0x04}},
+      {false, 0, 3, {28, 8, 0}, false, {false, false, false}, {true, true, false}, 1, 8, {0x09,0x09,0x3d,0x1d,0x41,0x20,0x00,0x08}},
+      {false, 2, 3, {30, 10, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x19,0x0b,0x3d,0x1f,0x41,0x00,0x00,0x08}},
+      {false, 6, 3, {2, 12, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x39,0x0d,0x3d,0x03,0x41,0x00,0x00,0x08}},
+      {false, 8, 3, {4, 14, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x49,0x0f,0x3d,0x05,0x41,0x00,0x00,0x08}},
+      {true, 10, 7, {42, 16, 12}, true, {false, true, false}, {false, false, true}, 0, 10, {0x59,0x91,0x26,0x2b,0x82,0x0c,0x42,0x02,0x00,0x18}},
+      {true, 12, 8, {44, 16, 20}, true, {false, true, false}, {false, false, true}, 0, 16, {0x21,0x80,0x07,0x8a,0x20,0x07,0xa3,0x1a,0x18,0x0b,0x88,0x00,0x14,0x08,0x00,0x80}},
+      {true, 14, 1, {46, 16, 12}, true, {false, false, false}, {false, true, true}, 0, 8, {0x79,0x11,0x2e,0x2f,0x81,0x0c,0x42,0x02}},
+      {true, 16, 4, {4, 6, 8}, false, {false, false, false}, {true, true, true}, 0, 10, {0x89,0x07,0x3e,0x05,0x82,0x08,0x42,0x00,0x00,0x0c}},
+
+   };
+   unsigned failed = 0;
+   for (const auto &c : cases) {
+      uint8_t bytes[16] = {0}, length = 0;
+      const bool ok = agx3_stage_vertex_alu(AGX_ISA_ENCODING_AGX3C, c.fma,
+                                            c.dest, c.slot, c.src, c.uniform0,
+                                            c.live, c.discard, c.wait, bytes,
+                                            &length);
+      if (!ok || length != c.length || std::memcmp(bytes, c.expected, length)) {
+         ++failed;
+         fprintf(stderr, "staged mismatch fma=%u dest=%u slot=%u ok=%u len=%u/%u got=",
+                 c.fma, c.dest, c.slot, ok, length, c.length);
          for (unsigned i = 0; i < length; ++i)
             fprintf(stderr, "%02x", bytes[i]);
          fprintf(stderr, " want=");

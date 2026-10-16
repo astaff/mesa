@@ -8913,8 +8913,10 @@ agx3_vertex_alu_operand(agx_index x, bool allow_uniform)
 static bool
 agx3_fuse_vertex_output_alu(agx_context *ctx)
 {
-   /* ST_VARY_FMA/MUL_AGX3 are G17P vertex-output forms with no AGX3C encoding. */
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   /* ST_VARY_FMA/MUL_AGX3 are the G17P vertex-output forms; native M5
+    * terrain vertex mains use the same three (agx3_stage_vertex_alu). */
+   if ((ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B &&
+        ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C) ||
        ctx->stage != MESA_SHADER_VERTEX || ctx->is_preamble)
       return false;
 

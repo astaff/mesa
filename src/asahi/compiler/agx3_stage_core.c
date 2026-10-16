@@ -18,11 +18,25 @@ stage_alu(enum agx_isa_encoding enc, bool fma, uint16_t dest, uint8_t slot,
           const bool live[3], const bool discard[3], uint16_t wait_mask,
           uint8_t out[16], uint8_t *len)
 {
-   if (enc != AGX_ISA_ENCODING_AGX3B || !src || !live || !discard || !out ||
-       !len || dest >= 256 || (dest & 1) || slot < 1 || slot > 6 ||
-       wait_mask > 0x3f || (unsigned)source0 > AGX3_STAGE_FMA_IMMEDIATE ||
-       (source0 != AGX3_STAGE_FMA_REGISTER && !fma))
+   /* M5 (G17G) terrain vertex mains write their outputs the same
+    * way: staged FMUL R*R, FMA U*R+R and FMA R*R+R with f9=5, the same
+    * operand fields, f95=1/f96=55 (FMA) or f78=1/f79=62 (MUL), eight
+    * completion slots and an eight-bit wait set. Native witnesses are
+    * asserted in test-agx3-uniform-alu.cpp. The coordinate FMA with an
+    * immediate stays an AGX3B form. */
+   const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
+   if ((!m5 && enc != AGX_ISA_ENCODING_AGX3B) || !src || !live || !discard ||
+       !out || !len || dest >= 256 || (dest & 1) || slot < 1 ||
+       slot > (m5 ? 8 : 6) || wait_mask > (m5 ? 0xff : 0x3f) ||
+       (unsigned)source0 > AGX3_STAGE_FMA_IMMEDIATE ||
+       (source0 != AGX3_STAGE_FMA_REGISTER && !fma) ||
+       (m5 && source0 == AGX3_STAGE_FMA_IMMEDIATE))
       return false;
+   for (unsigned s = 0; m5 && s < (fma ? 3 : 2); ++s) {
+      const bool uniform = s == 0 && source0 == AGX3_STAGE_FMA_UNIFORM;
+      if (!uniform && src[s] >= 252)
+         return false;
+   }
    for (unsigned s = 0; s < (fma ? 3 : 2); ++s) {
       const bool immediate = s == 0 && source0 == AGX3_STAGE_FMA_IMMEDIATE;
       if (src[s] >= 256 || (!immediate && (src[s] & 1)) ||
@@ -68,15 +82,35 @@ stage_alu(enum agx_isa_encoding enc, bool fma, uint16_t dest, uint8_t slot,
    } else {
       fields[n++] = (struct agx3_field_kv)KV(74, 2);
    }
-   for (unsigned s = 0; s < 6; ++s)
+   if (m5) {
+      fields[n++] = (struct agx3_field_kv)KV(fma ? 95 : 78, 1);
+      fields[n++] = (struct agx3_field_kv)KV(fma ? 96 : 79, fma ? 55 : 62);
+   }
+   for (unsigned s = 0; s < (m5 ? 8 : 6); ++s)
       fields[n++] = (struct agx3_field_kv)KV((fma ? 97 : 80) + s,
                                            (wait_mask >> s) & 1);
-   for (unsigned ep = 0; ep <= (fma ? 5 : 3); ++ep) {
+   /* M5 endpoints are not ordered by length: keep the shortest. */
+   uint8_t best[16], best_len = 0;
+   for (unsigned ep = 0; ep <= (m5 ? (fma ? 7 : 5) : fma ? 5 : 3); ++ep) {
+      uint8_t bytes[16], size;
       if (agx3_bind_compose(enc, fma ? "f32fma" : "f32mul", ep,
-                           base, 6, fields, n, out, len))
-         return true;
+                           base, 6, fields, n, bytes, &size)) {
+         if (!m5) {
+            memcpy(out, bytes, size);
+            *len = size;
+            return true;
+         }
+         if (!best_len || size < best_len) {
+            memcpy(best, bytes, size);
+            best_len = size;
+         }
+      }
    }
-   return false;
+   if (!best_len)
+      return false;
+   memcpy(out, best, best_len);
+   *len = best_len;
+   return true;
 }
 
 bool
