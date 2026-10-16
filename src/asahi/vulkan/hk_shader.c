@@ -3064,8 +3064,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* Mesh adds its native UVB shared arena after this frontend lowering.
     * Keep application shared accesses byte addressed until that arena exists;
     * the mesh branch then preprocesses every shared access exactly once.
-    * Reprocessing here and there divides preexisting element indices again. */
-   if (nir->info.stage != MESA_SHADER_MESH) {
+    * Reprocessing here and there divides preexisting element indices again.
+    * The M5 task (object) branch likewise preprocesses after adding its
+    * child-grid words. */
+   if (nir->info.stage != MESA_SHADER_MESH &&
+       !(nir->info.stage == MESA_SHADER_TASK && agx_chip_g17_m5(dev->dev.chip))) {
       if (agx_native_graphics(&dev->dev))
          agx_preprocess_nir_g17p(nir);
       else if (agx_chip_g17_m5(dev->dev.chip))
