@@ -5381,7 +5381,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       if (agx_chip_g17_m5(dev->dev.chip))
          NIR_PASS(_, nir, agx_nir_m5_canonicalize_empty_mesh);
-      if (dev->dev.chip == AGX_CHIP_G17P &&
+      if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
           nir->info.mesh.primitive_type == MESA_PRIM_POINTS &&
           !(nir->info.outputs_written & VARYING_BIT_PSIZ))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,

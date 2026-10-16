@@ -76,6 +76,20 @@ struct mesh_layout {
    int16_t vertex_plane[M5_MESH_MAX_PLANES], primitive_plane[M5_MESH_MAX_PLANES];
 };
 
+/* Index bytes per primitive. Native G17G point and line witnesses
+ * (lane-mesh/cwit-meshtopo mpt/mln) store one and two packed index bytes per
+ * primitive in the same 16-byte-aligned index region as triangles. */
+static unsigned
+prim_vertices(const nir_shader *s)
+{
+   switch (s->info.mesh.primitive_type) {
+   case MESA_PRIM_POINTS: return 1;
+   case MESA_PRIM_LINES: return 2;
+   case MESA_PRIM_TRIANGLES: return 3;
+   default: return 0;
+   }
+}
+
 static bool
 agx_m5_mesh_unwelds(const struct agx_m5_mesh_varyings *varyings)
 {
@@ -97,7 +111,8 @@ mesh_layout(const nir_shader *s, const struct agx_m5_mesh_varyings *varyings)
     * Native multi-varying witnesses (lane-mesh/native-var objects 9..17)
     * place one plane per UVS word directly after the four position planes,
     * in selector order. */
-   const unsigned count = ALIGN_POT(3 * s->info.mesh.max_primitives_out, 16);
+   const unsigned count =
+      ALIGN_POT(prim_vertices(s) * s->info.mesh.max_primitives_out, 16);
    const unsigned position = count + 16;
    const bool unweld = agx_m5_mesh_unwelds(varyings);
    const unsigned export_vertices = unweld
@@ -273,7 +288,8 @@ lower(nir_builder *b,nir_intrinsic_instr *i,void *data)
          }
          break;
       }
-      nir_def *element=nir_imul_imm(b,i->src[1].ssa,3);
+      nir_def *element=nir_imul_imm(b,i->src[1].ssa,
+                                    prim_vertices(b->shader));
       unsigned component=nir_intrinsic_component(i);
       u_foreach_bit(c,nir_intrinsic_write_mask(i)) {
          nir_def *index=nir_channel(b,i->src[0].ssa,c);
@@ -356,6 +372,14 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
             }
             if (slot == VARYING_SLOT_POS)
                continue;
+            if (slot == VARYING_SLOT_PSIZ &&
+                s->info.mesh.primitive_type == MESA_PRIM_POINTS) {
+               if (nir_intrinsic_component(i) != 0 ||
+                   nir_intrinsic_write_mask(i) != 1)
+                  return false;
+               varyings->components[slot] = 1;
+               continue;
+            }
             if (slot >= 64 || !(MESH_VERTEX_VARYINGS & BITFIELD64_BIT(slot)))
                return false;
             const unsigned end = nir_intrinsic_component(i) +
@@ -390,6 +414,8 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
    for (unsigned slot = 0; slot < 64; ++slot) {
       if (!varyings->components[slot])
          continue;
+      /* Point size is the native plane after the position (cwit-meshtopo
+       * mpt): the size-only point interface keeps it at plane 4. */
       varyings->first[slot] = next;
       next += varyings->components[slot];
       slots++;
@@ -428,7 +454,8 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
          if (v->components[slot] != 1 ||
              (slot == VARYING_SLOT_VIEWPORT && !v->primitive_comps[slot]))
             return false;
-      } else if (!(MESH_VERTEX_VARYINGS & BITFIELD64_BIT(slot)) ||
+      } else if (!((MESH_VERTEX_VARYINGS | VARYING_BIT_PSIZ) &
+                   BITFIELD64_BIT(slot)) ||
                  (v->primitive_comps[slot] &&
                   (!(USER_VARYINGS & BITFIELD64_BIT(slot)) ||
                    v->primitive_comps[slot] != v->components[slot]))) {
@@ -477,12 +504,20 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
       s->info.workgroup_size_variable || threads==0 || threads>1024 ||
       s->info.mesh.max_vertices_out==0 || s->info.mesh.max_vertices_out>256 ||
       s->info.mesh.max_primitives_out==0 || s->info.mesh.max_primitives_out>256 ||
-      s->info.mesh.primitive_type!=MESA_PRIM_TRIANGLES ||
+      prim_vertices(s)==0 ||
+      /* Private per-primitive vertices are triangle-only. */
+      (unweld && s->info.mesh.primitive_type!=MESA_PRIM_TRIANGLES) ||
+      /* Native points carry their size in the plane after the position. */
+      (s->info.mesh.primitive_type==MESA_PRIM_POINTS &&
+       (!varyings->components[VARYING_SLOT_PSIZ] ||
+        varyings->first[VARYING_SLOT_PSIZ]!=4 || varyings->size!=5)) ||
       /* Interstage compaction can leave per_primitive_outputs stale; with
        * per-primitive words every store is checked against them below. */
       (primitive_outputs&~(unweld ? ~UINT64_C(0) : primitive_slots)) ||
       s->info.outputs_written & ~(VARYING_BIT_POS|VARYING_BIT_PRIMITIVE_INDICES|MESH_VERTEX_VARYINGS|
-                                  (primitive_slots & (VARYING_BIT_LAYER|VARYING_BIT_VIEWPORT))) ||
+                                  (primitive_slots & (VARYING_BIT_LAYER|VARYING_BIT_VIEWPORT)) |
+                                  (s->info.mesh.primitive_type==MESA_PRIM_POINTS ?
+                                   VARYING_BIT_PSIZ : 0)) ||
       /* Every primitive gets three private vertices within the native
        * 256-vertex output limit. */
       (unweld && 3 * s->info.mesh.max_primitives_out > 256) ||
@@ -535,7 +570,7 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
                                   util_last_bit(nir_intrinsic_write_mask(i));
                if (slot==VARYING_SLOT_PRIMITIVE_INDICES) {
                   if(nir_intrinsic_io_semantics(i).location!=VARYING_SLOT_PRIMITIVE_INDICES ||
-                     nir_intrinsic_component(i)+i->src[0].ssa->num_components>3 ||
+                     nir_intrinsic_component(i)+i->src[0].ssa->num_components>prim_vertices(s) ||
                      nir_src_as_uint(i->src[2])!=0)
                      return false;
                } else if (slot>=64 || !varyings->primitive_comps[slot] ||
@@ -696,8 +731,8 @@ agx_nir_lower_m5_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyings
    nir_allocate_mesh_uvb_agx(&b,p,v);
    nir_def *lane=nir_load_subgroup_invocation(&b);
    nir_def *primitive_words=nir_udiv_imm(&b,
-      nir_iadd_imm(&b,nir_imul_imm(&b,nir_u2u32(&b,p),3),3),4);
-   for (unsigned word=0;word<DIV_ROUND_UP(3*s->info.mesh.max_primitives_out,4);word+=32) {
+      nir_iadd_imm(&b,nir_imul_imm(&b,nir_u2u32(&b,p),prim_vertices(s)),3),4);
+   for (unsigned word=0;word<DIV_ROUND_UP(prim_vertices(s)*s->info.mesh.max_primitives_out,4);word+=32) {
       nir_push_if(&b,nir_ult(&b,nir_iadd_imm(&b,lane,word),primitive_words));
       /* Native64/256 helper increments high16 target word by32 and
        * shared-byte address by128, while each active lane emits one word. */
