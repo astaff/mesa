@@ -492,12 +492,20 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
             goto invalid_start_marker;
          uint32_t at = link->rt_query_wait_offset;
          if (drop_entry[i] && at > link->entry_offset) at -= AGX3_PIXEL_MAX_LENGTH;
+         /* The main shader already holds the colour write class (pixwait 4
+          * ahead of its first traversal), so the epilog's read+write wait
+          * becomes a read wait. Native M5 colour fragments with a ray query
+          * show the same pair: pixwait 4 before intersect_ray, pixwait 8
+          * before lstcol. Encode both in the device's ISA. */
+         const enum agx_isa_encoding enc = agx_chip_g17_m5(dev->chip)
+                                              ? AGX_ISA_ENCODING_AGX3C
+                                              : AGX_ISA_ENCODING_AGX3B;
          uint8_t before[AGX3_PIXEL_MAX_LENGTH], after[AGX3_PIXEL_MAX_LENGTH];
          uint8_t before_len, after_len;
          if (at > sz || sz - at < AGX3_PIXEL_MAX_LENGTH ||
-             !agx3_pixel_wait(AGX_ISA_ENCODING_AGX3B, 12, link->rt_query_wait_mask,
+             !agx3_pixel_wait(enc, 12, link->rt_query_wait_mask,
                              before, &before_len) ||
-             !agx3_pixel_wait(AGX_ISA_ENCODING_AGX3B, 8, link->rt_query_wait_mask,
+             !agx3_pixel_wait(enc, 8, link->rt_query_wait_mask,
                              after, &after_len) || before_len != after_len ||
              before_len != AGX3_PIXEL_MAX_LENGTH ||
              memcmp(linked_map + offset + at, before, before_len))
