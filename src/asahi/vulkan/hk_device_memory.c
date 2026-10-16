@@ -191,6 +191,21 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (pAllocateInfo->allocationSize > UINT64_MAX - (alignment - 1))
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
+   /* An allocation that imports nothing needs a nonzero size (the spec
+    * requires allocationSize > 0 there), and no size beyond the heap can be
+    * satisfied. Refuse both before creating a BO: a 0-byte request, or one
+    * whose page rounding below wraps to 0, would otherwise reach
+    * agx_bo_create() as a 0-byte BO and fail in the kernel. */
+   if (!(fd_info && fd_info->handleType) &&
+       (pAllocateInfo->allocationSize == 0 ||
+        pAllocateInfo->allocationSize > heap->size)) {
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "allocationSize %" PRIu64 " is 0 or exceeds heap %u "
+                       "(%" PRIu64 " bytes)",
+                       (uint64_t)pAllocateInfo->allocationSize,
+                       type->heapIndex, (uint64_t)heap->size);
+   }
+
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
    uint64_t used = p_atomic_read(&heap->used);
