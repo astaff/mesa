@@ -4557,6 +4557,24 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    const bool m5_compute_cprog = agx_chip_g17_m5(dev->dev.chip) &&
       sw_stage == MESA_SHADER_COMPUTE && nir->info.stage == MESA_SHADER_COMPUTE;
 
+   /* A fragment shader that reads descriptor-backed memory forms its native
+    * constant program, as on G17P. The native HAL300 fragment program state
+    * uses the same constant-calculation program setup of the state-load
+    * encoder as compute and publishes the TI
+    * spill/IPR quads in its PPP records (agx_ppp_hal300_graphics_core_pack).
+    * An M5 fragment unrolled inline over 8 samples keeps no preamble: its
+    * launch needs the monolithic program, whose preamble need not match.
+    * Ray-query fragments keep their qualified launch unchanged, as their
+    * vertex programs do. */
+   const bool fs_reads_descriptors =
+      nir->info.stage == MESA_SHADER_FRAGMENT &&
+      (nir->info.num_ubos || nir->info.num_ssbos || nir->info.num_textures ||
+       nir->info.num_images || hk_nir_has_tex(nir));
+   const bool m5_fs_cprog = agx_chip_g17_m5(dev->dev.chip) &&
+      sw_stage == MESA_SHADER_FRAGMENT && fs_reads_descriptors &&
+      !shader->info.fs.m5_inline_sample_shading &&
+      !shader->info.agx3_gen1_fragment_rq;
+
    struct agx_shader_key backend_key = {
       .reserved_preamble = root + (4 * (1 + set_count)),
       .g17p_texture_uniform_base = m5_native_query_abi ? (dev->m5_rq_instances ? 168 : 156) : texture_uniform_base,
@@ -4578,20 +4596,19 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * texture/sampler-state-store protocol. Only G17P's constant program
        * is qualified among the AGX3B chips; G15 never forms a preamble. */
       .agx3_native_cprog = m5_compute_cprog,
-      .no_preamble = (agx_chip_g17_m5(dev->dev.chip) && !m5_compute_cprog) ||
+      .no_preamble = (agx_chip_g17_m5(dev->dev.chip) && !m5_compute_cprog &&
+                      !m5_fs_cprog) ||
          (agx_native_graphics(&dev->dev) &&
-          (!agx_chip_native_preamble(dev->dev.chip) ||
-           !(nir->info.stage == MESA_SHADER_FRAGMENT &&
-             (nir->info.num_ubos || nir->info.num_ssbos ||
-              nir->info.num_textures || nir->info.num_images ||
-              hk_nir_has_tex(nir))))),
+          (!agx_chip_native_preamble(dev->dev.chip) || !fs_reads_descriptors)),
    };
 
-   /* The native constant-program lowering applies exactly when G17P lets
-    * this compile form a preamble (fragment and vertex constant programs);
-    * carried in the key, never in the global debug word. */
+   /* The native constant-program lowering applies exactly when G17P or an
+    * M5 graphics stage lets this compile form a preamble (fragment and
+    * vertex constant programs); carried in the key, never in the global
+    * debug word. */
    backend_key.g17p_native_uniforms =
-      agx_native_graphics(&dev->dev) && !backend_key.no_preamble;
+      (agx_native_graphics(&dev->dev) || m5_fs_cprog) &&
+      !backend_key.no_preamble;
 
    /* Uniform DMA: the root table, every descriptor set pointer, the dynamic
     * buffers and the buffers of static sets are driver-resolvable
@@ -4705,13 +4722,19 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    /* G17P hardware vertex programs (API VS, GS raster and native TES
     * variants) run per-draw uniform work once in a native vertex constant
     * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
-   const bool vs_cprog = agx_chip_native_preamble(dev->dev.chip) && hw &&
-                         nir->info.stage == MESA_SHADER_VERTEX &&
-                         (!shader->info.agx3_gen1_fragment_rq ||
-                          debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_CPROG_DIAGNOSTIC", false));
+   /* HAL300 sets the same vertex constant program and packs its TI IPR/spill
+    * quads into every VDM template exactly as HAL200 does. */
+   const bool vs_cprog =
+      (agx_chip_native_preamble(dev->dev.chip) ||
+       agx_chip_g17_m5(dev->dev.chip)) &&
+      hw && nir->info.stage == MESA_SHADER_VERTEX &&
+      (!shader->info.agx3_gen1_fragment_rq ||
+       (agx_chip_native_preamble(dev->dev.chip) &&
+        debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_CPROG_DIAGNOSTIC", false)));
    bool compiled = vs_cprog &&
       hk_g17p_compile_vs_cprog(dev, &nir, &backend_key, shader);
-   if (!compiled && agx_native_graphics(&dev->dev) &&
+   if (!compiled &&
+       (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
        nir->info.stage == MESA_SHADER_FRAGMENT && !backend_key.no_preamble)
       compiled = hk_g17p_compile_fs_cprog(&nir, &backend_key, shader);
    if (!compiled)

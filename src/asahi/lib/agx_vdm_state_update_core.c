@@ -231,7 +231,7 @@ agx_vdm_state_update_template_pack(
 /*
  * Publish a vertex constant program's thread-invariant (TI) resources in the
  * two state-load counts, from the compiler's TI spill-buffer bytes and TI
- * largest-IPR bytes. G17P only.
+ * largest-IPR bytes. G17P and HAL300.
  *
  * Pinned AGXMetalG17P (HAL200):
  *
@@ -251,6 +251,13 @@ agx_vdm_state_update_template_pack(
  * (agx_ppp_hal200_fragment_ti_resources). A vertex shader without a constant
  * program leaves both zero. Fails closed, leaving `info` unchanged, outside
  * the encodable range.
+ *
+ * The native HAL300 vertex program finalization computes the same
+ * two quad counts (ESL+0x158/0x15c) and, after
+ * the state-load encoder finishes, packs each template's vertex-shader word
+ * 0 as IPR << 8 (ubfiz #8, #12) and its pipeline template as spill << 3
+ * (ubfiz #3, #18); the HAL300 materializer only
+ * omits bit 31.
  */
 static bool
 agx_vdm_state_update_vertex_ti_resources(
@@ -263,7 +270,8 @@ agx_vdm_state_update_vertex_ti_resources(
 
    /* Same bounds as the HAL200 fragment record: an 18-bit spill field and
     * the 12-bit IPR field, whose even rounding caps it at 0xffe. */
-   if (!agx_chip_native_agx3(chip) || !info || spill_quads > UINT32_C(0x3ffff) ||
+   if ((!agx_chip_native_agx3(chip) && !agx_vdm_state_update_is_hal300(chip)) ||
+       !info || spill_quads > UINT32_C(0x3ffff) ||
        ipr_quads > UINT32_C(0xffe))
       return false;
 
@@ -333,7 +341,8 @@ agx_g17p_vertex_program_info(
    const bool preamble_ok =
       compiler_info &&
       (compiler_info->has_preamble
-          ? agx_chip_native_agx3(chip) && compiler_info->constant_program_allowed &&
+          ? (agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip)) &&
+               compiler_info->constant_program_allowed &&
                compiler_info->preamble_staging_known &&
                compiler_info->nr_preamble_gprs != 0 &&
                compiler_info->nr_preamble_gprs <= 256

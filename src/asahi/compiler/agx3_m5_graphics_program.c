@@ -43,7 +43,10 @@ g17g_graphics_program_generate(
        (desc->cprog_inputs && desc->cprog_inputs->count &&
         !desc->constant_program.code_size) ||
        (desc->constant_program.code_size &&
-        stage != AGX_IOTO_G17G_PROGRAM_COMPUTE) ||
+        stage != AGX_IOTO_G17G_PROGRAM_COMPUTE &&
+        stage != AGX_IOTO_G17G_PROGRAM_VERTEX &&
+        stage != AGX_IOTO_G17G_PROGRAM_FRAGMENT &&
+        stage != AGX_IOTO_G17G_PROGRAM_COVERAGE_FRAGMENT) ||
        !desc->nr_gprs || desc->nr_gprs > 256 ||
        desc->scratch_size > UINT16_MAX * 4u ||
        !desc->compiler_d_valid ||
@@ -184,15 +187,19 @@ g17g_graphics_program_generate(
     * unknown; preserve that observed order in this probe. Put the prefix
     * before all loads:
     * placing it merely before COPY can clobber pending GPR0/2 carriers.
-    * This path is reached only by the explicit compute-CProg probe. */
-   if (desc->constant_program.code_size) {
+    * Graphics stages keep their composed order: the constant program only
+    * replaces the final END, after PIXREL, as HAL300
+    * native state-load encoder's finish step appends it (PIXREL, then
+    * the inline code or the external branch). */
+   const bool compute_cprog = desc->constant_program.code_size &&
+                              stage == AGX_IOTO_G17G_PROGRAM_COMPUTE;
+   if (compute_cprog) {
       const size_t state_size = AGX_IOTO_STATE_TAIL_TYPE0_SIZE;
       const size_t helper_size = AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE;
       const size_t prefix_size = state_size + helper_size;
       const size_t end_size = AGX_IOTO_PROGRAM_TERMINATE_SIZE;
       uint8_t helper[AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE];
-      if (stage != AGX_IOTO_G17G_PROGRAM_COMPUTE ||
-          written != body_size + prefix_size + end_size)
+      if (written != body_size + prefix_size + end_size)
          return false;
       memcpy(helper, staged.bytes + body_size + state_size, helper_size);
       memcpy(staged.bytes, tail.bytes, state_size);
@@ -226,7 +233,7 @@ g17g_graphics_program_generate(
           AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE);
       for (size_t i = 0; i < relocation_count; ++i) {
          struct agx_ioto_load_relocation *r = &template->relocations[i];
-         if (desc->constant_program.code_size) {
+         if (compute_cprog) {
             r->offset += AGX_IOTO_STATE_TAIL_TYPE0_SIZE +
                          AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE;
          } else if (r->offset >= first_copy) {
