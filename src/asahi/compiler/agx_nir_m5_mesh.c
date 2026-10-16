@@ -823,7 +823,7 @@ agx_nir_lower_m5_mesh_fragment(nir_shader *s)
 static bool
 lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
 {
-   (void)data;
+   const unsigned payload_base = *(const unsigned *)data;
    if (i->intrinsic==nir_intrinsic_barrier &&
        (nir_intrinsic_memory_modes(i)&nir_var_mem_task_payload)) {
       nir_intrinsic_set_memory_modes(i,
@@ -836,7 +836,7 @@ lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
    nir_def *pointer=nir_pack_64_2x32(b,nir_load_mesh_payload_address_agx(b));
    nir_def *offset=i->src[store ? 1 : 0].ssa;
    nir_def *addr=nir_iadd(b,pointer,nir_u2u64(b,
-                            nir_iadd_imm(b,offset,nir_intrinsic_base(i))));
+                            nir_iadd_imm(b,offset,nir_intrinsic_base(i)+payload_base)));
    if (store) {
       nir_store_global(b,i->src[0].ssa,addr,
          .write_mask=nir_intrinsic_write_mask(i),
@@ -856,11 +856,12 @@ lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
 bool
 agx_nir_lower_m5_task_payload_probe(nir_shader *s)
 {
-   return agx_nir_lower_m5_task_payload(s, 4);
+   return agx_nir_lower_m5_task_payload(s, 4, 0);
 }
 
 bool
-agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B)
+agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B,
+                              unsigned payload_base_B)
 {
    if (s->info.task_payload_size>max_payload_B) return false;
    bool reads=false;
@@ -869,7 +870,8 @@ agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B)
          nir_foreach_instr(in,block) {
             if (in->type!=nir_instr_type_intrinsic) continue;
             nir_intrinsic_instr *i=nir_instr_as_intrinsic(in);
-            reads |= i->intrinsic==nir_intrinsic_load_task_payload;
+            reads |= i->intrinsic==nir_intrinsic_load_task_payload ||
+                     i->intrinsic==nir_intrinsic_load_mesh_payload_address_agx;
             if (i->intrinsic==nir_intrinsic_task_payload_atomic ||
                 i->intrinsic==nir_intrinsic_task_payload_atomic_swap ||
                 i->intrinsic==nir_intrinsic_launch_mesh_workgroups_with_payload_deref)
@@ -881,8 +883,37 @@ agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B)
       nir_builder b=nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(s)));
       nir_mesh_payload_entry_barrier_agx(&b);
    }
-   nir_shader_intrinsics_pass(s,lower_payload,nir_metadata_control_flow,NULL);
+   nir_shader_intrinsics_pass(s,lower_payload,nir_metadata_control_flow,
+                              &payload_base_B);
    return true;
+}
+
+/* Native object->mesh record at the payload address (SR62/SR63): native G17G
+ * witnesses (lane-mesh nwit2 otpg/mtpg) store the child grid
+ * (threadgroups_per_grid) at +0 and the payload from +16; the mesh reads its
+ * threadgroups_per_grid from +0 after the payload-entry barrier. */
+#define M5_TASK_RECORD_PAYLOAD 16
+
+static bool
+lower_mesh_record_grid(nir_builder *b, nir_intrinsic_instr *i, void *data)
+{
+   (void)data;
+   if (i->intrinsic != nir_intrinsic_load_num_workgroups)
+      return false;
+   b->cursor = nir_before_instr(&i->instr);
+   nir_def *pointer = nir_pack_64_2x32(b, nir_load_mesh_payload_address_agx(b));
+   nir_def *grid = nir_load_global(b, 3, 32, pointer, .align_mul = 16);
+   nir_def_replace(&i->def, nir_u2uN(b, grid, i->def.bit_size));
+   return true;
+}
+
+bool
+agx_nir_lower_m5_mesh_task_record(nir_shader *s)
+{
+   if (s->info.stage != MESA_SHADER_MESH)
+      return false;
+   return nir_shader_intrinsics_pass(s, lower_mesh_record_grid,
+                                     nir_metadata_control_flow, NULL);
 }
 
 static bool
@@ -948,7 +979,7 @@ agx_nir_lower_m5_task_probe(nir_shader *s)
  * (zero refuses every payload access).
  */
 bool
-agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B)
+agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
 {
    const unsigned threads = s->info.workgroup_size[0] *
                             s->info.workgroup_size[1] *
@@ -990,7 +1021,8 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B)
    }
    const unsigned grid = ALIGN_POT(s->info.shared_size, 16);
    if (!launches || grid + 16 > 32768 ||
-       !agx_nir_lower_m5_task_payload(s, max_payload_B))
+       !agx_nir_lower_m5_task_payload(s, max_payload_B,
+                                      record ? M5_TASK_RECORD_PAYLOAD : 0))
       return false;
    /* SPIR-V EmitMeshTasksEXT terminates the invocation: vtn follows the
     * launch with a halt, which would skip the child-count epilogue appended
@@ -1018,7 +1050,7 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B)
     * _agc.object.write_childcount. (The latter shape faulted once on R239
     * with no 0x1ca48 mesh rendering buffer bound; it stays behind the
     * payload limit.) */
-   const bool direct = !s->info.task_payload_size && !payload_access;
+   const bool direct = !record && !s->info.task_payload_size && !payload_access;
    nir_function_impl *entry = nir_shader_get_entrypoint(s);
    nir_variable *grid_var = NULL;
    if (direct) {
@@ -1038,6 +1070,25 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B)
       nir_builder b = nir_builder_at(nir_before_impl(entry));
       nir_store_var(&b, grid_var, nir_imm_ivec3(&b, 0, 0, 0), 7);
    } else {
+      if (record) {
+         /* Native object shaders also publish the child grid at +0 of the
+          * record for the mesh stage's threadgroups_per_grid. */
+         nir_foreach_block(block, entry) {
+            nir_foreach_instr(in, block) {
+               if (in->type != nir_instr_type_intrinsic ||
+                   nir_instr_as_intrinsic(in)->intrinsic !=
+                      nir_intrinsic_launch_mesh_workgroups)
+                  continue;
+               nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+               nir_builder b = nir_builder_at(nir_before_instr(in));
+               nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
+               nir_store_global(&b, i->src[0].ssa,
+                  nir_pack_64_2x32(&b, nir_load_mesh_payload_address_agx(&b)),
+                  .write_mask = 7, .align_mul = 16);
+               nir_pop_if(&b, NULL);
+            }
+         }
+      }
       unsigned grid_offset = grid;
       nir_shader_intrinsics_pass(s, lower_launch, nir_metadata_none, &grid_offset);
    }

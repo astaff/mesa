@@ -1748,6 +1748,10 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
                                    object->b.info.workgroup_size[2]
                                  : 3;
       programs[2].usage_flags = DRM_ASAHI_RENDER_PROGRAM_OBJECT;
+      /* A task stage compiled for the native object->mesh record asks the
+       * kernel for the TA mesh rendering buffer that backs it. */
+      if (task && hk_m5_task_record(dev->dev.params.features))
+         programs[2].usage_flags |= DRM_ASAHI_RENDER_PROGRAM_TASK;
    }
    for (unsigned stage = 0; stage < 2; ++stage) {
       if (!(stage ? cs->gen1_native_fragment_rq : cs->gen1_native_vertex_rq))
@@ -10128,12 +10132,12 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
                return;
             }
-            /* Native object->mesh kicks with a payload-carrying object set
-             * tail[0] (native726 mesh-object, with the 0x1ca48 mesh rendering
-             * buffer bound). Payload-free objects keep the mesh-only value
-             * unless the diagnostic requests it. */
+            /* Native object->mesh kicks (native726 mesh-object, 0x1ca48
+             * bound) set tail[0]; task kicks with the native record do too.
+             * Payload-free task kicks without it keep the mesh-only value. */
             const char *tail0 = getenv("ASAHI_MESH_PP_TAIL0");
-            if (tail0 && !strcmp(tail0, "1"))
+            if ((task && hk_m5_task_record(dev->dev.params.features)) ||
+                (tail0 && !strcmp(tail0, "1")))
                state.raw_tail[0] = 1;
          }
          if (!agx_vdm_mesh_state_pack(dev->dev.chip, &state, out)) {

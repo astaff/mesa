@@ -58,8 +58,11 @@ bool agx_nir_lower_m5_mesh(nir_shader *shader,
 
 bool agx_nir_lower_m5_task_payload_probe(nir_shader *shader);
 bool agx_nir_lower_m5_task_probe(nir_shader *shader);
-bool agx_nir_lower_m5_task_payload(nir_shader *shader, unsigned max_payload_B);
-bool agx_nir_lower_m5_task(nir_shader *shader, unsigned max_payload_B);
+bool agx_nir_lower_m5_task_payload(nir_shader *shader, unsigned max_payload_B,
+                                   unsigned payload_base_B);
+bool agx_nir_lower_m5_task(nir_shader *shader, unsigned max_payload_B,
+                           bool record);
+bool agx_nir_lower_m5_mesh_task_record(nir_shader *shader);
 bool agx_gen1_mesh_gather_varyings(const nir_shader *, struct agx_m5_mesh_varyings *);
 bool agx_nir_lower_gen1_mesh(nir_shader *, const struct agx_m5_mesh_varyings *);
 bool agx_nir_lower_gen1_mesh_triangle_probe(nir_shader *);

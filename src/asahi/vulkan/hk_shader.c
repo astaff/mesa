@@ -5203,6 +5203,21 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       (nir->info.io_lowered ||
        hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups));
 
+   /* A mesh shader used with an opt-in task stage reads its child grid
+    * (gl_NumWorkGroups) from the native object->mesh record, not the API
+    * grid in the draw root. Without the record (no kernel mesh rendering
+    * buffer) there is no source for it. */
+   if (nir->info.stage == MESA_SHADER_MESH && hk_m5_task_opt_in() &&
+       !(info->flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT) &&
+       !nir->info.io_lowered &&
+       hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups)) {
+      if (!hk_m5_task_record(dev->dev.params.features)) {
+         ralloc_free(nir);
+         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "mesh gl_NumWorkGroups under a task stage needs the task record");
+      }
+      NIR_PASS(_, nir, agx_nir_lower_m5_mesh_task_record);
+   }
    if (!nir->info.io_lowered) {
        hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
                     info->set_layout_count, info->set_layouts, features);
@@ -5522,7 +5537,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (!layout_ok ||
           !(m5_mesh ? (hk_m5_task_opt_in()
                           ? agx_nir_lower_m5_task_payload(nir,
-                               hk_m5_task_payload_limit())
+                               hk_m5_task_payload_limit(dev->dev.params.features),
+                               hk_m5_task_record(dev->dev.params.features) ? 16 : 0)
                           : agx_nir_lower_m5_task_payload_probe(nir))
                     : agx_nir_lower_gen1_task_payload_probe(nir)) ||
           !(m5_mesh ? agx_nir_lower_m5_mesh(nir, &varyings)
@@ -5620,7 +5636,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (dev->dev.chip != AGX_CHIP_G17S ||
           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE ||
           !(hk_m5_task_opt_in()
-               ? agx_nir_lower_m5_task(nir, hk_m5_task_payload_limit())
+               ? agx_nir_lower_m5_task(nir,
+                    hk_m5_task_payload_limit(dev->dev.params.features),
+                    hk_m5_task_record(dev->dev.params.features))
                : agx_nir_lower_m5_task_probe(nir))) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);

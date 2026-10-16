@@ -181,10 +181,29 @@ static const struct drm_asahi_params_global params_g17s = {
    .usc_generation = 3, .gpu_hal_generation = DRM_ASAHI_GPU_HAL_300,
 };
 
+/* M5 Pro with the task (object->mesh) mesh rendering buffer bound
+ * (m5_mesh_storage_chunks != 0): DRM_ASAHI_FEATURE_TASK_MESH_STORAGE. */
+static const struct drm_asahi_params_global params_g17s_task = {
+   .features = DRM_ASAHI_FEATURE_SOFT_FAULTS | DRM_ASAHI_FEATURE_RENDER_RESOURCES |
+               DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 |
+               DRM_ASAHI_FEATURE_TASK_MESH_STORAGE,
+   .gpu_generation = 17, .gpu_variant = 'S', .gpu_revision = 0,
+   .chip_id = 0x6050, .num_dies = 1, .num_clusters_total = 2,
+   .num_cores_per_cluster = 10, .core_masks = {0x3ff, 0x3ff},
+   .vm_start = 0x4000, .vm_end = (1ull << 42) - 0x8000ull,
+   .vm_kernel_min_size = 0x20000000, .max_commands_per_submission = 64,
+   .max_attachments = 16, .max_frequency_khz = 1500000,
+   .command_timestamp_frequency_hz = 1000000000,
+   .usc_generation = 3, .gpu_hal_generation = DRM_ASAHI_GPU_HAL_300,
+};
+
 static const struct drm_asahi_params_global *
 shim_params(void)
 {
    const char *chip = getenv("ASAHI_SHIM_CHIP");
+
+   if (chip && !strcmp(chip, "g17s-task"))
+      return &params_g17s_task;
 
    if (chip && !strcmp(chip, "g17p"))
       return &params_g17p;
