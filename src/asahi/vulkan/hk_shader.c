@@ -4363,10 +4363,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
       /* Explicit interpolateAtSample() is not sample shading. Fold its
        * single-sample clamp too, without cloning the per-pixel shader body
-       * or guessing a G17P samples-log2 special-register encoding. */
-      if (agx_native_graphics(&dev->dev) && key->fs.g17p_samples)
-         NIR_PASS(_, nir, agx_nir_specialize_sample_count,
-                  key->fs.g17p_samples);
+       * or guessing a samples-log2 special-register encoding: neither G17P
+       * nor M5 has a grounded AGX3 encoding for that SR, and the packer
+       * refuses it. M5 keys the count as m5_position_samples. */
+      const unsigned native_samples =
+         hk_native_fs_samples(dev->dev.chip, &key->fs);
+      if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+          native_samples)
+         NIR_PASS(_, nir, agx_nir_specialize_sample_count, native_samples);
 
       if (!shader->info.fs.m5_inline_sample_shading)
          NIR_PASS(_, nir, agx_nir_lower_fs_active_samples_to_register);

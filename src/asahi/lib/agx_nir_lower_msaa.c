@@ -54,7 +54,7 @@ specialize_sample_count(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 bool
 agx_nir_specialize_sample_count(nir_shader *shader, unsigned samples)
 {
-   assert(samples == 1 || samples == 2 || samples == 4);
+   assert(samples == 1 || samples == 2 || samples == 4 || samples == 8);
    return nir_shader_intrinsics_pass(shader, specialize_sample_count,
                                      nir_metadata_control_flow, &samples);
 }
