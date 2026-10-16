@@ -227,6 +227,7 @@ if with_tests
          'test/test-fminmax-constant-denorm.cpp',
          'test/test-shared-byte-offsets.cpp',
          'test/test-device-load-batches.cpp',
+         'test/test-m5-copy-schedule.cpp',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',

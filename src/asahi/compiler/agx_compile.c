@@ -2499,6 +2499,19 @@ agx_emit_image_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *intr)
                                     agx_immediate(0), agx_null(),
                                     agx_tex_dim(dim, is_array), lod_mode, 0,
                                     false, sparse, nir_is_coherent(intr));
+   /* ACCESS_CAN_REORDER (nir_opt_access: the image is NonWritable, so
+    * nothing in this shader writes it) and ACCESS_RESTRICT (vtn: an image
+    * not decorated Aliased, which SPIR-V's Simple/GLSL/Vulkan memory models
+    * let the consumer assume does not alias another memory object
+    * declaration) together mean no store of this shader can write what the
+    * load reads, so it may be moved across them. M5 encodes the read as a
+    * native SMP, which Apple's compiler issues ahead of earlier image writes
+    * (native725 vs_copy). */
+   const enum gl_access_qualifier access = nir_intrinsic_access(intr);
+   I->memory_can_reorder =
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      (access & ACCESS_CAN_REORDER) && (access & ACCESS_RESTRICT) &&
+      !nir_is_coherent(intr);
    I->mask = agx_expand_tex_to(b, &intr->def, tmp, !sparse);
 
    b->shader->out->uses_txf = true;
