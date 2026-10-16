@@ -86,9 +86,10 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
       return 0;
 
    enum pipe_format p_format = hk_format_to_pipe_format(vk_format);
-   /* D16S8 uses the existing independent D16 and S8 planes. */
+   /* D16S8 uses the existing independent D16 and S8 planes, as D32S8 does
+    * on G17P and M5. */
    if (vk_format == VK_FORMAT_D16_UNORM_S8_UINT) {
-      if (pdev->dev.chip != AGX_CHIP_G17P)
+      if (pdev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(pdev->dev.chip))
          return 0;
       p_format = PIPE_FORMAT_Z16_UNORM;
    }
