@@ -1783,7 +1783,9 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       bool task;
       struct hk_shader *object = hk_native_mesh_object(gfx, &task);
       programs[2].legacy.threadgroup_bytes = object->b.info.local_size;
-      programs[2].legacy.primary_bytes = object->only_linked->b.scratch_size;
+      programs[2].legacy.primary_bytes =
+         MAX2(object->only_linked->b.scratch_size,
+              object->only_linked->b.agx3_spectpr_scratch_size);
       programs[2].legacy.secondary_bytes =
          hk_m5_vertex_secondary_storage(&object->only_linked->b);
       programs[2].threads = task ? object->b.info.workgroup_size[0] *
@@ -11714,9 +11716,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
       (!cpu_grid || count_address || conditional);
    uint64_t task_flag = 0;
    if (task) {
-      /* Task scratch needs a reservation this path does not make. */
-      if (!task->only_linked || task->only_linked->b.scratch_size ||
-          task->only_linked->b.agx3_spectpr_scratch_size) {
+      if (!task->only_linked) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
       }
