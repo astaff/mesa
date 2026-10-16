@@ -9,7 +9,9 @@
  *  - alpha-to-coverage: one DEPTHF per sample with the alpha coverage folded
  *    into its word, and no separate MOVMSK;
  *  - blended alpha-to-coverage without a depth write: one MOVMSK per pixel,
- *    ahead of the per-sample blend.
+ *    ahead of the per-sample blend;
+ *  - blended with a depth write: all of the depth words above, ahead of the
+ *    per-sample blend.
  */
 #include <gtest/gtest.h>
 #include <stdio.h>
@@ -370,6 +372,42 @@ TEST_F(M5DepthExport, BlendedAlphaCoverageTestsOncePerPixel)
          if (!sample_shading) {
             EXPECT_LT(index_of(m, "movmsk"), index_of(m, "lldcol"));
          }
+         free(part.binary);
+         ralloc_free(s);
+      }
+   }
+}
+
+/* Native blend_depth_{2,4,8}x and a2cb_depth_{2,4,8}x: a blended fragment
+ * that writes depth finishes its depth words before blending any sample. */
+TEST_F(M5DepthExport, BlendedDepthWritesPrecedeTheBlend)
+{
+   for (bool a2c : {false, true}) {
+      for (unsigned samples : {2u, 4u, 8u}) {
+         SCOPED_TRACE(::testing::Message() << samples << " samples"
+                      << (a2c ? ", alpha to coverage" : ""));
+         epilog_shape shape = {AGX_CHIP_G17S, samples, true, false, a2c};
+         shape.blend = true;
+         nir_shader *s = build_epilog(shape);
+         agx_preprocess_nir(s);
+         counts c = count_nir(s);
+         EXPECT_EQ(c.store_zs, 1u);
+         EXPECT_EQ(c.covered_sample, a2c ? 0u : 1u);
+         EXPECT_EQ(c.coverage_updates, 0u);
+
+         agx_shader_part part = {};
+         ASSERT_TRUE(compile_m5(s, samples, &part, true))
+            << agx_last_compile_refusal();
+         std::vector<std::string> m = mnemonics(part);
+         EXPECT_EQ(count_of(m, "lldcol"), samples);
+         EXPECT_EQ(count_of(m, "depthf"), a2c ? samples : 1u);
+         EXPECT_EQ(count_of(m, "movmsk"), 0u);
+         int last_depthf = -1;
+         for (unsigned i = 0; i < m.size(); ++i) {
+            if (m[i] == "depthf")
+               last_depthf = i;
+         }
+         EXPECT_LT(last_depthf, index_of(m, "lldcol"));
          free(part.binary);
          ralloc_free(s);
       }
