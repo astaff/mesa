@@ -2279,14 +2279,31 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
    VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties,
                           pPropertyCount);
    if (pdev->vk.supported_features.cooperativeMatrix) {
+      /* The order of this list is implementation-defined. List the 8x8x8
+       * FP32 x FP32 configuration first: CTS
+       * cooperative_matrix.op_constant_null steps through the device's
+       * configurations and, for the last one, needs it in its own table,
+       * which has no FP32 A/B operands; when the last configuration is
+       * missing there it builds a zero configuration and crashes. */
+      vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
+         *p = (VkCooperativeMatrixPropertiesKHR) {
+            .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+            .MSize = 8, .NSize = 8, .KSize = 8,
+            .AType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+            .BType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+            .CType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+            .ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR,
+            .saturatingAccumulation = VK_FALSE,
+            .scope = VK_SCOPE_SUBGROUP_KHR,
+         };
+      }
       unsigned max_size = (pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) ? 16 : 8;
       for (unsigned size = max_size; size >= 8; size /= 2) {
          const VkComponentTypeKHR types[] = {VK_COMPONENT_TYPE_FLOAT16_KHR,
-            VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR};
+            VK_COMPONENT_TYPE_BFLOAT16_KHR};
          for (unsigned i = 0; i < ARRAY_SIZE(types); ++i) {
-            if ((types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
-                 !pdev->vk.supported_features.shaderBFloat16CooperativeMatrix) ||
-                (types[i] == VK_COMPONENT_TYPE_FLOAT32_KHR && size != 8))
+            if (types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR &&
+                !pdev->vk.supported_features.shaderBFloat16CooperativeMatrix)
                continue;
             unsigned modes = types[i] == VK_COMPONENT_TYPE_BFLOAT16_KHR ? 2 : 1;
             for (unsigned accum = 0; accum < modes; ++accum) {
