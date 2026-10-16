@@ -46,7 +46,7 @@ agx_vdm_decode_one(enum agx_chip chip, const void *bytes, size_t available,
       record->chip = chip;
       return true;
    }
-   if (word0 == AGX_VDM_MESH_DISPATCH_HEADER) {
+   if ((word0 & ~UINT32_C(0xff00)) == AGX_VDM_MESH_DISPATCH_BASE) {
       if (available < AGX_VDM_MESH_DISPATCH_LENGTH ||
           !agx_vdm_mesh_dispatch_unpack(chip, bytes, AGX_VDM_MESH_DISPATCH_LENGTH,
                                        &record->data.mesh_dispatch))

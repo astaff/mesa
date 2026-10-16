@@ -11697,8 +11697,14 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
       memcpy(cs->current, &draw_state_offset, sizeof(draw_state_offset));
       cs->current += sizeof(draw_state_offset);
    }
+   /* The record is an Index List block; its Primitive field must name the
+    * mesh output topology. With the triangle value, point and line meshes
+    * of 22 or more primitives (more than 64 bytes at three index bytes per
+    * primitive) lost primitives on hardware. */
    struct agx_vdm_mesh_dispatch_info dispatch = {
       .threads = {3, 1, 1}, .local_size = {3, 1, 1},
+      .primitive = mesh_info->prim == MESA_PRIM_POINTS ? 0
+                 : mesh_info->prim == MESA_PRIM_LINES  ? 1 : 6,
    };
    if (task) {
       for (unsigned i = 0; i < 3; ++i) {

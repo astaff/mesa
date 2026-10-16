@@ -11,7 +11,10 @@ extern "C" {
 #define AGX_VDM_MESH_STATE_LENGTH    56u
 #define AGX_VDM_MESH_DISPATCH_LENGTH 28u
 #define AGX_VDM_MESH_STATE_HEADER    UINT32_C(0x40000d2c)
+/* Index List block with the mesh bit; bits 8..15 are the Index List
+ * "Primitive" field (cmdbuf.xml): native triangle mesh records carry 6. */
 #define AGX_VDM_MESH_DISPATCH_HEADER UINT32_C(0x70000600)
+#define AGX_VDM_MESH_DISPATCH_BASE   UINT32_C(0x70000000)
 
 
 struct agx_vdm_mesh_state_info {
@@ -22,6 +25,9 @@ struct agx_vdm_mesh_state_info {
 };
 struct agx_vdm_mesh_dispatch_info {
    uint32_t threads[3], local_size[3];
+   /* Index List "Primitive" of the mesh output: 0 points, 1 lines,
+    * 6 triangles. */
+   uint8_t primitive;
 };
 
 bool agx_vdm_mesh_threadgroup_pack(const uint32_t size[3], uint32_t *word);

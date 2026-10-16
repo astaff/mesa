@@ -124,9 +124,10 @@ agx_vdm_mesh_dispatch_pack(enum agx_chip chip,
 {
    if (out)
       memset(out, 0, AGX_VDM_MESH_DISPATCH_LENGTH);
-   if (!out || !supported(chip) || !valid_grid(info))
+   if (!out || !supported(chip) || !valid_grid(info) ||
+       (info->primitive != 0 && info->primitive != 1 && info->primitive != 6))
       return false;
-   agx_store_le32(out, AGX_VDM_MESH_DISPATCH_HEADER);
+   agx_store_le32(out, AGX_VDM_MESH_DISPATCH_BASE | (info->primitive << 8));
    for (unsigned i = 0; i < 3; i++) {
       agx_store_le32(out + 4 + 4 * i, info->threads[i]);
       agx_store_le32(out + 16 + 4 * i, info->local_size[i]);
@@ -144,7 +145,10 @@ agx_vdm_mesh_dispatch_unpack(enum agx_chip chip, const void *bytes, size_t size,
       return false;
    const uint8_t *raw = bytes;
    struct agx_vdm_mesh_dispatch_info tmp = {0};
-   if (agx_load_le32(raw) != AGX_VDM_MESH_DISPATCH_HEADER)
+   const uint32_t header = agx_load_le32(raw);
+   tmp.primitive = (header >> 8) & 0xff;
+   if ((header & ~UINT32_C(0xff00)) != AGX_VDM_MESH_DISPATCH_BASE ||
+       (tmp.primitive != 0 && tmp.primitive != 1 && tmp.primitive != 6))
       return false;
    for (unsigned i = 0; i < 3; i++) {
       tmp.threads[i] = agx_load_le32(raw + 4 + 4 * i);

@@ -104,6 +104,34 @@ TEST(M5MeshLimits, MatchesNativePackets)
    }
 }
 
+/* The mesh dispatch record is an Index List block whose Primitive field
+ * (bits 8..15) names the mesh output topology; native triangle meshes
+ * carry 6 (0x70000600). */
+TEST(M5MeshDispatch, PrimitiveFollowsTopology)
+{
+   for (const auto &c : {std::array<uint32_t, 2>{0, 0x70000000}, {1, 0x70000100},
+                        {6, 0x70000600}}) {
+      agx_vdm_mesh_dispatch_info info = {};
+      for (unsigned i = 0; i < 3; ++i)
+         info.threads[i] = info.local_size[i] = i ? 1 : 3;
+      info.primitive = c[0];
+      uint8_t bytes[AGX_VDM_MESH_DISPATCH_LENGTH];
+      ASSERT_TRUE(agx_vdm_mesh_dispatch_pack(AGX_CHIP_G17S, &info, bytes));
+      uint32_t header;
+      memcpy(&header, bytes, 4);
+      EXPECT_EQ(header, c[1]);
+      agx_vdm_mesh_dispatch_info back;
+      ASSERT_TRUE(agx_vdm_mesh_dispatch_unpack(AGX_CHIP_G17S, bytes, sizeof(bytes), &back));
+      EXPECT_EQ(back.primitive, c[0]);
+   }
+   agx_vdm_mesh_dispatch_info info = {};
+   for (unsigned i = 0; i < 3; ++i)
+      info.threads[i] = info.local_size[i] = 1;
+   info.primitive = 3; /* line strip: no mesh topology */
+   uint8_t bytes[AGX_VDM_MESH_DISPATCH_LENGTH];
+   EXPECT_FALSE(agx_vdm_mesh_dispatch_pack(AGX_CHIP_G17S, &info, bytes));
+}
+
 TEST(M5MeshLimits, RejectsInvalidLimitsWithoutMutation)
 {
    for (const auto &c : {std::array<uint32_t, 3>{0, 1, 4}, {1, 0, 4},
