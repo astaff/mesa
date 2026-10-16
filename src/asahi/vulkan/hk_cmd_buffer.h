@@ -939,6 +939,13 @@ struct hk_cs {
 
    /* Native private-memory profiles for every dispatch in this stream. */
    struct util_dynarray compute_resources;
+   /* Fields of the M5 HAL300 graphics core this stream last emitted. The
+    * PPP latches it for the following draws of the stream, so an identical
+    * one is not emitted again; any other PPP state emitted into the stream
+    * clears m5_ppp_emitted_valid. See hk_flush_ppp_state(). */
+   struct agx_ppp_hal300_graphics_fields m5_ppp_emitted;
+   bool m5_ppp_emitted_valid;
+
    struct util_dynarray render_resources;
    /* The render_resources entry the last draw matched or appended, see
     * hk_m5_note_render_resources(). */

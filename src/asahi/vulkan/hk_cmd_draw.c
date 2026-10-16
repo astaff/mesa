@@ -7097,6 +7097,9 @@ hk_flush_vp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
    const bool hal300 =
       agx_chip_command_stream_generation(dev->dev.chip) ==
       AGX_CS_GENERATION_HAL300;
+   /* The viewport records are PPP state too: re-emit the graphics core after
+    * them rather than rely on what the stream latched before. */
+   cs->m5_ppp_emitted_valid = false;
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
 
@@ -8616,6 +8619,11 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       fields.back_stencil = back_stencil.opaque[0];
       fields.visibility_mode = gfx->occlusion.mode;
       fields.visibility_index = gfx->occlusion.index;
+      /* The stream already latched this state (see hk_cs). */
+      if (cs->m5_ppp_emitted_valid &&
+          !memcmp(&cs->m5_ppp_emitted, &fields, sizeof(fields)))
+         return;
+
       __typeof__(gfx->m5_ppp_pack_memo) *pack = &gfx->m5_ppp_pack_memo;
       if (!pack->valid || memcmp(&pack->fields, &fields, sizeof(fields))) {
          pack->valid = false;
@@ -8646,6 +8654,8 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       }
       memcpy(*out, records, sizeof(records));
       *out += sizeof(records);
+      cs->m5_ppp_emitted = fields;
+      cs->m5_ppp_emitted_valid = true;
       return;
    }
 
