@@ -571,7 +571,7 @@ hk_get_device_features(
 
       /* VK_KHR_shader_fma */
       .shaderFmaFloat16 = true,
-      .shaderFmaFloat32 = true,
+      .shaderFmaFloat32 = agx_chip_exact_fma32(dev->chip),
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */

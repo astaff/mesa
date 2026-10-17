@@ -439,6 +439,15 @@ agx_chip_image_load_misses_own_store(enum agx_chip chip)
    return chip == AGX_CHIP_G17P;
 }
 
+/* Whether a 32-bit FFMA keeps a product below the normal range exactly, as
+ * the fused multiply-add of VK_KHR_shader_fma requires. G15's flushes such a
+ * product to zero before the add. */
+static inline bool
+agx_chip_exact_fma32(enum agx_chip chip)
+{
+   return !agx_chip_native_g15(chip);
+}
+
 /* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
  * layout has a bias field; Gen4 does not, so the shader applies the bias. */
 static inline bool
