@@ -4333,6 +4333,30 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
    agx_foreach_instr_global_safe(ctx, I) {
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
 
+      /* An AGX3 float add, multiply or fused multiply-add has no form whose
+       * operands are all immediates. The optimizer can leave one after
+       * folding a select to a constant; keep the first immediate and move
+       * the others into registers. */
+      bool all_immediate = I->nr_srcs > 0;
+      agx_foreach_src(I, s)
+         all_immediate &= I->src[s].type == AGX_INDEX_IMMEDIATE;
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B && all_immediate &&
+          (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
+           I->op == AGX_OPCODE_FFMA)) {
+         agx_foreach_src(I, s) {
+            if (s == 0)
+               continue;
+            float value = agx_minifloat_decode(I->src[s].value);
+            if (I->src[s].abs)
+               value = fabsf(value);
+            if (I->src[s].neg)
+               value = -value;
+            I->src[s] = I->dest[0].size == AGX_SIZE_16
+                           ? agx_mov_imm(&b, 16, _mesa_float_to_half(value))
+                           : agx_mov_imm(&b, 32, fui(value));
+         }
+      }
+
       /* AGX3's integer compare-select names an immediate comparand in eight
        * bits (agx3_pack_binary.c). A wider constant goes through a register
        * of the other comparand's width. */
