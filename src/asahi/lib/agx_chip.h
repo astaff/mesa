@@ -309,6 +309,19 @@ agx_chip_sampler_heap_element_size(enum agx_chip chip)
    }
 }
 
+/*
+ * Whether the native path runs on Apple's G15 command-stream generation
+ * (M3, RTKit 2419) rather than HAL200.  The record layouts are shared; the
+ * firmware-facing differences are the direct CDM launch pointer, the CDM
+ * visibility barrier and the render-command resource specifiers.
+ */
+static inline bool
+agx_chip_native_g15(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) &&
+          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G17P
  * has six; G15 and G16 parts have ten, and with six their fragment programs
  * of 256x256 and larger walk past the lead into the guard page. */

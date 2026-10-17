@@ -32,7 +32,8 @@ agx3_g17p_native_compute_program_bind(
    const struct agx3_g17p_native_compute_program_desc *desc,
    struct agx3_compute_program *program)
 {
-   if (!desc || !program || desc->program_va == 0 || desc->shader_va == 0 ||
+   if (!desc || !program || !agx_chip_native_agx3(desc->chip) ||
+       desc->program_va == 0 || desc->shader_va == 0 ||
        desc->program_va > UINT64_C(0xffffffffffff) ||
        desc->shader_va > UINT64_C(0xffffffffffff) ||
        (desc->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
@@ -45,7 +46,7 @@ agx3_g17p_native_compute_program_bind(
       return false;
 
    *program = (struct agx3_compute_program){
-      .chip = AGX_CHIP_G17P,
+      .chip = desc->chip,
       .program_va = desc->program_va,
       .shader_va = desc->shader_va,
       .launch_template = launch_template,
@@ -84,6 +85,28 @@ agx3_g17p_native_compute_launch_pack(
           (axis >= grid->dimensions &&
            (global_size[axis] != 1 || grid->local_size[axis] != 1)))
          return false;
+   }
+
+   /* The G15 firmware (T6030, RTKit 2419) parses the older launch layout:
+    * word 1 carries VA[47:32] in its high half, word 2 VA >> 6 and word 3
+    * the bare control 0x40.  There is no room for template word 1, and the
+    * template's subkernel bit stays set for one-dimensional grids too. */
+   if (agx_chip_native_g15(program->chip)) {
+      if (program->launch_template.word1 != 0)
+         return false;
+
+      agx3_cmdstream_store_le32(packed, program->launch_template.word0);
+      agx3_cmdstream_store_le32(packed + 4,
+                                (uint32_t)(program->program_va >> 32) << 16);
+      agx3_cmdstream_store_le32(packed + 8,
+                                (uint32_t)(program->program_va >> 6));
+      agx3_cmdstream_store_le32(packed + 12, UINT32_C(0x40));
+      for (unsigned axis = 0; axis < 3; ++axis) {
+         agx3_cmdstream_store_le32(packed + 16 + axis * 4, global_size[axis]);
+         agx3_cmdstream_store_le32(packed + 28 + axis * 4,
+                                   grid->local_size[axis]);
+      }
+      return true;
    }
 
    /* The output-positive A18 Pro add3 record stores the Ioto program pointer
@@ -153,7 +176,7 @@ agx3_g17p_native_compute_dispatch_append_with_barrier(
       return false;
 
    const struct agx3_cdm_barrier_info barrier = {
-      .chip = AGX_CHIP_G17P,
+      .chip = program->chip,
       .flags = barrier_flags,
    };
    if (!agx3_cdm_barrier_pack(&barrier,
@@ -242,7 +265,7 @@ agx3_g17p_native_indirect_compute_launch_append(
       return false;
 
    const struct agx3_cdm_barrier_info barrier = {
-      .chip = AGX_CHIP_G17P,
+      .chip = program->chip,
       .flags = barrier_flags,
    };
    if (!agx3_cdm_barrier_pack(&barrier,

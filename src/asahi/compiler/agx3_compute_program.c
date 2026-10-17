@@ -141,6 +141,7 @@ agx3_g17p_compute_program_generate(
       return false;
 
    const struct agx3_g17p_native_compute_program_desc launch_desc = {
+      .chip = chip,
       .program_va = desc->program_va,
       .shader_va = desc->shader_va,
       .launch_sources = desc->launch_sources,

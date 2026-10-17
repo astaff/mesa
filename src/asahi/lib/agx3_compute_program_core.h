@@ -23,6 +23,7 @@ extern "C" {
  * form.  The Ioto bytes remain frontend-owned; this object binds their exact
  * allocation to the launch metadata used below. */
 struct agx3_g17p_native_compute_program_desc {
+   enum agx_chip chip;
    uint64_t program_va;
    uint64_t shader_va;
    struct agx3_cdm_direct_template_sources launch_sources;
