@@ -172,7 +172,7 @@ enum agx_submission_model {
 static inline bool
 agx_chip_native_agx3(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P;
+   return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G17P;
 }
 
 /* The chip whose record encodings GPU-generated (libagx) command-stream
