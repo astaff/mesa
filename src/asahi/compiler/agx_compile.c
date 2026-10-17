@@ -4770,14 +4770,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                I->src[s] = plain;
                continue;
             }
-            /* An implicit zero is native, except beside a uniform: the
-             * tied uniform minimum/maximum takes its other comparand from a
+            /* An implicit zero is native, except beside a uniform in a tied
+             * minimum/maximum: that form takes its other comparand from a
              * register. */
+            const bool tied_uniform_minmax =
+               I->op == AGX_OPCODE_FCMPSEL &&
+               I->dest[0].size == AGX_SIZE_32 && !I->invert_cond &&
+               (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) &&
+               I->src[s ^ 1].type == AGX_INDEX_UNIFORM &&
+               agx_is_equiv(I->src[0], I->src[2]) &&
+               agx_is_equiv(I->src[1], I->src[3]);
             if (src.type != AGX_INDEX_IMMEDIATE ||
-                (src.value == 0 &&
-                 !(I->op == AGX_OPCODE_FCMPSEL &&
-                   I->dest[0].size == AGX_SIZE_32 &&
-                   I->src[s ^ 1].type == AGX_INDEX_UNIFORM)))
+                (src.value == 0 && !tied_uniform_minmax))
                continue;
 
             float value = agx_minifloat_decode(src.value);
