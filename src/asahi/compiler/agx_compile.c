@@ -4333,6 +4333,22 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
    agx_foreach_instr_global_safe(ctx, I) {
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
 
+      /* AGX3's integer compare-select names an immediate comparand in eight
+       * bits (agx3_pack_binary.c). A wider constant goes through a register
+       * of the other comparand's width. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          (I->op == AGX_OPCODE_ICMPSEL || I->op == AGX_OPCODE_ICMP)) {
+         for (unsigned s = 0; s < 2; ++s) {
+            const agx_index other = I->src[s ^ 1];
+            if (I->src[s].type != AGX_INDEX_IMMEDIATE ||
+                I->src[s].value <= 0xff ||
+                other.type == AGX_INDEX_IMMEDIATE)
+               continue;
+            I->src[s] = agx_mov_imm(
+               &b, other.size == AGX_SIZE_16 ? 16 : 32, I->src[s].value);
+         }
+      }
+
       /* G17P's grounded 32-bit saturating IADD encoding takes two registers.
        * Robust buffer bounds checks naturally produce uadd_sat(offset, #size),
        * where an immediate is implicitly unsigned and therefore lacks the ABS
