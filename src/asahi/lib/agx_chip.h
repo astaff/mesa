@@ -408,14 +408,16 @@ agx_chip_native_imageblock(enum agx_chip chip)
 }
 
 /*
- * Whether the A18 Pro defect applies that drops the upper bytes of a wide
- * multisample sample on a tile no geometry covered
- * (AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE). Measured on A18 Pro only.
+ * Whether the defect applies that drops the upper bytes of a wide multisample
+ * sample on a tile no geometry covered
+ * (AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE). Measured on A18 Pro, and on
+ * G15 (M3), where a layered 4x clear of a 16-byte format keeps only the low
+ * eight bytes of each sample.
  */
 static inline bool
 agx_chip_uncovered_tile_ms_defect(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P;
+   return chip == AGX_CHIP_G17P || agx_chip_native_g15(chip);
 }
 
 /* Whether a native fragment program may merge triangles across the
