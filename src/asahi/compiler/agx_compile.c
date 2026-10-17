@@ -4632,10 +4632,27 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
          if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
              I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16) {
-            /* Select alternatives are bit patterns, not minifloats. */
+            /* Select alternatives are bit patterns, not minifloats -- except
+             * in a tied minimum/maximum, where the optimizer deposited the
+             * compared minifloat into the select slot too. */
             for (unsigned s = 2; s < 4; ++s) {
-               if (I->src[s].type == AGX_INDEX_IMMEDIATE)
-                  I->src[s] = agx_mov_imm(&b, 16, I->src[s].value);
+               if (I->src[s].type != AGX_INDEX_IMMEDIATE)
+                  continue;
+               const agx_index cmp = I->src[s - 2];
+               const bool tied = cmp.type == AGX_INDEX_IMMEDIATE &&
+                                 cmp.value == I->src[s].value &&
+                                 cmp.abs == I->src[s].abs &&
+                                 cmp.neg == I->src[s].neg;
+               uint32_t bits = I->src[s].value;
+               if (tied) {
+                  float value = agx_minifloat_decode(I->src[s].value);
+                  if (I->src[s].abs)
+                     value = fabsf(value);
+                  if (I->src[s].neg)
+                     value = -value;
+                  bits = _mesa_float_to_half(value);
+               }
+               I->src[s] = agx_mov_imm(&b, 16, bits);
             }
          }
          /* The native F32/F16 route is qualified for EQ/LT and two full
@@ -4722,6 +4739,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             if (src.neg)
                value = -value;
             I->src[s] = agx_mov_imm(&b, 32, fui(value));
+
+            /* A tied minimum/maximum selects the same minifloat it compares.
+             * The select slot reads a bit pattern, so keep the tie through
+             * the register instead of leaving the minifloat there. */
+            const agx_index sel = I->src[s + 2];
+            if (I->op == AGX_OPCODE_FCMPSEL &&
+                I->dest[0].size == AGX_SIZE_32 &&
+                sel.type == AGX_INDEX_IMMEDIATE && sel.value == src.value &&
+                sel.abs == src.abs && sel.neg == src.neg)
+               I->src[s + 2] = I->src[s];
          }
       }
 
