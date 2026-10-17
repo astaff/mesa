@@ -337,7 +337,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
          cfg.width = DIV_ROUND_UP(u_minify(layout->width_px, level), denom.x);
          cfg.height = DIV_ROUND_UP(u_minify(layout->height_px, level), denom.y);
          cfg.first_level = 0;
-         cfg.last_level = dev->dev.chip == AGX_CHIP_G17P ? 0 : 1;
+         cfg.last_level = agx_native_graphics(&dev->dev) ? 0 : 1;
       } else {
          cfg.address = base_addr + ail_get_layer_offset_B(layout, layer);
          cfg.width = layout->width_px;
@@ -468,7 +468,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    if (eot)
       p_format = util_format_linear(p_format);
 
-   if (eot && dev->dev.chip == AGX_CHIP_G17P)
+   if (eot && agx_native_graphics(&dev->dev))
       p_format = agx_g17p_rt0_pbe_format(p_format);
 
    const struct util_format_description *desc =
@@ -718,7 +718,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       if (!textures_valid)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-      if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_native_graphics(&dev->dev)) {
          VkResult result = hk_descriptor_table_add(
             dev, &dev->sampled_images, &view->planes[p].sampled, 32,
             &view->planes[p].sampled_heap_index);
@@ -768,7 +768,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       view->planes[p].emrt_pbe_valid = pack_pbe(
          dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
          &view->planes[p].emrt_atomic_sw);
-      if (dev->dev.chip == AGX_CHIP_G17P &&
+      if (agx_native_graphics(&dev->dev) &&
           (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
           view->planes[p].emrt_pbe_valid) {
          const struct ail_layout *layout =
@@ -787,7 +787,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
          pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
                   &view->planes[p].layered_eot, NULL);
       if (debug_get_bool_option("ASAHI_G17P_IMAGE_DESCRIPTOR_DUMP", false) &&
-          dev->dev.chip == AGX_CHIP_G17P &&
+          agx_native_graphics(&dev->dev) &&
           image->vk.image_type == VK_IMAGE_TYPE_3D &&
           image->vk.extent.depth > 2048 &&
           (view->vk.view_type == VK_IMAGE_VIEW_TYPE_3D ||
@@ -832,7 +832,7 @@ hk_DestroyImageView(VkDevice _device, VkImageView imageView,
    if (!view)
       return;
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       for (unsigned p = 0; p < view->plane_count; ++p) {
          if (view->planes[p].emrt_read_heap_index)
             hk_descriptor_table_remove(dev, &dev->sampled_images,

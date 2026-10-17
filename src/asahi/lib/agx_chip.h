@@ -155,6 +155,35 @@ enum agx_submission_model {
  */
 #define AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE (8)
 
+/*
+ * Whether Honeykrisp drives a chip through its native AGX3 path: AGX3b shaders
+ * loaded by Ioto programs, VDM/PPP/CDM records in the HAL200 layout, Gen9
+ * descriptors with heap-indexed textures and samplers, firmware-owned USC
+ * private memory and no helper programs.
+ *
+ * Every native-path gate asks this question.  Where a chip on the path still
+ * differs from G17P, a narrower capability predicate below answers for it;
+ * the chip identity is never tested at the call site.
+ */
+#ifndef __OPENCL_VERSION__
+#include <stdbool.h>
+#endif
+
+static inline bool
+agx_chip_native_agx3(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/* The chip whose record encodings GPU-generated (libagx) command-stream
+ * records use.  Every native chip shares G17P's VDM records, so naming that
+ * one family keeps the precompiled kernels independent of the native chip. */
+static inline enum agx_chip
+agx_chip_record_family(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) ? AGX_CHIP_G17P : chip;
+}
+
 #ifndef __OPENCL_VERSION__
 
 #include <assert.h>

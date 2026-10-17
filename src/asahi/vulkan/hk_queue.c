@@ -194,7 +194,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       c->isp_zls_pixels = hk_drm_g17p_zls_pixels(
          cs->cr.zls_width, cs->cr.zls_height, cs->cr.depth.buffer,
          cs->cr.depth.meta, cs->cr.stencil.buffer, cs->cr.stencil.meta);
@@ -225,7 +225,7 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
     * render pass whose known primitive count is at most four, and never for
     * a continued pass or one with uncounted (indirect, mesh) work. This
     * stream's bound counts every draw of the whole pass, so it proves that. */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(&dev->dev) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
        cs->g17p_pass_begins && cs->g17p_pass_ends &&
        cs->g17p_primitive_bound <= 4) {
@@ -1254,7 +1254,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                  cs->sync.prior[HK_SYNC_VDM] != 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
             header.size = hk_drm_render_command_size(
-               dev->dev.chip == AGX_CHIP_G17P, queue->sync.exact_prior);
+               agx_native_graphics(&dev->dev), queue->sync.exact_prior);
             if (queue->sync.exact_prior) {
                cmd.prior_vdm = cs->sync.prior[HK_SYNC_VDM];
                cmd.prior_cdm = cs->sync.prior[HK_SYNC_CDM];

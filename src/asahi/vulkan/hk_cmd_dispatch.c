@@ -923,7 +923,7 @@ hk_g17p_prewarm_linked_compute_program_kind(
    struct hk_linked_shader *linked, bool internal_graphics,
    enum agx_ioto_g17p_compute_ldshdr_f1 kind)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P ||
+   if (!agx_native_graphics(&dev->dev) ||
        !hk_g17p_compute_shader_supported(s, linked))
       return;
 
@@ -1215,7 +1215,7 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (dev->dev.chip != AGX_CHIP_G17P || !prog->bo ||
+   if (!agx_native_graphics(&dev->dev) || !prog->bo ||
        !prog->info.main_size || !prog->info.nr_gprs ||
        prog->info.nr_preamble_gprs ||
        (prog->info.rodata.size_16 && !prog->rodata_offset) ||
@@ -1328,7 +1328,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    static_assert(HK_MAX_SETS == HK_AGX3_G17P_MAX_ROOT_SETS,
                  "G17P root range must cover every Honeykrisp set");
 
-   if (dev->dev.chip != AGX_CHIP_G17P || cs->type != HK_CS_CDM ||
+   if (!agx_native_graphics(&dev->dev) || cs->type != HK_CS_CDM ||
        !hk_g17p_compute_shader_supported(s, linked)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -2059,7 +2059,7 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
     * absent, keep the old behaviour rather than refusing the dispatch. */
    const bool have_sparse_helper = dev->g17p_grid_helper_sparse != NULL;
    const bool use_primary =
-      dev->dev.chip == AGX_CHIP_G17P && buffer->va &&
+      agx_native_graphics(&dev->dev) && buffer->va &&
       (!buffer->sparse_map || have_sparse_helper);
 
    uint64_t dispatch_addr = hk_buffer_address(buffer, offset, !use_primary);

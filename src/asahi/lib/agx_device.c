@@ -227,7 +227,7 @@ agx_drm_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
 uint64_t
 agx_bo_get_g17p_vdm_alias(struct agx_device *dev, struct agx_bo *bo)
 {
-   if (!bo || dev->chip != AGX_CHIP_G17P)
+   if (!bo || !agx_chip_native_agx3(dev->chip))
       return 0;
 
    /* A screen may have several contexts. Serialize first publication so they
@@ -1022,7 +1022,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * a power of two.  Shrinking the kernel reservation buys nothing -- the
     * power-of-two step dominates.  32GiB of VA against <=16GB of RAM is not
     * a practical limit. */
-   if (dev->chip == AGX_CHIP_G17P)
+   if (agx_chip_native_agx3(dev->chip))
       dev->shader_base = AGX_G17P_USC_WINDOW_BASE;
 
    if (dev->shader_base < reservation) {
@@ -1057,7 +1057,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * robustness carveout untouched while making every ordinary VDM payload
     * directly representable, with no per-run alias option.
     */
-   const bool heap_below_usc = dev->chip == AGX_CHIP_G17P;
+   const bool heap_below_usc = agx_chip_native_agx3(dev->chip);
 
    /*
     * Start the low heap as high as it can go rather than at the reservation.
@@ -1193,12 +1193,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
    util_vma_heap_init(&dev->main_heap, user_start, user_size);
    util_vma_heap_init(&dev->usc_heap, dev->shader_base, shader_size);
    initialized |= AGX_INIT_HEAPS;
-   if (dev->chip == AGX_CHIP_G17P &&
+   if (agx_chip_native_agx3(dev->chip) &&
        !agx_g17p_vdm_alias_heap_init(&dev->g17p_vdm_alias_heap)) {
       fprintf(stderr, "Failed to initialize G17P low VDM alias heap\n");
       goto fail;
    }
-   if (dev->chip == AGX_CHIP_G17P)
+   if (agx_chip_native_agx3(dev->chip))
       initialized |= AGX_INIT_ALIAS_HEAP;
 
    if (!agx_va_reserve_runtime_graph_hole(
@@ -1212,7 +1212,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    /* Keep captured addresses unavailable to ordinary allocations between
     * capture and replay. Reserve after all fixed firmware/alias holes, and
     * only for G17P using the common allocator; other winsyses own their VA. */
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(dev->chip)) {
       dev->replay_heap_initialized = agx_capture_replay_heap_init(
          &dev->main_heap, &dev->replay_heap, user_size);
       if (!dev->replay_heap_initialized) {
@@ -1304,7 +1304,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    struct agx_bo *bo =
-      dev->chip == AGX_CHIP_G17P
+      agx_chip_native_agx3(dev->chip)
          ? agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0, AGX_BO_WRITEBACK,
                          "Printf/abort")
          : agx_create_fixed_bo(
@@ -1316,7 +1316,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
-   if (dev->chip == AGX_CHIP_G17P &&
+   if (agx_chip_native_agx3(dev->chip) &&
        (bo->va == NULL || dev->main_heap_size < LIBAGX_PRINTF_BUFFER_SIZE ||
         bo->va->addr < dev->main_heap_base ||
         bo->va->addr - dev->main_heap_base >
@@ -1326,9 +1326,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
-   dev->printf_buffer_address =
-      dev->chip == AGX_CHIP_G17P ? bo->va->addr
-                                 : LIBAGX_PRINTF_BUFFER_ADDRESS;
+   dev->printf_buffer_address = agx_chip_native_agx3(dev->chip)
+                                   ? bo->va->addr
+                                   : LIBAGX_PRINTF_BUFFER_ADDRESS;
 
    dev->printf.bo = bo;
    uint32_t *printf_map = agx_bo_map(bo);
@@ -1353,7 +1353,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * dword terminates the chain, so it is a well-formed empty container
     * rather than a blank page.
     */
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(dev->chip)) {
       const size_t usc_base_size = AIL_PAGESIZE;
 
       simple_mtx_lock(&dev->vma_lock);
@@ -1417,7 +1417,7 @@ agx_close_device(struct agx_device *dev)
       util_vma_heap_finish(&dev->replay_heap);
    util_vma_heap_finish(&dev->main_heap);
    util_vma_heap_finish(&dev->usc_heap);
-   if (dev->chip == AGX_CHIP_G17P)
+   if (agx_chip_native_agx3(dev->chip))
       util_vma_heap_finish(&dev->g17p_vdm_alias_heap);
    glsl_type_singleton_decref();
 

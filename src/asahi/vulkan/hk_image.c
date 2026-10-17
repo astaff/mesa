@@ -144,7 +144,7 @@ hk_get_image_plane_format_features(struct hk_physical_device *pdev,
    /* Keep compressed-family reporting atomic with the corresponding Vulkan
     * feature. The complete BC, ETC2/EAC and ASTC LDR format matrices are
     * hardware-qualified through the native G17P sampled/upload path. */
-   if (pdev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(&pdev->dev) &&
        util_format_is_compressed(p_format) &&
        !hk_g17p_bc_format_supported(vk_format)) {
       const enum util_format_layout layout =

@@ -15,7 +15,7 @@ agx_ppp_hal200_raster_state_build(
 {
    if (out)
       memset(out, 0, sizeof(*out));
-   if (chip != AGX_CHIP_G17P || !fields || !out)
+   if (!agx_chip_native_agx3(chip) || !fields || !out)
       return false;
 
    out->fragment_control = AGX_PPP_HAL200_FRAGMENT_CONTROL_BASE;

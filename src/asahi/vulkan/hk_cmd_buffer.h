@@ -1660,7 +1660,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 
    if (cs) {
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      const bool full_usc_state = dev->dev.chip == AGX_CHIP_G17P;
+      const bool full_usc_state = agx_native_graphics(&dev->dev);
       /* Scissor and depth bias arrays are staged to dynamic arrays on the
        * CPU. When we end the control stream, they're done growing and are
        * ready for upload. G17P's ISP consumes these as full bit-40-set GART
@@ -1787,8 +1787,7 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * SPECTPR. There is no helper-program stack, and the kernel rejects a
     * command that names one. */
    if ((s->b.info.scratch_size == 0 && s->b.info.preamble_scratch_size == 0) ||
-       agx_chip_command_stream_generation(
-          hk_cmd_buffer_device(cmd)->dev.chip) == AGX_CS_GENERATION_HAL200)
+       agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev))
       return;
 
    hk_reserve_scratch_slow(cmd, cs, s);
@@ -1885,8 +1884,7 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (agx_chip_command_stream_generation(dev->dev.chip) ==
-       AGX_CS_GENERATION_HAL200) {
+   if (agx_native_graphics(&dev->dev)) {
       hk_reserve_scratch(cmd, cs, s);
       hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
       /* Software graphics stages communicate through memory: VS outputs,

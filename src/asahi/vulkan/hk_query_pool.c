@@ -109,7 +109,7 @@ hk_query_command_cs(struct hk_cmd_buffer *cmd)
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, HK_SYNC_ALL, cmd->current_cs.cs, dep);
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs && hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P)
+   if (cs && agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev))
       cs->g17p_timestamp_query = true;
    return cs;
 }
@@ -232,7 +232,7 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       /* End-of-stream writes belong to this exact post-graphics stream.
        * Pin it while the common native helper obtains its CDM stream; it
        * must not move availability ahead of the VDM producer. */
@@ -288,7 +288,7 @@ hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
    hk_cdm_cache_flush(dev, cs);
 
    perf_debug(cmd, "Queued write");
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       hk_g17p_meta_fill_addr(cmd, &cmd->current_cs.cs, address,
                              sizeof(value), value);
       return;
@@ -383,7 +383,7 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Query pool zero");
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       emit_zero_queries_g17p(cmd, pool, first_index, num_queries,
                              set_available);
       return;

@@ -49,7 +49,7 @@ agx3_g17p_compute_program_generate(
    enum agx_chip chip, const struct agx3_g17p_compute_program_desc *desc,
    struct agx3_g17p_compute_program *program)
 {
-   if (!program || chip != AGX_CHIP_G17P || !desc ||
+   if (!program || !agx_chip_native_agx3(chip) || !desc ||
        (desc->uniform_range_count && !desc->uniform_ranges) ||
        (desc->constant_program.code_size & 1) ||
        (desc->cprog_inputs && desc->cprog_inputs->count &&

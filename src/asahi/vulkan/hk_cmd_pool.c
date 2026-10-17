@@ -119,7 +119,7 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
     * draw. These BOs are recycled by the command pool, so populate and
     * initialize their shared mappings once at creation; subsequent command
     * buffers reuse already-resident pages without adding per-draw work. */
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       memset(bo->map, 0, bo->bo->size);
       if (hk_g17p_cached_cmd_memory(&dev->dev))
          util_flush_range(bo->map, bo->bo->size);
@@ -500,7 +500,7 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
 {
    const struct hk_device *dev = hk_cmd_pool_device(pool);
    const unsigned max_free =
-      dev->dev.chip == AGX_CHIP_G17P && type == HK_CMD_BO_MAIN
+      agx_native_graphics(&dev->dev) && type == HK_CMD_BO_MAIN
          ? HK_G17P_CMD_POOL_MAIN_BO_MAX
          : HK_CMD_POOL_BO_MAX;
 

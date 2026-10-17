@@ -190,13 +190,13 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
 
       unsigned bindless_base = 0;
       NIR_PASS(_, shader, agx_nir_lower_tilebuffer, tib, NULL, &bindless_base,
-               NULL, NULL, false, cache->dev->chip == AGX_CHIP_G17P);
+               NULL, NULL, false, agx_chip_native_agx3(cache->dev->chip));
       NIR_PASS(_, shader, agx_nir_lower_monolithic_msaa, tib->nr_samples);
       NIR_PASS(_, shader, agx_nir_lower_multisampled_image_store);
       NIR_PASS(_, shader, agx_nir_lower_texture);
       NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_tex_handle_to_u0,
                nir_metadata_control_flow, &descriptor_size);
-      if (cache->dev->chip == AGX_CHIP_G17P) {
+      if (agx_chip_native_agx3(cache->dev->chip)) {
          /* Monolithic MSAA introduces a small sample loop after the common
           * preprocessing pass has already run. Fold that loop here so each
           * local-pixel access has the static one-hot sample mask required by
@@ -228,7 +228,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
       return NULL;
    }
 
-   if (cache->dev->chip == AGX_CHIP_G17P && tib == NULL &&
+   if (agx_chip_native_agx3(cache->dev->chip) && tib == NULL &&
        !agx_g17p_rt0_eot_text_supported(&bin)) {
       free(bin.binary);
       ralloc_free(shader);
@@ -237,7 +237,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
    }
 
    res->info = bin.info;
-   if (cache->dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(cache->dev->chip)) {
       if (!agx_g17p_upload_bg_eot(cache, &bin, res)) {
          free(bin.binary);
          ralloc_free(shader);
@@ -310,9 +310,9 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       .fs.ignore_tib_dependencies = true,
       /* G17P multisample backgrounds store through the coverage register. */
       .fs.nr_samples =
-         cache->dev->chip == AGX_CHIP_G17P ? key->tib.nr_samples : 0,
+         agx_chip_native_agx3(cache->dev->chip) ? key->tib.nr_samples : 0,
       .reserved_preamble = key->reserved_preamble,
-      .no_preamble = cache->dev->chip == AGX_CHIP_G17P,
+      .no_preamble = agx_chip_native_agx3(cache->dev->chip),
    };
 
    /* The multi-target background protocol is keyed, not inferred: without
@@ -336,7 +336,7 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       assert(nr > 0);
 
       if (key->g17p_packed_clear && key->op[rt] == AGX_BG_CLEAR &&
-          cache->dev->chip == AGX_CHIP_G17P && rt == 0 &&
+          agx_chip_native_agx3(cache->dev->chip) && rt == 0 &&
           agx_g17p_packed_clear_ok(&key->tib)) {
          /* One raw tile word: the driver packed the clear colour exactly as
           * the R8G8B8A8_UNORM FLTNORM pair would, so store its 32 bits. */
@@ -352,7 +352,7 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
 
       nir_def *color = build_background_op(
          &b, key->op[rt], rt, nr, source_msaa, layered,
-         cache->dev->chip == AGX_CHIP_G17P);
+         agx_chip_native_agx3(cache->dev->chip));
       if (key->preserve_resolve_outside) {
          assert(rt == 0 && key->op[rt] == AGX_BG_LOAD);
          nir_def *xy = nir_u2u32(&b, nir_load_pixel_coord(&b));
@@ -384,7 +384,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
 {
    const unsigned rgba8_mask = agx_g17p_rgba8_mrt_mask(&key->tib);
    const unsigned active_count = util_bitcount(rgba8_mask);
-   if (cache->dev->chip == AGX_CHIP_G17P && rgba8_mask) {
+   if (agx_chip_native_agx3(cache->dev->chip) && rgba8_mask) {
       /* EOT partitions are physical offset/sample-stride quotients, not
        * fragment synchronization classes. All these compact offsets stay
        * in partition zero; native PBEs and offset arguments use active order. */
@@ -428,7 +428,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
     * 2D one -- so it is only selected when the caller asked for it and the
     * target really is multisample.
     */
-   const bool g17p = cache->dev->chip == AGX_CHIP_G17P;
+   const bool g17p = agx_chip_native_agx3(cache->dev->chip);
    if (key->store_and_resolve) {
       /* This bounded path has two memory outputs from one physical tile. */
       assert(g17p && key->multisample_store && key->tib.nr_samples > 1 &&
@@ -472,7 +472,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
 
       bool explicit = false;
       nir_def *coords = layer;
-      if (cache->dev->chip == AGX_CHIP_G17P) {
+      if (agx_chip_native_agx3(cache->dev->chip)) {
          /* AGX3's EOT imgwblk has no implicit pixel-coordinate form.  Apple's
           * G17P compiler reads the hardware grid X/Y SRs explicitly.  Array
           * stores append the hardware layer ID; dropping it here made every
@@ -490,13 +490,13 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
 
       enum pipe_format physical =
          agx_tilebuffer_physical_format(&key->tib, rt);
-      if (cache->dev->chip == AGX_CHIP_G17P &&
+      if (agx_chip_native_agx3(cache->dev->chip) &&
           (key->tib.logical_format[rt] == PIPE_FORMAT_R11G11B10_FLOAT ||
            key->tib.logical_format[rt] == PIPE_FORMAT_R9G9B9E5_FLOAT)) {
          /* G17P keeps packed-float tiles as one raw 32-bit word. The matching
           * PBE descriptor also uses R32_UINT to preserve those exact bits. */
          physical = PIPE_FORMAT_R32_UINT;
-      } else if (cache->dev->chip == AGX_CHIP_G17P &&
+      } else if (agx_chip_native_agx3(cache->dev->chip) &&
           util_format_is_srgb(key->tib.logical_format[rt])) {
          /* G17P applies the sRGB transfer in the fragment's own packs
           * (fltnorm/normflt sRGB modes) and stores the resulting bytes in a
@@ -528,10 +528,10 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    struct agx_shader_key compiler_key = {
       .dev = agx_gather_device_key(cache->dev),
       .reserved_preamble = key->reserved_preamble,
-      .no_preamble = cache->dev->chip == AGX_CHIP_G17P,
+      .no_preamble = agx_chip_native_agx3(cache->dev->chip),
    };
 
-   if (cache->dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(cache->dev->chip)) {
       agx_g17p_configure_rt0_eot_key(key->tib.logical_format[0],
                                     &compiler_key);
       compiler_key.g17p_rt0_eot_multisample = store_multisample;
@@ -566,7 +566,7 @@ agx_build_end_of_tile_shader(struct agx_bg_eot_cache *cache,
    }
 
    compiler_key.g17p_r11g11b10_mrt_eot =
-      cache->dev->chip == AGX_CHIP_G17P &&
+      agx_chip_native_agx3(cache->dev->chip) &&
       agx_g17p_classify_mrt(&key->tib) == AGX_G17P_MRT_R11G11B10;
 
    return agx_compile_bg_eot_shader(cache, b.shader, &compiler_key, NULL);
@@ -660,7 +660,7 @@ agx_get_precompiled_locked(struct agx_bg_eot_cache *cache, unsigned program)
       agx_workgroup(info->workgroup_size[0], info->workgroup_size[1],
                     info->workgroup_size[2]);
 
-   if (cache->dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(cache->dev->chip)) {
       const size_t lead_size = 0x340;
       const size_t main_span = MAX2(info->main_size, info->binary_size);
       const size_t block_size = agx3_code_block_size(main_span);
@@ -719,7 +719,7 @@ agx_get_precompiled_locked(struct agx_bg_eot_cache *cache, unsigned program)
       return NULL;
    }
 
-   if (cache->dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(cache->dev->chip)) {
       /* HAL200 consumes the CODE entry through a dispatch-local Ioto program;
        * none of the legacy USC launch words below are part of that ABI. */
       p_atomic_set(&cache->precomp[program], p);
