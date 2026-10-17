@@ -4691,8 +4691,10 @@ agx_g17p_append_compute(struct agx_batch *batch,
 
    struct agx3_cdm_direct_template_sources launch_sources;
    if (!agx3_cdm_direct_template_sources_compute(
-          info->uses_resource_info_query, info->uses_ray_traversal,
-          info->ray_traversal_depth_nonzero, &launch_sources))
+          info->uses_resource_info_query &&
+             agx_chip_query_ti_spill(dev->chip),
+          info->uses_ray_traversal, info->ray_traversal_depth_nonzero,
+          &launch_sources))
       return agx_g17p_compute_failed("launch template");
 
    const uint64_t shared = (uint64_t)info->local_size + variable_shared_mem;

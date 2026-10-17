@@ -458,6 +458,21 @@ agx_chip_native_preamble(enum agx_chip chip)
 }
 
 /*
+ * Whether a resource-info query reserves thread-invariant (TI) spill storage
+ * in a native compute launch.  Apple's compiler stages a uniform query's
+ * inputs for its constant program in TI storage, and the launch template
+ * follows that witness (agx3_cdm_direct_template_sources_compute()).  Mesa
+ * computes every query from descriptor memory, so only a constant program
+ * could consume the storage: a chip without native preambles needs none, and
+ * G15's direct launch has no TI field to carry it.
+ */
+static inline bool
+agx_chip_query_ti_spill(enum agx_chip chip)
+{
+   return agx_chip_native_preamble(chip);
+}
+
+/*
  * Whether this driver can generate code for a chip.
  *
  * True for every known encoding: AGX2 through agx_pack.c, AGX3b/AGX3c through
