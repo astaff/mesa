@@ -173,7 +173,7 @@ static inline bool
 agx_chip_native_agx3(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G15C ||
-          chip == AGX_CHIP_G17P;
+          chip == AGX_CHIP_G16G || chip == AGX_CHIP_G17P;
 }
 
 /* The chip whose record encodings GPU-generated (libagx) command-stream
@@ -341,7 +341,7 @@ static inline bool
 agx_chip_native_indirect_compute(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S ||
-          chip == AGX_CHIP_G15C;
+          chip == AGX_CHIP_G15C || chip == AGX_CHIP_G16G;
 }
 
 /* Whether the CDM's fetch of an indirect geometry block needs a cache flush
@@ -418,7 +418,7 @@ static inline bool
 agx_chip_native_imageblock(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S ||
-          chip == AGX_CHIP_G15C;
+          chip == AGX_CHIP_G15C || chip == AGX_CHIP_G16G;
 }
 
 /*
@@ -431,7 +431,8 @@ agx_chip_native_imageblock(enum agx_chip chip)
 static inline bool
 agx_chip_uncovered_tile_ms_defect(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P || agx_chip_native_g15(chip);
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G ||
+          agx_chip_native_g15(chip);
 }
 
 /* Whether a native fragment program may merge triangles across the
@@ -453,13 +454,13 @@ agx_chip_image_load_misses_own_store(enum agx_chip chip)
    return chip == AGX_CHIP_G17P;
 }
 
-/* Whether a 32-bit FFMA keeps a product below the normal range exactly, as
- * the fused multiply-add of VK_KHR_shader_fma requires. G15's flushes such a
- * product to zero before the add. */
+/* Whether native FP32 FFMA meets the exact rounding contract required by
+ * VK_KHR_shader_fma. G15 and G16G remain unqualified for that contract;
+ * G16G probes also fail near the minimum normal result. */
 static inline bool
 agx_chip_exact_fma32(enum agx_chip chip)
 {
-   return !agx_chip_native_g15(chip);
+   return chip != AGX_CHIP_G16G && !agx_chip_native_g15(chip);
 }
 
 /* Whether the sampler state word carries the LOD bias.  The HAL200 sampler

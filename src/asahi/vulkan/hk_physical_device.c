@@ -1033,10 +1033,11 @@ hk_get_device_properties(const struct agx_device *dev,
       /* Vulkan 1.0 limits */
       .maxImageDimension1D = 16384,
       .maxImageDimension2D = 16384,
-      /* G17P supports 3D base dimensions up to 2048, although the shared
-       * texture descriptor fields can encode larger arrays.
+      /* G17P and G16G use a 2048 limit for 3D base dimensions, although the
+       * shared texture descriptor fields can encode larger arrays.
        */
-      .maxImageDimension3D = dev->chip == AGX_CHIP_G17P ? 2048 : 16384,
+      .maxImageDimension3D =
+         (dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G16G) ? 2048 : 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
       /* The G17P texture/PBE includes the software alignment tail in its
@@ -1288,7 +1289,12 @@ hk_get_device_properties(const struct agx_device *dev,
       .independentResolveNone = true,
       .independentResolve = true,
       .driverID = VK_DRIVER_ID_MESA_HONEYKRISP,
-      .conformanceVersion = (VkConformanceVersion){1, 4, 6, 2},
+      /* The G16G port has not completed a conformance submission. Keep the
+       * implemented API/features available without claiming a passed CTS version.
+       */
+      .conformanceVersion = dev->chip == AGX_CHIP_G16G
+                               ? (VkConformanceVersion){0, 0, 0, 0}
+                               : (VkConformanceVersion){1, 4, 6, 2},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .shaderSignedZeroInfNanPreserveFloat16 = true,

@@ -1013,6 +1013,59 @@ TEST(NativeForms, HalfModifiedMultiplyAndSelect)
    }
 }
 
+TEST(NativeForms, ImageStoreUsesDataTypeAcrossChipsAndFormats)
+{
+   const struct {
+      nir_alu_type type;
+      pipe_format format;
+   } cases[] = {
+      {nir_type_uint32, PIPE_FORMAT_NONE},
+      {nir_type_uint32, PIPE_FORMAT_R32_UINT},
+      {nir_type_uint32, PIPE_FORMAT_R32G32B32A32_UINT},
+      {nir_type_int32, PIPE_FORMAT_NONE},
+      {nir_type_int32, PIPE_FORMAT_R32_SINT},
+      {nir_type_int32, PIPE_FORMAT_R32G32B32A32_SINT},
+      {nir_type_float32, PIPE_FORMAT_NONE},
+      {nir_type_float32, PIPE_FORMAT_R32_FLOAT},
+      {nir_type_float32, PIPE_FORMAT_R32G32B32A32_FLOAT},
+      {nir_type_invalid, PIPE_FORMAT_R32_UINT},
+   };
+   for (const auto &c : cases) {
+      std::vector<uint8_t> reference;
+      for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+         SCOPED_TRACE(::testing::Message() << chip << " " << c.type << " "
+                                          << c.format);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "image store data type");
+         nir_def *input = agx_test_load_preamble(&b, 4, 32, 4);
+         nir_intrinsic_instr *store = nir_image_store(
+            &b, nir_imm_intN_t(&b, 1, 16),
+            nir_imm_ivec4(&b, 0, 0, 0, 0), nir_imm_intN_t(&b, 0, 16),
+            input, nir_imm_intN_t(&b, 0, 16));
+         nir_intrinsic_set_image_dim(store, GLSL_SAMPLER_DIM_2D);
+         nir_intrinsic_set_format(store, c.format);
+         nir_intrinsic_set_src_type(store, c.type);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = chip;
+         key.no_preamble = true;
+         key.reserved_preamble = 16;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+         ASSERT_GT(part.info.binary_size, 0u);
+         const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+         std::vector<uint8_t> binary(code, code + part.info.binary_size);
+         if (reference.empty())
+            reference = binary;
+         else
+            EXPECT_EQ(binary, reference);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
 TEST(NativeForms, VertexImageLoadRegisterLod)
 {
    nir_builder b = nir_builder_init_simple_shader(

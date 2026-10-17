@@ -219,10 +219,11 @@ agx_chip_driver_supported(enum agx_chip chip)
    /*
     * Codegen is necessary, not sufficient. An AGX3 chip is admitted only on
     * the native path, and only with the exact axes that path is wired for:
-    * Gen9 descriptors in a 32-byte sampler heap, and either G17P's HAL200
-    * records, HAL200 sampler layout and dual queue model, or G15S's G15
-    * command stream, Gen4 sampler and classic queue model. Other AGX3
-    * identities still lack at least one of those pieces.
+    * Gen9 descriptors in a 32-byte sampler heap, with HAL200 records and
+    * samplers for G17P and G16G, or G15 records and Gen4 samplers for G15S
+    * and G15C. G17P uses dual queues; the other native profiles use the
+    * classic queue model. Other AGX3 identities still lack at least one
+    * of those pieces.
     */
    if (!agx_chip_codegen_supported(chip))
       return false;
@@ -252,6 +253,12 @@ agx_chip_driver_supported(enum agx_chip chip)
                 AGX_CS_GENERATION_G15 &&
              agx_chip_sampler_generation(chip) ==
                 AGX_SAMPLER_GENERATION_GEN4 &&
+             agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_CLASSIC;
+   case AGX_CHIP_G16G:
+      return agx_chip_command_stream_generation(chip) ==
+                AGX_CS_GENERATION_HAL200 &&
+             agx_chip_sampler_generation(chip) ==
+                AGX_SAMPLER_GENERATION_GEN4_HAL200 &&
              agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_CLASSIC;
    default:
       return false;
@@ -291,6 +298,11 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
              params->num_clusters_total == 4 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
+   case AGX_CHIP_G16G:
+      return params->chip_id == 0x8132 && params->num_dies == 1 &&
+             params->num_clusters_total == 1 &&
+             params->usc_generation == AGX_ISA_AGX3 &&
+             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
    default:
       return true;
    }

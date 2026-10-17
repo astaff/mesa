@@ -229,6 +229,7 @@ if with_tests
     executable(
       'libasahi_tests',
       files(
+        'tests/test-chip.cpp',
         'tests/test-packing.cpp',
         'tests/test-tilebuffer.cpp',
         'tests/test-g17p-msaa-epilog.cpp',
