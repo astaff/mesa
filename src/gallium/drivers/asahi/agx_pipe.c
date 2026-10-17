@@ -1139,7 +1139,7 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
       return;
 
    unsigned fastclear = buffers & ~(batch->draw | batch->load);
-   if (agx_device(pctx->screen)->chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(agx_device(pctx->screen))) {
       agx_batch_init_state(batch);
       const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
       for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
@@ -1423,7 +1423,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    /* G17P treats an absent ZLS allocation as an inactive depth surface.  Its
     * native render command keeps the clear register at 1.0 in that state;
     * zero is only a real clear value when depth or stencil storage exists. */
-   if (dev->chip == AGX_CHIP_G17P && !zres && !sres)
+   if (agx_native_graphics(dev) && !zres && !sres)
       c->isp_bgobjdepth = fui(1.0f);
 
    if ((dev->debug & AGX_DBG_NOCLUSTER) && dev->chip != AGX_CHIP_G17P)
@@ -1481,7 +1481,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    /* A direct resolve also writes a different image: loaded samples in
     * tiles without geometry must reach that destination. */
    if ((batch->clear & batch->resolve) ||
-       (dev->chip == AGX_CHIP_G17P && batch->key.resolve &&
+       (agx_native_graphics(dev) && batch->key.resolve &&
         (batch->load & PIPE_CLEAR_COLOR0)))
       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 
@@ -1583,7 +1583,7 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
 {
    /* Finalize the encoder */
    struct agx_device *dev = agx_device(ctx->base.screen);
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(dev)) {
       uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
       if (!agx3_cdm_stream_terminate_pack(dev->chip, terminate))
          UNREACHABLE("G17P CDM terminate must be grounded");
@@ -2062,7 +2062,7 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
        * texel-fetch entry, so native graphics and compute can expose
        * Gallium's complete API table without the legacy heap. Geometry
        * shaders use the same table through their lowered compute programs. */
-      if (agx_device(pscreen)->chip == AGX_CHIP_G17P &&
+      if (agx_native_graphics(agx_device(pscreen)) &&
           (i == MESA_SHADER_VERTEX || i == MESA_SHADER_FRAGMENT ||
            i == MESA_SHADER_GEOMETRY || i == MESA_SHADER_COMPUTE))
          caps->max_texture_samplers = PIPE_MAX_SAMPLERS;

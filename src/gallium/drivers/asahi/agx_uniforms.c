@@ -87,7 +87,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
    struct agx_device *dev = agx_device(ctx->base.screen);
 
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(dev)) {
       for (unsigned s = 0; s < PIPE_MAX_SAMPLERS; ++s) {
          unif->custom_border_sampler_handle[s] = -1;
          memset(unif->custom_border[s], 0, sizeof(unif->custom_border[s]));
@@ -97,7 +97,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    u_foreach_bit(s, st->valid_samplers) {
       unif->lod_bias[s] = st->samplers[s]->lod_bias_as_fp16;
 
-      if (dev->chip == AGX_CHIP_G17P &&
+      if (agx_native_graphics(dev) &&
           st->samplers[s]->uses_custom_border) {
          uint16_t handle;
          if (!agx_gallium_g17p_custom_border_handle(dev->chip, s, &handle))
@@ -113,7 +113,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
     * indexes the native per-stage table uploaded with the graphics program. */
    if (st->shader && st->shader->uses_bindless_samplers) {
       u_foreach_bit(s, st->valid_samplers) {
-         if (dev->chip == AGX_CHIP_G17P) {
+         if (agx_native_graphics(dev)) {
             /* The G17P graphics Ioto program publishes the per-stage HAL200
              * table directly. Indirect operands therefore name the same
              * i+1 entries as immediate operands; the old 28+index handle

@@ -100,7 +100,7 @@ agx_batch_get_g17p_vdm_alias(struct agx_batch *batch, struct agx_bo *bo,
                              uint64_t address)
 {
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
-   if (dev->chip != AGX_CHIP_G17P)
+   if (!agx_native_graphics(dev))
       return address;
 
    if (!bo || address < bo->va->addr || address - bo->va->addr >= bo->size)
@@ -130,7 +130,7 @@ agx_batch_get_g17p_vdm_alias(struct agx_batch *batch, struct agx_bo *bo,
 static void
 agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
 {
-   if (dev->chip != AGX_CHIP_G17P)
+   if (!agx_native_graphics(dev))
       return;
 
    encoder->g17p_vdm_alias = agx_bo_get_g17p_vdm_alias(dev, encoder->bo);
