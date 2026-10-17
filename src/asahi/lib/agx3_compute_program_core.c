@@ -175,9 +175,13 @@ agx3_g17p_native_compute_dispatch_append_with_barrier(
    if (!agx3_g17p_native_compute_launch_pack(program, grid, staged))
       return false;
 
+   /* A strong tail is a cache flush; publish it the way the chip's own
+    * encoder does. */
    const struct agx3_cdm_barrier_info barrier = {
       .chip = program->chip,
       .flags = barrier_flags,
+      .wide_visibility = barrier_flags == 0x5 &&
+                         agx_chip_cdm_wide_visibility(program->chip),
    };
    if (!agx3_cdm_barrier_pack(&barrier,
                               staged + AGX3_CDM_DIRECT_LAUNCH_SIZE))
@@ -264,9 +268,12 @@ agx3_g17p_native_indirect_compute_launch_append(
    if (!agx3_g17p_native_indirect_launch_pack(program, geometry_va, staged))
       return false;
 
+   /* A strong tail is a cache flush, as for the direct launch. */
    const struct agx3_cdm_barrier_info barrier = {
       .chip = program->chip,
       .flags = barrier_flags,
+      .wide_visibility = barrier_flags == 0x5 &&
+                         agx_chip_cdm_wide_visibility(program->chip),
    };
    if (!agx3_cdm_barrier_pack(&barrier,
                               staged + AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE))

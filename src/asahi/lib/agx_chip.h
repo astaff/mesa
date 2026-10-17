@@ -322,6 +322,19 @@ agx_chip_native_g15(enum agx_chip chip)
           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
 }
 
+/*
+ * Whether a CDM cache flush must use the wide-visibility barrier.  Apple's G15
+ * encoder publishes a memory dependency between dispatches of one compute
+ * stream with 0x600215fe, not the ordinary flags-5 word that suffices on
+ * HAL200; the kernel's end-of-command flush does not cover dependencies
+ * inside a stream.
+ */
+static inline bool
+agx_chip_cdm_wide_visibility(enum agx_chip chip)
+{
+   return agx_chip_native_g15(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G17P
  * has six; G15 and G16 parts have ten, and with six their fragment programs
  * of 256x256 and larger walk past the lead into the guard page. */

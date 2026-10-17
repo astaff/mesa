@@ -90,6 +90,10 @@ struct agx3_cdm_barrier_info {
    /* G17 Gen7 drives bits 12, 11, 10 and 1 from flags 0..3.  Earlier
     * inspected emitters expose only canonical flag sets 0 and 0b0101. */
    uint8_t flags;
+   /* The G15 and G16G ComputeContext::encodeBarrier emit 0x600201fe and
+    * 0x600215fe for a nonzero visibility: the ordinary word with 0x2009e
+    * set. */
+   bool wide_visibility;
 };
 
 struct agx3_cdm_substream_barrier_info {
@@ -585,6 +589,16 @@ agx3_cdm_barrier_flags_grounded(enum agx_chip chip, uint8_t flags)
    }
 }
 
+/* The wide-visibility barrier forms are witnessed in the G15S (AGXG15SDevice)
+ * and G16G CommandEncodingNext emitters only. */
+static inline bool
+agx3_cdm_barrier_wide_visibility_grounded(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G16G;
+}
+
+#define AGX3_CDM_BARRIER_WIDE_VISIBILITY UINT32_C(0x0002009e)
+
 static inline uint32_t
 agx3_cdm_barrier_word(uint8_t flags)
 {
@@ -603,10 +617,15 @@ agx3_cdm_barrier_pack(const struct agx3_cdm_barrier_info *info,
       return false;
 
    memset(packed, 0, AGX3_CDM_BARRIER_SIZE);
-   if (!info || !agx3_cdm_barrier_flags_grounded(info->chip, info->flags))
+   if (!info || !agx3_cdm_barrier_flags_grounded(info->chip, info->flags) ||
+       (info->wide_visibility &&
+        !agx3_cdm_barrier_wide_visibility_grounded(info->chip)))
       return false;
 
-   agx3_cmdstream_store_le32(packed, agx3_cdm_barrier_word(info->flags));
+   agx3_cmdstream_store_le32(
+      packed, agx3_cdm_barrier_word(info->flags) |
+                 (info->wide_visibility ? AGX3_CDM_BARRIER_WIDE_VISIBILITY
+                                        : 0));
    return true;
 }
 
@@ -622,7 +641,16 @@ agx3_cdm_barrier_unpack(enum agx_chip chip, const void *packed,
        !agx3_cdm_barrier_target_grounded(chip))
       return false;
 
-   const uint32_t word = agx3_cmdstream_load_le32((const uint8_t *)packed);
+   uint32_t word = agx3_cmdstream_load_le32((const uint8_t *)packed);
+   const bool wide_visibility =
+      (word & AGX3_CDM_BARRIER_WIDE_VISIBILITY) ==
+      AGX3_CDM_BARRIER_WIDE_VISIBILITY;
+   if (wide_visibility) {
+      if (!agx3_cdm_barrier_wide_visibility_grounded(chip))
+         return false;
+      word &= ~AGX3_CDM_BARRIER_WIDE_VISIBILITY;
+   }
+
    const uint32_t optional_mask = UINT32_C(0x00001c02);
    if ((word & ~optional_mask) != UINT32_C(0x60000160))
       return false;
@@ -636,6 +664,7 @@ agx3_cdm_barrier_unpack(enum agx_chip chip, const void *packed,
 
    info->chip = chip;
    info->flags = flags;
+   info->wide_visibility = wide_visibility;
    return true;
 }
 

@@ -431,6 +431,7 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
       const struct agx3_cdm_barrier_info info = {
          .chip = dev->dev.chip,
          .flags = 0x5,
+         .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
       };
       uint8_t packed[AGX3_CDM_BARRIER_SIZE];
       if (!agx3_cdm_barrier_pack(&info, packed)) {
