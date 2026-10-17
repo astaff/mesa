@@ -164,6 +164,12 @@ pass(agx_context *ctx, void *memctx)
     */
    qsort(flat, flat_count, sizeof(*flat), priority_compare);
 
+   const unsigned max_uniforms =
+      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            ctx->stage == MESA_SHADER_FRAGMENT
+         ? AGX3_FRAGMENT_UNIFORM_END
+         : AGX_NUM_UNIFORMS;
+
    /* Promote as many constants as we can */
    for (unsigned i = 0; i < flat_count; ++i) {
       struct constant_info *info = flat[i];
@@ -176,7 +182,7 @@ pass(agx_context *ctx, void *memctx)
                              i == 0 ? MAX2(info->align_16, 2) : info->align_16;
       unsigned uniform = ALIGN_POT(ctx->out->push_count, range_align);
       unsigned new_count = uniform + info->align_16;
-      if (new_count > AGX_NUM_UNIFORMS)
+      if (new_count > max_uniforms)
          break;
 
       /* Set the base for the first constant. This avoids uploading an extra

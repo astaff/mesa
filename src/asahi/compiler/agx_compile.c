@@ -11230,9 +11230,13 @@ agx3_nir_lower_uniform_dma(nir_shader *nir, const struct agx_shader_key *key,
    info->agx3_uniform_dma_count = 0;
 
    /* Copies end where the constant program's storage does, before the main
-    * program's promoted constants. */
+    * program's promoted constants, and a fragment shader's uniforms end by
+    * AGX3_FRAGMENT_UNIFORM_END. */
+   const unsigned reserve = agx3_uniform_dma_constant_reserve(nir);
    const unsigned limit =
-      MIN2(480, AGX_NUM_UNIFORMS - agx3_uniform_dma_constant_reserve(nir));
+      nir->info.stage == MESA_SHADER_FRAGMENT
+         ? AGX3_FRAGMENT_UNIFORM_END - MIN2(reserve, AGX3_FRAGMENT_UNIFORM_END)
+         : MIN2(480, AGX_NUM_UNIFORMS - reserve);
 
    /* Buffers first: copying one also retires its descriptor's loads. */
    struct util_dynarray cands = UTIL_DYNARRAY_INIT;
