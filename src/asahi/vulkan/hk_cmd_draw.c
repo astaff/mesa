@@ -2195,14 +2195,14 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
    /* Storage capacity and raster samples are independent limits. In
     * particular 16x16 at 4x may occupy the full 32 KiB, while 32x32 at 4x
     * exceeds the sample budget even for an eight-byte sample. */
-   const bool g17p = dev->dev.chip == AGX_CHIP_G17P;
+   const bool imageblock = agx_chip_native_imageblock(dev->dev.chip);
    const uint8_t max_sample_size_B =
-      !g17p                    ? 0
+      !imageblock              ? 0
       : g17p_wide_ms_to_memory ? AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE
                                : AGX_G17P_MAX_BYTES_PER_SAMPLE;
    return agx_build_tilebuffer_layout_with_limits(
       formats, count, samples, layered, max_sample_size_B,
-      g17p ? 32768 : 0, agx_native_graphics(&dev->dev) ? 2048 : 0);
+      imageblock ? 32768 : 0, agx_native_graphics(&dev->dev) ? 2048 : 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2300,7 +2300,8 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * tiles the application does not draw to. Multiview has a second, separate
     * defect that the clear draw does not cover either. Those two spill. */
    bool g17p_wide_ms_to_memory = false;
-   if (dev->dev.chip == AGX_CHIP_G17P && render->tilebuffer.nr_samples > 1) {
+   if (agx_chip_uncovered_tile_ms_defect(dev->dev.chip) &&
+       render->tilebuffer.nr_samples > 1) {
       g17p_wide_ms_to_memory = render->view_mask != 0;
 
       for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
@@ -2717,12 +2718,19 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * an ordinary full-area draw instead. That covers every tile, so the
     * background program only ever runs on a tile the hardware also
     * rasterizes, which keeps the whole sample. The target stays in the
-    * tilebuffer. */
+    * tilebuffer.
+    *
+    * A spilling multisample tilebuffer takes the same full clear on every
+    * chip: a draw that clears only the spilled targets makes its epilog
+    * preserve the resident ones by reading the tile back, a multisample eMRT
+    * shape the packer cannot encode. (On G17P such a tilebuffer is always
+    * wider than eight bytes a sample, so this adds nothing there.) */
    const bool clear_wide_multisample =
-      dev->dev.chip == AGX_CHIP_G17P && color_clear_count > 0 &&
-      render->tilebuffer.nr_samples > 1 &&
-      render->tilebuffer.sample_size_B >
-         AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE;
+      color_clear_count > 0 && render->tilebuffer.nr_samples > 1 &&
+      (clear_spills ||
+       (agx_chip_uncovered_tile_ms_defect(dev->dev.chip) &&
+        render->tilebuffer.sample_size_B >
+           AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE));
    if (clear_spills && !incomplete_render_area && !clear_wide_multisample) {
       unsigned selected = 0;
       for (unsigned i = 0; i < clear_count; ++i) {

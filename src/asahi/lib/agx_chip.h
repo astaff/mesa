@@ -364,6 +364,28 @@ agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
    return chip == AGX_CHIP_G16G || agx_chip_native_g15(chip);
 }
 
+/*
+ * Whether the Apple9 imageblock applies: up to 128 bytes a sample in a full
+ * 32 KiB (32768-byte) tile. Apple's Metal feature set tables give G15 (M3)
+ * and G17P (A18 Pro) the same Apple9 limits.
+ */
+static inline bool
+agx_chip_native_imageblock(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S;
+}
+
+/*
+ * Whether the A18 Pro defect applies that drops the upper bytes of a wide
+ * multisample sample on a tile no geometry covered
+ * (AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE). Measured on A18 Pro only.
+ */
+static inline bool
+agx_chip_uncovered_tile_ms_defect(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
 /* Whether a native fragment program may merge triangles across the
  * linker's other merge-disabling cases: memory writes and wide subgroup
  * operations. Apple's G17P metadata leaves the bit clear for both; on other
