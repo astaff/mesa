@@ -897,12 +897,88 @@ lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
    return true;
 }
 
+/*
+ * A Gen4 sampler word has no LOD-bias field, so NIR's sampler-bias lowering
+ * hands a LOD query the API bias as an instruction operand. G15's native
+ * query does not apply that operand correctly: a null texture reports a
+ * nonzero LOD. Query without it, add the bias to the query's unclamped LOD
+ * and select the accessed level from the sampler's LOD range and mip filter,
+ * as lower_compute_lod_query does. A view without levels (a null descriptor)
+ * reports zero.
+ */
+static void
+lower_gen4_biased_lod_query(nir_builder *b, nir_tex_instr *tex,
+                            const struct lower_descriptors_ctx *ctx)
+{
+   if (tex->op != nir_texop_lod || ctx->descriptor_generation != 9 ||
+       ctx->sampler_has_lod_bias ||
+       nir_tex_instr_src_index(tex, nir_tex_src_bias) < 0 ||
+       nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref) < 0)
+      return;
+
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *bias = nir_f2f32(b, nir_steal_tex_src(tex, nir_tex_src_bias));
+
+   nir_def *levels = nir_build_texture_query(b, tex, nir_texop_query_levels, 1,
+                                             nir_type_int32, false, false);
+   lower_tex(b, nir_instr_as_tex(nir_def_instr(levels)), ctx);
+   b->cursor = nir_before_instr(&tex->instr);
+
+   const int sampler_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   nir_deref_instr *sampler = nir_src_as_deref(tex->src[sampler_idx].src);
+   const int plane_idx = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   const uint32_t plane =
+      plane_idx >= 0 ? nir_src_as_uint(tex->src[plane_idx].src) : 0;
+   const struct hk_sampled_image_descriptor_layout native =
+      hk_sampled_image_descriptor_layout(ctx->descriptor_generation);
+
+   nir_def *index = load_resource_deref_desc(
+      b, 1, 16, sampler, plane * native.stride + native.sampler_index, ctx);
+   nir_def *heap = load_root(
+      b, 1, 64, nir_imm_int(b, hk_root_descriptor_offset(sampler_heap_address)),
+      8);
+   nir_def *addr = nir_iadd(
+      b, heap,
+      nir_imul_imm(b, nir_u2u64(b, index),
+                   agx_chip_sampler_heap_element_size(AGX_CHIP_G15S)));
+   nir_def *word = load_speculatable(b, 1, 32, addr, 8);
+   nir_def *min_lod =
+      nir_fmul_imm(b, nir_u2f32(b, nir_iand_imm(b, word, 0x3ff)), 1.0 / 64.0);
+   nir_def *max_lod = nir_fmul_imm(
+      b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, word, 10), 0x3ff)),
+      1.0 / 64.0);
+   nir_def *mip_filter = nir_iand_imm(b, nir_ushr_imm(b, word, 27), 3);
+
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *lambda =
+      nir_fadd(b, nir_f2f32(b, nir_channel(b, &tex->def, 1)), bias);
+   nir_def *clamped = nir_fclamp(b, lambda, min_lod, max_lod);
+   nir_def *nearest =
+      nir_fadd_imm(b, nir_fceil(b, nir_fadd_imm(b, clamped, 0.5)), -1.0);
+   nir_def *level = nir_bcsel(
+      b, nir_ieq_imm(b, mip_filter, AGX_MIP_FILTER_NEAREST), nearest,
+      nir_bcsel(b, nir_ieq_imm(b, mip_filter, AGX_MIP_FILTER_LINEAR), clamped,
+                nir_imm_float(b, 0.0)));
+   nir_def *last = nir_i2f32(b, nir_iadd_imm(b, levels, -1));
+   level = nir_fclamp(b, level, nir_imm_float(b, 0.0), last);
+
+   nir_def *result = nir_bcsel(b, nir_ieq_imm(b, levels, 0),
+                               nir_imm_zero(b, 2, 32),
+                               nir_vec2(b, level, lambda));
+   if (tex->def.bit_size != 32)
+      result = nir_f2fN(b, result, tex->def.bit_size);
+   nir_def_rewrite_uses_after(&tex->def, result);
+}
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx)
 {
    if (lower_compute_lod_query(b, tex, ctx))
       return true;
+
+   lower_gen4_biased_lod_query(b, tex, ctx);
 
    b->cursor = nir_before_instr(&tex->instr);
 
