@@ -5688,3 +5688,59 @@ TEST(NativeForms, M5UniformDifferenceHonorsNIRSignedZero)
    }
    EXPECT_NE(programs[1], programs[0]);
 }
+
+TEST(NativeForms, M5OrSelectTracksVectorConversionComponent)
+{
+   for (unsigned bits : {16u, 32u}) {
+      for (unsigned conditions = 0; conditions < 8; ++conditions) {
+         for (unsigned component = 0; component < 2; ++component) {
+            for (unsigned selected = 0; selected < 2; ++selected) {
+               for (bool swapped : {false, true}) {
+                  for (bool inverted : {false, true}) {
+                     SCOPED_TRACE(::testing::Message() << bits << ":" << conditions
+                        << ":" << component << ":" << selected << ":"
+                        << swapped << ":" << inverted);
+                     nir_builder b = nir_builder_init_simple_shader(
+                        MESA_SHADER_COMPUTE, &agx_nir_options, "vector b2f component");
+                     nir_def *a = nir_ieq(&b,
+                        nir_imm_ivec2(&b, conditions & 1, (conditions >> 1) & 1),
+                        nir_imm_int(&b, 1));
+                     nir_def *other = nir_ieq(&b, nir_imm_int(&b, conditions >> 2),
+                                              nir_imm_int(&b, 1));
+                     nir_def *condition = nir_ior(&b, nir_channel(&b, a, component), other);
+                     nir_alu_instr *ior = nir_def_as_alu(condition);
+                     nir_src_rewrite(&ior->src[0].src, a);
+                     ior->src[0].swizzle[0] = component;
+                     nir_def *boolean = inverted ? nir_inot(&b, a) : a;
+                     nir_def *converted = bits == 16 ? nir_b2f16(&b, boolean)
+                                                     : nir_b2f32(&b, boolean);
+                     nir_alu_instr *b2f = nir_def_as_alu(converted);
+                     b2f->src[0].swizzle[0] = swapped ? 1 : 0;
+                     b2f->src[0].swizzle[1] = swapped ? 0 : 1;
+                     nir_def *value = nir_bcsel(&b, condition,
+                        nir_channel(&b, converted, selected), nir_imm_floatN_t(&b, 3.0, bits));
+                     nir_alu_instr *sel = nir_def_as_alu(value);
+                     nir_src_rewrite(&sel->src[1].src, converted);
+                     sel->src[1].swizzle[0] = selected;
+                     nir_intrinsic_instr *store = nir_store_global(&b,
+                        bits == 16 ? nir_f2f32(&b, value) : value,
+                        nir_imm_int64(&b, 0x2000000), .write_mask = 1, .align_mul = 4);
+                     nir_validate_shader(b.shader, "vector conversion before OR select");
+                     unsigned source_component = selected ^ unsigned(swapped);
+                     EXPECT_EQ(agx_nir_m5_split_or_selects(b.shader),
+                               source_component == component);
+                     nir_validate_shader(b.shader, "vector conversion after OR select");
+                     while (nir_opt_constant_folding(b.shader)) {}
+                     ASSERT_TRUE(nir_src_is_const(store->src[0]));
+                     bool selected_bool = ((conditions >> source_component) & 1) ^ inverted;
+                     bool taken = ((conditions >> component) & 1) || (conditions & 4);
+                     EXPECT_FLOAT_EQ(nir_src_as_float(store->src[0]),
+                                     taken ? float(selected_bool) : 3.0f);
+                     ralloc_free(b.shader);
+                  }
+               }
+            }
+         }
+      }
+   }
+}

@@ -7876,7 +7876,6 @@ set_speculate(nir_builder *b, nir_instr *instr, UNUSED void *_)
 
 static bool agx_g17p_discard_word(nir_shader *nir);
 static bool agx_m5_discard_word(nir_shader *nir);
-static bool agx_m5_split_or_selects(nir_shader *nir);
 
 /* Drop a constant program left without instructions. */
 static void
@@ -8302,7 +8301,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    /* After the selects of trivial if-else statements exist. */
    if (m5) {
       bool folded = false;
-      NIR_PASS(folded, nir, agx_m5_split_or_selects);
+      NIR_PASS(folded, nir, agx_nir_m5_split_or_selects);
       if (folded) {
          NIR_PASS(_, nir, nir_opt_copy_prop);
          NIR_PASS(_, nir, nir_opt_dce);
@@ -12357,16 +12356,17 @@ agx_g17p_discard_word(nir_shader *nir)
  * unchanged. Bit 0 is the only bit the one-sample word reads, so the update
  * is unchanged by construction.
  */
-/* Whether `d` is b2f of `c` or of its inversion; *value is then the float
- * that b2f gives when `c` holds. */
+/* Whether component d_comp of d is b2f of component c_comp of c or its
+ * inversion. Keep the consumer and producer swizzles composed. */
 static bool
-agx_b2f_of(nir_def *d, nir_def *c, unsigned c_comp, bool *inverted)
+agx_b2f_of(nir_def *d, unsigned d_comp, nir_def *c, unsigned c_comp,
+           bool *inverted)
 {
    nir_alu_instr *b2f = nir_def_as_alu_or_null(d);
    if (!b2f || (b2f->op != nir_op_b2f32 && b2f->op != nir_op_b2f16))
       return false;
    nir_def *x = b2f->src[0].src.ssa;
-   unsigned xc = b2f->src[0].swizzle[0];
+   unsigned xc = b2f->src[0].swizzle[d_comp];
    nir_alu_instr *inot = nir_def_as_alu_or_null(x);
    *inverted = inot && inot->op == nir_op_inot;
    if (*inverted) {
@@ -12400,7 +12400,8 @@ agx_m5_split_or_select(nir_builder *b, nir_alu_instr *sel, void *data)
       nir_def *a = ior->src[first].src.ssa;
       unsigned ac = ior->src[first].swizzle[0];
       bool inverted;
-      if (!agx_b2f_of(sel->src[1].src.ssa, a, ac, &inverted) ||
+      if (!agx_b2f_of(sel->src[1].src.ssa, sel->src[1].swizzle[0],
+                      a, ac, &inverted) ||
           a->num_components <= ac)
          continue;
 
@@ -12419,8 +12420,8 @@ agx_m5_split_or_select(nir_builder *b, nir_alu_instr *sel, void *data)
    return false;
 }
 
-static bool
-agx_m5_split_or_selects(nir_shader *nir)
+bool
+agx_nir_m5_split_or_selects(nir_shader *nir)
 {
    return nir_shader_alu_pass(nir, agx_m5_split_or_select,
                               nir_metadata_control_flow, NULL);
