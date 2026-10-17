@@ -2098,7 +2098,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_early, support_lod_bias);
 
-   if (dev->dev.chip == AGX_CHIP_G17P)
+   if (agx_native_graphics(&dev->dev) &&
+       agx_chip_sampler_has_lod_bias(dev->dev.chip))
       NIR_PASS(_, nir, nir_shader_tex_pass, hk_lower_g17p_sampler_bias,
                nir_metadata_control_flow, NULL);
 
@@ -2116,7 +2117,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 
    NIR_PASS(_, nir, hk_nir_lower_descriptors, rs, set_layout_count,
             set_layouts, false, dev->dev.sparse_ro_offset,
-            hk_device_physical(dev)->scaled_sampling);
+            hk_device_physical(dev)->scaled_sampling,
+            agx_chip_sampler_has_lod_bias(dev->dev.chip));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,

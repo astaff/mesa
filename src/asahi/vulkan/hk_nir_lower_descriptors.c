@@ -38,6 +38,8 @@ struct lower_descriptors_ctx {
    uint64_t sparse_ro_offset;
    unsigned descriptor_generation;
    bool scaled_sampling;
+   /* Whether the hardware sampler word applies the API LOD bias. */
+   bool sampler_has_lod_bias;
    mesa_shader_stage stage;
 };
 
@@ -925,13 +927,15 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
     */
    if (tex->op == nir_texop_lod_bias) {
       /* G17P carries API LOD bias in its native sampler word. Avoid a
-       * redundant software load, including for dynamically indexed sets. */
-      if (ctx->descriptor_generation == 9 &&
+       * redundant software load, including for dynamically indexed sets.
+       * A Gen4 sampler has no such field, so the shader loads the bias. */
+      if (ctx->descriptor_generation == 9 && ctx->sampler_has_lod_bias &&
           !(tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS)) {
          nir_def_replace(&tex->def, nir_imm_float16(b, 0.0));
          return true;
       }
-      const bool combined = ctx->descriptor_generation == 9;
+      const bool combined =
+         tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS;
       unsigned offs = combined
          ? native.sampler + offsetof(struct hk_sampled_image_descriptor_sw,
                                      g17p.lod_bias)
@@ -1439,11 +1443,13 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          uint32_t set_layout_count,
                          struct vk_descriptor_set_layout *const *set_layouts,
                          bool sparse_buffer_residency,
-                         uint64_t sparse_ro_offset, bool scaled_sampling)
+                         uint64_t sparse_ro_offset, bool scaled_sampling,
+                         bool sampler_has_lod_bias)
 {
    struct lower_descriptors_ctx ctx = {
       .stage = nir->info.stage,
       .scaled_sampling = scaled_sampling,
+      .sampler_has_lod_bias = sampler_has_lod_bias,
       .sparse_buffer_residency = sparse_buffer_residency,
       .sparse_ro_offset = sparse_ro_offset,
       .clamp_desc_array_bounds =
