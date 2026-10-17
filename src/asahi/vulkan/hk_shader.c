@@ -3392,12 +3392,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * longer offline (light FS main 48 -> 52 + 12-instruction CProg, and
        * the loop's uniform compare/early compare were lost). Descriptor
        * lowering above uses immediate native state slots, never the AGX2
-       * texture/sampler-state-store protocol. */
-      .no_preamble = dev->dev.chip == AGX_CHIP_G17P &&
-         !(nir->info.stage == MESA_SHADER_FRAGMENT &&
-           (nir->info.num_ubos || nir->info.num_ssbos ||
-            nir->info.num_textures || nir->info.num_images ||
-            hk_nir_has_tex(nir))),
+       * texture/sampler-state-store protocol. Only G17P's constant program
+       * is qualified; other native chips never form a preamble. */
+      .no_preamble = agx_native_graphics(&dev->dev) &&
+         (!agx_chip_native_preamble(dev->dev.chip) ||
+          !(nir->info.stage == MESA_SHADER_FRAGMENT &&
+            (nir->info.num_ubos || nir->info.num_ssbos ||
+             nir->info.num_textures || nir->info.num_images ||
+             hk_nir_has_tex(nir)))),
    };
 
    /* The native constant-program lowering applies exactly when G17P lets
@@ -3476,7 +3478,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    /* G17P hardware vertex programs (API VS, GS raster and native TES
     * variants) run per-draw uniform work once in a native vertex constant
     * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
-   const bool vs_cprog = dev->dev.chip == AGX_CHIP_G17P && hw &&
+   const bool vs_cprog = agx_chip_native_preamble(dev->dev.chip) && hw &&
                          nir->info.stage == MESA_SHADER_VERTEX &&
                          (!shader->info.agx3_gen1_fragment_rq ||
                           debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_CPROG_DIAGNOSTIC", false));

@@ -237,7 +237,7 @@ agx_ioto_constant_program_emit(
          return false;
 
       if (program->absolute_branch) {
-         if (chip != AGX_CHIP_G17P)
+         if (!agx_chip_native_preamble(chip))
             return false;
          desc.external_va = program->code_va;
       } else {

@@ -354,6 +354,17 @@ agx_chip_sampler_has_lod_bias(enum agx_chip chip)
 }
 
 /*
+ * Whether native shaders may carry an Ioto constant program (CProg) and a
+ * shader preamble.  Only the G17P Ioto preamble sequence is qualified; other
+ * native chips compile every stage with no_preamble.
+ */
+static inline bool
+agx_chip_native_preamble(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/*
  * Whether this driver can generate code for a chip.
  *
  * True for every known encoding: AGX2 through agx_pack.c, AGX3b/AGX3c through
