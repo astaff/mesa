@@ -365,6 +365,17 @@ agx_chip_cdm_wide_visibility(enum agx_chip chip)
    return agx_chip_native_g15(chip);
 }
 
+/* Whether consecutive application dispatches of one CDM stream may omit the
+ * ordering barrier between them.  Vulkan orders dispatches only through
+ * explicit barriers, and Apple's G15 encoder emits none between independent
+ * dispatches; every other record (internal or indirect launch, cache flush,
+ * link, stream end) still follows a barrier. */
+static inline bool
+agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
+{
+   return agx_chip_native_g15(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G17P
  * has six; G15 and G16 parts have ten, and with six their fragment programs
  * of 256x256 and larger walk past the lead into the guard page. */

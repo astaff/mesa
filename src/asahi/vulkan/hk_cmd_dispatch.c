@@ -1787,6 +1787,21 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * ZINK_DEBUG=sync cures is unproven.
     */
    const uint8_t barrier_flags = 0;
+
+   /* Two application dispatches in a row need no barrier between them: drop
+    * the previous one's weak tail, which nothing else has followed or
+    * strengthened, and let this launch's own tail end the stream instead. */
+   const bool app_dispatch =
+      !cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
+      agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
+   if (app_dispatch && cs->app_dispatch_end &&
+       cs->current == cs->app_dispatch_end &&
+       cs->current == cs->weak_barrier_end) {
+      cs->current = (uint32_t *)((uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE);
+      sink.data = (uint8_t *)cs->current;
+      sink.capacity += AGX3_CDM_BARRIER_SIZE;
+   }
+
    if (!hk_agx3_g17p_native_compute_dispatch_append_with_barrier(
           &program.launch, &direct, barrier_flags, &sink)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1800,6 +1815,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    } else {
       cs->weak_barrier_end = cs->current;
    }
+   cs->app_dispatch_end = app_dispatch ? cs->current : NULL;
    cs->stats.cmds++;
 }
 

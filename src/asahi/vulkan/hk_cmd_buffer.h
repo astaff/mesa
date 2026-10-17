@@ -769,6 +769,12 @@ struct hk_cs {
     * fold the leading record into the destination's trailing one. */
    void *leading_barrier_end;
 
+   /* AGX3 CDM: weak_barrier_end when that barrier ends an application
+    * dispatch. Where agx_chip_elide_app_dispatch_barrier() holds, a following
+    * application dispatch overwrites it, so consecutive application dispatches
+    * carry no barrier between them; any other record still follows it. */
+   void *app_dispatch_end;
+
    /* Whether there is more than just the root chunk */
    bool stream_linked;
 
@@ -962,6 +968,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
             ? dst + ((uint8_t *)b->weak_barrier_end - (uint8_t *)b->start) -
                  b_skip
             : NULL;
+      a->app_dispatch_end = NULL;
    } else {
       void *link_end =
          hk_cmd_buffer_emit_cs_jump(a->cmd, a->current, b->addr, false);
@@ -972,6 +979,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
       a->stream_linked |= linked || b->stream_linked;
       a->strong_flush_end = b->strong_flush_end;
       a->weak_barrier_end = b->weak_barrier_end;
+      a->app_dispatch_end = NULL;
    }
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
