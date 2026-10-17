@@ -4746,7 +4746,14 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                I->src[s] = plain;
                continue;
             }
-            if (src.type != AGX_INDEX_IMMEDIATE || src.value == 0)
+            /* An implicit zero is native, except beside a uniform: the
+             * tied uniform minimum/maximum takes its other comparand from a
+             * register. */
+            if (src.type != AGX_INDEX_IMMEDIATE ||
+                (src.value == 0 &&
+                 !(I->op == AGX_OPCODE_FCMPSEL &&
+                   I->dest[0].size == AGX_SIZE_32 &&
+                   I->src[s ^ 1].type == AGX_INDEX_UNIFORM)))
                continue;
 
             float value = agx_minifloat_decode(src.value);
