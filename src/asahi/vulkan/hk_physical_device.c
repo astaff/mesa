@@ -570,7 +570,7 @@ hk_get_device_features(
       .shaderFloatControls2 = true,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = true,
+      .shaderFmaFloat16 = agx_chip_exact_fma32(dev->chip),
       .shaderFmaFloat32 = agx_chip_exact_fma32(dev->chip),
       .shaderFmaFloat64 = false,
 
@@ -1796,6 +1796,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        * subgroup quad shuffle operations exposed above. */
       supported_extensions.KHR_shader_quad_control = false;
    }
+
+   /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
+   if (!agx_chip_exact_fma32(pdev->dev.chip))
+      supported_extensions.KHR_shader_fma = false;
 
    if (pdev->dev.chip == AGX_CHIP_G17P) {
       /* Advanced blending is hardware-qualified on A18 Pro for every
