@@ -322,6 +322,15 @@ agx_chip_native_g15(enum agx_chip chip)
           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
 }
 
+/* Whether the kernel presents the T8140 native render context: a fixed Bind0
+ * and seven low context views at 0x1000000000 that every render job needs.
+ * This is a HAL200 firmware construct; the G15 firmware has none. */
+static inline bool
+agx_chip_has_native_render_context(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
 /*
  * Whether a CDM cache flush must use the wide-visibility barrier.  Apple's G15
  * encoder publishes a memory dependency between dispatches of one compute
@@ -353,6 +362,25 @@ static inline bool
 agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G16G || agx_chip_native_g15(chip);
+}
+
+/* Whether a native fragment program may merge triangles across the
+ * linker's other merge-disabling cases: memory writes and wide subgroup
+ * operations. Apple's G17P metadata leaves the bit clear for both; on other
+ * chips it is unverified, so they keep the linker's conservative bit. */
+static inline bool
+agx_chip_tri_merge_across_side_effects(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/* Whether an image load misses a store made earlier in the same invocation,
+ * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
+ * behave this way; G15 loads observe the invocation's own stores. */
+static inline bool
+agx_chip_image_load_misses_own_store(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
 }
 
 /* Whether the sampler state word carries the LOD bias.  The HAL200 sampler

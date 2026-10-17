@@ -1273,7 +1273,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       memset(map, 0xCA, AIL_PAGESIZE);
    }
 
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_has_native_render_context(dev->chip)) {
       struct agx_bo *context = agx_create_fixed_bo(
          dev, AGX_G17P_RENDER_CONTEXT_SIZE,
          AGX_BO_WRITEBACK | AGX_BO_SHAREABLE,

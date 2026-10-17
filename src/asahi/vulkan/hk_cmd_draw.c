@@ -5758,7 +5758,10 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       .shader_tri_merge_disable =
          fs->b.info.needs_quad_derivatives ||
          (render->tilebuffer.nr_samples > 1 &&
-          fs->info.fs.epilog_key.write_z),
+          fs->info.fs.epilog_key.write_z) ||
+         /* The linker's own merge-disable bit. */
+         (!agx_chip_tri_merge_across_side_effects(dev->dev.chip) &&
+          (linked_fragment_control & (UINT32_C(1) << 26))),
 
       /* Native forces bit26 for type2 and conditionally for type3 from the
        * draw-buffer state. Keep the already-qualified conservative type3

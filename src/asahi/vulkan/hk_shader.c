@@ -2052,7 +2052,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    /* A G17P image load does not see a store made earlier in the same
     * invocation; forward the stored value. Run it before the robust lowering
     * so the loads and stores it tracks are still unconditional. */
-   if (agx_native_graphics(&dev->dev))
+   if (agx_chip_image_load_misses_own_store(dev->dev.chip))
       NIR_PASS(_, nir, hk_nir_forward_image_stores, lower_g17p_robust_images);
    NIR_PASS(_, nir, hk_nir_lower_robust_image_access,
             lower_g17p_robust_images);
