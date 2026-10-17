@@ -744,7 +744,7 @@ static void
 hk_init_g17p_grid_helper(struct hk_device *dev,
                          const VkAllocationCallbacks *pAllocator)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P)
+   if (!agx_chip_native_indirect_compute(dev->dev.chip))
       return;
 
    dev->g17p_grid_helper =

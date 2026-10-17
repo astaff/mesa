@@ -7,6 +7,7 @@
 
 #include "asahi/genxml/agx3_cmdstream.h"
 
+#include <assert.h>
 #include <string.h>
 
 _Static_assert(AGX3_G17S_MINIMAL_COMPUTE_DISPATCH_SIZE ==
@@ -232,7 +233,7 @@ agx3_g17p_native_indirect_launch_pack(
       return false;
 
    memset(packed, 0, AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE);
-   if (!program || program->chip != AGX_CHIP_G17P ||
+   if (!program || !agx_chip_native_indirect_compute(program->chip) ||
        !program->g17p_native_compute_live_bound || program->program_va == 0 ||
        program->program_va > UINT64_C(0xffffffffffff) ||
        (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
@@ -292,9 +293,9 @@ agx3_g17p_native_indirect_compute_dispatch_append(
 {
    if (!program || !dispatch || !dispatch->helper_program || !sink ||
        (sink->capacity != 0 && !sink->data) || sink->length > sink->capacity ||
-       AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE >
+       agx3_native_indirect_compute_dispatch_size(program->chip) >
           sink->capacity - sink->length ||
-       program->chip != AGX_CHIP_G17P ||
+       !agx_chip_native_indirect_compute(program->chip) ||
        !program->g17p_native_compute_live_bound || program->program_va == 0 ||
        program->program_va > UINT64_C(0xffffffffffff) ||
        (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
@@ -306,7 +307,7 @@ agx3_g17p_native_indirect_compute_dispatch_append(
        program->launch_template.word1 >= (UINT32_C(1) << 22))
       return false;
 
-   uint8_t staged[AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE] = {0};
+   uint8_t staged[AGX3_NATIVE_INDIRECT_COMPUTE_DISPATCH_MAX_SIZE] = {0};
    struct agx3_compute_dispatch_sink helper_sink = {
       .data = staged,
       .capacity = sizeof(staged),
@@ -324,6 +325,20 @@ agx3_g17p_native_indirect_compute_dispatch_append(
           dispatch->helper_program, &helper_grid, &helper_sink))
       return false;
 
+   /* Where the CDM's geometry fetch is not ordered after the helper's stores
+    * by the launch tail alone, flush between the two records the way a
+    * strong dependency inside the stream is published. */
+   if (agx_chip_indirect_geometry_flush(program->chip)) {
+      const struct agx3_cdm_barrier_info flush = {
+         .chip = program->chip,
+         .flags = 0x5,
+         .wide_visibility = agx_chip_cdm_wide_visibility(program->chip),
+      };
+      if (!agx3_cdm_barrier_pack(&flush, staged + helper_sink.length))
+         return false;
+      helper_sink.length += AGX3_CDM_BARRIER_SIZE;
+   }
+
    /* Exactly the standalone record, appended after the helper: there is one
     * encoder for the six words so the coupled and uncoupled forms cannot
     * drift apart. */
@@ -331,8 +346,10 @@ agx3_g17p_native_indirect_compute_dispatch_append(
           program, dispatch->geometry_va, 0, &helper_sink))
       return false;
 
-   memcpy(sink->data + sink->length, staged, sizeof(staged));
-   sink->length += sizeof(staged);
+   assert(helper_sink.length ==
+          agx3_native_indirect_compute_dispatch_size(program->chip));
+   memcpy(sink->data + sink->length, staged, helper_sink.length);
+   sink->length += helper_sink.length;
    return true;
 }
 

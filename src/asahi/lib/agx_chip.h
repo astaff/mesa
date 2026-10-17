@@ -331,6 +331,27 @@ agx_chip_has_native_render_context(enum agx_chip chip)
    return chip == AGX_CHIP_G17P;
 }
 
+/* Whether the native indirect compute pair (grid helper plus the 24-byte
+ * mode-2 launch) is qualified.  G15 reads the same mode-2 record and the same
+ * six-word geometry (three global thread counts, three local sizes); other
+ * native chips refuse indirect dispatches rather than run an unqualified
+ * record. */
+static inline bool
+agx_chip_native_indirect_compute(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S;
+}
+
+/* Whether the CDM's fetch of an indirect geometry block needs a cache flush
+ * after the dispatch that wrote it.  On G15 the ordinary launch tail is not
+ * established for a shader-store to CDM-fetch edge, so the grid helper's tail
+ * is followed by the wide flush before the mode-2 launch. */
+static inline bool
+agx_chip_indirect_geometry_flush(enum agx_chip chip)
+{
+   return agx_chip_native_g15(chip);
+}
+
 /*
  * Whether a CDM cache flush must use the wide-visibility barrier.  Apple's G15
  * encoder publishes a memory dependency between dispatches of one compute
