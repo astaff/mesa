@@ -2093,7 +2093,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * agx_validate_sources() in a debug build and, in a release build, reaches
     * an encoder with no offset field at all. */
    if (agx_native_graphics(&dev->dev))
-      NIR_PASS(_, nir, agx_nir_lower_g17p_texture_early, support_lod_bias);
+      NIR_PASS(_, nir, agx_nir_lower_g17p_texture_early, support_lod_bias,
+               agx_chip_sampler_has_lod_bias(dev->dev.chip));
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_early, support_lod_bias);
 

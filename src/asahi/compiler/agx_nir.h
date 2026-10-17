@@ -51,7 +51,8 @@ bool agx_nir_lower_atomics(struct nir_shader *s, bool native_fadd);
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias);
 bool agx_nir_lower_g17p_helper_samples(struct nir_shader *s);
 bool agx_nir_lower_g17p_texture_early(struct nir_shader *s,
-                                     bool support_lod_bias);
+                                     bool support_lod_bias,
+                                     bool sampler_has_lod_bias);
 bool agx_nir_lower_texture(struct nir_shader *s);
 bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generation);
 /* robust_formatless_images: formatless image loads have not been lowered for

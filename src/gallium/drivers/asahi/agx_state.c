@@ -2325,7 +2325,8 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
 
    /* Similarly, we need to do early texture lowering before bindings. */
    if (dev->chip == AGX_CHIP_G17P)
-      NIR_PASS(_, nir, agx_nir_lower_g17p_texture_early, support_lod_bias);
+      NIR_PASS(_, nir, agx_nir_lower_g17p_texture_early, support_lod_bias,
+               agx_chip_sampler_has_lod_bias(dev->chip));
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_early, support_lod_bias);
 

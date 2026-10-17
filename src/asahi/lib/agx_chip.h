@@ -344,6 +344,15 @@ agx_chip_usc_helper_table_slots(enum agx_chip chip)
    return chip == AGX_CHIP_G17P ? 6 : 10;
 }
 
+/* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
+ * layout has a bias field; Gen4 does not, so the shader applies the bias. */
+static inline bool
+agx_chip_sampler_has_lod_bias(enum agx_chip chip)
+{
+   return agx_chip_sampler_generation(chip) ==
+          AGX_SAMPLER_GENERATION_GEN4_HAL200;
+}
+
 /*
  * Whether this driver can generate code for a chip.
  *
