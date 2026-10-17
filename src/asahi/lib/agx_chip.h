@@ -344,6 +344,17 @@ agx_chip_usc_helper_table_slots(enum agx_chip chip)
    return chip == AGX_CHIP_G17P ? 6 : 10;
 }
 
+/* Robust image accesses on native chips need explicit Vulkan view bounds:
+ * native 2D accesses outside the view alias other texels of the image. G17P
+ * lowers them together with its own hardware defects; G15 and G16 parts
+ * bound the coordinates in NIR and take the out-of-bounds alpha from the
+ * view swizzle. */
+static inline bool
+agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G16G || agx_chip_native_g15(chip);
+}
+
 /* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
  * layout has a bias field; Gen4 does not, so the shader applies the bias. */
 static inline bool

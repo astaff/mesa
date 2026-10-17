@@ -2046,7 +2046,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       dev->dev.chip == AGX_CHIP_G17P &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
-      dev->dev.chip == AGX_CHIP_G16G &&
+      agx_chip_explicit_robust_image_bounds(dev->dev.chip) &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
 
    /* A G17P image load does not see a store made earlier in the same
