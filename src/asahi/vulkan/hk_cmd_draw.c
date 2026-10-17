@@ -6379,6 +6379,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          }
          fragment_pipeline = uploaded;
          break;
+      case AGX_CS_GENERATION_G15:
       case AGX_CS_GENERATION_HAL200:
          if (uploaded == 0 || uploaded < dev->dev.shader_base ||
              uploaded - dev->dev.shader_base > UINT32_MAX) {
@@ -6387,7 +6388,6 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          }
          fragment_pipeline = agx_usc_addr(&dev->dev, uploaded);
          break;
-      case AGX_CS_GENERATION_G15:
       case AGX_CS_GENERATION_HAL300:
       case AGX_CS_GENERATION_UNKNOWN:
       default:
