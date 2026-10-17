@@ -266,6 +266,15 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
           src.size == AGX_SIZE_32 && (def->src[0].abs || def->src[0].neg))
          continue;
 
+      /* The half-width TRUNC/ROUNDEVEN forms are grounded for plain
+       * registers only; the packer refuses -x or |x| there, which fails the
+       * whole pipeline (vkQuake's ssao_evaluate: roundeven of a negated
+       * half). Keep the modifier on its own move in front instead. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          (ins->op == AGX_OPCODE_TRUNC || ins->op == AGX_OPCODE_ROUNDEVEN) &&
+          src.size == AGX_SIZE_16 && (def->src[0].abs || def->src[0].neg))
+         continue;
+
       ins->src[s] = agx_compose_float_src(src, def->src[0]);
    }
 }
