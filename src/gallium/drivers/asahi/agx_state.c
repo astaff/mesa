@@ -3931,6 +3931,38 @@ agx_sampler_heap_add(struct agx_device *dev, struct agx_sampler_heap *heap,
    return heap->count++;
 }
 
+/* Native table entry for an API sampler, with the given border colour. */
+static struct agx_gallium_native_sampler
+agx_native_sampler_state(const struct pipe_sampler_state *state,
+                         enum agx_border_colour border_colour)
+{
+   const bool compare_enable =
+      state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
+
+   return (struct agx_gallium_native_sampler){
+      .minimum_lod = state->min_lod,
+      .maximum_lod = state->max_lod,
+      .maximum_anisotropy =
+         util_next_power_of_two(MAX2(state->max_anisotropy, 1)),
+      .magnify = agx_filters[state->mag_img_filter],
+      .minify = agx_filters[state->min_img_filter],
+      .mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter),
+      .wrap_s = agx_wrap_from_pipe(state->wrap_s),
+      .wrap_t = agx_wrap_from_pipe(state->wrap_t),
+      .wrap_r = agx_wrap_from_pipe(state->wrap_r),
+      .pixel_coordinates = state->unnormalized_coords,
+      .compare_func = agx_compare_funcs[state->compare_func],
+      .compare_enable = compare_enable,
+      /* An ordinary sample takes the bias as a shader operand, summed with
+       * the shader's own in floating point; only a depth comparison, whose
+       * level has no per-lane form here, keeps it in the descriptor where the
+       * sampler has a bias field. See agx_create_context(). */
+      .lod_bias = compare_enable ? CLAMP(state->lod_bias, -16.0, 16.0) : 0.0f,
+      .seamful_cube_maps = !state->seamless_cube_map,
+      .border_colour = border_colour,
+   };
+}
+
 static void
 agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
                     mesa_shader_stage stage)
@@ -3979,32 +4011,14 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
          uint8_t *out = (uint8_t *)T.cpu + sampler_length * (i + 1);
          if (sampler) {
             const struct pipe_sampler_state *state = &sampler->base;
-            agx_pack(out, SAMPLER_HAL200, cfg) {
-               cfg.minimum_lod = state->min_lod;
-               cfg.maximum_lod = state->max_lod;
-               cfg.maximum_anisotropy = util_next_power_of_two(
-                  MAX2(state->max_anisotropy, 1));
-               cfg.magnify = agx_filters[state->mag_img_filter];
-               cfg.minify = agx_filters[state->min_img_filter];
-               cfg.mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter);
-               cfg.wrap_s = agx_wrap_from_pipe(state->wrap_s);
-               cfg.wrap_t = agx_wrap_from_pipe(state->wrap_t);
-               cfg.wrap_r = agx_wrap_from_pipe(state->wrap_r);
-               cfg.pixel_coordinates = state->unnormalized_coords;
-               cfg.compare_func = agx_compare_funcs[state->compare_func];
-               cfg.compare_enable =
-                  state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
-               /* An ordinary sample takes the bias as a shader operand,
-                * summed with the shader's own in floating point; only a depth
-                * comparison, whose level has no per-lane form here, keeps it
-                * in the descriptor. See agx_create_context(). */
-               if (cfg.compare_enable)
-                  cfg.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
-               cfg.seamful_cube_maps = !state->seamless_cube_map;
-               cfg.border_colour = sampler->uses_custom_border
-                                      ? AGX_BORDER_COLOUR_OPAQUE_WHITE
-                                      : sampler->border_colour;
-            }
+            const struct agx_gallium_native_sampler native =
+               agx_native_sampler_state(
+                  state, sampler->uses_custom_border
+                            ? AGX_BORDER_COLOUR_OPAQUE_WHITE
+                            : sampler->border_colour);
+            if (!agx_gallium_pack_native_sampler(dev->chip, (void *)out,
+                                                 &native))
+               agx_native_descriptor_rejected(dev, "sampler");
 
             if (sampler->uses_custom_border) {
                uint16_t clamp_handle;
@@ -4015,39 +4029,28 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
                uint8_t *clamp = (uint8_t *)T.cpu +
                                 sampler_length * clamp_handle;
-               agx_pack(clamp, SAMPLER_HAL200, cfg) {
-                  cfg.minimum_lod = state->min_lod;
-                  cfg.maximum_lod = state->max_lod;
-                  cfg.maximum_anisotropy = util_next_power_of_two(
-                     MAX2(state->max_anisotropy, 1));
-                  cfg.magnify = agx_filters[state->mag_img_filter];
-                  cfg.minify = agx_filters[state->min_img_filter];
-                  cfg.mip_filter =
-                     agx_mip_filter_from_pipe(state->min_mip_filter);
-                  cfg.wrap_s = agx_wrap_from_pipe(state->wrap_s);
-                  cfg.wrap_t = agx_wrap_from_pipe(state->wrap_t);
-                  cfg.wrap_r = agx_wrap_from_pipe(state->wrap_r);
-                  cfg.pixel_coordinates = state->unnormalized_coords;
-                  cfg.compare_func = agx_compare_funcs[state->compare_func];
-                  cfg.compare_enable =
-                     state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
-                  if (cfg.compare_enable)
-                     cfg.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
-                  cfg.seamful_cube_maps = !state->seamless_cube_map;
-                  cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
-               }
+               const struct agx_gallium_native_sampler clamp_state =
+                  agx_native_sampler_state(
+                     state, AGX_BORDER_COLOUR_TRANSPARENT_BLACK);
+               if (!agx_gallium_pack_native_sampler(dev->chip, (void *)clamp,
+                                                    &clamp_state))
+                  agx_native_descriptor_rejected(dev,
+                                                 "custom-border sampler");
             }
          } else {
-            agx_pack(out, SAMPLER_HAL200, cfg) {
-               cfg.maximum_lod = INFINITY;
-               cfg.maximum_anisotropy = 1;
-               cfg.mip_filter = AGX_MIP_FILTER_NEAREST;
-               cfg.wrap_s = AGX_WRAP_CLAMP_TO_BORDER;
-               cfg.wrap_t = AGX_WRAP_CLAMP_TO_BORDER;
-               cfg.wrap_r = AGX_WRAP_CLAMP_TO_BORDER;
-               cfg.compare_func = AGX_COMPARE_FUNC_LEQUAL;
-               cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
-            }
+            const struct agx_gallium_native_sampler null_state = {
+               .maximum_lod = INFINITY,
+               .maximum_anisotropy = 1,
+               .mip_filter = AGX_MIP_FILTER_NEAREST,
+               .wrap_s = AGX_WRAP_CLAMP_TO_BORDER,
+               .wrap_t = AGX_WRAP_CLAMP_TO_BORDER,
+               .wrap_r = AGX_WRAP_CLAMP_TO_BORDER,
+               .compare_func = AGX_COMPARE_FUNC_LEQUAL,
+               .border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK,
+            };
+            if (!agx_gallium_pack_native_sampler(dev->chip, (void *)out,
+                                                 &null_state))
+               agx_native_descriptor_rejected(dev, "null sampler");
          }
       }
 
@@ -4059,6 +4062,12 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
                (const uint8_t *)T.cpu + sampler_length * (i + 1);
             uint8_t *query = (uint8_t *)T.cpu + sampler_length *
                (AGX_GALLIUM_G17P_QUERY_LOD_BASE + i);
+            /* A Gen4 sampler has no bias field to carry the API bias into
+             * the LOD query, so the query reads the ordinary entry. */
+            if (!agx_chip_sampler_has_lod_bias(dev->chip)) {
+               memcpy(query, ordinary, sampler_length);
+               continue;
+            }
             agx_unpack(NULL, ordinary, SAMPLER_HAL200, cfg);
             cfg.lod_bias = sampler ? CLAMP(sampler->base.lod_bias, -16.0, 16.0)
                                    : 0.0;
@@ -4724,11 +4733,19 @@ agx_g17p_append_compute(struct agx_batch *batch,
       .data = batch->cdm.current,
       .capacity = batch->cdm.end - batch->cdm.current,
    };
+   /* The software graphics stages (vertex, tessellation and geometry
+    * programs run as compute) hand their results to the next dispatch of the
+    * stream through memory, with no barrier of their own in between. The
+    * launch's weak tail orders them on HAL200. On G15, a dependency inside
+    * the stream is published only by the wide flush, so there every launch
+    * ends in it, as Honeykrisp's software stages do. */
+   const uint8_t barrier_flags =
+      agx_chip_cdm_wide_visibility(dev->chip) ? 0x5 : 0;
    if (indirect_local) {
       /* The kernel that writes this grid is already its own dispatch earlier
        * in the stream, behind a full barrier, so the launch stands alone. */
-      if (!agx3_g17p_native_indirect_compute_launch_append(&native.launch,
-                                                           grid.ptr, 0, &sink))
+      if (!agx3_g17p_native_indirect_compute_launch_append(
+             &native.launch, grid.ptr, barrier_flags, &sink))
          return agx_g17p_compute_failed("indirect launch append");
    } else {
       const struct agx3_compute_direct_grid direct = {
@@ -4739,8 +4756,8 @@ agx_g17p_append_compute(struct agx_batch *batch,
                           ? 3
                        : grid.count[1] != 1 || wg.y != 1 ? 2 : 1,
       };
-      if (!agx3_g17p_native_compute_dispatch_append(&native.launch, &direct,
-                                                     &sink))
+      if (!agx3_g17p_native_compute_dispatch_append_with_barrier(
+             &native.launch, &direct, barrier_flags, &sink))
          return agx_g17p_compute_failed("direct launch append");
    }
    batch->cdm.current += sink.length;
@@ -6213,8 +6230,11 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
    const struct agx_ppp_hal200_fragment_control_fields control_fields = {
       .linked_control = linked_fragment_control,
       .shader_tri_merge_disable =
-         batch->tilebuffer_layout.nr_samples > 1 &&
-         ctx->fs->epilog_key.write_z,
+         (batch->tilebuffer_layout.nr_samples > 1 &&
+          ctx->fs->epilog_key.write_z) ||
+         /* The linker's own merge-disable bit. */
+         (!agx_chip_tri_merge_across_side_effects(dev->chip) &&
+          (linked_fragment_control & (UINT32_C(1) << 26))),
       .coverage_tri_merge_disable =
          pass_type == AGX_PASS_TYPE_PUNCH_THROUGH ||
          pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH,

@@ -226,6 +226,33 @@ bool agx_gallium_pack_native_texture(
    struct agx_gallium_texture_descriptor *out,
    const struct AGX_TEXTURE *semantic);
 
+/* Sampler state of one native per-stage table entry. */
+struct agx_gallium_native_sampler {
+   float minimum_lod;
+   float maximum_lod;
+   /* Applied only where the sampler word has a bias field
+    * (agx_chip_sampler_has_lod_bias()); elsewhere the shader applies it. */
+   float lod_bias;
+   unsigned maximum_anisotropy;
+   enum agx_filter magnify;
+   enum agx_filter minify;
+   enum agx_mip_filter mip_filter;
+   enum agx_wrap wrap_s;
+   enum agx_wrap wrap_t;
+   enum agx_wrap wrap_r;
+   bool pixel_coordinates;
+   bool compare_enable;
+   enum agx_compare_func compare_func;
+   enum agx_border_colour border_colour;
+   bool seamful_cube_maps;
+};
+
+/* Pack a native sampler table entry in the chip's sampler layout: HAL200 on
+ * G17P, Gen4 on G15. */
+bool agx_gallium_pack_native_sampler(
+   enum agx_chip chip, struct agx_gallium_sampler_descriptor *out,
+   const struct agx_gallium_native_sampler *state);
+
 /* Exact sampler zero used by native G17P texture.read()/texel-fetch paths. */
 bool agx_gallium_pack_g17p_txf_sampler(
    enum agx_chip chip, struct agx_gallium_sampler_descriptor *out);

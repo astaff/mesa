@@ -1139,13 +1139,23 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
       return;
 
    unsigned fastclear = buffers & ~(batch->draw | batch->load);
-   if (agx_native_graphics(agx_device(pctx->screen))) {
+   struct agx_device *dev = agx_device(pctx->screen);
+   if (agx_native_graphics(dev)) {
       agx_batch_init_state(batch);
       const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
+      /* A spilling multisample tilebuffer clears every target with the
+       * draw, as Honeykrisp does: a background clear of the resident targets
+       * would leave the draw's epilog to preserve them by reading the tile
+       * back, a multisample eMRT shape the packer refuses. On G17P such a
+       * tilebuffer is always wider than the uncovered-tile limit, which
+       * already sends it there. */
+      const bool clear_all =
+         tib->nr_samples > 1 &&
+         (agx_tilebuffer_spills(tib) ||
+          (agx_chip_uncovered_tile_ms_defect(dev->chip) &&
+           tib->sample_size_B > AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE));
       for (unsigned rt = 0; rt < PIPE_MAX_COLOR_BUFS; ++rt) {
-         if (tib->spilled[rt] ||
-             (tib->nr_samples > 1 && tib->sample_size_B >
-                AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE))
+         if (tib->spilled[rt] || clear_all)
             fastclear &= ~(PIPE_CLEAR_COLOR0 << rt);
       }
    }
