@@ -9866,6 +9866,18 @@ agx3_scratch_word_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
    };
 }
 
+bool
+agx3_nir_lower_scratch_words(nir_shader *nir)
+{
+   nir_lower_mem_access_bit_sizes_options scratch_words = {
+      .modes = nir_var_function_temp,
+      .callback = agx3_scratch_word_size_align_cb,
+   };
+   bool progress = false;
+   NIR_PASS(progress, nir, nir_lower_mem_access_bit_sizes, &scratch_words);
+   return progress;
+}
+
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p)
 {
@@ -9903,13 +9915,8 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p)
     * pass's read-modify-write of the containing word
     * (subgroups.ballot_broadcast.*.subgroupbroadcast_{f,i,u}16vec*,
     * {i,u}8vec*). */
-   if (g17p) {
-      nir_lower_mem_access_bit_sizes_options scratch_words = {
-         .modes = nir_var_function_temp,
-         .callback = agx3_scratch_word_size_align_cb,
-      };
-      NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &scratch_words);
-   }
+   if (g17p)
+      agx3_nir_lower_scratch_words(nir);
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             nir_var_function_temp, ~0);
    NIR_PASS(_, nir, nir_split_var_copies);

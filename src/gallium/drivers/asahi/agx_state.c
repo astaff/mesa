@@ -2456,6 +2456,11 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
 
    agx_preprocess_nir(nir);
 
+   /* The native stack protocol only encodes whole words; Honeykrisp gets
+    * this from agx_preprocess_nir_g17p(). */
+   if (agx_native_graphics(dev))
+      agx3_nir_lower_scratch_words(nir);
+
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        (nir->info.inputs_read & VARYING_BITS_TEX_ANY)) {
 
