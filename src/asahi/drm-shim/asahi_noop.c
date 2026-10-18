@@ -1668,6 +1668,12 @@ drm_shim_driver_init(void)
    shim_device.driver_ioctls = driver_ioctls;
    shim_device.driver_ioctl_count = ARRAY_SIZE(driver_ioctls);
 
+   /* libdrm tells the bus from this link; without it drmGetDevices2() skips
+    * the node, and Vulkan and the Gallium loader find no device. */
+   drm_shim_override_link("../../../../../bus/platform",
+                          "/sys/dev/char/%d:%d/device/subsystem", DRM_MAJOR,
+                          render_node_minor);
+
    const char *chip = getenv("ASAHI_SHIM_CHIP");
    const bool g17p = chip && !strcmp(chip, "g17p");
    const bool g15s = chip && !strcmp(chip, "g15s");
