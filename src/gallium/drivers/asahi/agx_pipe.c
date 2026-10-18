@@ -1180,6 +1180,13 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
          &batch->pool, clamped.f, sizeof(clamped.f), 16);
    }
 
+   /* A batch resolving to a single-sample image reloads that image as its
+    * background; a fast clear of the colour replaces it instead. Without
+    * this, a clear of a multisampled window-system buffer was dropped and
+    * the resolve wrote back the old image. */
+   if (fastclear & PIPE_CLEAR_COLOR0)
+      batch->g17p_resolve_reload = false;
+
    if (fastclear & PIPE_CLEAR_DEPTH)
       batch->clear_depth = depth;
 

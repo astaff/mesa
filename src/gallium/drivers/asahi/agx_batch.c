@@ -153,8 +153,14 @@ agx_batch_init(struct agx_context *ctx,
 
    batch->ctx = ctx;
    util_copy_framebuffer_state(&batch->key, key);
-   batch->g17p_resolve_reload = key->resolve != NULL;
-   batch->g17p_resolve_preserve = false;
+   /* A framebuffer resolve (a multisampled window-system buffer) keeps its
+    * multisample image as well: GL reads it back (glReadPixels, copies,
+    * blits) and later batches load it. Reloading the resolved image into
+    * every sample instead loses the samples, and a reader of the
+    * multisample image saw whatever was there before. Only the DRI seed
+    * copy (agx_blit) reloads from the single-sample image. */
+   batch->g17p_resolve_reload = false;
+   batch->g17p_resolve_preserve = key->resolve != NULL;
    batch->seqnum = ++ctx->batches.seqnum;
    batch->g17p_fragment_program = 0;
    batch->g17p_emrt_heap = 0;
