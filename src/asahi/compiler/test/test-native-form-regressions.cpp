@@ -1187,6 +1187,32 @@ TEST(NativeForms, RectangleImplicitLodOutsideFragment)
    }
 }
 
+TEST(NativeForms, ImageWriteHighUniformHeap)
+{
+   for (unsigned uniform : {252u, 256u, 296u, 508u}) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G16G;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_index data = agx_register(16, AGX_SIZE_32);
+      data.channels_m1 = 3;
+      agx_index coord = agx_register(24, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      agx_image_write(b, data, coord, agx_zero(),
+                      agx_uniform(uniform, AGX_SIZE_64),
+                      agx_register(28, AGX_SIZE_32), AGX_DIM_2D, true);
+      agx_stop(b);
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      EXPECT_TRUE(agx3_pack_binary(b->shader, &binary)) << uniform;
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
+   }
+}
+
 TEST(NativeForms, ImageFenceWaitsRotatingWriteSlots)
 {
    void *mem = ralloc_context(NULL);
