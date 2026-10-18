@@ -8776,8 +8776,15 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
          agx_native_graphics(agx_device(pipe->screen)) &&
          ctx->stage[MESA_SHADER_COMPUTE].custom_borders,
    };
+   /* The variant compiled at link time, or by an earlier dispatch, is in
+    * the shader's table; agx_get_shader_variant() would compile (or fetch
+    * from the disk cache) and insert it again on every dispatch. */
+   struct hash_entry *variant =
+      _mesa_hash_table_search(uncompiled->variants, &key);
    struct agx_compiled_shader *cs =
-      agx_get_shader_variant(agx_screen(pipe->screen), pipe, uncompiled, &key);
+      variant ? variant->data
+              : agx_get_shader_variant(agx_screen(pipe->screen), pipe,
+                                       uncompiled, &key);
 
    struct agx_grid grid;
    if (indirect && agx_native_graphics(agx_device(pipe->screen))) {
