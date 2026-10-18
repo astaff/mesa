@@ -593,6 +593,13 @@ agx_create_sampler_state(struct pipe_context *pctx,
          fixup_border_zs(state->border_color_format, &border);
       const bool integer = util_format_is_pure_integer(format);
 
+      /* A depth comparison uses the border depth clamped to [0, 1] for every
+       * depth format, Z32F included. The hardware's sampled comparison
+       * clamps it itself, but a gathered comparison takes the raw border. */
+      if (state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE &&
+          util_format_has_depth(util_format_description(format)))
+         border.f[0] = SATURATE(border.f[0]);
+
       if (!agx_gallium_classify_standard_border(
              border.ui, integer, &so->border_colour)) {
          so->uses_custom_border = true;
