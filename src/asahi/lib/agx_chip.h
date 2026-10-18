@@ -172,7 +172,8 @@ enum agx_submission_model {
 static inline bool
 agx_chip_native_agx3(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G17P;
+   return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G15C ||
+          chip == AGX_CHIP_G17P;
 }
 
 /* The chip whose record encodings GPU-generated (libagx) command-stream
@@ -339,7 +340,8 @@ agx_chip_has_native_render_context(enum agx_chip chip)
 static inline bool
 agx_chip_native_indirect_compute(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S;
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S ||
+          chip == AGX_CHIP_G15C;
 }
 
 /* Whether the CDM's fetch of an indirect geometry block needs a cache flush
@@ -404,7 +406,8 @@ agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
 static inline bool
 agx_chip_native_imageblock(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S;
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S ||
+          chip == AGX_CHIP_G15C;
 }
 
 /*
