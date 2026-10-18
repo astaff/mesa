@@ -10941,7 +10941,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   AGX3_REFUSE(I);
                for (unsigned j=0;j<2;j++) {
                   agx_index word=I->src[2+j];
-                  uint8_t copy[AGX3_STAGE_MAX_LENGTH], n;
+                  uint8_t copy[16], n;
                   if (!agx3_src_is_register(word) || word.size!=AGX_SIZE_32 ||
                       word.memory || word.abs || word.neg || (word.value&1) ||
                       !agx3_rt_gen1_encode_launch_word(j,word.value,copy,&n) ||
