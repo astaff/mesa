@@ -509,6 +509,10 @@ agx_nir_rebind_g17p_texture_crawls(nir_shader *shader)
 {
    bool progress = false;
 
+   /* Fold bound samplers' API index + 1 so only register samplers remain
+    * non-constant. */
+   NIR_PASS(progress, shader, nir_opt_constant_folding);
+
    nir_foreach_function_impl(impl, shader) {
       nir_builder b = nir_builder_create(impl);
       bool impl_progress = false;
@@ -519,10 +523,32 @@ agx_nir_rebind_g17p_texture_crawls(nir_shader *shader)
 
             nir_tex_instr *tex = nir_instr_as_tex(instr);
 
+            /* The cube pipeline has no form pairing an immediate texture with
+             * a register sampler, which 2D has. A sampler past the bindful
+             * range is a register, so index its texture the same way. */
+            const int sampler_idx =
+               nir_tex_instr_src_index(tex, nir_tex_src_sampler_handle);
+            const bool register_cube =
+               tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && sampler_idx >= 0 &&
+               !nir_src_is_const(tex->src[sampler_idx].src);
+
             const int handle_idx =
                nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
-            if (handle_idx < 0)
+            if (handle_idx < 0) {
+               if (register_cube &&
+                   nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) <
+                      0) {
+                  b.cursor = nir_before_instr(instr);
+                  nir_tex_instr_add_src(
+                     tex, nir_tex_src_texture_offset,
+                     load_g17p_texture_index(
+                        &b, nir_imm_int(&b, tex->texture_index)));
+                  tex->texture_index = 0;
+                  impl_progress = true;
+                  progress = true;
+               }
                continue;
+            }
 
             nir_intrinsic_instr *handle =
                nir_src_as_intrinsic(tex->src[handle_idx].src);
@@ -532,7 +558,7 @@ agx_nir_rebind_g17p_texture_crawls(nir_shader *shader)
 
             b.cursor = nir_before_instr(instr);
             nir_steal_tex_src(tex, nir_tex_src_texture_handle);
-            if (nir_src_is_const(handle->src[0]) &&
+            if (!register_cube && nir_src_is_const(handle->src[0]) &&
                 nir_src_as_uint(handle->src[0]) <
                    AGX_NUM_TEXTURE_STATE_REGS) {
                tex->texture_index = nir_src_as_uint(handle->src[0]);
