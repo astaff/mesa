@@ -1093,22 +1093,24 @@ TEST(NativeForms, TexturePublicationWaitPreservesUnrelatedResult)
 TEST(NativeForms, MinmaxReusesUniformCopiedForComparison)
 {
    for (agx_fcond cond : {AGX_FCOND_LTN, AGX_FCOND_GTN}) {
-      void *mem = ralloc_context(NULL);
-      agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
-      agx_builder *b = agx_test_builder(mem);
-      b->shader->key = &key;
-      agx_instr *I = agx_alloc_instr(b, AGX_OPCODE_FCMPSEL, 1, 4);
-      I->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
-      I->src[0] = I->src[2] = agx_uniform(8, AGX_SIZE_32);
-      I->src[1] = I->src[3] = agx_immediate(176); /* -1.0 minifloat */
-      I->fcond = cond;
-      agx_builder_insert(&b->cursor, I);
-      agx_lower_uniform_sources(b->shader);
-      EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
-      EXPECT_TRUE(agx_is_equiv(I->src[0], I->src[2]));
-      ralloc_free(mem);
+      for (unsigned immediate : {0u, 176u}) {
+         void *mem = ralloc_context(NULL);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G17P;
+         agx_builder *b = agx_test_builder(mem);
+         b->shader->key = &key;
+         agx_instr *I = agx_alloc_instr(b, AGX_OPCODE_FCMPSEL, 1, 4);
+         I->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+         I->src[0] = I->src[2] = agx_uniform(8, AGX_SIZE_32);
+         I->src[1] = I->src[3] = agx_immediate(immediate);
+         I->fcond = cond;
+         agx_builder_insert(&b->cursor, I);
+         agx_lower_uniform_sources(b->shader);
+         EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
+         EXPECT_TRUE(agx_is_equiv(I->src[0], I->src[2]));
+         ralloc_free(mem);
+      }
    }
 }
 

@@ -448,6 +448,7 @@ agx_lower_uniform_sources(agx_context *ctx)
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             !ctx->is_preamble && I->op == AGX_OPCODE_FCMPSEL &&
             I->nr_dests == 1 && I->nr_srcs == 4 && !I->saturate &&
+            I->fcond != AGX_FCOND_LTN && I->fcond != AGX_FCOND_GTN &&
             (I->dest[0].size == AGX_SIZE_16 ||
              I->dest[0].size == AGX_SIZE_32) &&
             agx_channels(I->dest[0]) == 1 && !native_minmax && s < 2 &&
@@ -505,6 +506,7 @@ agx_lower_uniform_sources(agx_context *ctx)
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             !ctx->is_preamble && I->op == AGX_OPCODE_FCMPSEL &&
             I->nr_dests == 1 && I->nr_srcs == 4 && !I->saturate &&
+            I->fcond != AGX_FCOND_LTN && I->fcond != AGX_FCOND_GTN &&
             (I->dest[0].size == AGX_SIZE_16 ||
              I->dest[0].size == AGX_SIZE_32) &&
             agx_channels(I->dest[0]) == 1 && !native_minmax && s >= 2 &&
