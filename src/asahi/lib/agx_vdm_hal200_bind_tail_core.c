@@ -48,7 +48,7 @@ agx_vdm_hal200_bind_tail_pack(
    if (out)
       memset(out, 0, sizeof(*out));
 
-   if (!out || !pairs || chip != AGX_CHIP_G17P)
+   if (!out || !pairs || !agx_chip_native_agx3(chip))
       return false;
 
    agx_store_le32(out->bytes, AGX_VDM_HAL200_BIND_HEADER_CONTROL);
@@ -79,7 +79,7 @@ agx_vdm_hal200_bind_tail_unpack(
              sizeof(struct agx_vdm_hal200_bind_pair) *
                 AGX_VDM_HAL200_BIND_COUNT);
 
-   if (!bytes || !pairs || chip != AGX_CHIP_G17P ||
+   if (!bytes || !pairs || !agx_chip_native_agx3(chip) ||
        size != AGX_VDM_HAL200_BIND_TAIL_LENGTH)
       return false;
 

@@ -266,7 +266,7 @@ pack_cprog_copy(void *context, enum agx_chip chip,
                 struct agx_ioto_load_raw_record records[2], uint8_t *count)
 {
    struct agx3_ioto_load_packer *packer = context;
-   if (!packer || packer->chip != chip || chip != AGX_CHIP_G17P ||
+   if (!packer || packer->chip != chip || !agx_chip_native_preamble(chip) ||
        !load || !records || !count || dword >= load->count_dwords ||
        dword >= 4 || !direct_load_registers_ok(load))
       return false;
@@ -396,7 +396,7 @@ load_indirect_uniform_range(
    const struct agx3_cprog_inputs *inputs, void *output, size_t capacity,
    size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !output || !written ||
+   if (!agx_chip_native_preamble(chip) || !output || !written ||
        (root_base_half & 1) || (uniform_half & 1) || (size_halfs & 1) ||
        size_halfs == 0 || uniform_half + size_halfs > 512 ||
        root_base_half + 4 > (root_base_is_uniform ? 512 : 256))

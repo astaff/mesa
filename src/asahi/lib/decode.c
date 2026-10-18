@@ -1015,7 +1015,7 @@ agxdecode_ppp_agx3(struct agxdecode_ctx *ctx, enum agx_chip chip, uint64_t va,
 static uint64_t
 agxdecode_g17p_ppp_fetch_address(enum agx_chip chip, uint64_t wire_pointer)
 {
-   if (chip == AGX_CHIP_G17P &&
+   if (agx_chip_native_agx3(chip) &&
        wire_pointer < AGX_G17P_VDM_USER_SIZE)
       return AGX_G17P_VDM_USER_BASE + wire_pointer;
 
@@ -1411,7 +1411,7 @@ agxdecode_drm_cmd_render(struct agxdecode_ctx *ctx,
 {
    const enum agx_chip chip = agxdecode_chip_from_params(params);
    decode_cmd graphics_program_decoder =
-      chip == AGX_CHIP_G17P ? agxdecode_ioto : agxdecode_usc;
+      agx_chip_native_agx3(chip) ? agxdecode_ioto : agxdecode_usc;
 
    DUMP_FIELD(c, "%x", flags);
    DUMP_FIELD(c, "0x%llx", vdm_ctrl_stream_base);

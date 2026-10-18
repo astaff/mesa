@@ -441,7 +441,7 @@ agx_ioto_decode_program_record(enum agx_chip chip, const void *stream,
     * mask, carry exactly these descriptors, 0x2f3 through 0x202. Accepting
     * only the all-partition forms left subset fragments undecodable, so a
     * program walk lost its boundary there. */
-   if (chip == AGX_CHIP_G17P && available >= 6 && bytes[0] == 0x07 &&
+   if (agx_chip_native_agx3(chip) && available >= 6 && bytes[0] == 0x07 &&
        bytes[1] == 0x02 && bytes[2] == 0x54 &&
        (bytes[3] == 0x00 || agx_ioto_g17p_fragment_release(bytes[3])) &&
        bytes[4] == 0x02 &&

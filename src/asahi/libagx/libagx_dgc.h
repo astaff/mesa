@@ -854,6 +854,9 @@ agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
                           bool render_state_emitted,
                           uint64_t empty_draw_jump)
 {
+   /* `chip` names the record family: every native AGX3 chip encodes these
+    * records as G17P does, and passes agx_chip_record_family() so that one
+    * precompiled kernel serves them all. */
    /* G17P's native direct indexed packet requires both counts to be nonzero.
     * Indirect-count predication deliberately zeros records above the runtime
     * count, so those slots cannot contain a direct packet. Jump over the

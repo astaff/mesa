@@ -79,7 +79,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
 
    enum pipe_format format = hk_format_to_pipe_format(view->vk.format);
    const struct util_format_description *desc = util_format_description(format);
-   const bool g17p = device->dev.chip == AGX_CHIP_G17P;
+   const bool g17p = agx_native_graphics(&device->dev);
    const bool rgb32 =
       ail_pixel_format[format].channels == AGX_CHANNELS_R32G32B32_EMULATED;
 
@@ -256,7 +256,7 @@ hk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
 
    if (hk_native_pbe_supported(generation)) {
       hk_pack_native_pbe(generation, &view->pbe, &pbe);
-   } else if (device->dev.chip == AGX_CHIP_G17P) {
+   } else if (agx_native_graphics(&device->dev)) {
       /* Gen9's linear PBE is architectural and has no software tail field,
        * exactly like the texture above: the store lowering adds the tail from
        * the buffer metadata. A format the Gen9 packer cannot represent (the

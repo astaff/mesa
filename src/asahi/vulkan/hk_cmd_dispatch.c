@@ -431,6 +431,7 @@ hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
       const struct agx3_cdm_barrier_info info = {
          .chip = dev->dev.chip,
          .flags = 0x5,
+         .wide_visibility = agx_chip_cdm_wide_visibility(dev->dev.chip),
       };
       uint8_t packed[AGX3_CDM_BARRIER_SIZE];
       if (!agx3_cdm_barrier_pack(&info, packed)) {
@@ -923,7 +924,7 @@ hk_g17p_prewarm_linked_compute_program_kind(
    struct hk_linked_shader *linked, bool internal_graphics,
    enum agx_ioto_g17p_compute_ldshdr_f1 kind)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P ||
+   if (!agx_native_graphics(&dev->dev) ||
        !hk_g17p_compute_shader_supported(s, linked))
       return;
 
@@ -1215,7 +1216,7 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (dev->dev.chip != AGX_CHIP_G17P || !prog->bo ||
+   if (!agx_native_graphics(&dev->dev) || !prog->bo ||
        !prog->info.main_size || !prog->info.nr_gprs ||
        prog->info.nr_preamble_gprs ||
        (prog->info.rodata.size_16 && !prog->rodata_offset) ||
@@ -1328,7 +1329,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    static_assert(HK_MAX_SETS == HK_AGX3_G17P_MAX_ROOT_SETS,
                  "G17P root range must cover every Honeykrisp set");
 
-   if (dev->dev.chip != AGX_CHIP_G17P || cs->type != HK_CS_CDM ||
+   if (!agx_native_graphics(&dev->dev) || cs->type != HK_CS_CDM ||
        !hk_g17p_compute_shader_supported(s, linked)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -1786,6 +1787,21 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * ZINK_DEBUG=sync cures is unproven.
     */
    const uint8_t barrier_flags = 0;
+
+   /* Two application dispatches in a row need no barrier between them: drop
+    * the previous one's weak tail, which nothing else has followed or
+    * strengthened, and let this launch's own tail end the stream instead. */
+   const bool app_dispatch =
+      !cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
+      agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
+   if (app_dispatch && cs->app_dispatch_end &&
+       cs->current == cs->app_dispatch_end &&
+       cs->current == cs->weak_barrier_end) {
+      cs->current = (uint32_t *)((uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE);
+      sink.data = (uint8_t *)cs->current;
+      sink.capacity += AGX3_CDM_BARRIER_SIZE;
+   }
+
    if (!hk_agx3_g17p_native_compute_dispatch_append_with_barrier(
           &program.launch, &direct, barrier_flags, &sink)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -1799,6 +1815,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    } else {
       cs->weak_barrier_end = cs->current;
    }
+   cs->app_dispatch_end = app_dispatch ? cs->current : NULL;
    cs->stats.cmds++;
 }
 
@@ -2059,7 +2076,7 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
     * absent, keep the old behaviour rather than refusing the dispatch. */
    const bool have_sparse_helper = dev->g17p_grid_helper_sparse != NULL;
    const bool use_primary =
-      dev->dev.chip == AGX_CHIP_G17P && buffer->va &&
+      agx_native_graphics(&dev->dev) && buffer->va &&
       (!buffer->sparse_map || have_sparse_helper);
 
    uint64_t dispatch_addr = hk_buffer_address(buffer, offset, !use_primary);

@@ -9419,6 +9419,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             const uint16_t staging_dest =
                resource_bases[native_coord_values[instr_index] - 1] +
                2 * (uint16_t)I->agx3_tex_coord_component;
+            /* An unpublished sample reads its fixed staging bank through
+             * completion, which the resource allocator does not model. Retire
+             * any such reader before overwriting its coordinates. */
+            agx3_staging_release(&staging_banks, outstanding_here);
+            const uint16_t staging_war =
+               agx3_staging_conflicts(&staging_banks, staging_dest, 2) & ~wait;
+            if (staging_war) {
+               if (!agx3_retire_slots_noop(emission, enc, staging_war))
+                  AGX3_REFUSE(I);
+               outstanding &= (uint16_t)~staging_war;
+               agx3_staging_forget(&staging_banks, staging_war);
+            }
             uint8_t bytes[AGX3_ALU_MAX_LENGTH];
             uint8_t len = 0;
             if (I->op == AGX_OPCODE_PERSP_MUL_AGX3) {

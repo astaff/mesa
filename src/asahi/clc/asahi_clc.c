@@ -25,11 +25,31 @@
 #include "util/macros.h"
 #include <sys/mman.h>
 
-const char *targets[] = {"g13g", "g13x", "g17p"};
+const char *targets[] = {"g13g", "g13x", "g17p", "g15s"};
 
 #define foreach_target(target)                                                 \
    for (const char **target = &targets[0];                                     \
         target < &targets[ARRAY_SIZE(targets)]; ++target)
+
+static enum agx_chip
+target_chip(const char *target)
+{
+   if (!strcmp(target, "g17p"))
+      return AGX_CHIP_G17P;
+   else if (!strcmp(target, "g15s"))
+      return AGX_CHIP_G15S;
+   else if (!strcmp(target, "g13x"))
+      return AGX_CHIP_G13X;
+   else
+      return AGX_CHIP_G13G;
+}
+
+/* Whether a target runs on the native AGX3 path rather than AGX2. */
+static bool
+target_is_native_agx3(const char *target)
+{
+   return agx_chip_native_agx3(target_chip(target));
+}
 
 static const struct spirv_to_nir_options spirv_options = {
    .environment = NIR_SPIRV_OPENCL,
@@ -265,7 +285,7 @@ target_supports_program(const char *target, const nir_function *func)
     * Ioto/CDM launch contract. Keep unqualified slots NULL and fail closed.
     * Fast clear is required by the qualified G17P compressed color shapes;
     * compressed render-pass clears dispatch this program for metadata/body. */
-   return strcmp(target, "g17p") ||
+   return !target_is_native_agx3(target) ||
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
@@ -535,21 +555,18 @@ main(int argc, char **argv)
 
                .reserved_preamble = layout.size_B / 2,
                .is_helper = is_helper,
-               .no_preamble = !strcmp(*target, "g17p"),
+               .no_preamble = target_is_native_agx3(*target),
 
-               /* G17P has a smaller register file than AGX2, so the largest
+               /* AGX3 has a smaller register file than AGX2, so the largest
                 * kernels spill to thread-private storage like API shaders.
                 */
-               .has_scratch = !strcmp(*target, "g17p"),
+               .has_scratch = target_is_native_agx3(*target),
             };
 
-            key.dev.encoding = !strcmp(*target, "g17p")
+            key.dev.encoding = target_is_native_agx3(*target)
                                   ? AGX_ISA_ENCODING_AGX3B
                                   : AGX_ISA_ENCODING_AGX2;
-            key.dev.chip = !strcmp(*target, "g17p")
-                              ? AGX_CHIP_G17P
-                              : !strcmp(*target, "g13x") ? AGX_CHIP_G13X
-                                                          : AGX_CHIP_G13G;
+            key.dev.chip = target_chip(*target);
 
             if (has_atomic) {
                key.dev.needs_g13x_coherency =
@@ -568,7 +585,7 @@ main(int argc, char **argv)
             }
 
             uint16_t printf_uniform = 0;
-            if (!strcmp(*target, "g17p")) {
+            if (target_is_native_agx3(*target)) {
                /* Both frontends publish the allocator-owned printf buffer.
                 * Keep that runtime ABI instead of dropping kernel assertions
                 * as upstream did before this branch supplied the address. */
@@ -602,8 +619,8 @@ main(int argc, char **argv)
             ralloc_free(clone);
 
             assert((compiled.info.scratch_size == 0 ||
-                    !strcmp(*target, "g17p")) &&
-                   "only G17P internal shaders spill");
+                    target_is_native_agx3(*target)) &&
+                   "only AGX3 internal shaders spill");
 
             assert(compiled.info.preamble_scratch_size == 0 &&
                    "internal shader preambles do not spill");

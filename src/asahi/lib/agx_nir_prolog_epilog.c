@@ -1415,7 +1415,7 @@ bool
 agx_nir_lower_fs_output_to_epilog_for_device(
    nir_shader *s, enum agx_chip chip, struct agx_fs_epilog_link_info *out)
 {
-   return lower_fs_output_to_epilog(s, out, chip == AGX_CHIP_G17P);
+   return lower_fs_output_to_epilog(s, out, agx_chip_native_agx3(chip));
 }
 
 static bool

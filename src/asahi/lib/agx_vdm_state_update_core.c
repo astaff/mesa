@@ -263,7 +263,7 @@ agx_vdm_state_update_vertex_ti_resources(
 
    /* Same bounds as the HAL200 fragment record: an 18-bit spill field and
     * the 12-bit IPR field, whose even rounding caps it at 0xffe. */
-   if (chip != AGX_CHIP_G17P || !info || spill_quads > UINT32_C(0x3ffff) ||
+   if (!agx_chip_native_agx3(chip) || !info || spill_quads > UINT32_C(0x3ffff) ||
        ipr_quads > UINT32_C(0xffe))
       return false;
 
@@ -340,7 +340,7 @@ agx_g17p_vertex_program_info(
           : compiler_info->nr_preamble_gprs == 0 &&
                compiler_info->preamble_scratch_size == 0);
 
-   if (chip != AGX_CHIP_G17P || !compiler_info || !program ||
+   if (!agx_chip_native_agx3(chip) || !compiler_info || !program ||
        !compiler_info->hardware_vertex || !preamble_ok ||
        compiler_info->position_off != 0 || compiler_info->varyings_off != 4 ||
        compiler_info->psiz_off != 4 + compiler_info->user_size ||

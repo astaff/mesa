@@ -31,6 +31,15 @@ _Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior, prior_vdm) ==
 _Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior, prior_cdm) ==
                   144,
                "compute prior cdm");
+_Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior,
+                        cdm_auxiliary_allocation) == 152,
+               "compute auxiliary allocation");
+_Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior,
+                        intersection_pool) == 160,
+               "compute intersection pool");
+_Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior,
+                        intersection_default_control) == 192,
+               "compute intersection default control");
 static unsigned tests, failures;
 static void *test_context;
 

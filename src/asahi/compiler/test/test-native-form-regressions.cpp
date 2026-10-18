@@ -1004,7 +1004,7 @@ TEST(NativeForms, RectangleImplicitLodOutsideFragment)
             nir_tex_src_coord, nir_imm_vec2(&b, 3.0, 5.0));
          nir_def_init(&tex->instr, &tex->def, 4, 32);
          nir_builder_instr_insert(&b, &tex->instr);
-         agx_nir_lower_g17p_texture_early(b.shader, sampler_bias);
+         agx_nir_lower_g17p_texture_early(b.shader, sampler_bias, true);
          EXPECT_EQ(tex->sampler_dim, GLSL_SAMPLER_DIM_RECT);
          EXPECT_GE(nir_tex_instr_src_index(tex, nir_tex_src_coord), 0);
          if (stage == MESA_SHADER_FRAGMENT) {

@@ -763,13 +763,13 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    agx_legalize_compression(ctx, agx_resource(info->src.resource),
                             info->src.format);
 
-   if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(agx_device(ctx->base.screen)) &&
        agx_g17p_direct_resolve_blit_shape(info, true) &&
        agx_g17p_attach_direct_resolve(ctx, info->src.resource,
                                       info->dst.resource, true))
       return;
 
-   if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(agx_device(ctx->base.screen)) &&
        agx_g17p_staged_resolve_blit_shape(info) &&
        agx_g17p_staged_resolve_blit(ctx, info))
       return;
@@ -800,7 +800,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * from the WSI image. Keep that copy in the same tile batch, and publish
     * the tile directly back to the WSI image when the swap resolve arrives.
     */
-   if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(agx_device(ctx->base.screen)) &&
        agx_g17p_direct_resolve_blit_shape(info, false)) {
       if (agx_g17p_attach_direct_resolve(ctx, info->dst.resource,
                                        info->src.resource, false)) {

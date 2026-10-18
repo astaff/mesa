@@ -151,12 +151,77 @@ test_g17p_txf_sampler(void)
    CHECK(agx_gallium_pack_g17p_txf_sampler(AGX_CHIP_G17P, &sampler));
    CHECK(memcmp(&sampler, expected, sizeof(expected)) == 0);
 
+   /* G15S packs the Gen4 layout, which differs from HAL200 only above bit
+    * 42 (bias, border colour, seamful cubes); sampler zero leaves those
+    * clear, so the bytes are the same. */
+   memset(&sampler, 0xa5, sizeof(sampler));
+   CHECK(agx_gallium_pack_g17p_txf_sampler(AGX_CHIP_G15S, &sampler));
+   CHECK(memcmp(&sampler, expected, sizeof(expected)) == 0);
+
    memset(&sampler, 0xa5, sizeof(sampler));
    CHECK(!agx_gallium_pack_g17p_txf_sampler(AGX_CHIP_G17G, &sampler));
    CHECK(memcmp(&sampler,
                 &(struct agx_gallium_sampler_descriptor){0},
                 sizeof(sampler)) == 0);
    CHECK(!agx_gallium_pack_g17p_txf_sampler(AGX_CHIP_G17P, NULL));
+}
+
+/* The same API state lands in the chip's own sampler word: G17P keeps the
+ * bias in the HAL200 field, G15S's Gen4 word has none. */
+static void
+test_native_sampler_generations(void)
+{
+   const struct agx_gallium_native_sampler state = {
+      .minimum_lod = 1.0f,
+      .maximum_lod = 100.0f,
+      .lod_bias = -1.015625f,
+      .maximum_anisotropy = 8,
+      .magnify = AGX_FILTER_LINEAR,
+      .mip_filter = AGX_MIP_FILTER_LINEAR,
+      .wrap_s = AGX_WRAP_REPEAT,
+      .compare_enable = true,
+      .compare_func = AGX_COMPARE_FUNC_GEQUAL,
+      .border_colour = AGX_BORDER_COLOUR_OPAQUE_WHITE,
+      .seamful_cube_maps = true,
+   };
+
+   struct agx_gallium_sampler_descriptor hal200, gen4;
+   uint32_t expected[AGX_GALLIUM_SAMPLER_AGX3_SIZE / 4] = {0};
+   CHECK(agx_gallium_pack_native_sampler(AGX_CHIP_G17P, &hal200, &state));
+   agx_pack(expected, SAMPLER_HAL200, cfg) {
+      cfg.minimum_lod = 1.0f;
+      cfg.maximum_lod = 100.0f;
+      cfg.lod_bias = -1.015625f;
+      cfg.maximum_anisotropy = 8;
+      cfg.magnify = AGX_FILTER_LINEAR;
+      cfg.mip_filter = AGX_MIP_FILTER_LINEAR;
+      cfg.wrap_s = AGX_WRAP_REPEAT;
+      cfg.compare_enable = true;
+      cfg.compare_func = AGX_COMPARE_FUNC_GEQUAL;
+      cfg.border_colour = AGX_BORDER_COLOUR_OPAQUE_WHITE;
+      cfg.seamful_cube_maps = true;
+   }
+   CHECK(memcmp(&hal200, expected, sizeof(expected)) == 0);
+
+   memset(expected, 0, sizeof(expected));
+   CHECK(agx_gallium_pack_native_sampler(AGX_CHIP_G15S, &gen4, &state));
+   agx_pack(expected, SAMPLER, cfg) {
+      cfg.minimum_lod = 1.0f;
+      cfg.maximum_lod = 100.0f;
+      cfg.maximum_anisotropy = 8;
+      cfg.magnify = AGX_FILTER_LINEAR;
+      cfg.mip_filter = AGX_MIP_FILTER_LINEAR;
+      cfg.wrap_s = AGX_WRAP_REPEAT;
+      cfg.compare_enable = true;
+      cfg.compare_func = AGX_COMPARE_FUNC_GEQUAL;
+      cfg.border_colour = AGX_BORDER_COLOUR_OPAQUE_WHITE;
+      cfg.seamful_cube_maps = true;
+   }
+   CHECK(memcmp(&gen4, expected, sizeof(expected)) == 0);
+   CHECK(memcmp(&gen4, &hal200, sizeof(gen4)) != 0);
+
+   CHECK(!agx_gallium_pack_native_sampler(AGX_CHIP_G13G, &gen4, &state));
+   CHECK(!agx_gallium_pack_native_sampler(AGX_CHIP_G17P, &gen4, NULL));
 }
 
 static void
@@ -185,6 +250,14 @@ test_g17p_sampler_handles(void)
       CHECK(agx_gallium_g17p_custom_border_handle(
          AGX_CHIP_G17P, cases[i].api, &custom));
       CHECK(custom == AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE + cases[i].api);
+
+      native = custom = UINT16_MAX;
+      CHECK(agx_gallium_g17p_sampler_handle(AGX_CHIP_G15S, cases[i].api,
+                                            &native));
+      CHECK(agx_gallium_g17p_custom_border_handle(
+         AGX_CHIP_G15S, cases[i].api, &custom));
+      CHECK(native == cases[i].native &&
+            custom == AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE + cases[i].api);
    }
 
    uint16_t untouched = 0x5555;
@@ -934,6 +1007,7 @@ main(void)
    test_chip_routing();
    test_feature_gates();
    test_g17p_txf_sampler();
+   test_native_sampler_generations();
    test_g17p_sampler_handles();
    test_standard_border_colours();
    test_gen9_uncompressed_mip_views();

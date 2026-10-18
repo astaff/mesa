@@ -472,6 +472,17 @@ done:
    return ok;
 }
 
+/* Non-published texture and image operations stage their operands at a fixed
+ * sampler-private bank that the resource allocator does not reserve. */
+static bool
+staging_without_resource(const agx_instr *I)
+{
+   return (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+           I->op == AGX_OPCODE_TEXTURE_LOAD ||
+           I->op == AGX_OPCODE_IMAGE_LOAD) &&
+          !agx_texture_resource(I) && !I->agx3_tex_coords_staged;
+}
+
 static bool
 fma_staging_producer(const agx_instr *I, bool immutable_uniforms)
 {
@@ -547,6 +558,7 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       if (!valid || producer[0] == producer[1])
          continue;
       unsigned earlier = 0, found = 0;
+      bool crosses_staging = false;
       agx_foreach_instr_global(ctx, I) {
          if (I == publication)
             break;
@@ -555,6 +567,8 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
             if (!found)
                earlier = c;
             found |= 1u << c;
+         } else if (found == 3 && staging_without_resource(I)) {
+            crosses_staging = true;
          } else if (found &&
                     (I->op == AGX_OPCODE_BEGIN_CF ||
                      agx_opcodes_info[I->op].schedule_class ==
@@ -578,7 +592,9 @@ agx3_fuse_fma_texture_publications(agx_context *ctx)
       struct list_head *publication_next = publication->link.next;
       agx_index dest[2] = {producer[0]->dest[0], producer[1]->dest[0]};
       agx_index src[2] = {publication->src[0], publication->src[1]};
-      for (unsigned late = 0; late < 2; ++late) {
+      /* Hoisting the publication to its producers would keep it live across
+       * that instruction's staging, so only sink the producers. */
+      for (unsigned late = crosses_staging; late < 2; ++late) {
          struct list_head *anchor = late ? publication_next : next[earlier ^ 1];
          if (anchor == &publication->link)
             anchor = publication_next;

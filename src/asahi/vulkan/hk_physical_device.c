@@ -382,7 +382,7 @@ hk_get_device_features(
       .storagePushConstant16 = true,
       /* HAL200 interpolation is 32-bit, but the compiler performs matching
        * type-correct widening at ST_VARY and narrowing after interpolation. */
-      .storageInputOutput16 = dev->chip == AGX_CHIP_G17P,
+      .storageInputOutput16 = agx_chip_native_agx3(dev->chip),
       .multiview = true,
       /* ViewIndex is lowered into the layer output of the last
        * pre-rasterization stage and the draw is duplicated per view, so
@@ -570,8 +570,8 @@ hk_get_device_features(
       .shaderFloatControls2 = true,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = true,
-      .shaderFmaFloat32 = true,
+      .shaderFmaFloat16 = agx_chip_exact_fma32(dev->chip),
+      .shaderFmaFloat32 = agx_chip_exact_fma32(dev->chip),
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */
@@ -832,7 +832,7 @@ hk_get_device_features(
 #endif
    };
 
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(dev->chip)) {
       /* The first HAL200 path is intentionally one ordinary, single-sample
        * graphics pipeline. Keep optional feature reporting within that path
        * until the corresponding joined Ioto programs are implemented. */
@@ -884,8 +884,10 @@ hk_get_device_features(
        * a read-only shadow at +sparse_ro_offset, and a userspace sparse map
        * that the G17P texture descriptor points at in Sparse mode. The kernel
        * already accepts DRM_ASAHI_BIND_SINGLE_PAGE binds, and the G17P user VA
-       * window is split for the RO alias exactly as AGX2 is. */
-      const bool sparse = true;
+       * window is split for the RO alias exactly as AGX2 is. Sparse texture
+       * updates flush the SSTT with a HAL200 CDM record, so other native
+       * chips do not advertise it. */
+      const bool sparse = dev->chip == AGX_CHIP_G17P;
       features->shaderResourceResidency = sparse;
       features->sparseBinding = sparse;
       features->sparseResidencyAliased = false;
@@ -911,9 +913,13 @@ hk_get_device_features(
        * inside divergent control flow.  The ordinary subgroup quad shuffles
        * exposed below do not establish that stronger execution guarantee. */
       features->shaderQuadControl = false;
-      features->computeDerivativeGroupQuads = true;
-      features->computeDerivativeGroupLinear = true;
-      features->textureCompressionASTC_HDR = true;
+
+      /* Qualified on A18 Pro only. */
+      if (dev->chip == AGX_CHIP_G17P) {
+         features->computeDerivativeGroupQuads = true;
+         features->computeDerivativeGroupLinear = true;
+         features->textureCompressionASTC_HDR = true;
+      }
    }
 
    /* A multiview promise for a stage this device does not expose is
@@ -968,7 +974,7 @@ hk_get_device_properties(const struct agx_device *dev,
       agx_chip_descriptor_generation(dev->chip);
    const bool texel_buffer_single_texel_alignment =
       hk_descriptor_generation_is_agx2(descriptor_generation) ||
-      dev->chip == AGX_CHIP_G17P;
+      agx_chip_native_agx3(dev->chip);
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
@@ -980,7 +986,7 @@ hk_get_device_properties(const struct agx_device *dev,
     * G17P restriction until that image descriptor path is qualified.
     */
    const VkSampleCountFlagBits storage_sample_counts =
-      dev->chip == AGX_CHIP_G17P ? VK_SAMPLE_COUNT_1_BIT : sample_counts;
+      agx_chip_native_agx3(dev->chip) ? VK_SAMPLE_COUNT_1_BIT : sample_counts;
 
    uint64_t os_page_size = 16384;
    os_get_page_size(&os_page_size);
@@ -1008,7 +1014,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
-      .deviceID = dev->chip == AGX_CHIP_G17P ? dev->params.chip_id : 0,
+      .deviceID = agx_chip_native_agx3(dev->chip) ? dev->params.chip_id : 0,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
       /* Vulkan 1.0 limits */
@@ -1025,7 +1031,7 @@ hk_get_device_properties(const struct agx_device *dev,
        * view at a single-texel offset still fits the native 2D descriptor.
        */
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
-                               (dev->chip == AGX_CHIP_G17P ? 15 : 0),
+                               (agx_chip_native_agx3(dev->chip) ? 15 : 0),
       .maxUniformBufferRange = 65536,
 
       /* From a hardware perspective, storage buffers are lowered to global
@@ -1464,7 +1470,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .advancedBlendAllOperations = true,
    };
 
-   if (dev->chip == AGX_CHIP_G17P) {
+   if (agx_chip_native_agx3(dev->chip)) {
       /* Measured per operation under the G17P drm-shim:
        *
        *   BASIC             g22_subgroup_basic          encodes
@@ -1785,14 +1791,20 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
 
+   if (agx_native_graphics(&pdev->dev)) {
+      /* This extension controls divergent quad derivatives, not the standard
+       * subgroup quad shuffle operations exposed above. */
+      supported_extensions.KHR_shader_quad_control = false;
+   }
+
+   /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
+   if (!agx_chip_exact_fma32(pdev->dev.chip))
+      supported_extensions.KHR_shader_fma = false;
+
    if (pdev->dev.chip == AGX_CHIP_G17P) {
       /* Advanced blending is hardware-qualified on A18 Pro for every
        * operation and advertised overlap/premultiplication mode, including
        * coherent sequencing, across the bounded one-attachment profile. */
-
-      /* This extension controls divergent quad derivatives, not the standard
-       * subgroup quad shuffle operations exposed above. */
-      supported_extensions.KHR_shader_quad_control = false;
       supported_extensions.KHR_compute_shader_derivatives = true;
       supported_extensions.EXT_shader_atomic_float = true;
       supported_extensions.EXT_shader_atomic_float2 = true;
@@ -1889,7 +1901,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    VkQueueFlags queue_flags =
       VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
       VK_QUEUE_SPARSE_BINDING_BIT;
-   if (pdev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&pdev->dev)) {
       /* Graphics, compute and transfers use the native HAL200 queue path.
        * Sparse binding rides the shared per-page VM_BIND path; advertise it
        * only when the same opt-in that turns on the sparse features above is

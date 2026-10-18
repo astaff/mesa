@@ -49,7 +49,7 @@ hk_descriptor_stride_align_for_type(
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
       *stride = hk_storage_image_descriptor_layout(
                    agx_chip_descriptor_generation(pdev->dev.chip)).stride;
-      if (pdev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_native_graphics(&pdev->dev)) {
          *stride += HK_G17P_STORAGE_SW_SIZE;
          /* imgwci addresses PBE records in a heap, and stores treat the
           * descriptor set as that heap. The PBE descriptor starts 32 bytes
@@ -72,7 +72,7 @@ hk_descriptor_stride_align_for_type(
        * heap indices and 24 bytes of buffer size/offset/address metadata.
        * The shader must never decode AGX2 software fields from Gen9 bytes.
        */
-      if (pdev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_native_graphics(&pdev->dev)) {
          *stride = AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE;
          /* Texel-buffer stores address the PBE through the set's PBE heap,
           * like storage images. */
@@ -108,7 +108,7 @@ hk_descriptor_stride_align_for_type(
       *stride = *alignment = 0;
       if (type_list == NULL || type_list->descriptorTypeCount == 0) {
          *stride = HK_MAX_DESCRIPTOR_SIZE;
-         *alignment = pdev->dev.chip == AGX_CHIP_G17P
+         *alignment = agx_native_graphics(&pdev->dev)
                          ? HK_G17P_STORAGE_ALIGNMENT
                          : 8;
       }
@@ -191,7 +191,7 @@ hk_CreateDescriptorSetLayout(VkDevice device,
    layout->binding_count = num_bindings;
    layout->descriptor_generation =
       agx_chip_descriptor_generation(pdev->dev.chip);
-   layout->native_sampler_indices = pdev->dev.chip == AGX_CHIP_G17P;
+   layout->native_sampler_indices = agx_native_graphics(&pdev->dev);
 
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];

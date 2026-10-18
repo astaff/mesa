@@ -155,6 +155,36 @@ enum agx_submission_model {
  */
 #define AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE (8)
 
+/*
+ * Whether Honeykrisp drives a chip through its native AGX3 path: AGX3b shaders
+ * loaded by Ioto programs, VDM/PPP/CDM records in the HAL200 layout, Gen9
+ * descriptors with heap-indexed textures and samplers, firmware-owned USC
+ * private memory and no helper programs.
+ *
+ * Every native-path gate asks this question.  Where a chip on the path still
+ * differs from G17P, a narrower capability predicate below answers for it;
+ * the chip identity is never tested at the call site.
+ */
+#ifndef __OPENCL_VERSION__
+#include <stdbool.h>
+#endif
+
+static inline bool
+agx_chip_native_agx3(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G15S || chip == AGX_CHIP_G15C ||
+          chip == AGX_CHIP_G17P;
+}
+
+/* The chip whose record encodings GPU-generated (libagx) command-stream
+ * records use.  Every native chip shares G17P's VDM records, so naming that
+ * one family keeps the precompiled kernels independent of the native chip. */
+static inline enum agx_chip
+agx_chip_record_family(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) ? AGX_CHIP_G17P : chip;
+}
+
 #ifndef __OPENCL_VERSION__
 
 #include <assert.h>
@@ -278,6 +308,193 @@ agx_chip_sampler_heap_element_size(enum agx_chip chip)
    default:
       return 0;
    }
+}
+
+/*
+ * Whether the native path runs on Apple's G15 command-stream generation
+ * (M3, RTKit 2419) rather than HAL200.  The record layouts are shared; the
+ * firmware-facing differences are the direct CDM launch pointer, the CDM
+ * visibility barrier and the render-command resource specifiers.
+ */
+static inline bool
+agx_chip_native_g15(enum agx_chip chip)
+{
+   return agx_chip_native_agx3(chip) &&
+          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_G15;
+}
+
+/* Whether the kernel presents the T8140 native render context: a fixed Bind0
+ * and seven low context views at 0x1000000000 that every render job needs.
+ * This is a HAL200 firmware construct; the G15 firmware has none. */
+static inline bool
+agx_chip_has_native_render_context(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/* Whether the native indirect compute pair (grid helper plus the 24-byte
+ * mode-2 launch) is qualified.  G15 reads the same mode-2 record and the same
+ * six-word geometry (three global thread counts, three local sizes); other
+ * native chips refuse indirect dispatches rather than run an unqualified
+ * record. */
+static inline bool
+agx_chip_native_indirect_compute(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S ||
+          chip == AGX_CHIP_G15C;
+}
+
+/* Whether the CDM's fetch of an indirect geometry block needs a cache flush
+ * after the dispatch that wrote it.  On G15 the ordinary launch tail is not
+ * established for a shader-store to CDM-fetch edge, so the grid helper's tail
+ * is followed by the wide flush before the mode-2 launch. */
+static inline bool
+agx_chip_indirect_geometry_flush(enum agx_chip chip)
+{
+   return agx_chip_native_g15(chip);
+}
+
+/*
+ * Whether a CDM cache flush must use the wide-visibility barrier.  Apple's G15
+ * encoder publishes a memory dependency between dispatches of one compute
+ * stream with 0x600215fe, not the ordinary flags-5 word that suffices on
+ * HAL200; the kernel's end-of-command flush does not cover dependencies
+ * inside a stream.
+ */
+static inline bool
+agx_chip_cdm_wide_visibility(enum agx_chip chip)
+{
+   return agx_chip_native_g15(chip);
+}
+
+/* Whether consecutive application dispatches of one CDM stream may omit the
+ * ordering barrier between them.  Vulkan orders dispatches only through
+ * explicit barriers, and Apple's G15 encoder emits none between independent
+ * dispatches; every other record (internal or indirect launch, cache flush,
+ * link, stream end) still follows a barrier. */
+static inline bool
+agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
+{
+   return agx_chip_native_g15(chip);
+}
+
+/* Number of helper-table slots in the USC code-container lead block.  G17P
+ * has six; G15 and G16 parts have ten, and with six their fragment programs
+ * of 256x256 and larger walk past the lead into the guard page. */
+static inline unsigned
+agx_chip_usc_helper_table_slots(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P ? 6 : 10;
+}
+
+/* Whether the USC window base page needs a return in every slot past its
+ * helper tables.  On G15C the profile prefix's computed helper call can
+ * index past both ten-slot tables on some shader cores; with zeroes there
+ * the call never returns and runs into the unbound page after the base
+ * page. */
+static inline bool
+agx_chip_usc_base_page_fill_returns(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G15C;
+}
+
+/* Robust image accesses on native chips need explicit Vulkan view bounds:
+ * native 2D accesses outside the view alias other texels of the image. G17P
+ * lowers them together with its own hardware defects; G15 and G16 parts
+ * bound the coordinates in NIR and take the out-of-bounds alpha from the
+ * view swizzle. */
+static inline bool
+agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G16G || agx_chip_native_g15(chip);
+}
+
+/*
+ * Whether the Apple9 imageblock applies: up to 128 bytes a sample in a full
+ * 32 KiB (32768-byte) tile. Apple's Metal feature set tables give G15 (M3)
+ * and G17P (A18 Pro) the same Apple9 limits.
+ */
+static inline bool
+agx_chip_native_imageblock(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G15S ||
+          chip == AGX_CHIP_G15C;
+}
+
+/*
+ * Whether the defect applies that drops the upper bytes of a wide multisample
+ * sample on a tile no geometry covered
+ * (AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE). Measured on A18 Pro, and on
+ * G15 (M3), where a layered 4x clear of a 16-byte format keeps only the low
+ * eight bytes of each sample.
+ */
+static inline bool
+agx_chip_uncovered_tile_ms_defect(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || agx_chip_native_g15(chip);
+}
+
+/* Whether a native fragment program may merge triangles across the
+ * linker's other merge-disabling cases: memory writes and wide subgroup
+ * operations. Apple's G17P metadata leaves the bit clear for both; on other
+ * chips it is unverified, so they keep the linker's conservative bit. */
+static inline bool
+agx_chip_tri_merge_across_side_effects(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/* Whether an image load misses a store made earlier in the same invocation,
+ * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
+ * behave this way; G15 loads observe the invocation's own stores. */
+static inline bool
+agx_chip_image_load_misses_own_store(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/* Whether a 32-bit FFMA keeps a product below the normal range exactly, as
+ * the fused multiply-add of VK_KHR_shader_fma requires. G15's flushes such a
+ * product to zero before the add. */
+static inline bool
+agx_chip_exact_fma32(enum agx_chip chip)
+{
+   return !agx_chip_native_g15(chip);
+}
+
+/* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
+ * layout has a bias field; Gen4 does not, so the shader applies the bias. */
+static inline bool
+agx_chip_sampler_has_lod_bias(enum agx_chip chip)
+{
+   return agx_chip_sampler_generation(chip) ==
+          AGX_SAMPLER_GENERATION_GEN4_HAL200;
+}
+
+/*
+ * Whether native shaders may carry an Ioto constant program (CProg) and a
+ * shader preamble.  Only the G17P Ioto preamble sequence is qualified; other
+ * native chips compile every stage with no_preamble.
+ */
+static inline bool
+agx_chip_native_preamble(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/*
+ * Whether a resource-info query reserves thread-invariant (TI) spill storage
+ * in a native compute launch.  Apple's compiler stages a uniform query's
+ * inputs for its constant program in TI storage, and the launch template
+ * follows that witness (agx3_cdm_direct_template_sources_compute()).  Mesa
+ * computes every query from descriptor memory, so only a constant program
+ * could consume the storage: a chip without native preambles needs none, and
+ * G15's direct launch has no TI field to carry it.
+ */
+static inline bool
+agx_chip_query_ti_spill(enum agx_chip chip)
+{
+   return agx_chip_native_preamble(chip);
 }
 
 /*

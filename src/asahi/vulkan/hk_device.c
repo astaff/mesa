@@ -103,7 +103,7 @@ hk_upload_rodata(struct hk_device *dev)
    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
    /* Background reloads use the same two native texel-fetch selectors as
     * ordinary shaders: staged multisample reads name entry one. */
-   const unsigned sampler_count = dev->dev.chip == AGX_CHIP_G17P ? 2 : 1;
+   const unsigned sampler_count = agx_native_graphics(&dev->dev) ? 2 : 1;
    const size_t rodata_size = align(sampler_count * sampler_size, sizeof(uint64_t));
    dev->rodata.bo =
       agx_bo_create(&dev->dev, rodata_size, 0, 0, "Read only data");
@@ -139,7 +139,7 @@ hk_upload_rodata(struct hk_device *dev)
       memcpy(map + offs + i * sampler_size, &txf, sampler_size);
    offs += sampler_count * sampler_size;
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       const uint64_t pointers[2] = {
          dev->sampled_images.base_va,
          dev->samplers.table.bo->va->addr,
@@ -258,14 +258,14 @@ hk_init_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
 
    VkResult result =
       hk_descriptor_table_init(dev, &h->table, sampler_size, 1024,
-                               dev->dev.chip == AGX_CHIP_G17P ? 4096 : 1024);
+                               agx_native_graphics(&dev->dev) ? 4096 : 1024);
 
    if (result != VK_SUCCESS) {
       ralloc_free(h->ht);
       return result;
    }
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       /* Native indexed read() and sample() share the sampler table prefix.
        * Reserve texel-fetch sampler zero once, so mixed shaders need no
        * per-fetch pointer switch or descriptor copy. Preserve at least the
@@ -744,7 +744,7 @@ static void
 hk_init_g17p_grid_helper(struct hk_device *dev,
                          const VkAllocationCallbacks *pAllocator)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P)
+   if (!agx_chip_native_indirect_compute(dev->dev.chip))
       return;
 
    dev->g17p_grid_helper =
@@ -878,7 +878,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_dev;
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       /* Capacity stays HK_MAX_DESCRIPTORS, but memory is added a chunk at a
        * time as image and buffer views are created. */
       result = hk_descriptor_table_init(dev, &dev->sampled_images, 32,
@@ -920,7 +920,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
     * Upload their immutable internal kernels with the device instead of
     * making the first vkCmdDraw that needs each kernel serialize on the
     * cache lock and allocate its executable image. */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(&dev->dev) &&
        !hk_g17p_prewarm_poly_kernels(dev)) {
       result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
       goto fail_bg_eot;
@@ -1020,7 +1020,7 @@ fail_rodata:
 fail_queries:
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
 fail_sampled_images:
-   if (dev->dev.chip == AGX_CHIP_G17P)
+   if (agx_native_graphics(&dev->dev))
       hk_descriptor_table_finish(dev, &dev->sampled_images);
 fail_samplers:
    hk_destroy_sampler_heap(dev, &dev->samplers);
@@ -1094,7 +1094,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    }
 
    hk_destroy_sampler_heap(dev, &dev->samplers);
-   if (dev->dev.chip == AGX_CHIP_G17P)
+   if (agx_native_graphics(&dev->dev))
       hk_descriptor_table_finish(dev, &dev->sampled_images);
    hk_descriptor_table_finish(dev, &dev->occlusion_queries);
    agx_bo_unreference(&dev->dev, dev->rodata.heap_bo);

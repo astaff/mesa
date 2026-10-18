@@ -1731,7 +1731,8 @@ lower_g17p_rectangle_lod(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
 }
 
 bool
-agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias)
+agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias,
+                                 bool sampler_has_lod_bias)
 {
    bool progress = false;
    const unsigned runtime_offset_modes =
@@ -1751,8 +1752,11 @@ agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias)
     * AGX3B comparison sample has no witnessed per-lane level form in the
     * vertex stage, where a GLSL `texture()` arrives as an explicit level
     * zero, and folding a bias into that level would leave the shape
-    * unencodable. agx_upload_samplers() packs the field to match. */
-   progress |= lower_texture_early(s, support_lod_bias, false, true);
+    * unencodable. agx_upload_samplers() packs the field to match. A Gen4
+    * sampler has no bias field to keep it in, so there the shader applies
+    * it like any other bias. */
+   progress |= lower_texture_early(s, support_lod_bias, false,
+                                   sampler_has_lod_bias);
    NIR_PASS(progress, s, nir_shader_tex_pass, lower_g17p_rectangle_lod,
             nir_metadata_control_flow, NULL);
 

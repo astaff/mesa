@@ -178,7 +178,7 @@ hk_g17p_xfb_vertex_side_effects(struct hk_cmd_buffer *cmd,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
 
-   return hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P &&
+   return agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
           gfx->xfb_enabled && gs && gs->is_passthrough &&
           hw_vs == &gs->variants[HK_GS_VARIANT_RAST];
 }
@@ -732,7 +732,7 @@ void
 hk_g17p_bg_eot_dev_cache_init(struct hk_device *dev)
 {
    dev->g17p_bg_eot_dev_cache = NULL;
-   if (dev->dev.chip != AGX_CHIP_G17P)
+   if (!agx_native_graphics(&dev->dev))
       return;
    struct hk_g17p_bg_eot_dev_cache *dc = calloc(1, sizeof(*dc));
    if (!dc)
@@ -1235,9 +1235,9 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
        * diagnostic. Refuse that combination instead of storing wrong pixels.
        */
       const bool multisample_store =
-         dev->dev.chip == AGX_CHIP_G17P && key->multisample_store;
+         agx_native_graphics(&dev->dev) && key->multisample_store;
       if (!iview || !target ||
-          (dev->dev.chip == AGX_CHIP_G17P && !direct_resolve &&
+          (agx_native_graphics(&dev->dev) && !direct_resolve &&
            !multisample_store && target->vk.image->samples != 1) ||
           (multisample_store &&
            (direct_resolve || target != iview ||
@@ -1577,7 +1577,7 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
                  "G17P BG/EOT cache key storage");
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.chip != AGX_CHIP_G17P)
+   if (!agx_native_graphics(&dev->dev))
       return NULL;
 
    struct hk_g17p_bg_eot_cache_key cache_key = {
@@ -1704,7 +1704,7 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
        * there's nothing to do.
        */
       if (key.tib.spilled[i] &&
-          (partial_render || store || dev->dev.chip == AGX_CHIP_G17P))
+          (partial_render || store || agx_native_graphics(&dev->dev)))
          continue;
 
       if (store) {
@@ -1770,7 +1770,7 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       }
    }
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       const unsigned variant = (store ? 2 : 0) | (partial_render ? 1 : 0);
       if (cache && (cache->valid_variants & BITFIELD_BIT(variant))) {
          render->g17p_direct_color_resolve |=
@@ -2195,14 +2195,14 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
    /* Storage capacity and raster samples are independent limits. In
     * particular 16x16 at 4x may occupy the full 32 KiB, while 32x32 at 4x
     * exceeds the sample budget even for an eight-byte sample. */
-   const bool g17p = dev->dev.chip == AGX_CHIP_G17P;
+   const bool imageblock = agx_chip_native_imageblock(dev->dev.chip);
    const uint8_t max_sample_size_B =
-      !g17p                    ? 0
+      !imageblock              ? 0
       : g17p_wide_ms_to_memory ? AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE
                                : AGX_G17P_MAX_BYTES_PER_SAMPLE;
    return agx_build_tilebuffer_layout_with_limits(
       formats, count, samples, layered, max_sample_size_B,
-      g17p ? 32768 : 0, g17p ? 2048 : 0);
+      imageblock ? 32768 : 0, agx_native_graphics(&dev->dev) ? 2048 : 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2284,7 +2284,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    /* On G17P, zero dimensions are the native inactive-ZLS encoding.  Keep
     * them zero for attachmentless and colour-only rendering; every control
     * stream, including a partial stream, inherits that state from render. */
-   if (!render->cr.zls_width && dev->dev.chip != AGX_CHIP_G17P) {
+   if (!render->cr.zls_width && !agx_native_graphics(&dev->dev)) {
       render->cr.zls_width = render->cr.width;
       render->cr.zls_height = render->cr.height;
    }
@@ -2300,7 +2300,8 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * tiles the application does not draw to. Multiview has a second, separate
     * defect that the clear draw does not cover either. Those two spill. */
    bool g17p_wide_ms_to_memory = false;
-   if (dev->dev.chip == AGX_CHIP_G17P && render->tilebuffer.nr_samples > 1) {
+   if (agx_chip_uncovered_tile_ms_defect(dev->dev.chip) &&
+       render->tilebuffer.nr_samples > 1) {
       g17p_wide_ms_to_memory = render->view_mask != 0;
 
       for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
@@ -2315,15 +2316,15 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    render->tilebuffer = hk_tilebuffer_layout(
       dev, &render->color_att[0].vk_format, sizeof(render->color_att[0]),
       render->color_att_count, render->tilebuffer.nr_samples,
-      dev->dev.chip != AGX_CHIP_G17P ||
+      !agx_native_graphics(&dev->dev) ||
          !hk_agx3_g17p_single_layer_rendering(render->view_mask, layer_count),
       g17p_wide_ms_to_memory);
 
-   if (dev->dev.chip == AGX_CHIP_G17P)
+   if (agx_native_graphics(&dev->dev))
       render->g17p_rt0_layout_supported =
          hk_agx3_g17p_rt0_tile_layout_supported(&render->tilebuffer);
 
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(&dev->dev) &&
        !render->g17p_rt0_layout_supported) {
       mesa_loge_once("G17P tilebuffer layout refused: attachments=%u "
                      "samples=%u sample_size=%u tile_size=%u",
@@ -2431,7 +2432,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
        * The stride is unused for one layer; Apple's G17P Framebuffer writes
        * 0 for a sub-cacheline layer and cacheline units below one page, a
        * form the G17P kernel's ZLS validation does not accept. Send 0. */
-      if (dev->dev.chip == AGX_CHIP_G17P && stride_pages == 0) {
+      if (agx_native_graphics(&dev->dev) && stride_pages == 0) {
          assert(z_layout->depth_px == 1);
          render->cr.depth.stride = 0;
       }
@@ -2486,7 +2487,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
              "Page aligned S layers");
       unsigned stride_pages = s_layout->layer_stride_B / AIL_PAGESIZE;
       render->cr.stencil.stride = ((stride_pages - 1) << 14) | 1;
-      if (dev->dev.chip == AGX_CHIP_G17P && stride_pages == 0) {
+      if (agx_native_graphics(&dev->dev) && stride_pages == 0) {
          assert(s_layout->depth_px == 1);
          render->cr.stencil.stride = 0;
       }
@@ -2708,7 +2709,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    if (clear_att[clear_count].aspectMask != 0)
       clear_count++;
 
-   const bool clear_spills = dev->dev.chip == AGX_CHIP_G17P &&
+   const bool clear_spills = agx_native_graphics(&dev->dev) &&
       agx_tilebuffer_spills(&render->tilebuffer);
 
    /* A G17P multisample tilebuffer wider than eight bytes per sample cannot
@@ -2717,12 +2718,19 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
     * an ordinary full-area draw instead. That covers every tile, so the
     * background program only ever runs on a tile the hardware also
     * rasterizes, which keeps the whole sample. The target stays in the
-    * tilebuffer. */
+    * tilebuffer.
+    *
+    * A spilling multisample tilebuffer takes the same full clear on every
+    * chip: a draw that clears only the spilled targets makes its epilog
+    * preserve the resident ones by reading the tile back, a multisample eMRT
+    * shape the packer cannot encode. (On G17P such a tilebuffer is always
+    * wider than eight bytes a sample, so this adds nothing there.) */
    const bool clear_wide_multisample =
-      dev->dev.chip == AGX_CHIP_G17P && color_clear_count > 0 &&
-      render->tilebuffer.nr_samples > 1 &&
-      render->tilebuffer.sample_size_B >
-         AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE;
+      color_clear_count > 0 && render->tilebuffer.nr_samples > 1 &&
+      (clear_spills ||
+       (agx_chip_uncovered_tile_ms_defect(dev->dev.chip) &&
+        render->tilebuffer.sample_size_B >
+           AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE));
    if (clear_spills && !incomplete_render_area && !clear_wide_multisample) {
       unsigned selected = 0;
       for (unsigned i = 0; i < clear_count; ++i) {
@@ -3468,7 +3476,7 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    /* Launch the vertex shader first */
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs, wg);
    } else {
       hk_reserve_scratch(cmd, cs, vs);
@@ -3606,7 +3614,7 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs,
                                   agx_workgroup(64, 1, 1));
       hk_dispatch_with_local_size(
@@ -4100,7 +4108,7 @@ hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
 {
    struct agx_shader_part *prolog =
       hk_get_prolog_epilog(dev, &key->prolog, sizeof(key->prolog),
-                           dev->dev.chip == AGX_CHIP_G17P
+                           agx_native_graphics(&dev->dev)
                               ? agx_nir_vs_prolog_raw : agx_nir_vs_prolog,
                            false, false, 0, 0, 0);
    if (!prolog)
@@ -4580,7 +4588,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    /* A G17P epilog selects each written target's pixel classes from its
     * position among all of the framebuffer's colour targets. */
    BITSET_DECLARE(g17p_tile_partitions, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       const struct agx_tilebuffer_layout tib =
          agx_build_tilebuffer_layout_with_limits(
             key->epilog.rt_formats, ARRAY_SIZE(key->epilog.rt_formats),
@@ -4596,7 +4604,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
 
    /* Inline blend: try one monolithic fragment program first;
     * any refusal falls through to the split link below, unchanged. */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(&dev->dev) &&
        (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
        !prolog && key->nr_samples_shaded == 0 && shader->g17p_mono_nir) {
       struct agx_shader_part *mono = hk_g17p_inline_epilog_part(
@@ -4625,11 +4633,11 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
 
    struct agx_shader_part *epilog =
       hk_get_prolog_epilog(dev, &key->epilog, sizeof(key->epilog),
-                           dev->dev.chip == AGX_CHIP_G17P
+                           agx_native_graphics(&dev->dev)
                               ? build_g17p_fs_epilog
                               : agx_nir_fs_epilog,
                            true, epilog_stop, 0, g17p_tile_partitions,
-                           dev->dev.chip == AGX_CHIP_G17P
+                           agx_native_graphics(&dev->dev)
                               ? key->epilog.nr_samples
                               : 0);
    if (!epilog) {
@@ -5307,7 +5315,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    if (prepared)
       prepared->valid = false;
 
-   if (dev->dev.chip != AGX_CHIP_G17P || !prepared)
+   if (!agx_native_graphics(&dev->dev) || !prepared)
       return hk_g17p_bind_tail_refused(__LINE__);
    if (!hk_g17p_viewport_state_supported(dyn->vp.viewport_count,
                                          dyn->vp.scissor_count))
@@ -5758,7 +5766,10 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       .shader_tri_merge_disable =
          fs->b.info.needs_quad_derivatives ||
          (render->tilebuffer.nr_samples > 1 &&
-          fs->info.fs.epilog_key.write_z),
+          fs->info.fs.epilog_key.write_z) ||
+         /* The linker's own merge-disable bit. */
+         (!agx_chip_tri_merge_across_side_effects(dev->dev.chip) &&
+          (linked_fragment_control & (UINT32_C(1) << 26))),
 
       /* Native forces bit26 for type2 and conditionally for type3 from the
        * draw-buffer state. Keep the already-qualified conservative type3
@@ -6190,7 +6201,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       .viewport_count = 1, /* irrelevant */
    };
 
-   if (dev->dev.chip != AGX_CHIP_G17P)
+   if (!agx_native_graphics(&dev->dev))
       dirty.fragment_shader &= !linked_fs->b.no_op;
 
    /* Calculate the update size. If it equals the header, there is nothing to
@@ -6368,6 +6379,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          }
          fragment_pipeline = uploaded;
          break;
+      case AGX_CS_GENERATION_G15:
       case AGX_CS_GENERATION_HAL200:
          if (uploaded == 0 || uploaded < dev->dev.shader_base ||
              uploaded - dev->dev.shader_base > UINT32_MAX) {
@@ -6376,7 +6388,6 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
          }
          fragment_pipeline = agx_usc_addr(&dev->dev, uploaded);
          break;
-      case AGX_CS_GENERATION_G15:
       case AGX_CS_GENERATION_HAL300:
       case AGX_CS_GENERATION_UNKNOWN:
       default:
@@ -6487,7 +6498,7 @@ hk_g17p_read_only_early_reject_in(const struct hk_device *dev,
    /* Moving a test ahead of a discard is unobservable only when neither the
     * test nor the skipped fragment has a side effect. The all-live prolog
     * also must not inherit an API-mask or cull-distance kill. */
-   return dev->dev.chip == AGX_CHIP_G17P && fs->b.info.writes_sample_mask &&
+   return agx_native_graphics(&dev->dev) && fs->b.info.writes_sample_mask &&
           !fs->b.info.early_fragment_tests && !fs->info.fs.writes_memory &&
           !fs->info.fs.epilog_key.write_z && !fs->info.fs.epilog_key.write_s &&
           samples == 1 && in->depth_attachment && dyn->ds.depth.test_enable &&
@@ -6599,7 +6610,7 @@ hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
 
       /* G17P materialises adjacency into an index buffer before the hardware
        * vertex program. Applying the remap again in the prolog is wrong. */
-      if (dev->dev.chip != AGX_CHIP_G17P)
+      if (!agx_native_graphics(&dev->dev))
          key->prolog.adjacency = prim;
    }
 
@@ -6645,10 +6656,10 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    bool epilog_discards = agx_fs_epilog_may_discard(
       fs ? &fs->info.fs.epilog_key : NULL,
       dyn->ms.alpha_to_coverage_enable, nontrivial_force_early);
-   bool defer_api_sample_mask = dev->dev.chip == AGX_CHIP_G17P &&
+   bool defer_api_sample_mask = agx_native_graphics(&dev->dev) &&
                                 has_sample_mask && !nontrivial_force_early;
 
-   if (dev->dev.chip == AGX_CHIP_G17P && fs->info.fs.uses_sample_shading &&
+   if (agx_native_graphics(&dev->dev) && fs->info.fs.uses_sample_shading &&
        dyn->ms.rasterization_samples > 1) {
       if (report_errors)
          mesa_loge("G17P: per-sample fragment execution needs a fixed sample "
@@ -6657,7 +6668,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       return false;
    }
 
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(&dev->dev) &&
        fs->info.fs.epilog_key.sample_shading &&
        fs->info.fs.g17p_samples != samples) {
       if (report_errors)
@@ -6667,7 +6678,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       return false;
    }
 
-   if (dev->dev.chip == AGX_CHIP_G17P && fs->b.info.writes_sample_mask &&
+   if (agx_native_graphics(&dev->dev) && fs->b.info.writes_sample_mask &&
        fs->info.fs.g17p_samples != samples) {
       if (report_errors)
          mesa_loge("G17P: fragment coverage updates compiled for %u samples "
@@ -6678,7 +6689,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
 
    unsigned samples_shaded = 0;
    if (fs->info.fs.epilog_key.sample_shading &&
-       dev->dev.chip != AGX_CHIP_G17P)
+       !agx_native_graphics(&dev->dev))
       samples_shaded = dyn->ms.rasterization_samples;
 
    *key = (struct hk_fast_link_key_fs){
@@ -6688,7 +6699,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
          has_sample_mask && !nontrivial_force_early && !defer_api_sample_mask
             ? api_sample_mask
             : 0xff,
-      .prolog.nr_samples = dev->dev.chip == AGX_CHIP_G17P ? samples : 0,
+      .prolog.nr_samples = agx_native_graphics(&dev->dev) ? samples : 0,
       .nr_samples_shaded = samples_shaded,
    };
 
@@ -6721,7 +6732,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    }
    agx_fs_epilog_apply_device_policy(dev->dev.chip, &key->epilog);
 
-   key->epilog.native_spills = dev->dev.chip == AGX_CHIP_G17P &&
+   key->epilog.native_spills = agx_native_graphics(&dev->dev) &&
                                agx_tilebuffer_spills(in->tib);
    if (key->epilog.native_spills) {
       uint16_t base;
@@ -6732,7 +6743,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       key->epilog.blend_constant_base = key->epilog.emrt_heap_base + 4;
    }
 
-   if (!key->epilog.native_spills && dev->dev.chip == AGX_CHIP_G17P &&
+   if (!key->epilog.native_spills && agx_native_graphics(&dev->dev) &&
        hk_uses_blend_constant(&dyn->cb) &&
        (fs->info.agx3_combined_sampler_valid ||
         fs->info.agx3_indexed_sampler_valid) &&
@@ -6774,7 +6785,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       unsigned write_mask = write_enable ? cb->write_mask : 0;
 
       if ((dev->dev.chip == AGX_CHIP_G16G ||
-           dev->dev.chip == AGX_CHIP_G17P) && !write_enable) {
+           agx_native_graphics(&dev->dev)) && !write_enable) {
          key->epilog.preserve_rt |= BITFIELD_BIT(i);
          key->epilog.blend.rt[i] = (struct agx_blend_rt_key){
             .colormask = BITFIELD_MASK(4),
@@ -7076,7 +7087,7 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    gfx->g17p_vdm_update_memo.valid = true;
 
 tail:
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       if (!hk_g17p_emit_native_bind_tail(cmd, cs, &out,
                                            tail_known_match)) {
          mesa_loge("failed to emit native HAL200 bind tail for %s",
@@ -7205,7 +7216,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool early_reject_has_api_mask =
       (dyn->ms.sample_mask & early_reject_full_mask) != early_reject_full_mask;
    const bool early_reject_defer_api_mask =
-      dev->dev.chip == AGX_CHIP_G17P && early_reject_has_api_mask &&
+      agx_native_graphics(&dev->dev) && early_reject_has_api_mask &&
       !nontrivial_force_early;
    const bool early_reject_prolog_discards =
       (early_reject_has_api_mask && !early_reject_defer_api_mask) ||
@@ -7414,7 +7425,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       /* The provisional attachmentless layout was admitted at begin time;
        * enforce the hardware contract again once the sample count is known.
        */
-      if (dev->dev.chip == AGX_CHIP_G17P &&
+      if (agx_native_graphics(&dev->dev) &&
           !(gfx->render.g17p_rt0_layout_supported =
                hk_agx3_g17p_rt0_tile_layout_supported(
                   &gfx->render.tilebuffer))) {
@@ -7465,7 +7476,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    bool linked_vs_dirty = IS_LINKED_DIRTY(VERTEX);
    bool linked_fs_dirty = IS_LINKED_DIRTY(FRAGMENT);
    const bool prepared_varyings =
-      dev->dev.chip == AGX_CHIP_G17P &&
+      agx_native_graphics(&dev->dev) &&
       hk_g17p_prepared_bind_tail_matches(cmd, &gfx->g17p_bind_tail);
    /* Between here and the bind-tail emission below only the root can move
     * one of the tail's inputs (varyings are relinked only when this is
@@ -7480,7 +7491,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          size_t linkage_size =
             AGX_CF_BINDING_HEADER_LENGTH + (bindings * AGX_CF_BINDING_LENGTH);
 
-         const bool native_vit = dev->dev.chip == AGX_CHIP_G17P;
+         const bool native_vit = agx_native_graphics(&dev->dev);
          struct agx_ptr t =
             hk_pool_usc_alloc(cmd, linkage_size, native_vit ? 64 : 16);
          if (!t.cpu)
@@ -7554,7 +7565,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * Letting those changes fall through to hk_flush_ppp_state() emits the
     * legacy aggregate layout into an otherwise native stream. The initial
     * draw hid this because all shader state was dirty on stream creation. */
-   if (dev->dev.chip == AGX_CHIP_G17P ||
+   if (agx_native_graphics(&dev->dev) ||
       (gfx->dirty & (HK_DIRTY_PROVOKING | HK_DIRTY_VARYINGS)) ||
       IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE) || linked_vs_dirty || vgt_dirty ||
       gfx->descriptors.root_dirty || gfx->draw_id_ptr || gfx->draw_params ||
@@ -7713,7 +7724,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* A pure cull/winding update needs new immutable fragment state, but
     * leaves the vertex program and its VDM state unchanged. */
-   if (dev->dev.chip == AGX_CHIP_G17P && !g17p_native_bind_tail_emitted &&
+   if (agx_native_graphics(&dev->dev) && !g17p_native_bind_tail_emitted &&
        (IS_DIRTY(RS_CULL_MODE) || IS_DIRTY(RS_FRONT_FACE))) {
       if (!hk_g17p_emit_native_bind_tail(cmd, cs, &out, false)) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -7831,7 +7842,7 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
     * page instead.
     */
    if (draw->index_buffer_range_B == 0 ||
-       (dev->dev.chip == AGX_CHIP_G17P &&
+       (agx_native_graphics(&dev->dev) &&
         draw->index_buffer == AGX_ZERO_PAGE_ADDRESS &&
         draw->index_buffer_range_B == 4)) {
       draw->index_buffer = AGX_ZERO_PAGE_ADDRESS;
@@ -8082,7 +8093,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * dereference the heap. Direct adjacency without restart uses no heap. */
    const bool needs_heap = geom || tess || (*needs_idx_robust && !adj) ||
       (adj && (draw->restart ||
-               (dev->dev.chip == AGX_CHIP_G17P && agx_is_indirect(draw->b))));
+               (agx_native_graphics(&dev->dev) && agx_is_indirect(draw->b))));
    if (needs_heap && !hk_cmd_ensure_geometry_heap(cmd))
       return NULL;
 
@@ -8092,7 +8103,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * publication path as well; the generated body carries the matching
     * context-relative selector when that publication is fresh. */
    const bool g17p_robust_index_path =
-      dev->dev.chip == AGX_CHIP_G17P && *needs_idx_robust;
+      agx_native_graphics(&dev->dev) && *needs_idx_robust;
    const bool ordinary_draw_path =
       !geom && !tess && !adj &&
       (!*needs_idx_robust || g17p_robust_index_path);
@@ -8107,7 +8118,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * adjacency topology failed at vkEndCommandBuffer with
     * VK_ERROR_FEATURE_NOT_PRESENT. */
    const bool g17p_transformed_path =
-      dev->dev.chip == AGX_CHIP_G17P && (geom || tess || adj);
+      agx_native_graphics(&dev->dev) && (geom || tess || adj);
    if (desc->push_dirty)
       hk_cmd_buffer_flush_push_descriptors(cmd, desc);
 
@@ -8115,7 +8126,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * record. Geometry/XFB lowers even a non-indexed API draw to that packet,
     * so emitting the legacy state here as well produces two consecutive
     * restart records before the synthetic indexed draw. */
-   if ((draw->restart || geom) && dev->dev.chip != AGX_CHIP_G17P)
+   if ((draw->restart || geom) && !agx_native_graphics(&dev->dev))
       hk_flush_index(cmd, cs);
 
    /* Everything that can dirty render state for this draw has now run, so
@@ -8132,7 +8143,7 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
     * before the republication instead of failing the draw. */
    const unsigned ppp_margin = AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS + 1;
    const bool ppp_index_limit =
-      dev->dev.chip == AGX_CHIP_G17P &&
+      agx_native_graphics(&dev->dev) &&
       (cs->scissor.size / AGX_SCISSOR_LENGTH + ppp_margin > UINT16_MAX ||
        cs->depth_bias.size / AGX_DEPTH_BIAS_LENGTH + ppp_margin > UINT16_MAX);
 
@@ -8266,7 +8277,7 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
     * scratch page, like a disabled one.
     */
    if (geom || tess) {
-      c_prims = dev->dev.chip == AGX_CHIP_G17P ? AGX_SCRATCH_PAGE_ADDRESS : 0;
+      c_prims = agx_native_graphics(&dev->dev) ? AGX_SCRATCH_PAGE_ADDRESS : 0;
       c_inv = c_prims;
    }
 
@@ -8280,7 +8291,7 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
        */
       uint64_t index_buffer = agx_draw_index_buffer(draw);
 
-      if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_native_graphics(&dev->dev)) {
          /* Disabled statistics are represented by the writable scratch page,
           * so all five addresses are valid. Use the native specialization
           * that does not need to reduce nullable 64-bit pointers. */
@@ -8472,7 +8483,7 @@ refused:
 static void
 hk_g17p_note_layer_zero_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
-   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P ||
+   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
        cmd->state.gfx.render.view_mask ||
        cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] ||
        cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL]) {
@@ -8552,7 +8563,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
     * older path does in hk_needs_index_robustness. The one-dword range bounds
     * hardware fetches to the zero page; it is not a count limit.
     */
-   if (dev->dev.chip == AGX_CHIP_G17P && draw_.indexed &&
+   if (agx_native_graphics(&dev->dev) && draw_.indexed &&
        draw_.index_buffer_range_B == 0) {
       draw_.index_buffer = AGX_ZERO_PAGE_ADDRESS;
       draw_.index_buffer_range_B = 4;
@@ -8560,7 +8571,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    }
    const struct agx_draw api_draw = draw_;
    bool conditional_direct_indexed = false;
-   const uint64_t primitive_bound = dev->dev.chip == AGX_CHIP_G17P
+   const uint64_t primitive_bound = agx_native_graphics(&dev->dev)
       ? hk_draw_primitive_bound(cmd, &api_draw) : 0;
 
    /* There is no native conditional-render packet on AGX. Lower the command
@@ -8627,7 +8638,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    const bool software_index_fetch =
       cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] ||
       cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL];
-   if (dev->dev.chip == AGX_CHIP_G17P && draw_.indexed &&
+   if (agx_native_graphics(&dev->dev) && draw_.indexed &&
        !software_index_fetch) {
       uint64_t address;
       uint32_t size_word;
@@ -8742,7 +8753,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
             uint64_t out_draw = hk_pool_alloc(cmd, size, 4).gpu;
             struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-            if (dev->dev.chip == AGX_CHIP_G17P) {
+            if (agx_native_graphics(&dev->dev)) {
                /* As in the direct case above, a G17P hardware vertex shader
                 * never sees the prolog's remap, so the mapping has to reach
                 * the input assembler as real indices.  The output count is
@@ -8784,7 +8795,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
              * draw fetched in[i] where it owed in[map(i)].  Materialise the
              * mapping as an index buffer instead and let the input assembler
              * apply it, which is the one path the vertex stage does see. */
-            if (count > 0 && dev->dev.chip == AGX_CHIP_G17P) {
+            if (count > 0 && agx_native_graphics(&dev->dev)) {
                unsigned ib_B = count * sizeof(uint32_t);
                uint64_t ib = hk_pool_alloc(cmd, ib_B, 4).gpu;
 
@@ -8818,7 +8829,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          /* The bind tail was already published before lowering determined
           * there were no complete primitives. Its selector word must still
           * be present, even though no Index List follows it. */
-         if (dev->dev.chip == AGX_CHIP_G17P && g17p_native_bind_tail_emitted) {
+         if (agx_native_graphics(&dev->dev) && g17p_native_bind_tail_emitted) {
             struct agx_ptr state = hk_pool_vdm_alloc(cmd, 8, 4);
             uint32_t offset;
             if (!state.cpu || !hk_g17p_upload_draw_indices(
@@ -8838,7 +8849,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
 
       /* hk_g17p_emit_draw() validates a direct draw as it encodes it. */
       enum agx_primitive topology = cmd->state.gfx.topology;
-      if ((dev->dev.chip != AGX_CHIP_G17P || agx_is_indirect(draw.b)) &&
+      if ((!agx_native_graphics(&dev->dev) || agx_is_indirect(draw.b)) &&
           !agx_vdm_draw_supported(dev->dev.chip, draw, topology)) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
@@ -8857,7 +8868,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          }
 
          uint32_t draw_state_offset = 0;
-         if (dev->dev.chip == AGX_CHIP_G17P &&
+         if (agx_native_graphics(&dev->dev) &&
              g17p_native_bind_tail_emitted) {
             struct agx_ptr draw_state = hk_pool_vdm_alloc(cmd, 8, 4);
             if (!draw_state.cpu ||
@@ -8873,11 +8884,12 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          }
 
          size_t size_B = libagx_draw_robust_index_vdm_size(
-            dev->dev.chip, g17p_native_bind_tail_emitted);
+            agx_chip_record_family(dev->dev.chip),
+            g17p_native_bind_tail_emitted);
          uint64_t target = hk_cs_alloc_for_indirect(cs, size_B);
 
          uint64_t empty_draw_jump = 0;
-         if (dev->dev.chip == AGX_CHIP_G17P) {
+         if (agx_native_graphics(&dev->dev)) {
             const uint64_t compact =
                hk_g17p_vdm_compact(cmd, target + size_B);
             if (!compact || compact >= (UINT64_C(1) << 40)) {
@@ -8891,13 +8903,15 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          libagx_draw_robust_index(cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX,
                                   target, hk_heap(cmd), draw.b.ptr,
                                   draw.index_buffer, draw.index_buffer_range_B,
-                                  draw.restart, dev->dev.chip, topology,
+                                  draw.restart,
+                                  agx_chip_record_family(dev->dev.chip),
+                                  topology,
                                   draw_state_offset,
                                   g17p_native_bind_tail_emitted,
                                   empty_draw_jump,
                                   draw.index_size);
       } else {
-         if (dev->dev.chip == AGX_CHIP_G17P) {
+         if (agx_native_graphics(&dev->dev)) {
             if (!hk_g17p_emit_draw(cmd, cs, out, draw, topology,
                                    g17p_native_bind_tail_emitted))
                return;
@@ -9354,7 +9368,7 @@ hk_draw_indirect_inner(VkCommandBuffer commandBuffer, uint64_t base,
       assert(stride >= sizeof(VkDrawIndirectCommand));
    }
 
-   int eligible = hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ? -1 : 0;
+   int eligible = agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ? -1 : 0;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {
       uint64_t addr = base + stride * draw_id;
       hk_draw_indirect_record(cmd, draw_id, agx_draw_indirect(addr),
@@ -9395,7 +9409,7 @@ hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
       assert(stride >= sizeof(VkDrawIndexedIndirectCommand));
    }
 
-   int eligible = hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ? -1 : 0;
+   int eligible = agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ? -1 : 0;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {
       uint64_t addr = buffer + stride * draw_id;
       struct hk_addr_range buf = cmd->state.gfx.index.buffer;
