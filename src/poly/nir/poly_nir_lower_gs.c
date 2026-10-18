@@ -211,6 +211,7 @@ struct lower_output_to_var_slot {
    nir_variable *output_var;
    nir_variable *selected_var;
    nir_alu_type type;
+   nir_alu_type component_types[4];
    unsigned nr_components;
 };
 
@@ -233,11 +234,15 @@ collect_output_types(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (output->type == nir_type_invalid) {
       output->type = nir_intrinsic_src_type(intr);
    } else {
-      /* Stores to the same varying must always have the same type */
-      assert(output->type == nir_intrinsic_src_type(intr));
+      assert(nir_alu_type_get_type_size(output->type) ==
+             nir_alu_type_get_type_size(nir_intrinsic_src_type(intr)));
    }
 
    unsigned component = nir_intrinsic_component(intr);
+   assert(component < ARRAY_SIZE(output->component_types));
+   nir_alu_type *type = &output->component_types[component];
+   assert(*type == nir_type_invalid || *type == nir_intrinsic_src_type(intr));
+   *type = nir_intrinsic_src_type(intr);
    output->nr_components = MAX2(output->nr_components, component + 1);
 
    return false;
@@ -874,9 +879,24 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
             nir_bcsel(b, nir_ieq(b, rs.stream, rast_stream), value, killed);
       }
 
-      nir_store_output(b, value, nir_imm_int(b, 0),
-                       .src_type = output->type,
-                       .io_semantics.location = slot);
+      unsigned pending = BITFIELD_MASK(output->nr_components);
+      while (pending) {
+         unsigned c = ffs(pending) - 1;
+         nir_alu_type type = output->component_types[c];
+         if (type == nir_type_invalid)
+            type = output->type;
+         unsigned mask = 0;
+         u_foreach_bit(i, pending) {
+            nir_alu_type component_type = output->component_types[i];
+            if (component_type == nir_type_invalid)
+               component_type = output->type;
+            if (component_type == type)
+               mask |= BITFIELD_BIT(i);
+         }
+         nir_store_output(b, value, nir_imm_int(b, 0), .write_mask = mask,
+                          .src_type = type, .io_semantics.location = slot);
+         pending &= ~mask;
+      }
    }
 
    /* The geometry shader might not write point size - ensure it does, if we're
