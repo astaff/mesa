@@ -4333,6 +4333,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
    agx_foreach_instr_global_safe(ctx, I) {
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
 
+      /* AGX3 square-root steps are 16-bit to 16-bit or 32-bit to 32-bit;
+       * a half source feeding a 32-bit result is widened exactly first. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_SRSQRT && I->nr_srcs == 1 &&
+          I->dest[0].size == AGX_SIZE_32 &&
+          I->src[0].size == AGX_SIZE_16 &&
+          I->src[0].type != AGX_INDEX_IMMEDIATE) {
+         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+         agx_fmov_to(&b, wide, I->src[0]);
+         I->src[0] = wide;
+      }
+
       /* An AGX3 float add, multiply or fused multiply-add has no form whose
        * operands are all immediates. The optimizer can leave one after
        * folding a select to a constant; keep the first immediate and move
