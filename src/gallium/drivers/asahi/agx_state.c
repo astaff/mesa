@@ -1995,6 +1995,12 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       struct asahi_fs_shader_key *key = &key_->fs;
 
+      const bool native_msaa_fbfetch =
+         agx_native_graphics(dev) && key->nr_samples > 1 &&
+         nir->info.fs.uses_fbfetch_output;
+      if (native_msaa_fbfetch)
+         nir->info.fs.uses_sample_shading = true;
+
       /* Discards must be lowering before lowering MSAA to handle discards */
       NIR_PASS(_, nir, agx_nir_lower_discard_zs_emit);
 
@@ -2097,6 +2103,11 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             .base = AGX_ABI_FOUT_SAMPLE_MASK);
 
          NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
+      }
+
+      if (native_msaa_fbfetch) {
+         NIR_PASS(_, nir, nir_opt_constant_folding);
+         NIR_PASS(_, nir, agx_nir_lower_g17p_tile_samples, key->nr_samples);
       }
 
       NIR_PASS(_, nir, agx_nir_lower_sample_mask);

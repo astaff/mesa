@@ -319,3 +319,36 @@ TEST(LegacyFragments, EarlyCoverageIsPerSample)
    EXPECT_FALSE(nir_src_is_const(mask->src[0]));
    ralloc_free(b.shader);
 }
+
+TEST_F(G17PMSAAEpilog, PerSampleFramebufferFetchMainCompiles)
+{
+   for (unsigned samples : {2u, 4u}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "sample framebuffer fetch");
+      b.shader->info.fs.uses_sample_shading = true;
+      nir_def *color = nir_load_local_pixel_agx(
+         &b, 4, 32, nir_imm_intN_t(&b, 0xff, 16),
+         .format = PIPE_FORMAT_R8_UNORM);
+      nir_store_output(&b, color, nir_imm_int(&b, 0),
+                       .write_mask = 0xf, .src_type = nir_type_float32,
+                       .io_semantics = {.location = FRAG_RESULT_DATA0});
+      b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+      agx_fs_epilog_link_info link = {};
+      agx_nir_lower_fs_output_to_epilog_for_device(b.shader, AGX_CHIP_G17P, &link);
+      ASSERT_TRUE(agx_nir_lower_g17p_sample_shading(b.shader, &link, samples));
+      nir_opt_constant_folding(b.shader);
+      agx_nir_lower_g17p_tile_samples(b.shader, samples);
+      agx_preprocess_nir(b.shader);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.no_stop = true;
+      key.fs.nr_samples = samples;
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << agx_last_compile_refusal();
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
