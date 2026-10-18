@@ -239,6 +239,8 @@ if with_tests
         'tests/test-tilebuffer.cpp',
         'tests/test-g17p-msaa-epilog.cpp',
         'tests/test-m5-depth-export.cpp',
+        'tests/test-primitive-varyings.cpp',
+        '../vulkan/hk_nir_widen_16bit_varyings.c',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
