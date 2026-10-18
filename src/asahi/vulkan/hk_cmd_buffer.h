@@ -769,6 +769,12 @@ struct hk_cs {
     * fold the leading record into the destination's trailing one. */
    void *leading_barrier_end;
 
+   /* AGX3 CDM: weak_barrier_end when that barrier ends an application
+    * dispatch. Where agx_chip_elide_app_dispatch_barrier() holds, a following
+    * application dispatch overwrites it, so consecutive application dispatches
+    * carry no barrier between them; any other record still follows it. */
+   void *app_dispatch_end;
+
    /* Whether there is more than just the root chunk */
    bool stream_linked;
 
@@ -962,6 +968,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
             ? dst + ((uint8_t *)b->weak_barrier_end - (uint8_t *)b->start) -
                  b_skip
             : NULL;
+      a->app_dispatch_end = NULL;
    } else {
       void *link_end =
          hk_cmd_buffer_emit_cs_jump(a->cmd, a->current, b->addr, false);
@@ -972,6 +979,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
       a->stream_linked |= linked || b->stream_linked;
       a->strong_flush_end = b->strong_flush_end;
       a->weak_barrier_end = b->weak_barrier_end;
+      a->app_dispatch_end = NULL;
    }
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
@@ -1660,7 +1668,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 
    if (cs) {
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      const bool full_usc_state = dev->dev.chip == AGX_CHIP_G17P;
+      const bool full_usc_state = agx_native_graphics(&dev->dev);
       /* Scissor and depth bias arrays are staged to dynamic arrays on the
        * CPU. When we end the control stream, they're done growing and are
        * ready for upload. G17P's ISP consumes these as full bit-40-set GART
@@ -1787,8 +1795,7 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * SPECTPR. There is no helper-program stack, and the kernel rejects a
     * command that names one. */
    if ((s->b.info.scratch_size == 0 && s->b.info.preamble_scratch_size == 0) ||
-       agx_chip_command_stream_generation(
-          hk_cmd_buffer_device(cmd)->dev.chip) == AGX_CS_GENERATION_HAL200)
+       agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev))
       return;
 
    hk_reserve_scratch_slow(cmd, cs, s);
@@ -1885,8 +1892,7 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (agx_chip_command_stream_generation(dev->dev.chip) ==
-       AGX_CS_GENERATION_HAL200) {
+   if (agx_native_graphics(&dev->dev)) {
       hk_reserve_scratch(cmd, cs, s);
       hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
       /* Software graphics stages communicate through memory: VS outputs,

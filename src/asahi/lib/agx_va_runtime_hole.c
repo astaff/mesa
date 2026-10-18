@@ -139,7 +139,7 @@ bool
 agx_va_overlaps_runtime_graph_hole(enum agx_chip chip, uint64_t addr,
                                    uint64_t size)
 {
-   if (chip != AGX_CHIP_G17P || size == 0 ||
+   if (!agx_chip_native_agx3(chip) || size == 0 ||
        addr >= AGX_G17_RUNTIME_GRAPH_VA_END)
       return false;
 
@@ -212,7 +212,7 @@ agx_va_reserve_runtime_graph_hole(
    uint64_t main_size, uint64_t sparse_ro_offset,
    struct util_vma_heap *usc_heap, uint64_t usc_start, uint64_t usc_size)
 {
-   if (chip != AGX_CHIP_G17P)
+   if (!agx_chip_native_agx3(chip))
       return true;
 
    uint64_t main_end, usc_end;

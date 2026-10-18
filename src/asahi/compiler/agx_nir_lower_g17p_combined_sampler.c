@@ -130,7 +130,13 @@ g17p_sample_shape(const nir_tex_instr *tex)
         * array form
         * here was what refused textureLod(samplerCube, dir, lod) -- the
         * roughness-indexed probe lookup every image-based lighting shader
-        * does, SuperTuxKart's IBL.frag included. */
+        * does, SuperTuxKart's IBL.frag included.
+        *
+        * A cube-array comparison takes a per-lane bias beside its face and
+        * layer, as the packer stages it: a Gen4 sampler has no bias field,
+        * so G15 hands every depth cube-array texture() its sampler bias this
+        * way (dEQP-VK.texture.shadow.cube_array). A constant bias or a bias
+        * with a minimum stays closed. */
        (cube &&
         (tex->op != nir_texop_tex && tex->op != nir_texop_tg4 && !query_lod &&
          !((!tex->is_shadow || shadow_level_zero ||
@@ -141,7 +147,7 @@ g17p_sample_shape(const nir_tex_instr *tex)
            (!tex->is_shadow ||
             nir_tex_instr_src_index(tex, nir_tex_src_lod_bias_min_agx) >= 0 ||
             register_bias) &&
-           !(tex->is_shadow && cube_array)))) ||
+           !(tex->is_shadow && cube_array && !register_bias)))) ||
        /* Sparse residency rides on the ordinary sample: the encoder sets
         * three extra fields and the instruction writes one more register.
         * A depth comparison and a LOD query have no sparse witness. */

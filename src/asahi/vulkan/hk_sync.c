@@ -675,7 +675,7 @@ static void
 stamp_carrier_launch(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P || !cs ||
+   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) || !cs ||
        (!cs->timestamp.start.handle && !cs->timestamp.end.handle) ||
        cs->stats.cmds || cs->stats.flushes || cs->imm_writes.size)
       return;
@@ -694,7 +694,7 @@ hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd)
       return;
 
    const bool g17p_start =
-      hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P &&
+      agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
       cs->timestamp.start.handle;
    if (cs->timestamp.end.handle || g17p_start) {
       stamp_carrier_launch(cmd);

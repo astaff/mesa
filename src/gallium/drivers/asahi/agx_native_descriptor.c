@@ -51,41 +51,94 @@ agx_gallium_classify_standard_border(const uint32_t color[4], bool integer,
 }
 
 bool
-agx_gallium_pack_g17p_txf_sampler(
-   enum agx_chip chip, struct agx_gallium_sampler_descriptor *out)
+agx_gallium_pack_native_sampler(
+   enum agx_chip chip, struct agx_gallium_sampler_descriptor *out,
+   const struct agx_gallium_native_sampler *state)
 {
    if (!out)
       return false;
 
    memset(out, 0, sizeof(*out));
-   if (chip != AGX_CHIP_G17P)
+   if (!state || !agx_chip_native_agx3(chip) ||
+       agx_chip_sampler_heap_element_size(chip) != sizeof(*out))
       return false;
 
+   /* The packed word is eight bytes at the start of the 32-byte heap slot;
+    * the rest stays zero. */
+   switch (agx_chip_sampler_generation(chip)) {
+   case AGX_SAMPLER_GENERATION_GEN4_HAL200:
+      agx_pack(out->opaque, SAMPLER_HAL200, cfg) {
+         cfg.minimum_lod = state->minimum_lod;
+         cfg.maximum_lod = state->maximum_lod;
+         cfg.maximum_anisotropy = state->maximum_anisotropy;
+         cfg.magnify = state->magnify;
+         cfg.minify = state->minify;
+         cfg.mip_filter = state->mip_filter;
+         cfg.wrap_s = state->wrap_s;
+         cfg.wrap_t = state->wrap_t;
+         cfg.wrap_r = state->wrap_r;
+         cfg.pixel_coordinates = state->pixel_coordinates;
+         cfg.compare_func = state->compare_func;
+         cfg.compare_enable = state->compare_enable;
+         cfg.lod_bias = state->lod_bias;
+         cfg.seamful_cube_maps = state->seamful_cube_maps;
+         cfg.border_colour = state->border_colour;
+      }
+      return true;
+
+   case AGX_SAMPLER_GENERATION_GEN4:
+      /* No bias field: the shader applies every sampler bias. */
+      agx_pack(out->opaque, SAMPLER, cfg) {
+         cfg.minimum_lod = state->minimum_lod;
+         cfg.maximum_lod = state->maximum_lod;
+         cfg.maximum_anisotropy = state->maximum_anisotropy;
+         cfg.magnify = state->magnify;
+         cfg.minify = state->minify;
+         cfg.mip_filter = state->mip_filter;
+         cfg.wrap_s = state->wrap_s;
+         cfg.wrap_t = state->wrap_t;
+         cfg.wrap_r = state->wrap_r;
+         cfg.pixel_coordinates = state->pixel_coordinates;
+         cfg.compare_func = state->compare_func;
+         cfg.compare_enable = state->compare_enable;
+         cfg.seamful_cube_maps = state->seamful_cube_maps;
+         cfg.border_colour = state->border_colour;
+      }
+      return true;
+
+   default:
+      return false;
+   }
+}
+
+bool
+agx_gallium_pack_g17p_txf_sampler(
+   enum agx_chip chip, struct agx_gallium_sampler_descriptor *out)
+{
    /* Honeykrisp's passing G17P texture.read() path reserves sampler zero with
     * these exact HAL200 semantics. In particular, texel fetch does not use
     * the legacy background path's pixel-coordinate/linear/edge-clamp state.
     * Keep the remaining 24 bytes in the 32-byte heap slot zero. */
-   agx_pack(out->opaque, SAMPLER_HAL200, cfg) {
-      cfg.minimum_lod = 0.0f;
-      cfg.maximum_lod = INFINITY;
-      cfg.maximum_anisotropy = 1;
-      cfg.mip_filter = AGX_MIP_FILTER_NEAREST;
-      cfg.wrap_s = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.wrap_t = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.wrap_r = AGX_WRAP_CLAMP_TO_BORDER;
-      cfg.compare_func = AGX_COMPARE_FUNC_LEQUAL;
-      cfg.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
-   }
-
-   return true;
+   const struct agx_gallium_native_sampler txf = {
+      .minimum_lod = 0.0f,
+      .maximum_lod = INFINITY,
+      .maximum_anisotropy = 1,
+      .mip_filter = AGX_MIP_FILTER_NEAREST,
+      .wrap_s = AGX_WRAP_CLAMP_TO_BORDER,
+      .wrap_t = AGX_WRAP_CLAMP_TO_BORDER,
+      .wrap_r = AGX_WRAP_CLAMP_TO_BORDER,
+      .compare_func = AGX_COMPARE_FUNC_LEQUAL,
+      .border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK,
+   };
+   return agx_gallium_pack_native_sampler(chip, out, &txf);
 }
 
 bool
 agx_gallium_g17p_sampler_handle(enum agx_chip chip, unsigned api_sampler,
                                 uint16_t *native_handle)
 {
-   if (chip != AGX_CHIP_G17P || api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS ||
-       !native_handle)
+   if (!agx_chip_native_agx3(chip) ||
+       api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS || !native_handle)
       return false;
 
    *native_handle = api_sampler + 1;
@@ -97,8 +150,8 @@ agx_gallium_g17p_custom_border_handle(enum agx_chip chip,
                                       unsigned api_sampler,
                                       uint16_t *native_handle)
 {
-   if (chip != AGX_CHIP_G17P || api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS ||
-       !native_handle)
+   if (!agx_chip_native_agx3(chip) ||
+       api_sampler >= AGX_GALLIUM_G17P_API_SAMPLERS || !native_handle)
       return false;
 
    *native_handle = AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE + api_sampler;

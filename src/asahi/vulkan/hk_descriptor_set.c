@@ -979,9 +979,9 @@ hk_CreateDescriptorPool(VkDevice _device,
        * written (hk_descriptor_set_publish()); write-combined stores of
        * every descriptor and of the per-allocation zeroing above stalled
        * the recording core. */
-      pool->cpu_cached = dev->dev.chip == AGX_CHIP_G17P && util_has_cache_ops();
+      pool->cpu_cached = hk_g17p_cached_cmd_memory(&dev->dev);
       const enum agx_bo_flags pool_flags =
-         dev->dev.chip == AGX_CHIP_G17P
+         agx_native_graphics(&dev->dev)
             ? AGX_BO_ZERO_ON_REUSE |
                  (pool->cpu_cached ? AGX_BO_WRITEBACK : 0)
             : 0;
@@ -1086,7 +1086,7 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
        * null texture / heap index 0, which is bound and safe.
        */
       set->cpu_cached = pool->cpu_cached;
-      if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_native_graphics(&dev->dev)) {
          memset(set->mapped_ptr, 0, set->size);
          hk_descriptor_set_publish(set, set->mapped_ptr, set->size);
       }

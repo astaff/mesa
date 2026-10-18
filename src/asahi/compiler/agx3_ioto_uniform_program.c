@@ -88,7 +88,8 @@ agx3_ioto_uniform_program_desc_body_bound(
       if (!agx3_cprog_inputs_init(inputs->halves, &checked) ||
           checked.count != inputs->count ||
           checked.storage_bytes != inputs->storage_bytes ||
-          (inputs->count && (chip != AGX_CHIP_G17P || desc->fast_path_enabled)))
+          (inputs->count &&
+           (!agx_chip_native_preamble(chip) || desc->fast_path_enabled)))
          return false;
       uint64_t covered[AGX3_CPROG_INPUT_WORDS] = {0};
       for (size_t i = 0; i < desc->range_count; ++i) {

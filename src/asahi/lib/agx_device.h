@@ -482,11 +482,11 @@ unsigned agx_get_num_cores(const struct agx_device *dev);
 
 struct agx_device_key agx_gather_device_key(struct agx_device *dev);
 
-/* Native HAL200 graphics recording shared by G16G and G17P. */
+/* Native AGX3 recording: Ioto programs and HAL200-format records. */
 static inline bool
 agx_native_graphics(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G16G || dev->chip == AGX_CHIP_G17P;
+   return agx_chip_native_agx3(dev->chip);
 }
 
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
@@ -507,15 +507,15 @@ agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
 }
 
 /* Size of the render command passed to the kernel. drm_asahi_cmd_render grew
- * the high words of the background/EOT resource specifiers for G17P, and
- * kernels that predate them reject the longer packet with EINVAL. Every other
- * chip keeps the original layout, as Honeykrisp does in
- * hk_drm_render_command_size().
+ * the high words of the background/EOT resource specifiers for the native
+ * AGX3 path, whose USC window sits at 2^40, and kernels that predate them
+ * reject the longer packet with EINVAL. Every other chip keeps the original
+ * layout, as Honeykrisp does in hk_drm_render_command_size().
  */
 static inline uint16_t
 agx_render_command_size(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P
+   return agx_chip_native_agx3(dev->chip)
              ? sizeof(struct drm_asahi_cmd_render)
              : offsetof(struct drm_asahi_cmd_render, bg_eot_rsrc_spec_hi);
 }

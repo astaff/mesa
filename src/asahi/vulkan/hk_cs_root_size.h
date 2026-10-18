@@ -21,8 +21,8 @@
 static inline size_t
 hk_cs_root_size(enum agx_chip chip, bool compute)
 {
-   return chip == AGX_CHIP_G17P && !compute ? HK_G17P_VDM_ROOT_SIZE
-                                            : HK_CS_ROOT_SIZE;
+   return agx_chip_native_agx3(chip) && !compute ? HK_G17P_VDM_ROOT_SIZE
+                                                 : HK_CS_ROOT_SIZE;
 }
 
 static inline bool
@@ -37,5 +37,5 @@ hk_graphics_cs_publishable(enum agx_chip chip, bool initialized,
                            bool active_context_selector_valid)
 {
    return initialized &&
-          (chip != AGX_CHIP_G17P || active_context_selector_valid);
+          (!agx_chip_native_agx3(chip) || active_context_selector_valid);
 }

@@ -27,6 +27,11 @@ extern "C" {
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 
+/* Where an AGX3 fragment shader's uniforms must end. A spilling epilog places
+ * its eMRT heap pointer after them, and the spill store's heap operand names
+ * uniform halves up to 252 (agx3_tex_plain_uniform64). */
+#define AGX3_FRAGMENT_UNIFORM_END (252)
+
 /* Semi-arbitrary limit for spill slot allocation */
 #define AGX_NUM_MODELED_REGS_LOG2 (11)
 #define AGX_NUM_MODELED_REGS      (1 << AGX_NUM_MODELED_REGS_LOG2)

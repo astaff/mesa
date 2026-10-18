@@ -416,7 +416,8 @@ hk_CreateSampler(VkDevice device,
       sampler->border_is_int = vk_border_color_is_int(info->borderColor);
    }
 
-   if (pdev->dev.chip == AGX_CHIP_G17P && info->mipLodBias != 0.0f) {
+   if (agx_chip_sampler_has_lod_bias(pdev->dev.chip) &&
+       info->mipLodBias != 0.0f) {
       VkSamplerCreateInfo unbiased_info = *info;
       unbiased_info.mipLodBias = 0.0f;
 

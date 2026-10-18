@@ -45,7 +45,7 @@ agx_fs_epilog_apply_device_policy(enum agx_chip chip,
    if (!key)
       return;
 
-   const bool g17p = chip == AGX_CHIP_G17P;
+   const bool g17p = agx_chip_native_agx3(chip);
    key->preserve_zero_mask = g17p;
    key->g17p_tile_formats = g17p;
 }
@@ -138,30 +138,44 @@ static const uint8_t sample_loop_footer[] = {
 #define AGX3_CONTAINER_BLOCK_HDR   0x40u
 #define AGX3_CONTAINER_CONST_PROG  0x40u
 
-/* "0f 00 54 <opcode> 00 x6 06 00 06 00 06 00" per record, then two terminals. */
-static void
-agx3_fill_helper_table(uint8_t *image, size_t base)
-{
-   static const uint8_t opcodes[] = {0x60, 0x50, 0x40, 0x30, 0x20, 0x10};
-   static const uint8_t terminal[16] = {
-      0xf7, 0x03, 0xaa, 0x00, 0x8f, 0x02, 0x54, 0x01,
-      0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
-   };
+/* "0f 00 54 <opcode> 00 x6 06 00 06 00 06 00" per record, then two terminals.
+ * The opcodes count down by 0x10 from 0x10 * slots, so G17P's six slots are
+ * 0x60..0x10 and the ten-slot table of G15 and G16 parts is 0xa0..0x10. */
+static const uint8_t agx3_helper_terminal[16] = {
+   0xf7, 0x03, 0xaa, 0x00, 0x8f, 0x02, 0x54, 0x01,
+   0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00,
+};
 
-   for (unsigned i = 0; i < ARRAY_SIZE(opcodes); ++i) {
+static void
+agx3_fill_helper_table(uint8_t *image, size_t base, unsigned slots)
+{
+   const uint8_t *terminal = agx3_helper_terminal;
+
+   assert(slots <= 14 && "both tables fit below the block-size dword");
+   for (unsigned i = 0; i < slots; ++i) {
       uint8_t *record = image + base + i * 0x10;
 
       memset(record, 0, 0x10);
       record[0] = 0x0f;
       record[2] = 0x54;
-      record[3] = opcodes[i];
+      record[3] = (slots - i) * 0x10;
       for (unsigned h = 10; h < 16; h += 2) {
          record[h] = 0x06;
          record[h + 1] = 0x00;
       }
    }
-   memcpy(image + base + 0x60, terminal, sizeof(terminal));
-   memcpy(image + base + 0x70, terminal, sizeof(terminal));
+   memcpy(image + base + slots * 0x10, terminal, 0x10);
+   memcpy(image + base + (slots + 1) * 0x10, terminal, 0x10);
+}
+
+/* Store the helper tables' terminal record (a return) in every 16-byte slot
+ * of [from, to), so a helper call that lands on any of them returns rather
+ * than running whatever bytes the image holds there. */
+static void
+agx3_fill_helper_terminals(uint8_t *image, size_t from, size_t to)
+{
+   for (size_t offset = from; offset + 0x10 <= to; offset += 0x10)
+      memcpy(image + offset, agx3_helper_terminal, 0x10);
 }
 
 /* Total container bytes for `code_size` bytes of executable. */
@@ -176,24 +190,48 @@ agx3_container_size(size_t code_size)
  * tables. Identical in both captured Apple code images, so it is a fixed
  * prologue rather than anything workload-specific. */
 void
-agx3_build_container_lead(uint8_t *image)
+agx3_build_container_lead(uint8_t *image, enum agx_chip chip)
 {
+   const unsigned slots = agx_chip_usc_helper_table_slots(chip);
+
    memset(image, 0, AGX3_CONTAINER_LEAD);
    agx_store_le32(image, AGX3_CONTAINER_LEAD);
    for (size_t offset = 0x40; offset < AGX3_CONTAINER_LEAD; offset += 2) {
       image[offset] = 0x06;
       image[offset + 1] = 0x00;
    }
-   agx3_fill_helper_table(image, 0x100);
-   agx3_fill_helper_table(image, 0x200);
+   agx3_fill_helper_table(image, 0x100, slots);
+   agx3_fill_helper_table(image, 0x200, slots);
+}
+
+/* The USC window's base page: the container lead, then zeroes, so the zero
+ * dword at +0x340 ends the page's container chain.  Where
+ * agx_chip_usc_base_page_fill_returns() holds, every slot after the two
+ * ten-slot tables (from +0x2c0) and after that dword (from +0x350) to the
+ * end of the page returns, so a helper call that misses the tables stays in
+ * the page.  Only the base page gets this; per-shader containers keep the
+ * plain lead. */
+void
+agx3_build_usc_base_page(uint8_t *image, size_t size, enum agx_chip chip)
+{
+   assert(size >= AGX3_CONTAINER_LEAD + 0x10);
+
+   memset(image, 0, size);
+   agx3_build_container_lead(image, chip);
+
+   if (agx_chip_usc_base_page_fill_returns(chip)) {
+      assert(agx_chip_usc_helper_table_slots(chip) == 10);
+      agx3_fill_helper_terminals(image, 0x2c0, AGX3_CONTAINER_LEAD);
+      agx3_fill_helper_terminals(image, AGX3_CONTAINER_LEAD + 0x10, size);
+   }
 }
 
 static void
-agx3_build_container(uint8_t *image, size_t code_size, bool fragment,
-                     bool sampled_fragment)
+agx3_build_container(uint8_t *image, enum agx_chip chip, size_t code_size,
+                     bool fragment, bool sampled_fragment)
 {
    memset(image, 0, agx3_container_size(code_size));
-   agx3_build_container_lead(image);
+   agx3_build_container_lead(image, chip);
 
    agx_store_le32(image + AGX3_CONTAINER_LEAD,
                  AGX3_CONTAINER_BLOCK_HDR + AGX3_CONTAINER_CONST_PROG +
@@ -207,7 +245,7 @@ agx3_build_container(uint8_t *image, size_t code_size, bool fragment,
 static bool
 agx3_uses_code_container(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P;
+   return agx_chip_native_agx3(dev->chip);
 }
 
 bool
@@ -219,14 +257,14 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    /* These literal loop fragments are AGX2 machine code. G17P exposes only
     * one sample and its Vulkan path folds sample shading before split-FS
     * lowering; fail closed if a caller ever bypasses that canonicalization. */
-   if (dev->chip == AGX_CHIP_G17P && nr_samples_shaded) {
+   if (agx_chip_native_agx3(dev->chip) && nr_samples_shaded) {
       fprintf(stderr,
               "agx_fast_link: external sample loop is not AGX3 machine code\n");
       return false;
    }
 
    uint8_t fused_colour[AGX3_COLOUR_LINK_SIZE];
-   const bool colour_fused = dev->chip == AGX_CHIP_G17P && fragment &&
+   const bool colour_fused = agx_chip_native_agx3(dev->chip) && fragment &&
       !prolog && !nr_samples_shaded && main && epilog &&
       agx3_fuse_colour_parts(&main->info.agx3_colour_link,
                               &epilog->info.agx3_colour_link, fused_colour);
@@ -239,7 +277,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    struct agx_shader_part *parts[] = {prolog, main, epilog};
    bool drop_entry[ARRAY_SIZE(parts)] = {false};
    bool entry_seen = false;
-   if (dev->chip == AGX_CHIP_G17P && fragment && !nr_samples_shaded &&
+   if (agx_chip_native_agx3(dev->chip) && fragment && !nr_samples_shaded &&
        !colour_fused) {
       for (unsigned i = 0; i < ARRAY_SIZE(parts); ++i) {
          struct agx_shader_part *part = parts[i];
@@ -329,7 +367,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    /* The staging accounting is per instruction, so a linked software vertex
     * shader (a compute-stage main behind the vertex prolog) is described the
     * same way as a hardware vertex or fragment program. */
-   if (dev->chip == AGX_CHIP_G17P &&
+   if (agx_chip_native_agx3(dev->chip) &&
        (main->info.stage == MESA_SHADER_VERTEX ||
         main->info.stage == MESA_SHADER_FRAGMENT ||
         main->info.stage == MESA_SHADER_COMPUTE ||
@@ -378,7 +416,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    }
 
    if (container)
-      agx3_build_container(container_map, size, fragment,
+      agx3_build_container(container_map, dev->chip, size, fragment,
                            fragment && sampled_fragment);
 
    size_t offset = 0;
@@ -391,7 +429,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
    if (prolog) {
       size_t sz = prolog->info.main_size;
       memcpy(linked_map + offset, prolog->binary, sz);
-      if (dev->chip == AGX_CHIP_G17P && fragment &&
+      if (agx_chip_native_agx3(dev->chip) && fragment &&
           !agx3_fltnorm_relocate_start(linked_map + offset, sz,
                                        prolog->info.agx3_fltnorm_start, offset))
          goto invalid_start_marker;
@@ -441,7 +479,7 @@ agx_fast_link(struct agx_linked_shader *linked, struct agx_device *dev,
             goto invalid_start_marker;
          memcpy(linked_map + offset + at, after, after_len);
       }
-      if (dev->chip == AGX_CHIP_G17P && fragment &&
+      if (agx_chip_native_agx3(dev->chip) && fragment &&
           !agx3_fltnorm_relocate_start(linked_map + offset, sz,
                                        part->info.agx3_fltnorm_start, offset))
          goto invalid_start_marker;

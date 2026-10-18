@@ -135,7 +135,7 @@ agx_vdm_tessellate_indirect_unpack(
    if (info)
       memset(info, 0, sizeof(*info));
 
-   if (!bytes || !info || chip != AGX_CHIP_G17P ||
+   if (!bytes || !info || !agx_chip_native_agx3(chip) ||
        size != AGX_VDM_TESSELLATE_INDIRECT_CORE_LENGTH)
       return false;
 

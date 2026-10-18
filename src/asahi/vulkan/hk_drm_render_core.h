@@ -49,7 +49,7 @@ void hk_drm_render_resource_specs_pack(
 unsigned hk_drm_submit_command_limit(bool batch_enabled,
                                      uint32_t kernel_limit);
 
-uint16_t hk_drm_render_command_size(bool g17p, bool exact_prior);
+uint16_t hk_drm_render_command_size(bool native, bool exact_prior);
 
 void hk_drm_attachment_set_init(struct hk_drm_attachment_set *set);
 

@@ -91,7 +91,7 @@ agx3_g17p_graphics_program_bound(
    size_t range_count, size_t *size)
 {
    size_t body, chunks;
-   if (!size || chip != AGX_CHIP_G17P ||
+   if (!size || !agx_chip_native_agx3(chip) ||
        range_count > AGX3_G17P_GRAPHICS_MAX_RANGES ||
        !agx3_ioto_uniform_program_body_bound(chip, ranges, range_count, &body,
                                              &chunks) ||
@@ -208,7 +208,7 @@ graphics_program_write_unpublished(
    size_t *constant_suffix_offset)
 {
    size_t input_body, input_chunks;
-   if (!output || !written_out || chip != AGX_CHIP_G17P || !desc ||
+   if (!output || !written_out || !agx_chip_native_agx3(chip) || !desc ||
        (desc->writes_sample_mask && !desc->fragment) ||
        (!desc->fragment && desc->colour_classes) ||
        (desc->colour_classes &
@@ -517,7 +517,7 @@ agx3_g17p_graphics_program_template_relocate(
    const struct agx3_g17p_graphics_program_template *program,
    void *output, size_t capacity, uint16_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !program || !output || !written ||
+   if (!agx_chip_native_agx3(chip) || !program || !output || !written ||
        program->program.length == 0 ||
        program->program.length > sizeof(program->program.bytes) ||
        program->program.length > capacity ||
@@ -613,7 +613,7 @@ agx3_g17p_fragment_blend_constant_base(enum agx_chip chip,
                                         unsigned occupied_halfs,
                                         uint16_t *base)
 {
-   if (chip != AGX_CHIP_G17P || !base)
+   if (!agx_chip_native_agx3(chip) || !base)
       return false;
 
    const unsigned start = ALIGN_POT(MAX2(occupied_halfs, 8), 2);
@@ -629,7 +629,7 @@ agx3_g17p_rt0_bg_resource_spec(enum agx_chip chip,
                                enum agx3_g17p_rt0_bg_op op,
                                uint64_t *resource_spec)
 {
-   if (chip != AGX_CHIP_G17P || !resource_spec)
+   if (!agx_chip_native_agx3(chip) || !resource_spec)
       return false;
 
    uint64_t pass_mask;
@@ -694,7 +694,7 @@ agx3_g17p_rt0_bg_program_generate(
    enum agx_chip chip, const struct agx3_g17p_rt0_bg_program_desc *desc,
    struct agx3_g17p_rt0_bg_program *program)
 {
-   if (!program || chip != AGX_CHIP_G17P || !desc)
+   if (!program || !agx_chip_native_agx3(chip) || !desc)
       return false;
 
    if (desc->resolve_bounds_va &&
@@ -925,7 +925,7 @@ agx3_g17p_rt0_eot_program_generate(
                              : offsets[rt] == 0;
    }
    const bool multi_mrt = raw32_mrt || mixed_mrt;
-   if (!program || chip != AGX_CHIP_G17P || !desc ||
+   if (!program || !agx_chip_native_agx3(chip) || !desc ||
        (!rt0 && !dual_mrt && !multi_mrt) ||
        (!mixed_mrt && high_offsets) ||
        !desc->pbe_argument_va ||

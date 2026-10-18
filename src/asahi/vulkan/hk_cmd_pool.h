@@ -83,7 +83,7 @@ void hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation);
 static inline bool
 hk_g17p_vdm_low_window_enabled(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P;
+   return agx_chip_native_agx3(dev->chip);
 }
 
 struct hk_cmd_pool {

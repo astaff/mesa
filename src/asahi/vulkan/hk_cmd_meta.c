@@ -64,24 +64,24 @@ hk_device_init_meta(struct hk_device *dev)
 
    dev->meta.use_gs_for_layer = false;
    dev->meta.use_layer_output = true;
-   dev->meta.use_view_relative_3d_layer = dev->dev.chip == AGX_CHIP_G17P;
+   dev->meta.use_view_relative_3d_layer = agx_native_graphics(&dev->dev);
    /* G17P has ordinary fixed-function stencil testing/updates, but its
     * fragment stencil-export operand is not part of the grounded AGX3B ABI.
     * Let common meta lower a stencil blit to eight bit-selective discard
     * passes instead of compiling an unencodable stencil-export shader. */
-   dev->meta.use_stencil_export = dev->dev.chip != AGX_CHIP_G17P;
+   dev->meta.use_stencil_export = !agx_native_graphics(&dev->dev);
    /* A scaled image is read through an exact integer descriptor or a
     * filterable normalized one depending on whether the sampler filters, so
     * a blit source has to arrive together with its sampler for the driver to
     * choose.  See hk_descriptor_set.c. */
-   dev->meta.use_combined_blit_descriptors = dev->dev.chip == AGX_CHIP_G17P;
+   dev->meta.use_combined_blit_descriptors = agx_native_graphics(&dev->dev);
    dev->meta.use_masked_rgba8_buffer_unpack =
-      dev->dev.chip == AGX_CHIP_G17P;
+      agx_native_graphics(&dev->dev);
    dev->meta.use_rect_list_pipeline = true;
    dev->meta.cmd_bind_map_buffer = hk_cmd_bind_map_buffer;
    dev->meta.max_bind_map_buffer_size_B = 64 * 1024;
    dev->meta.buffer_access.max_fill_chunk_size =
-      dev->dev.chip == AGX_CHIP_G17P ? 16 : 0;
+      agx_native_graphics(&dev->dev) ? 16 : 0;
 
    for (unsigned i = 0; i < VK_META_BUFFER_CHUNK_SIZE_COUNT; ++i) {
       dev->meta.buffer_access.optimal_wg_size[i] = 64;
@@ -229,7 +229,7 @@ hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
                        uint64_t address, uint64_t size, uint32_t value)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.chip != AGX_CHIP_G17P || !target || !address ||
+   if (!agx_native_graphics(&dev->dev) || !target || !address ||
        ((address | size) & 3)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
@@ -432,7 +432,7 @@ hk_g17p_sparse_buffer_copy(struct hk_cmd_buffer *cmd,
                            uint64_t dst_addr, VkDeviceSize size)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   assert(dev->dev.chip == AGX_CHIP_G17P && src_buffer->sparse_map);
+   assert(agx_native_graphics(&dev->dev) && src_buffer->sparse_map);
 
    /* Resident writes use the primary VA while nonresident reads must use the
     * zero-page shadow. Read the live map in the copy shader so a sparse bind
@@ -583,7 +583,7 @@ hk_g17p_meta_wait_addr(struct hk_cmd_buffer *cmd, uint64_t address,
                        uint32_t value)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.chip != AGX_CHIP_G17P || !address || (address & 3)) {
+   if (!agx_native_graphics(&dev->dev) || !address || (address & 3)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -1314,7 +1314,7 @@ get_image_copy_pipeline(struct vk_device *device, struct vk_meta_device *meta,
        * The existing NIR pack/unpack path retains a single aligned raw store.
        * Meta pipelines are cached per device, so no extra key is needed. */
       .nir = build_image_copy_shader(key,
-         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G17P &&
+         !agx_native_graphics(&container_of(device, struct hk_device, vk)->dev) &&
          container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G16G),
    };
    const VkPipelineShaderStageCreateInfo cs_info = {
@@ -1374,8 +1374,8 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
          VkImageAspectFlags aspect = region->imageSubresource.aspectMask;
          VkFormat aspect_fmt = aspect_format(image->format, aspect);
          const bool g17p_color =
-            container_of(device, struct hk_device, vk)->dev.chip ==
-               AGX_CHIP_G17P &&
+            agx_native_graphics(
+               &container_of(device, struct hk_device, vk)->dev) &&
             !vk_format_is_depth_or_stencil(image->format);
          const struct hk_image *hk_image =
             container_of(image, struct hk_image, vk);
@@ -2110,7 +2110,7 @@ hk_g17p_compute_blit_supported(const struct hk_device *dev,
                                const struct hk_image *dst,
                                const VkBlitImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0)
+   if (!agx_native_graphics(&dev->dev) || info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -2243,7 +2243,7 @@ hk_xfer_blitimage2(VkCommandBuffer commandBuffer,
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_native_graphics(&dev->dev) &&
        src_image->vk.image_type == VK_IMAGE_TYPE_2D &&
        dst_image->vk.image_type == VK_IMAGE_TYPE_2D) {
       for (uint32_t r = 0; r < pBlitImageInfo->regionCount; ++r) {
@@ -2313,7 +2313,7 @@ hk_xfer_resolveimage2(VkCommandBuffer commandBuffer,
    const struct ail_layout *src_layout = &src_image->planes[0].layout;
    const struct ail_layout *dst_layout = &dst_image->planes[0].layout;
    bool raw_unorm8x4 =
-      dev->dev.chip == AGX_CHIP_G17P &&
+      agx_native_graphics(&dev->dev) &&
       src_image->vk.image_type == VK_IMAGE_TYPE_2D &&
       dst_image->vk.image_type == VK_IMAGE_TYPE_2D &&
       src_image->vk.format == VK_FORMAT_R8G8B8A8_UNORM &&
@@ -2477,7 +2477,7 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       /* Retain the aligned 16-byte bulk path even when the original
@@ -2603,7 +2603,7 @@ hk_g17p_copy_buffer_to_image_supported(
 static bool
 hk_g17p_block_copy_format(struct hk_device *dev, VkFormat format)
 {
-   if (!dev || dev->dev.chip != AGX_CHIP_G17P)
+   if (!dev || !agx_native_graphics(&dev->dev))
       return false;
 
    switch (hk_g17p_block_format_family(format)) {
@@ -2883,7 +2883,7 @@ hk_g17p_copy_padded_rgb_buffer_image(
    VkImageLayout image_layout, bool to_image)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.chip != AGX_CHIP_G17P || region_count == 0 ||
+   if (!agx_native_graphics(&dev->dev) || region_count == 0 ||
        image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
        (image_layout != (to_image ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
                                   : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) &&
@@ -3059,7 +3059,7 @@ hk_g17p_copy_uncompressed_buffer_to_image_supported(
    struct hk_device *dev, const struct hk_buffer *buffer,
    const struct hk_image *image, const VkCopyBufferToImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0)
+   if (!agx_native_graphics(&dev->dev) || info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -3349,7 +3349,7 @@ hk_g17p_raw_image_copy_supported(struct hk_device *dev,
                                  const struct hk_image *dst,
                                  const VkCopyImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0 ||
+   if (!agx_native_graphics(&dev->dev) || info->regionCount == 0 ||
        src->vk.samples != dst->vk.samples ||
        (src->vk.samples != VK_SAMPLE_COUNT_1_BIT &&
         src->vk.samples != VK_SAMPLE_COUNT_2_BIT &&
@@ -3578,7 +3578,7 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    bool gfx = hk_copy_requires_gfx(dst_image);
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       uint8_t plane;
       VkFormat format;
       uint32_t api_block_B, physical_block_B;
@@ -3651,9 +3651,9 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    if (gfx) {
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image,
-                                          dev->dev.chip == AGX_CHIP_G17P);
+                                          agx_native_graphics(&dev->dev));
 
-      if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_native_graphics(&dev->dev)) {
          /* Native single-slice EOT views already select the mip and array
           * layer or 3D Z slice. Keep source row/image strides intact while
           * splitting multi-layer and volume regions; no staging copy. */
@@ -3727,7 +3727,7 @@ hk_g17p_r32_volume_copy_diagnostic(
    const VkCopyImageToBufferInfo2 *info)
 {
    if (!debug_get_bool_option("ASAHI_G17P_R32_3D_ADDRESS_DIAGNOSTIC", false) ||
-       hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P ||
+       !agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
        image->vk.image_type != VK_IMAGE_TYPE_3D ||
        image->vk.format != VK_FORMAT_R32_SINT || image->plane_count != 1 ||
        image->vk.extent.width != 1 || image->vk.extent.height != 1 ||
@@ -3846,7 +3846,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
    VkFormat format;
    uint32_t api_block_B, physical_block_B;
    const bool padded_rgb =
-      dev->dev.chip == AGX_CHIP_G17P &&
+      agx_native_graphics(&dev->dev) &&
       pCopyImageToBufferInfo->regionCount > 0 &&
       hk_g17p_buffer_upload_plane(
          src_image,
@@ -3862,7 +3862,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
              pCopyImageToBufferInfo->pRegions,
              pCopyImageToBufferInfo->srcImageLayout, false))
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-   } else if (dev->dev.chip == AGX_CHIP_G17P &&
+   } else if (agx_native_graphics(&dev->dev) &&
               hk_g17p_block_copy_format(dev, src_image->vk.format)) {
       /* A compressed Vulkan copy preserves the encoded block bytes.  The
        * common meta path samples and decodes the source, so use the symmetric
@@ -3901,7 +3901,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    /* G17P copies through its native tile renderer, as buffer uploads do.
     * The common meta path preserves partial rectangles, layers and format
     * reinterpretation without the AGX2 compute imageblock protocol. */
-   bool gfx = dev->dev.chip == AGX_CHIP_G17P ||
+   bool gfx = agx_native_graphics(&dev->dev) ||
               hk_copy_requires_gfx(dst_image);
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
 
@@ -3911,12 +3911,12 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    if (gfx) {
       struct vk_meta_copy_image_properties src_props =
          hk_meta_copy_get_image_properties(src_image,
-                                          dev->dev.chip == AGX_CHIP_G17P);
+                                          agx_native_graphics(&dev->dev));
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image,
-                                          dev->dev.chip == AGX_CHIP_G17P);
+                                          agx_native_graphics(&dev->dev));
 
-      if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_native_graphics(&dev->dev)) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
           * arbitrary mip and rectangle selection while expanding array and
           * 3D regions into per-slice native meta draws. */
@@ -3975,7 +3975,7 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       /* VK_WHOLE_SIZE fills only complete 32-bit words. */
       VkDeviceSize size =
          vk_buffer_range(&buffer->vk, dstOffset, dstRange) & ~(VkDeviceSize)3;
@@ -4012,7 +4012,7 @@ hk_xfer_updatebuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_native_graphics(&dev->dev)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       vk_meta_update_buffer(&cmd->vk, &dev->meta, dstBuffer, dstOffset, dstRange,

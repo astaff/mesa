@@ -217,11 +217,12 @@ bool
 agx_chip_driver_supported(enum agx_chip chip)
 {
    /*
-    * Codegen is necessary, not sufficient. G17P is admitted as one exact
-    * bring-up identity because its HAL200 VDM/PPP records, Gen9 descriptors,
-    * HAL200 sampler layout, dual queue model, no-resource graphics programs,
-    * and RT0 clear/reload/store programs are all wired into Honeykrisp. Other
-    * AGX3 identities still lack at least one of those pieces.
+    * Codegen is necessary, not sufficient. An AGX3 chip is admitted only on
+    * the native path, and only with the exact axes that path is wired for:
+    * Gen9 descriptors in a 32-byte sampler heap, and either G17P's HAL200
+    * records, HAL200 sampler layout and dual queue model, or G15S's G15
+    * command stream, Gen4 sampler and classic queue model. Other AGX3
+    * identities still lack at least one of those pieces.
     */
    if (!agx_chip_codegen_supported(chip))
       return false;
@@ -233,13 +234,28 @@ agx_chip_driver_supported(enum agx_chip chip)
                 AGX_SAMPLER_GENERATION_UNKNOWN;
    }
 
-   return chip == AGX_CHIP_G17P &&
-          agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_HAL200 &&
-          agx_chip_descriptor_generation(chip) == AGX_DESCRIPTOR_GENERATION_9 &&
-          agx_chip_sampler_generation(chip) ==
-             AGX_SAMPLER_GENERATION_GEN4_HAL200 &&
-          agx_chip_sampler_heap_element_size(chip) == 32 &&
-          agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_DUAL;
+   if (!agx_chip_native_agx3(chip) ||
+       agx_chip_descriptor_generation(chip) != AGX_DESCRIPTOR_GENERATION_9 ||
+       agx_chip_sampler_heap_element_size(chip) != 32)
+      return false;
+
+   switch (chip) {
+   case AGX_CHIP_G17P:
+      return agx_chip_command_stream_generation(chip) ==
+                AGX_CS_GENERATION_HAL200 &&
+             agx_chip_sampler_generation(chip) ==
+                AGX_SAMPLER_GENERATION_GEN4_HAL200 &&
+             agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_DUAL;
+   case AGX_CHIP_G15S:
+   case AGX_CHIP_G15C:
+      return agx_chip_command_stream_generation(chip) ==
+                AGX_CS_GENERATION_G15 &&
+             agx_chip_sampler_generation(chip) ==
+                AGX_SAMPLER_GENERATION_GEN4 &&
+             agx_chip_submission_model(chip) == AGX_SUBMISSION_MODEL_CLASSIC;
+   default:
+      return false;
+   }
 }
 
 bool
@@ -252,16 +268,32 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
    if (!agx_chip_driver_supported(chip))
       return false;
 
-   if (chip == AGX_CHIP_G17P) {
+   switch (chip) {
+   case AGX_CHIP_G17P:
       /* Honeykrisp's first AGX3 path is the exact T8140/A18 Pro contract.
        * Do not let the shared G17P ISA name admit another SoC or topology. */
       return params->chip_id == 0x8140 && params->num_dies == 1 &&
              params->num_clusters_total == 1 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
+   case AGX_CHIP_G15S:
+      /* T6030/M3 Pro: one die, two clusters, AGX3 shaders on the legacy
+       * (pre-HAL200) firmware interface. */
+      return params->chip_id == 0x6030 && params->num_dies == 1 &&
+             params->num_clusters_total == 2 &&
+             params->usc_generation == AGX_ISA_AGX3 &&
+             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
+   case AGX_CHIP_G15C:
+      /* T6031/M3 Max: the same generation as T6030 with four clusters.
+       * Binned parts differ only in their core masks, which every consumer
+       * reads from the parameters, so the masks are not part of the check. */
+      return params->chip_id == 0x6031 && params->num_dies == 1 &&
+             params->num_clusters_total == 4 &&
+             params->usc_generation == AGX_ISA_AGX3 &&
+             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
+   default:
+      return true;
    }
-
-   return true;
 }
 
 const char *

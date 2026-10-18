@@ -7,6 +7,7 @@
 
 #include "asahi/genxml/agx3_cmdstream.h"
 
+#include <assert.h>
 #include <string.h>
 
 _Static_assert(AGX3_G17S_MINIMAL_COMPUTE_DISPATCH_SIZE ==
@@ -32,7 +33,8 @@ agx3_g17p_native_compute_program_bind(
    const struct agx3_g17p_native_compute_program_desc *desc,
    struct agx3_compute_program *program)
 {
-   if (!desc || !program || desc->program_va == 0 || desc->shader_va == 0 ||
+   if (!desc || !program || !agx_chip_native_agx3(desc->chip) ||
+       desc->program_va == 0 || desc->shader_va == 0 ||
        desc->program_va > UINT64_C(0xffffffffffff) ||
        desc->shader_va > UINT64_C(0xffffffffffff) ||
        (desc->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
@@ -45,7 +47,7 @@ agx3_g17p_native_compute_program_bind(
       return false;
 
    *program = (struct agx3_compute_program){
-      .chip = AGX_CHIP_G17P,
+      .chip = desc->chip,
       .program_va = desc->program_va,
       .shader_va = desc->shader_va,
       .launch_template = launch_template,
@@ -64,7 +66,7 @@ agx3_g17p_native_compute_launch_pack(
       return false;
 
    memset(packed, 0, AGX3_CDM_DIRECT_LAUNCH_SIZE);
-   if (!program || !grid || program->chip != AGX_CHIP_G17P ||
+   if (!program || !grid || !agx_chip_native_agx3(program->chip) ||
        program->program_va == 0 ||
        program->program_va > UINT64_C(0xffffffffffff) ||
        (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
@@ -84,6 +86,28 @@ agx3_g17p_native_compute_launch_pack(
           (axis >= grid->dimensions &&
            (global_size[axis] != 1 || grid->local_size[axis] != 1)))
          return false;
+   }
+
+   /* The G15 firmware (T6030, RTKit 2419) parses the older launch layout:
+    * word 1 carries VA[47:32] in its high half, word 2 VA >> 6 and word 3
+    * the bare control 0x40.  There is no room for template word 1, and the
+    * template's subkernel bit stays set for one-dimensional grids too. */
+   if (agx_chip_native_g15(program->chip)) {
+      if (program->launch_template.word1 != 0)
+         return false;
+
+      agx3_cmdstream_store_le32(packed, program->launch_template.word0);
+      agx3_cmdstream_store_le32(packed + 4,
+                                (uint32_t)(program->program_va >> 32) << 16);
+      agx3_cmdstream_store_le32(packed + 8,
+                                (uint32_t)(program->program_va >> 6));
+      agx3_cmdstream_store_le32(packed + 12, UINT32_C(0x40));
+      for (unsigned axis = 0; axis < 3; ++axis) {
+         agx3_cmdstream_store_le32(packed + 16 + axis * 4, global_size[axis]);
+         agx3_cmdstream_store_le32(packed + 28 + axis * 4,
+                                   grid->local_size[axis]);
+      }
+      return true;
    }
 
    /* The output-positive A18 Pro add3 record stores the Ioto program pointer
@@ -144,7 +168,7 @@ agx3_g17p_native_compute_dispatch_append_with_barrier(
        (sink->capacity != 0 && !sink->data) || sink->length > sink->capacity ||
        AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE >
           sink->capacity - sink->length ||
-       program->chip != AGX_CHIP_G17P ||
+       !agx_chip_native_agx3(program->chip) ||
        !program->g17p_native_compute_live_bound)
       return false;
 
@@ -152,9 +176,13 @@ agx3_g17p_native_compute_dispatch_append_with_barrier(
    if (!agx3_g17p_native_compute_launch_pack(program, grid, staged))
       return false;
 
+   /* A strong tail is a cache flush; publish it the way the chip's own
+    * encoder does. */
    const struct agx3_cdm_barrier_info barrier = {
-      .chip = AGX_CHIP_G17P,
+      .chip = program->chip,
       .flags = barrier_flags,
+      .wide_visibility = barrier_flags == 0x5 &&
+                         agx_chip_cdm_wide_visibility(program->chip),
    };
    if (!agx3_cdm_barrier_pack(&barrier,
                               staged + AGX3_CDM_DIRECT_LAUNCH_SIZE))
@@ -205,7 +233,7 @@ agx3_g17p_native_indirect_launch_pack(
       return false;
 
    memset(packed, 0, AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE);
-   if (!program || program->chip != AGX_CHIP_G17P ||
+   if (!program || !agx_chip_native_indirect_compute(program->chip) ||
        !program->g17p_native_compute_live_bound || program->program_va == 0 ||
        program->program_va > UINT64_C(0xffffffffffff) ||
        (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
@@ -241,9 +269,12 @@ agx3_g17p_native_indirect_compute_launch_append(
    if (!agx3_g17p_native_indirect_launch_pack(program, geometry_va, staged))
       return false;
 
+   /* A strong tail is a cache flush, as for the direct launch. */
    const struct agx3_cdm_barrier_info barrier = {
-      .chip = AGX_CHIP_G17P,
+      .chip = program->chip,
       .flags = barrier_flags,
+      .wide_visibility = barrier_flags == 0x5 &&
+                         agx_chip_cdm_wide_visibility(program->chip),
    };
    if (!agx3_cdm_barrier_pack(&barrier,
                               staged + AGX3_G17P_NATIVE_INDIRECT_LAUNCH_SIZE))
@@ -262,9 +293,9 @@ agx3_g17p_native_indirect_compute_dispatch_append(
 {
    if (!program || !dispatch || !dispatch->helper_program || !sink ||
        (sink->capacity != 0 && !sink->data) || sink->length > sink->capacity ||
-       AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE >
+       agx3_native_indirect_compute_dispatch_size(program->chip) >
           sink->capacity - sink->length ||
-       program->chip != AGX_CHIP_G17P ||
+       !agx_chip_native_indirect_compute(program->chip) ||
        !program->g17p_native_compute_live_bound || program->program_va == 0 ||
        program->program_va > UINT64_C(0xffffffffffff) ||
        (program->program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 ||
@@ -276,7 +307,7 @@ agx3_g17p_native_indirect_compute_dispatch_append(
        program->launch_template.word1 >= (UINT32_C(1) << 22))
       return false;
 
-   uint8_t staged[AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE] = {0};
+   uint8_t staged[AGX3_NATIVE_INDIRECT_COMPUTE_DISPATCH_MAX_SIZE] = {0};
    struct agx3_compute_dispatch_sink helper_sink = {
       .data = staged,
       .capacity = sizeof(staged),
@@ -294,6 +325,20 @@ agx3_g17p_native_indirect_compute_dispatch_append(
           dispatch->helper_program, &helper_grid, &helper_sink))
       return false;
 
+   /* Where the CDM's geometry fetch is not ordered after the helper's stores
+    * by the launch tail alone, flush between the two records the way a
+    * strong dependency inside the stream is published. */
+   if (agx_chip_indirect_geometry_flush(program->chip)) {
+      const struct agx3_cdm_barrier_info flush = {
+         .chip = program->chip,
+         .flags = 0x5,
+         .wide_visibility = agx_chip_cdm_wide_visibility(program->chip),
+      };
+      if (!agx3_cdm_barrier_pack(&flush, staged + helper_sink.length))
+         return false;
+      helper_sink.length += AGX3_CDM_BARRIER_SIZE;
+   }
+
    /* Exactly the standalone record, appended after the helper: there is one
     * encoder for the six words so the coupled and uncoupled forms cannot
     * drift apart. */
@@ -301,8 +346,10 @@ agx3_g17p_native_indirect_compute_dispatch_append(
           program, dispatch->geometry_va, 0, &helper_sink))
       return false;
 
-   memcpy(sink->data + sink->length, staged, sizeof(staged));
-   sink->length += sizeof(staged);
+   assert(helper_sink.length ==
+          agx3_native_indirect_compute_dispatch_size(program->chip));
+   memcpy(sink->data + sink->length, staged, helper_sink.length);
+   sink->length += helper_sink.length;
    return true;
 }
 

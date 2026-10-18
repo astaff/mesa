@@ -137,6 +137,15 @@ hk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
    hk_event_write(cmd, event, hk_sync_kinds_src(stageMask), VK_EVENT_RESET);
 }
 
+/* A wait polls the event word on the GPU, so a later host vkSetEvent is
+ * honoured. A poll whose set never comes hangs the queue, which only G17P
+ * recovers from; elsewhere the wait is the plain barrier below. */
+static bool
+hk_event_wait_polls(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17P;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                   const VkEvent *pEvents,
@@ -162,7 +171,7 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
 
-      if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (hk_event_wait_polls(dev)) {
          cmd->sync.kind_override = HK_SYNC_ALL;
          struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
          if (cs)

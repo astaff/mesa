@@ -23,6 +23,7 @@ extern "C" {
  * form.  The Ioto bytes remain frontend-owned; this object binds their exact
  * allocation to the launch metadata used below. */
 struct agx3_g17p_native_compute_program_desc {
+   enum agx_chip chip;
    uint64_t program_va;
    uint64_t shader_va;
    struct agx3_cdm_direct_template_sources launch_sources;
@@ -95,6 +96,17 @@ struct agx3_compute_program_upload {
 #define AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE \
    (AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE + \
     AGX3_G17P_NATIVE_INDIRECT_MAIN_SIZE)
+/* The pair plus the flush agx_chip_indirect_geometry_flush() places between
+ * the helper and the launch. */
+#define AGX3_NATIVE_INDIRECT_COMPUTE_DISPATCH_MAX_SIZE \
+   (AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE + 4u)
+
+static inline size_t
+agx3_native_indirect_compute_dispatch_size(enum agx_chip chip)
+{
+   return AGX3_G17P_NATIVE_INDIRECT_COMPUTE_DISPATCH_SIZE +
+          (agx_chip_indirect_geometry_flush(chip) ? 4u : 0u);
+}
 
 /* Caller-owned command-stream span.  A successful append writes one exact
  * direct launch followed by CommandEncodingNext's strong flags=5 barrier. */

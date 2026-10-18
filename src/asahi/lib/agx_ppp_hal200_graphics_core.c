@@ -14,7 +14,7 @@ agx_ppp_hal200_cull_mode_pack(enum agx_chip chip, unsigned cull_mode,
                               bool front_face_ccw, uint32_t original,
                               uint32_t *out)
 {
-   if (chip != AGX_CHIP_G17P || cull_mode > 3 || !out)
+   if (!agx_chip_native_agx3(chip) || cull_mode > 3 || !out)
       return false;
 
    *out = (original & ~UINT32_C(0x10003)) | cull_mode |
@@ -26,7 +26,7 @@ bool
 agx_ppp_hal200_cull_provoking_pack(enum agx_chip chip, unsigned selector,
                                    uint32_t original, uint32_t *out)
 {
-   if (chip != AGX_CHIP_G17P || selector > 2 || !out)
+   if (!agx_chip_native_agx3(chip) || selector > 2 || !out)
       return false;
 
    *out = (original & ~UINT32_C(0x180)) | ((selector + 1) << 7);
@@ -38,7 +38,7 @@ agx_ppp_hal200_fragment_face_raster_pack(
    enum agx_chip chip, unsigned line_width, unsigned polygon_mode,
    uint32_t original, uint32_t *out)
 {
-   if (chip != AGX_CHIP_G17P || line_width > 0xff || polygon_mode > 2 || !out)
+   if (!agx_chip_native_agx3(chip) || line_width > 0xff || polygon_mode > 2 || !out)
       return false;
 
    /* setLineWidth is consumed by the native finalize path as unsigned 4:4
@@ -56,7 +56,7 @@ agx_ppp_hal200_fragment_face_object_pack(
 {
    /* These are the four native Object Type encodings: triangle, line, and
     * the two point-sprite UV conventions. Reject every ungrounded nibble. */
-   if (chip != AGX_CHIP_G17P ||
+   if (!agx_chip_native_agx3(chip) ||
        (object_type != 0 && object_type != 1 && object_type != 2 &&
         object_type != 4) ||
        !out)
@@ -70,7 +70,7 @@ bool
 agx_ppp_hal200_primitive_msaa_pack(enum agx_chip chip, bool enable,
                                    uint32_t original, uint32_t *out)
 {
-   if (chip != AGX_CHIP_G17P || !out)
+   if (!agx_chip_native_agx3(chip) || !out)
       return false;
 
    *out = (original & ~UINT32_C(0x00008000)) |
@@ -82,7 +82,7 @@ bool
 agx_ppp_hal200_depth_clip_pack(enum agx_chip chip, bool depth_clip,
                                uint32_t original, uint32_t *out)
 {
-   if (chip != AGX_CHIP_G17P || !out)
+   if (!agx_chip_native_agx3(chip) || !out)
       return false;
 
    *out = (original & ~UINT32_C(0xc00)) |
@@ -95,7 +95,7 @@ agx_ppp_hal200_rasterizer_discard_pack(
    enum agx_chip chip, bool discard, uint32_t secondary_original,
    uint32_t cull_original, uint32_t *secondary_out, uint32_t *cull_out)
 {
-   if (chip != AGX_CHIP_G17P || !secondary_out || !cull_out)
+   if (!agx_chip_native_agx3(chip) || !secondary_out || !cull_out)
       return false;
 
    const uint32_t secondary_mask = UINT32_C(1) << 21;
@@ -114,7 +114,7 @@ agx_ppp_hal200_fragment_controls_pack(
    uint32_t primary_original, uint32_t secondary_original,
    uint32_t *primary_out, uint32_t *secondary_out)
 {
-   if (chip != AGX_CHIP_G17P || !fields || !primary_out || !secondary_out)
+   if (!agx_chip_native_agx3(chip) || !fields || !primary_out || !secondary_out)
       return false;
 
    const uint32_t pass_type = fields->linked_control >> 29;
@@ -156,7 +156,7 @@ agx_ppp_hal200_occlusion_pack(enum agx_chip chip, unsigned mode,
                               uint32_t *fragment_control,
                               uint32_t *query_offset)
 {
-   if (chip != AGX_CHIP_G17P || (mode != 0 && mode != 2 && mode != 3) ||
+   if (!agx_chip_native_agx3(chip) || (mode != 0 && mode != 2 && mode != 3) ||
        index >= 32768 || !fragment_control || !query_offset)
       return false;
 
@@ -220,7 +220,7 @@ bundle_layout(enum agx_ppp_hal200_graphics_bundle bundle, uint32_t *header,
 static bool
 agx_ppp_hal200_graphics_core_supported(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P;
+   return agx_chip_native_agx3(chip);
 }
 
 bool
@@ -236,7 +236,7 @@ agx_ppp_hal200_output_select_pack(enum agx_chip chip,
    const uint32_t vertex_mask = clip_distances | point_size |
                                 viewport_target | render_target;
 
-   if (chip != AGX_CHIP_G17P || !out ||
+   if (!agx_chip_native_agx3(chip) || !out ||
        (vertex_output_select & ~vertex_mask) ||
        !!(vertex_output_select & viewport_target) !=
           !!(vertex_output_select & render_target))
@@ -308,7 +308,7 @@ agx_ppp_hal200_fragment_ti_resources(
    const uint64_t spill_quads = ((uint64_t)spill_bytes + 3) >> 2;
    const uint64_t ipr_quads = ((((uint64_t)largest_ipr_bytes + 3) >> 2) + 1) &
                              ~UINT64_C(1);
-   if (chip != AGX_CHIP_G17P || !fields || spill_quads > 0x3ffff ||
+   if (!agx_chip_native_agx3(chip) || !fields || spill_quads > 0x3ffff ||
        ipr_quads > 0xffe)
       return false;
 
@@ -378,7 +378,7 @@ bool
 agx_ppp_hal200_viewport_count_pack(enum agx_chip chip,
                                    unsigned viewport_count, uint32_t *out)
 {
-   if (chip != AGX_CHIP_G17P || viewport_count == 0 ||
+   if (!agx_chip_native_agx3(chip) || viewport_count == 0 ||
        viewport_count > 16 || !out)
       return false;
 
@@ -397,7 +397,7 @@ agx_ppp_hal200_depth_face_pack(enum agx_chip chip, bool test_enable,
                                bool write_enable, uint32_t compare,
                                uint32_t original, uint32_t *out)
 {
-   if (!out || chip != AGX_CHIP_G17P || compare > 7)
+   if (!out || !agx_chip_native_agx3(chip) || compare > 7)
       return false;
 
    const uint32_t mask = UINT32_C(0x07200000);
@@ -412,7 +412,7 @@ agx_ppp_hal200_fragment_face_depth_pack(
    enum agx_chip chip, unsigned conservative_depth, bool early_tests,
    bool writes_memory, uint32_t original, uint32_t *out)
 {
-   if (!out || chip != AGX_CHIP_G17P || conservative_depth > 3)
+   if (!out || !agx_chip_native_agx3(chip) || conservative_depth > 3)
       return false;
 
    /* Native __GPU_LD_MD root2.field4 -> FragmentProgramVariant+0xfcd

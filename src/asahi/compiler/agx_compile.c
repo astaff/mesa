@@ -4333,6 +4333,61 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
    agx_foreach_instr_global_safe(ctx, I) {
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
 
+      /* A half source feeding a 32-bit square-root step is widened exactly
+       * first. Apple's half-input step (agx3_alu_sqrt_step_half) is grounded
+       * only with a cached source and result, so the packer refuses the other
+       * forms. G17P keeps that native step, and its existing output. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          ctx->key->dev.chip != AGX_CHIP_G17P &&
+          I->op == AGX_OPCODE_SRSQRT && I->nr_srcs == 1 &&
+          I->dest[0].size == AGX_SIZE_32 &&
+          I->src[0].size == AGX_SIZE_16 &&
+          I->src[0].type != AGX_INDEX_IMMEDIATE) {
+         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+         agx_fmov_to(&b, wide, I->src[0]);
+         I->src[0] = wide;
+      }
+
+      /* An AGX3 float add, multiply or fused multiply-add has no form whose
+       * operands are all immediates. The optimizer can leave one after
+       * folding a select to a constant; keep the first immediate and move
+       * the others into registers. */
+      bool all_immediate = I->nr_srcs > 0;
+      agx_foreach_src(I, s)
+         all_immediate &= I->src[s].type == AGX_INDEX_IMMEDIATE;
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B && all_immediate &&
+          (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
+           I->op == AGX_OPCODE_FFMA)) {
+         agx_foreach_src(I, s) {
+            if (s == 0)
+               continue;
+            float value = agx_minifloat_decode(I->src[s].value);
+            if (I->src[s].abs)
+               value = fabsf(value);
+            if (I->src[s].neg)
+               value = -value;
+            I->src[s] = I->dest[0].size == AGX_SIZE_16
+                           ? agx_mov_imm(&b, 16, _mesa_float_to_half(value))
+                           : agx_mov_imm(&b, 32, fui(value));
+         }
+      }
+
+      /* AGX3's integer compare-select names an immediate comparand in eight
+       * bits (agx3_pack_binary.c). A wider constant goes through a register
+       * of the other comparand's width. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          (I->op == AGX_OPCODE_ICMPSEL || I->op == AGX_OPCODE_ICMP)) {
+         for (unsigned s = 0; s < 2; ++s) {
+            const agx_index other = I->src[s ^ 1];
+            if (I->src[s].type != AGX_INDEX_IMMEDIATE ||
+                I->src[s].value <= 0xff ||
+                other.type == AGX_INDEX_IMMEDIATE)
+               continue;
+            I->src[s] = agx_mov_imm(
+               &b, other.size == AGX_SIZE_16 ? 16 : 32, I->src[s].value);
+         }
+      }
+
       /* G17P's grounded 32-bit saturating IADD encoding takes two registers.
        * Robust buffer bounds checks naturally produce uadd_sat(offset, #size),
        * where an immediate is implicitly unsigned and therefore lacks the ABS
@@ -4632,10 +4687,27 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
          if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
              I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16) {
-            /* Select alternatives are bit patterns, not minifloats. */
+            /* Select alternatives are bit patterns, not minifloats -- except
+             * in a tied minimum/maximum, where the optimizer deposited the
+             * compared minifloat into the select slot too. */
             for (unsigned s = 2; s < 4; ++s) {
-               if (I->src[s].type == AGX_INDEX_IMMEDIATE)
-                  I->src[s] = agx_mov_imm(&b, 16, I->src[s].value);
+               if (I->src[s].type != AGX_INDEX_IMMEDIATE)
+                  continue;
+               const agx_index cmp = I->src[s - 2];
+               const bool tied = cmp.type == AGX_INDEX_IMMEDIATE &&
+                                 cmp.value == I->src[s].value &&
+                                 cmp.abs == I->src[s].abs &&
+                                 cmp.neg == I->src[s].neg;
+               uint32_t bits = I->src[s].value;
+               if (tied) {
+                  float value = agx_minifloat_decode(I->src[s].value);
+                  if (I->src[s].abs)
+                     value = fabsf(value);
+                  if (I->src[s].neg)
+                     value = -value;
+                  bits = _mesa_float_to_half(value);
+               }
+               I->src[s] = agx_mov_imm(&b, 16, bits);
             }
          }
          /* The native F32/F16 route is qualified for EQ/LT and two full
@@ -4713,7 +4785,18 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                I->src[s] = plain;
                continue;
             }
-            if (src.type != AGX_INDEX_IMMEDIATE || src.value == 0)
+            /* An implicit zero is native, except beside a uniform in a tied
+             * minimum/maximum: that form takes its other comparand from a
+             * register. */
+            const bool tied_uniform_minmax =
+               I->op == AGX_OPCODE_FCMPSEL &&
+               I->dest[0].size == AGX_SIZE_32 && !I->invert_cond &&
+               (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) &&
+               I->src[s ^ 1].type == AGX_INDEX_UNIFORM &&
+               agx_is_equiv(I->src[0], I->src[2]) &&
+               agx_is_equiv(I->src[1], I->src[3]);
+            if (src.type != AGX_INDEX_IMMEDIATE ||
+                (src.value == 0 && !tied_uniform_minmax))
                continue;
 
             float value = agx_minifloat_decode(src.value);
@@ -4722,6 +4805,16 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
             if (src.neg)
                value = -value;
             I->src[s] = agx_mov_imm(&b, 32, fui(value));
+
+            /* A tied minimum/maximum selects the same minifloat it compares.
+             * The select slot reads a bit pattern, so keep the tie through
+             * the register instead of leaving the minifloat there. */
+            const agx_index sel = I->src[s + 2];
+            if (I->op == AGX_OPCODE_FCMPSEL &&
+                I->dest[0].size == AGX_SIZE_32 &&
+                sel.type == AGX_INDEX_IMMEDIATE && sel.value == src.value &&
+                sel.abs == src.abs && sel.neg == src.neg)
+               I->src[s + 2] = I->src[s];
          }
       }
 
@@ -9788,6 +9881,18 @@ agx3_scratch_word_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
    };
 }
 
+bool
+agx3_nir_lower_scratch_words(nir_shader *nir)
+{
+   nir_lower_mem_access_bit_sizes_options scratch_words = {
+      .modes = nir_var_function_temp,
+      .callback = agx3_scratch_word_size_align_cb,
+   };
+   bool progress = false;
+   NIR_PASS(progress, nir, nir_lower_mem_access_bit_sizes, &scratch_words);
+   return progress;
+}
+
 static void
 agx_preprocess_nir_internal(nir_shader *nir, bool g17p)
 {
@@ -9825,13 +9930,8 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p)
     * pass's read-modify-write of the containing word
     * (subgroups.ballot_broadcast.*.subgroupbroadcast_{f,i,u}16vec*,
     * {i,u}8vec*). */
-   if (g17p) {
-      nir_lower_mem_access_bit_sizes_options scratch_words = {
-         .modes = nir_var_function_temp,
-         .callback = agx3_scratch_word_size_align_cb,
-      };
-      NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &scratch_words);
-   }
+   if (g17p)
+      agx3_nir_lower_scratch_words(nir);
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             nir_var_function_temp, ~0);
    NIR_PASS(_, nir, nir_split_var_copies);
@@ -11152,9 +11252,13 @@ agx3_nir_lower_uniform_dma(nir_shader *nir, const struct agx_shader_key *key,
    info->agx3_uniform_dma_count = 0;
 
    /* Copies end where the constant program's storage does, before the main
-    * program's promoted constants. */
+    * program's promoted constants, and a fragment shader's uniforms end by
+    * AGX3_FRAGMENT_UNIFORM_END. */
+   const unsigned reserve = agx3_uniform_dma_constant_reserve(nir);
    const unsigned limit =
-      MIN2(480, AGX_NUM_UNIFORMS - agx3_uniform_dma_constant_reserve(nir));
+      nir->info.stage == MESA_SHADER_FRAGMENT
+         ? AGX3_FRAGMENT_UNIFORM_END - MIN2(reserve, AGX3_FRAGMENT_UNIFORM_END)
+         : MIN2(480, AGX_NUM_UNIFORMS - reserve);
 
    /* Buffers first: copying one also retires its descriptor's loads. */
    struct util_dynarray cands = UTIL_DYNARRAY_INIT;

@@ -92,16 +92,18 @@ hk_drm_submit_command_limit(bool batch_enabled, uint32_t kernel_limit)
 }
 
 uint16_t
-hk_drm_render_command_size(bool g17p, bool exact_prior)
+hk_drm_render_command_size(bool native, bool exact_prior)
 {
    if (exact_prior)
       return sizeof(struct drm_asahi_cmd_render_with_prior);
 
    /* Legacy kernels consume only the fields they know, without skipping an
-    * appended tail. Even zero G17P resource-specifier high words would then
-    * be parsed as another command. Keep their original packet boundary. */
-   return g17p ? sizeof(struct drm_asahi_cmd_render)
-               : offsetof(struct drm_asahi_cmd_render, bg_eot_rsrc_spec_hi);
+    * appended tail. Even zero resource-specifier high words would then be
+    * parsed as another command. Keep their original packet boundary. The
+    * native path's USC window sits at 2^40, so it always needs the high
+    * words. */
+   return native ? sizeof(struct drm_asahi_cmd_render)
+                 : offsetof(struct drm_asahi_cmd_render, bg_eot_rsrc_spec_hi);
 }
 
 void
