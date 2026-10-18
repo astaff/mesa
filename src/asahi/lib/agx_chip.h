@@ -387,6 +387,17 @@ agx_chip_usc_helper_table_slots(enum agx_chip chip)
    return chip == AGX_CHIP_G17P ? 6 : 10;
 }
 
+/* Whether the USC window base page needs a return in every slot past its
+ * helper tables.  On G15C the profile prefix's computed helper call can
+ * index past both ten-slot tables on some shader cores; with zeroes there
+ * the call never returns and runs into the unbound page after the base
+ * page. */
+static inline bool
+agx_chip_usc_base_page_fill_returns(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G15C;
+}
+
 /* Robust image accesses on native chips need explicit Vulkan view bounds:
  * native 2D accesses outside the view alias other texels of the image. G17P
  * lowers them together with its own hardware defects; G15 and G16 parts
