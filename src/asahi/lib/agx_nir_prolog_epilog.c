@@ -1853,6 +1853,11 @@ agx_nir_fs_epilog_g17p(nir_builder *b, const void *key_)
          opt_progress = false;
          NIR_PASS(opt_progress, b->shader, nir_opt_constant_folding);
          NIR_PASS(opt_progress, b->shader, nir_opt_algebraic);
+         /* M5 folds dead branches so its sample-rate coverage updates
+          * coalesce ahead of the colour stores. Other parts keep their
+          * qualified epilog shape. */
+         if (key->m5_coverage)
+            NIR_PASS(opt_progress, b->shader, nir_opt_dead_cf);
       } while (opt_progress);
       NIR_PASS(_, b->shader, agx_nir_hoist_g17p_zs_writes);
    } else {

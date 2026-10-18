@@ -315,11 +315,7 @@ TEST_F(M5DepthExport, OtherShapesUnchanged)
    ralloc_free(s);
 }
 
-/* pipeline.*.multisample.sample_rate_a2c: a sample-rate epilog updates each
- * sample's coverage on its own. Each update is split into a testing MOVMSK
- * for a live sample and a killing one for a dead sample. A whole-pixel
- * update stays one testing MOVMSK. */
-TEST_F(M5DepthExport, SampleRateCoverageUpdatesSplit)
+TEST_F(M5DepthExport, SampleRateCoverageTestsBeforeColour)
 {
    for (bool sample_shading : {false, true}) {
       for (unsigned samples : {2u, 4u}) {
@@ -330,23 +326,20 @@ TEST_F(M5DepthExport, SampleRateCoverageUpdatesSplit)
          nir_shader *s = build_epilog(shape);
          agx_preprocess_nir(s);
          counts c = count_nir(s);
-         EXPECT_EQ(c.coverage_updates, sample_shading ? samples : 1u);
+         EXPECT_EQ(c.coverage_updates, 1u);
 
          agx_shader_part part = {};
          ASSERT_TRUE(compile_m5(s, samples, &part, true))
             << agx_last_compile_refusal();
          std::vector<std::string> m = mnemonics(part);
-         EXPECT_EQ(count_of(m, "movmsk"), sample_shading ? 2 * samples : 1u);
+         EXPECT_EQ(count_of(m, "movmsk"), 1u);
+         EXPECT_LT(index_of(m, "movmsk"), index_of(m, "lstcol"));
          free(part.binary);
          ralloc_free(s);
       }
    }
 }
 
-/* Native a2cb_pure_{2,4,8}x: a blended alpha-to-coverage fragment tests once
- * per pixel, then blends each sample. Native a2cb_ss_{2,4}x, which read
- * [[sample_id]], keep one update per sample; ours splits each in two (see
- * SampleRateCoverageUpdatesSplit). */
 TEST_F(M5DepthExport, BlendedAlphaCoverageTestsOncePerPixel)
 {
    for (bool sample_shading : {false, true}) {
@@ -361,17 +354,15 @@ TEST_F(M5DepthExport, BlendedAlphaCoverageTestsOncePerPixel)
          nir_shader *s = build_epilog(shape);
          agx_preprocess_nir(s);
          counts c = count_nir(s);
-         EXPECT_EQ(c.coverage_updates, sample_shading ? samples : 1u);
+         EXPECT_EQ(c.coverage_updates, 1u);
 
          agx_shader_part part = {};
          ASSERT_TRUE(compile_m5(s, samples, &part, true))
             << agx_last_compile_refusal();
          std::vector<std::string> m = mnemonics(part);
          EXPECT_EQ(count_of(m, "lldcol"), samples);
-         EXPECT_EQ(count_of(m, "movmsk"), sample_shading ? 2 * samples : 1u);
-         if (!sample_shading) {
-            EXPECT_LT(index_of(m, "movmsk"), index_of(m, "lldcol"));
-         }
+         EXPECT_EQ(count_of(m, "movmsk"), 1u);
+         EXPECT_LT(index_of(m, "movmsk"), index_of(m, "lldcol"));
          free(part.binary);
          ralloc_free(s);
       }

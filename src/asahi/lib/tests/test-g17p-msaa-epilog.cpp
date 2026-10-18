@@ -18,6 +18,55 @@ class G17PMSAAEpilog : public ::testing::Test {
    ~G17PMSAAEpilog() { glsl_type_singleton_decref(); }
 };
 
+TEST_F(G17PMSAAEpilog, M5SampleAlphaCoveragePrecedesAllColourStores)
+{
+   for (unsigned samples : {2u, 4u, 8u}) {
+      SCOPED_TRACE(samples);
+      agx_fs_epilog_key fs = {};
+      fs.nr_samples = samples;
+      fs.max_sample_size_B = 248;
+      fs.max_bytes_per_tile = 65536;
+      fs.max_samples_per_tile = 2048;
+      fs.link.loc_written = 1;
+      fs.link.size_32 = 1;
+      fs.link.colour_comps = 15;
+      fs.link.sample_shading = true;
+      fs.rt_formats[0] = PIPE_FORMAT_R8G8B8A8_UNORM;
+      fs.remap[0] = 0;
+      fs.blend.rt[0].colormask = 15;
+      fs.blend.rt[0].mode = agx_pack_blend_standard(
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+         PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
+      fs.blend.alpha_to_coverage = true;
+      agx_fs_epilog_apply_device_policy(AGX_CHIP_G17S, &fs);
+
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 sample alpha coverage");
+      agx_nir_fs_epilog_g17p(&b, &fs);
+      agx_preprocess_nir(b.shader);
+      nir_validate_shader(b.shader, "M5 sample alpha coverage ordering");
+
+      unsigned updates = 0, stores = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->intrinsic == nir_intrinsic_sample_mask_agx) {
+               EXPECT_EQ(stores, 0u);
+               EXPECT_EQ(block->cf_node.parent, &b.impl->cf_node);
+               updates++;
+            }
+            if (in->intrinsic == nir_intrinsic_store_local_pixel_agx)
+               stores++;
+         }
+      }
+      EXPECT_EQ(updates, 1u);
+      EXPECT_EQ(stores, samples);
+      ralloc_free(b.shader);
+   }
+}
+
 TEST_F(G17PMSAAEpilog, PerSampleColourImportsCompile)
 {
    for (unsigned samples : {2u, 4u}) {
