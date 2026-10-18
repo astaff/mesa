@@ -60,6 +60,42 @@ agx_nir_specialize_sample_count(nir_shader *shader, unsigned samples)
 }
 
 static bool
+apply_api_mask_to_force_early(nir_builder *b, nir_intrinsic_instr *intr,
+                              void *data)
+{
+   bool *done = data;
+   if (*done || intr->intrinsic != nir_intrinsic_sample_mask_agx)
+      return false;
+
+   /* Fold the API mask into the one forced-early coverage update. A separate
+    * prolog MOVMSK followed by the main shader's forced-early MOVMSK loses the
+    * surviving samples on G17P; Apple's native program performs one combined
+    * update before reading the post-test coverage for fragment side effects.
+    * M5 also suppresses the separate prolog mask for forced-early shaders, so
+    * its per-pixel program must include the API mask in this update. */
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *api = nir_load_api_sample_mask_agx(b);
+   nir_src_rewrite(&intr->src[1],
+                   nir_iand(b, intr->src[1].ssa,
+                            nir_u2uN(b, api, nir_src_bit_size(intr->src[1]))));
+   *done = true;
+   return true;
+}
+
+bool
+agx_nir_apply_api_mask_to_force_early(nir_shader *shader, enum agx_chip chip)
+{
+   const bool supported = agx_chip_native_agx3(chip) ||
+      (agx_chip_g17_m5(chip) && !shader->info.fs.uses_sample_shading);
+   if (!supported || !shader->info.fs.early_fragment_tests)
+      return false;
+
+   bool done = false;
+   return nir_shader_intrinsics_pass(shader, apply_api_mask_to_force_early,
+                                     nir_metadata_control_flow, &done);
+}
+
+static bool
 lower_to_per_sample(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    struct lower_per_sample_ctx *ctx = data;

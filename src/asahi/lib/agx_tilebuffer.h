@@ -148,6 +148,8 @@ bool agx_nir_lower_tilebuffer(struct nir_shader *shader,
                               bool lower_g17p_formats);
 
 bool agx_nir_lower_to_per_sample(struct nir_shader *shader);
+bool agx_nir_apply_api_mask_to_force_early(struct nir_shader *shader,
+                                          enum agx_chip chip);
 
 bool agx_nir_lower_monolithic_msaa(struct nir_shader *shader,
                                    uint8_t nr_samples);

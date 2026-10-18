@@ -3331,26 +3331,6 @@ hk_g17p_lower_is_first_fan(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-static bool
-hk_g17p_apply_api_mask_to_force_early(nir_builder *b,
-                                      nir_intrinsic_instr *intr, void *data)
-{
-   bool *done = data;
-   if (*done || intr->intrinsic != nir_intrinsic_sample_mask_agx)
-      return false;
-
-   /* Fold the API mask into the one forced-early coverage update.  A separate
-    * prolog MOVMSK followed by the main shader's forced-early MOVMSK loses the
-    * surviving samples on G17P; Apple's native program performs one combined
-    * update before reading the post-test coverage for fragment side effects. */
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *api = nir_load_api_sample_mask_agx(b);
-   nir_src_rewrite(&intr->src[1],
-                   nir_iand(b, intr->src[1].ssa,
-                            nir_u2uN(b, api, nir_src_bit_size(intr->src[1]))));
-   *done = true;
-   return true;
-}
 
 static bool
 kill_psiz_write(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -4333,13 +4313,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          shader->info.fs.static_tests = folded;
       }
 
-      if (agx_native_graphics(&dev->dev) &&
-          nir->info.fs.early_fragment_tests) {
-         bool done = false;
-         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-                  hk_g17p_apply_api_mask_to_force_early,
-                  nir_metadata_control_flow, &done);
-      }
+      NIR_PASS(_, nir, agx_nir_apply_api_mask_to_force_early, dev->dev.chip);
 
       if (nir->info.fs.uses_sample_shading &&
           (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))) {
