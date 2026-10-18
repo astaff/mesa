@@ -391,6 +391,12 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           I->op == AGX_OPCODE_ST_TILE && s == 1 && def->imm != 0xff)
          continue;
+      /* Tile loads likewise: a per-sample load (multisample framebuffer
+       * fetch) names its sample mask in a register, as Apple's multisample
+       * LLDCol does; only the whole-pixel 0xff mask is an immediate. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_LD_TILE && s == 0 && def->imm != 0xff)
+         continue;
       if (I->op == AGX_OPCODE_ZS_EMIT && s != 0)
          continue;
       /* G17P names an explicit level and an implicit-LOD bias in the same
