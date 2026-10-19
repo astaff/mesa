@@ -552,6 +552,15 @@ agx_optimizer_fmov_rev(agx_context *ctx, agx_instr *I, agx_instr *use)
        use->saturate)
       return false;
 
+   /* M5 (AGX3C) encodes reciprocal and reciprocal square root without a
+    * saturating form, so a saturate folded into one made the shader
+    * unencodable (Skyrim SE's fragment shaders clamp a reciprocal). Keep the
+    * separate saturating move there. */
+   if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       use->saturate &&
+       (I->op == AGX_OPCODE_RCP || I->op == AGX_OPCODE_RSQRT))
+      return false;
+
    /* We can fold f2f16 into 32-bit instructions, but we can't fold f2f32 into
     * 16-bit instructions, since the latter would implicitly promote to a 32-bit
     * instruction which is not exact.
