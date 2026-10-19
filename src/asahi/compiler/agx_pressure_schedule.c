@@ -1059,9 +1059,29 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
    return samples;
 }
 
+/* Register halves the block's sample results occupy together. */
+static unsigned
+ilp_block_sample_halves(const agx_context *ctx, const agx_block *block)
+{
+   unsigned halves = 0;
+   agx_foreach_instr_in_block(block, I) {
+      if (!ilp_is_sample(ctx, I))
+         continue;
+      agx_foreach_ssa_dest(I, d)
+         halves += agx_index_size_16(I->dest[d]);
+   }
+   return halves;
+}
+
 /* Reads a copy block keeps in flight ahead of the write consuming the oldest
  * one: Apple's vs_copy issues four SMP before its four IMGWCI. */
 #define AGX_ILP_M5_COPY_SAMPLES 4
+
+/* Samples a geometry-side M5 loop block needs for the sample-issue schedule.
+ * Its pressure order otherwise places each sample right before its first use,
+ * so the block waits for them one at a time; Apple issues a loop body's
+ * samples ahead of the consumers (native robust_loop witness). */
+#define AGX_ILP_M5_LOOP_MIN_SAMPLES 2
 
 static bool
 ilp_m5_copy_block(const agx_context *ctx, const agx_block *block)
@@ -1299,6 +1319,25 @@ agx_ilp_schedule(agx_context *ctx)
       }
    }
 
+   /* Geometry-side M5 loop blocks with several samples and no memory writes:
+    * after agx_nir_opt_sink_loop_sample_uses the robustness2 sampled_image
+    * 3D vertex loop ends in a block holding two samples and the consumers of
+    * all twelve; the pressure order placed those two samples late, behind
+    * the consumers of the earlier ten, each completing on its own. */
+   bool *loop_sample_mode = rzalloc_array(memctx, bool, MAX2(nr_blocks, 1));
+   if (!loop_sample_mode) {
+      ralloc_free(memctx);
+      return;
+   }
+   if (m5_copy) {
+      agx_foreach_block(ctx, block) {
+         if (block->index < nr_blocks && in_loop[block->index] &&
+             !copy_mode[block->index] &&
+             ilp_block_samples(ctx, block) >= AGX_ILP_M5_LOOP_MIN_SAMPLES)
+            loop_sample_mode[block->index] = true;
+      }
+   }
+
    /* M5 fragments: the same occupancy-capped growth as M5 compute where it
     * exceeds the G17P fragment slack below. */
    const bool m5_fragment = m5 && !ctx->is_preamble &&
@@ -1336,17 +1375,31 @@ agx_ilp_schedule(agx_context *ctx)
        * whole policy under ASAHI_M5_ILP_PROBE). Other M5 stages take the
        * shared AGX3 policy below, as agx_isa_is_agx3() gates it. */
       const bool copy = copy_mode[block->index];
-      if ((m5_compute && !m5_full) || copy) {
-         if ((m5_samples || copy) &&
-             (!in_loop[block->index] || m5_sample_probe || copy) &&
-             ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
+      const bool loop_samples = loop_sample_mode[block->index];
+      if ((m5_compute && !m5_full) || copy || loop_samples) {
+         if ((m5_samples || copy || loop_samples) &&
+             (!in_loop[block->index] || m5_sample_probe || copy ||
+              loop_samples) &&
+             ilp_block_samples(ctx, block) >=
+                (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
+                              : AGX_ILP_FS_MIN_SAMPLES)) {
             /* Let the block's peak grow only up to the largest register
              * count with the occupancy the whole program already has, so
              * batching never costs threads; a program at or past the last
              * bucket (the spilling raygens) may not grow at all. */
             const signed peak = ilp_block_peak(ctx, block, size16, memctx);
-            const signed growth = m5_occupancy_cap > peak
-                                     ? m5_occupancy_cap - peak : 0;
+            signed growth = m5_occupancy_cap > peak
+                               ? m5_occupancy_cap - peak : 0;
+            /* A loop block's samples otherwise complete one after another
+             * on every iteration. Let the block hold all of its sample
+             * results in flight, plus the fragment sample-issue slack for
+             * their operands, even past the occupancy bucket (the
+             * robustness2 3D vertex loop's last block: two vec4 results,
+             * 21 halves of growth). */
+            if (loop_samples) {
+               growth = MAX2(growth, ilp_block_sample_halves(ctx, block) +
+                                        AGX_ILP_FS_SAMPLE_SLACK);
+            }
             ilp_schedule_block(ctx, block, memctx, native_uniforms,
                                alu_latency, 16 * alu_latency, growth, 0,
                                false, true, AGX_ILP_FS_SAMPLE_HALVES,

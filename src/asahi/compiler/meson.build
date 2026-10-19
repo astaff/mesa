@@ -15,6 +15,7 @@ libasahi_agx_files = files(
   'agx_nir_lower_divmod64.c',
   'agx_nir_lower_atomics.c',
   'agx_nir_opt_select_load.c',
+  'agx_nir_opt_sink_loop_sample_uses.c',
   'agx_nir_lower_cull_distance.c',
   'agx_nir_lower_fminmax.c',
   'agx_nir_lower_frag_sidefx.c',
@@ -320,6 +321,18 @@ if with_tests
     executable(
       'agx3_gen1_scs_nir_test',
       files('test/test-gen1-scs-nir.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'agx_nir_sink_loop_sample_uses',
+    executable(
+      'agx_nir_sink_loop_sample_uses_test',
+      files('test/test-sink-loop-sample-uses.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],
