@@ -1288,6 +1288,7 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
  * encoding. */
 bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
+const char *agx3_last_pack_refusal(void);
 
 #ifndef NDEBUG
 void agx_validate(agx_context *ctx, const char *after_str);

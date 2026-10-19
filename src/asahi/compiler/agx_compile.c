@@ -10502,8 +10502,11 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
        * If the encoder refuses an instruction, discard the emitted prefix and
        * report compilation failure. */
       if (!agx3_pack_binary(ctx, binary)) {
-         agx_set_refusal(ctx, "AGX3 binary packer refused an instruction "
-                         "(AGX_MESA_DEBUG=shaders names it)", __LINE__);
+         char what[160];
+         snprintf(what, sizeof(what), "AGX3 binary packer refused %s",
+                  agx3_last_pack_refusal()[0] ? agx3_last_pack_refusal()
+                                              : "an instruction");
+         agx_set_refusal(ctx, what, __LINE__);
          binary->size = initial_binary_size;
          ralloc_free(ctx);
          return false;

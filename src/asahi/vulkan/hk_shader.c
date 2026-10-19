@@ -3669,8 +3669,8 @@ hk_g17p_compile_vs_cprog(struct hk_device *dev, nir_shader **nir,
    } else {
       if (agx_get_compiler_debug() & AGX_DBG_SHADERDB)
          fprintf(stderr, "HK G17P VS CProg: declined:%s\n", declined);
-      mesa_loge("G17P vertex constant program failed to compile; "
-                "compiling without it");
+      mesa_loge("G17P vertex constant program failed to compile (%s); "
+                "compiling without it", agx_last_compile_refusal());
    }
 
    memset(&shader->b, 0, sizeof(shader->b));
@@ -3721,8 +3721,8 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
                 info->nr_preamble_gprs, info->agx3_preamble_staging_known);
       free(shader->b.binary);
    } else {
-      mesa_logw("G17P fragment constant program failed to compile; "
-                "compiling without it");
+      mesa_logw("G17P fragment constant program failed to compile (%s); "
+                "compiling without it", agx_last_compile_refusal());
    }
 
    memset(&shader->b, 0, sizeof(shader->b));

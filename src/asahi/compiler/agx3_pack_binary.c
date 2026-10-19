@@ -120,9 +120,24 @@ agx3_index_kind(const agx_index x)
  * only the mnemonic costs a round trip to hardware every time -- "no grounded
  * AGX3 encoding for fcmpsel" is true of the shapes that encode as well.
  */
+/* The first refusal of the current pack, kept without AGX_MESA_DEBUG so that a
+ * compile failure (and the driver's fallback warning) names the instruction
+ * and gate. Reset by agx3_pack_binary(). */
+static __thread char agx3_first_refusal[96];
+
+const char *
+agx3_last_pack_refusal(void)
+{
+   return agx3_first_refusal;
+}
+
 static void
 agx3_report_refusal_why(const agx_instr *I, unsigned line, const char *why)
 {
+   if (!agx3_first_refusal[0])
+      snprintf(agx3_first_refusal, sizeof(agx3_first_refusal), "%s at line %u%s%s",
+               agx_opcodes_info[I->op].name, line, why ? ", " : "", why ? why : "");
+
    if (!(agx_compiler_debug & AGX_DBG_SHADERS))
       return;
 
@@ -8343,6 +8358,7 @@ agx3_reusable_cube_scratch(agx_context *ctx, unsigned maximum,
 bool
 agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 {
+   agx3_first_refusal[0] = 0;
    const enum agx_isa_encoding enc = ctx->key->dev.encoding;
    const unsigned nslots = (enc == AGX_ISA_ENCODING_AGX3C) ? 8 : 6;
    const unsigned initial_size = emission->size;
