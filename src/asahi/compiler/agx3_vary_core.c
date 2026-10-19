@@ -84,9 +84,13 @@ agx3_vary_coords(enum agx_isa_encoding enc, uint16_t dest, uint8_t mode,
                  uint16_t source, bool source_kill, uint16_t wait_mask,
                  uint8_t out[AGX3_VARY_MAX_LENGTH], uint8_t *len)
 {
+   /* G17P has six scoreboard slots, f30..f35. The ten-byte G17G form adds
+    * f36 and f37 for slots 6 and 7, at the same bits (22 and 3) as every
+    * other C-class wait field. */
+   const uint16_t slots = is_b(enc) ? 0x3f : 0xff;
    if ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
        (dest & 1) != 0 || dest >= 256 || source >= 256 ||
-       (wait_mask & ~0x3f) != 0)
+       (wait_mask & ~slots) != 0)
       return false;
 
    /* ITRCOORDS is an eight-byte G17P instruction: register/32-bit
@@ -98,13 +102,13 @@ agx3_vary_coords(enum agx_isa_encoding enc, uint16_t dest, uint8_t mode,
       KV(9, 2), KV(10, 2), KV(11, 1), KV(23, 2), KV(24, 1), KV(38, mode),
       KV(28, 3), KV(29, 102),
    };
-   struct agx3_field_kv ov[10];
+   struct agx3_field_kv ov[11];
    unsigned n = 0;
    ov[n++] = (struct agx3_field_kv)KV(2, dest);
    ov[n++] = (struct agx3_field_kv)KV(16, source);
    if (source_kill)
       ov[n++] = (struct agx3_field_kv)KV(27, 1);
-   for (unsigned i = 0; i < 6; ++i)
+   for (unsigned i = 0; i < 8; ++i)
       if (wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(30 + i, 1);
 

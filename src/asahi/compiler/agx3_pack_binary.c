@@ -10448,8 +10448,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          if (I->op == AGX_OPCODE_ITRCOORDS_AGX3) {
             if (ctx->stage != MESA_SHADER_FRAGMENT ||
-                !agx3_emit_itrcoords(emission, enc, I, wait))
-               AGX3_REFUSE(I);
+                !agx3_emit_itrcoords(emission, enc, I, wait)) {
+               /* The operand list cannot show the mode or the scoreboard
+                * slots waited on, which are what the encoder gates on. */
+               char why[48];
+               snprintf(why, sizeof(why), "interpolation %u, wait 0x%x",
+                        (unsigned)I->interpolation, (unsigned)wait);
+               AGX3_REFUSE_WHY(I, why);
+            }
             continue;
          }
 
