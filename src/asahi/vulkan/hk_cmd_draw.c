@@ -9666,8 +9666,10 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
 /* Emit one eligible record (see hk_g17p_indirect_records_eligible()). */
 static void
 hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
-                             struct agx_draw draw, bool republishes)
+                             struct agx_draw draw, bool republishes,
+                             bool continuing)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
@@ -9715,15 +9717,22 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          gfx->g17p_draw_id_host_valid = false;
       }
 
+      /* Only the native bind tail consumes this (hk_agx3_publish_vertex_state),
+       * as in hk_flush_dynamic_state_slow(). */
       const bool prepared_varyings =
+         agx_native_graphics(&dev->dev) &&
          hk_g17p_prepared_bind_tail_matches(cmd, &gfx->g17p_bind_tail);
       const uint64_t prepared_varyings_root = gfx->root;
 
       hk_reserve_scratch(cmd, cs, hw_vs);
       struct hk_linked_shader *linked_hw_vs =
          (hw_vs == sw_vs) ? linked_vs : hw_vs->only_linked;
+      /* A record after the first of a multi-draw republishes the previous
+       * record's program with its own draw parameters. */
       const uint64_t pipeline_program =
-         hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
+         continuing && agx_chip_native_agx3(dev->dev.chip)
+            ? hk_m5_multi_draw_vertex_program(cmd, hw_vs, linked_hw_vs)
+            : hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
 
       if (!hk_agx3_publish_vertex_state(
              cmd, cs, &out, hw_vs, pipeline_program, draw, true,
@@ -9762,6 +9771,9 @@ hk_draw_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    if (*eligible != 0) {
       struct agx_draw normalized = draw;
       hk_g17p_normalize_indirect_draw(cmd, &normalized);
+      /* The previous record of this multi-draw was emitted directly, with
+       * nothing recorded since. */
+      const bool continuing = *eligible > 0;
       if (*eligible < 0) {
          *eligible = hk_g17p_indirect_records_eligible(cmd, &normalized)
                         ? 1 : -1;
@@ -9770,7 +9782,8 @@ hk_draw_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       if (*eligible > 0 && normalized.b.ptr &&
           !vk_command_buffer_has_error(&cmd->vk)) {
          hk_g17p_emit_indirect_record(
-            cmd, draw_id, normalized, hk_gfx_republishes_render_state(cmd));
+            cmd, draw_id, normalized, hk_gfx_republishes_render_state(cmd),
+            continuing);
          return;
       }
    }

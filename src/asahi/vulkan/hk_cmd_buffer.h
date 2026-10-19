@@ -1836,6 +1836,13 @@ hk_stat_enabled(uint64_t addr)
 void hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
                               const VkDependencyInfo *info);
 
+/* The vertex stage program of record draw_id > 0 of a multi-draw on M5
+ * (hk_cmd_buffer.c): only the draw parameters and draw index may differ from
+ * the program the previous record of the same multi-draw published. */
+uint64_t hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd,
+                                         struct hk_shader *s,
+                                         struct hk_linked_shader *linked);
+
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);
 void hk_cmd_buffer_begin_compute(struct hk_cmd_buffer *cmd,

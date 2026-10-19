@@ -2822,6 +2822,48 @@ refused:
 
 static uint64_t
 hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                             struct hk_linked_shader *linked);
+
+uint64_t
+hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                                struct hk_linked_shader *linked)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
+   const struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
+
+   /* No command was recorded between the records of one multi-draw, so
+    * every range the previous record's launch replay derived from the root,
+    * the descriptor sets and their buffers (hk_g17p_launch_replay()) is
+    * unchanged; only the draw-parameter and draw-index ranges follow the
+    * record. The previous record left that launch's loader and ranges as the
+    * stage's last publication. Anything else takes the general path. */
+   if (s->info.stage == MESA_SHADER_VERTEX && !s->info.agx3_gen1_fragment_rq &&
+       launch->valid && launch->s == s && launch->linked == linked &&
+       launch->loader && cached->loader == launch->loader &&
+       cached->loader_linked == linked && cached->loader_program &&
+       launch->flags == hk_g17p_launch_flags(cmd, s)) {
+      struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+      const unsigned count = launch->count;
+      memcpy(ranges, cached->loader_ranges, count * sizeof(ranges[0]));
+      for (unsigned i = 0; i < count; ++i) {
+         if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_PARAMS)
+            ranges[i].address = gfx->draw_params;
+         else if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_ID)
+            ranges[i].address = gfx->draw_id_ptr;
+      }
+
+      if (hk_g17p_patch_plan_fits(&launch->loader->plan, ranges)) {
+         return hk_g17p_gfx_loader_publish(cmd, linked, cached, launch->loader,
+                                           ranges, count);
+      }
+   }
+
+   return hk_upload_usc_words_internal(cmd, s, linked);
+}
+
+static uint64_t
+hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
