@@ -123,7 +123,11 @@ struct hk_vs_key {
    bool skip_prolog;
    bool static_strides;
    bool kill_psiz;
-   bool pad[1];
+
+   /** Compiled together with a fragment shader that never reads gl_Layer:
+    * no default layer output (agx_nir_lower_default_layer()) is needed.
+    */
+   bool no_default_layer;
 };
 static_assert(sizeof(struct hk_vs_key) == 260, "packed");
 
@@ -2685,7 +2689,8 @@ hk_g17p_saturate_layer_viewport(nir_builder *b, nir_intrinsic_instr *intr,
 
 static void
 hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader, bool kill_psiz,
-               bool layer_as_varying, bool original_vertex_stage)
+               bool layer_as_varying, bool default_layer,
+               bool original_vertex_stage)
 {
    /* Point size must be clamped, excessively large points don't render
     * properly on G13.
@@ -2708,7 +2713,7 @@ hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader, bool kill_psiz,
       original_vertex_stage && layer_as_varying &&
       !nir->info.layer_viewport_relative &&
       !(nir->info.outputs_written & VARYING_BIT_LAYER);
-   if (layer_as_varying)
+   if (layer_as_varying && default_layer)
       NIR_PASS(_, nir, agx_nir_lower_default_layer);
 
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs,
@@ -2991,6 +2996,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 {
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
+   bool default_layer = true;
    if ((sw_stage == MESA_SHADER_FRAGMENT && dev->gen1_native_fragment_rq) ||
        (sw_stage != MESA_SHADER_FRAGMENT && sw_stage != MESA_SHADER_COMPUTE &&
         dev->gen1_native_graphics_rq)) {
@@ -3179,6 +3185,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       nr_vbos = DIV_ROUND_UP(
          BITSET_LAST_BIT(shader->info.vs.attrib_components_read), 4);
       kill_psiz = key->vs.kill_psiz;
+      default_layer = !key->vs.no_default_layer;
    } else if (sw_stage == MESA_SHADER_FRAGMENT) {
       shader->info.fs.writes_memory = nir->info.writes_memory;
       shader->info.fs.interp.linear = nir->info.linear_varyings;
@@ -3307,7 +3314,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          }
          hk_lower_hw_vs(nir, shader, kill_psiz,
                         agx_native_graphics(&dev->dev),
-                        sw_stage == MESA_SHADER_VERTEX);
+                        default_layer, sw_stage == MESA_SHADER_VERTEX);
          outputs = nir->info.outputs_written;
       } else {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
@@ -3930,6 +3937,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   const struct vk_features *vk_features,
                   const VkAllocationCallbacks *pAllocator,
                   const struct hk_border_source *twin_of,
+                  bool no_default_layer,
                   struct hk_api_shader **shader_out)
 {
    VkResult result;
@@ -4014,6 +4022,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       has_key = true;
    } else if (info->stage == MESA_SHADER_VERTEX) {
       hk_populate_vs_key(&key_tmp.vs, state);
+      key_tmp.vs.no_default_layer = no_default_layer;
       has_key = true;
    }
 
@@ -4315,7 +4324,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   NULL);
       }
       hk_lower_hw_vs(rast, shader, false,
-                     agx_native_graphics(&dev->dev), false);
+                     agx_native_graphics(&dev->dev), true, false);
       shader->info.gs = count_variant->info.gs;
       main_variant->info.gs = count_variant->info.gs;
 
@@ -4574,7 +4583,7 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
                   struct hk_api_shader **shader_out)
 {
    return hk_compile_shader_impl(dev, info, state, features, allocator, NULL,
-                                 shader_out);
+                                 false, shader_out);
 }
 
 struct hk_api_shader *
@@ -4601,7 +4610,7 @@ hk_border_twin(struct hk_device *dev, struct hk_api_shader *obj)
          };
          struct hk_api_shader *built = NULL;
          if (hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
-                                    &built) == VK_SUCCESS)
+                                    false, &built) == VK_SUCCESS)
             p_atomic_set(&src->twin, built);
       }
    }
@@ -4865,10 +4874,31 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       }
    }
 
+   /* A vertex shader compiled together with its fragment shader writes no
+    * default layer when that fragment shader never reads gl_Layer: nothing
+    * else consumes the output, and its UVS words would be stored for every
+    * vertex. A vertex shader compiled alone keeps it for whichever fragment
+    * shader it meets. */
+   bool fs_reads_layer = true;
    for (uint32_t i = 0; i < shader_count; i++) {
+      if (shaders[i]->info.stage == MESA_SHADER_FRAGMENT) {
+         nir_shader_gather_info(shaders[i],
+                                nir_shader_get_entrypoint(shaders[i]));
+         fs_reads_layer =
+            (shaders[i]->info.inputs_read & VARYING_BIT_LAYER) ||
+            BITSET_TEST(shaders[i]->info.system_values_read,
+                        SYSTEM_VALUE_LAYER_ID);
+      }
+   }
+
+   for (uint32_t i = 0; i < shader_count; i++) {
+      const bool no_default_layer =
+         !fs_reads_layer && infos[i].stage == MESA_SHADER_VERTEX &&
+         infos[i].next_stage_mask == VK_SHADER_STAGE_FRAGMENT_BIT;
       VkResult result =
          hk_compile_shader_impl(dev, &infos[i], state, features, pAllocator,
-                                NULL, (struct hk_api_shader **)&shaders_out[i]);
+                                NULL, no_default_layer,
+                                (struct hk_api_shader **)&shaders_out[i]);
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
