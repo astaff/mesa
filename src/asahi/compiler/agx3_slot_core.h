@@ -72,6 +72,9 @@ struct agx3_slot_instr {
     * its descriptor operands retain the existing issue-time contract. */
    uint32_t late_src_mask;
    uint8_t preferred_slot; /* 0=round-robin, otherwise required slot */
+   /* 0 = any slot. Otherwise the round-robin choice is limited to slots
+    * 1..max_slot, for an encoding that can only name those slots. */
+   uint8_t max_slot;
    /* Optional source index plus one whose completed producer slot may be
     * recycled for this event. This is a preference, never a new wait: the
     * source's actual generation must already be synchronized by dataflow.

@@ -1404,6 +1404,20 @@ agx3_tex_plain_uniform64(agx_index index)
           !index.kill && !index.cache && !index.discard;
 }
 
+/* Whether agx3_emit_texture_sample() publishes this sample's CEM face
+ * coordinates with the sample's result slot rather than a staging slot: a cube
+ * sample whose texture and sampler operands are both non-register. */
+static bool
+agx3_tex_cube_groups_result_slot(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_TEXTURE_SAMPLE ||
+       (I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY) ||
+       I->nr_srcs < 5)
+      return false;
+   return I->src[3].type != AGX_INDEX_REGISTER &&
+          I->src[4].type != AGX_INDEX_REGISTER;
+}
+
 /* Translate the corpus-grounded texel fetch. Dynamic integer LOD is
  * published into operand bank 6. Native G17P array fetches publish their
  * combined layer/LOD word and return the texture result on slot 1; plain 2D
@@ -9523,6 +9537,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             e->preferred_slot = 6;
          if (I->agx3_tex_coords_staged)
             e->preferred_slot = 1;
+         /* A cube sample whose descriptors are uniforms or immediates groups
+          * CEM's face finalizers with its own result slot (f12), and that
+          * field only carries slots 1..7: on AGX3C a round-robin slot 8 made
+          * the whole shader unencodable. Register descriptors stage on slot
+          * 6 instead and are unaffected. */
+         if (enc == AGX_ISA_ENCODING_AGX3C && agx3_tex_cube_groups_result_slot(I))
+            e->max_slot = 7;
 
          unsigned nd = 0, ns = 0;
          if (!I->agx3_tex_coord_stage) {

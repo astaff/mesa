@@ -230,18 +230,21 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
           * when every slot is in that state it takes the next one as before.
           */
          uint8_t slot = I->preferred_slot;
+         const unsigned cap =
+            I->max_slot && I->max_slot < nslots ? I->max_slot : nslots;
          if (!slot) {
             if (I->coalesce_src) {
                const unsigned source = I->src[I->coalesce_src - 1];
                const uint8_t producer_slot = reg_slot[source];
-               if (producer_slot && slot_waited[producer_slot] &&
+               if (producer_slot && producer_slot <= cap &&
+                   slot_waited[producer_slot] &&
                    !(I->transient_slots & (1u << (producer_slot - 1))))
                   slot = producer_slot;
             }
             if (I->prefer_join && !slot) {
                for (unsigned t = 0; t < nslots && !slot; ++t) {
                   const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
-                  if (!slot_waited[candidate] &&
+                  if (candidate <= cap && !slot_waited[candidate] &&
                       slot_join_class[candidate] == I->join_class &&
                       slot_join_count[candidate] < I->join_limit)
                      slot = candidate;
@@ -249,6 +252,8 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
             }
             for (unsigned t = 0; t < nslots && !slot; ++t) {
                const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
+               if (candidate > cap)
+                  continue;
                if (slot_waited[candidate] ||
                    !agx3_slot_generation_live(reg_slot, reader_slots, candidate,
                                              token_count) ||
@@ -259,6 +264,8 @@ agx3_slot_assign_with_entry(const struct agx3_slot_instr *instrs, unsigned n,
             }
             if (!slot) {
                slot = (uint8_t)(next + 1);
+               if (slot > cap)
+                  slot = 1;
                if (!I->reissues_live_slot) {
                   wait_mask |= (uint16_t)(1u << (slot - 1));
                   slot_waited[slot] = true;
