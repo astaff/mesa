@@ -698,8 +698,82 @@ struct m5_rq_state {
    nir_variable *started, *resident_id, *cursor, *owner, *capture_event;
    nir_variable *processed, *replay, *commit_history, *prune_t;
    nir_variable *batch_completed;
-   unsigned allocation_index;
+   /* Logical query numbers of this variable's elements: first_logical for a
+    * scalar query, first_logical..first_logical+logical_count-1 for a query
+    * array. Native allocation slots are assigned from the logical number by
+    * m5_rq_slot(). */
+   unsigned first_logical;
+   unsigned logical_count;
+   /* Some use of the query array has a non-constant element index. */
+   bool dynamic;
 };
+
+/* Logical queries beyond the witnessed native allocation indices share a
+ * slot. Every use publishes its own owner token and a slot switch between
+ * logical queries restarts traversal through the existing owner-mismatch
+ * replay, so a shared slot only costs that replay. */
+static unsigned
+m5_rq_slot(unsigned logical)
+{
+   return 4 + logical % AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES;
+}
+
+/* Logical number of the query element a deref selects, or NULL when the
+ * deref is a scalar query or a constant element (then *constant is set). */
+static nir_def *
+m5_rq_logical(nir_builder *b, const struct m5_rq_state *state,
+              nir_deref_instr *query, unsigned *constant)
+{
+   *constant = state->first_logical;
+   if (query->deref_type == nir_deref_type_var)
+      return NULL;
+   assert(query->deref_type == nir_deref_type_array &&
+          nir_deref_instr_parent(query)->deref_type == nir_deref_type_var);
+   if (nir_src_is_const(query->arr.index)) {
+      *constant += nir_src_as_uint(query->arr.index);
+      return NULL;
+   }
+   return nir_iadd_imm(b, nir_u2u32(b, query->arr.index.ssa),
+                       state->first_logical);
+}
+
+static nir_def *
+m5_rq_enter_reachable(nir_builder *b, nir_def *slot, unsigned first,
+                      unsigned i, unsigned slots)
+{
+   const unsigned candidate =
+      (first + i) % AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES;
+   if (i + 1 == slots)
+      return nir_enter_query_agx(b, .base = 4 + candidate);
+   nir_push_if(b, nir_ieq_imm(b, slot, candidate));
+   nir_def *then_value = nir_enter_query_agx(b, .base = 4 + candidate);
+   nir_push_else(b, NULL);
+   nir_def *else_value = m5_rq_enter_reachable(b, slot, first, i + 1, slots);
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, then_value, else_value);
+}
+
+/* Enter the native query slot of a logical query. A constant logical number
+ * enters its slot directly; a dynamically selected element chooses among the
+ * slots its elements can map to. */
+static nir_def *
+m5_rq_enter(nir_builder *b, const struct m5_rq_state *state,
+            nir_deref_instr *query)
+{
+   unsigned constant;
+   nir_def *logical = m5_rq_logical(b, state, query, &constant);
+   if (!logical)
+      return nir_enter_query_agx(b, .base = m5_rq_slot(constant));
+
+   /* The elements reach min(count, slot count) consecutive slots starting at
+    * the first element's slot; the last reachable slot needs no test. */
+   const unsigned slots = MIN2(state->logical_count,
+                               AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES);
+   nir_def *slot = nir_umod_imm(b, logical,
+                                AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES);
+   return m5_rq_enter_reachable(b, slot, m5_rq_slot(state->first_logical) - 4,
+                                0, slots);
+}
 
 /* Shared-edge/vertex candidate filtering, see m5_boundary_duplicate. On by
  * default (Vulkan requires watertight single hits); ASAHI_M5_RQ_WATERTIGHT=0
@@ -749,15 +823,16 @@ m5_model_capture_address(void)
 
 static void
 m5_model_capture(nir_builder *b, struct m5_rq_state *state,
+                 nir_deref_instr *capture_event,
                  nir_deref_instr *owner, nir_deref_instr *resident_id,
                  nir_deref_instr *cursor, nir_deref_instr *active,
                  nir_deref_instr *result, unsigned phase)
 {
    const uint64_t output = m5_model_capture_address();
-   if (!output || !state->capture_event)
+   if (!output || !capture_event)
       return;
    nir_def *id = nir_load_deref(b, resident_id);
-   nir_def *event = nir_load_var(b, state->capture_event);
+   nir_def *event = nir_load_deref(b, capture_event);
    nir_push_if(b, nir_iand(b, nir_ult_imm(b, id, 64),
                              nir_ult_imm(b, event, 64)));
    nir_def *lane = nir_iand_imm(b, id, 31);
@@ -769,7 +844,7 @@ m5_model_capture(nir_builder *b, struct m5_rq_state *state,
       .base = 256, .component = 3);
    nir_def *offset = nir_iadd(b, nir_imul_imm(b, id, 8 * 64 * 32),
       nir_iadd_imm(b, nir_imul_imm(b, event, 32),
-         (state->allocation_index - 4) * 64 * 32));
+         (m5_rq_slot(state->first_logical) - 4) * 64 * 32));
    nir_def *address = nir_iadd_imm(b, nir_u2u64(b, offset), output);
    nir_store_global(b, nir_vec4(b, nir_imm_int(b, phase),
       nir_load_deref(b, owner), id, control), address,
@@ -779,7 +854,7 @@ m5_model_capture(nir_builder *b, struct m5_rq_state *state,
       nir_ior(b, nir_iand_imm(b, nir_channel(b, nir_load_deref(b, result), 2),
          ~1u), nir_b2i32(b, nir_load_deref(b, active)))),
       nir_iadd_imm(b, address, 16), .align_mul = 16, .write_mask = 15);
-   nir_store_var(b, state->capture_event, nir_iadd_imm(b, event, 1), 1);
+   nir_store_deref(b, capture_event, nir_iadd_imm(b, event, 1), 1);
    nir_pop_if(b, NULL);
 }
 
@@ -1253,13 +1328,17 @@ agx_nir_m5_split_ray_query_arrays(nir_shader *shader)
          continue;
       const struct glsl_type *elem = glsl_get_array_element(var->type);
       const unsigned len = glsl_get_length(var->type);
-      if (glsl_type_is_array(elem) || len == 0 || len > 64)
+      if (glsl_type_is_array(elem) || len == 0)
          continue;
 
-      /* Native contexts have lexical allocation slots. Resolve a dynamic
-       * query-array selection into control flow before splitting the slots;
-       * the general indirect-deref pass handles loads/stores, not rq_* ops. */
+      /* A dynamically selected element of a small array is resolved into
+       * control flow before splitting, so each element becomes a separate
+       * query with its own copy of the operation (the qualified form for
+       * arrays of up to the native slot count). Larger arrays keep their
+       * array form: agx_nir_lower_m5_ray_query gives every element its own
+       * state and selects the native slot per use. */
       nir_builder indirect = nir_builder_create(impl);
+      if (len <= AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES)
       nir_foreach_block(block, impl) {
          nir_foreach_instr_safe(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
@@ -1300,7 +1379,6 @@ agx_nir_m5_split_ray_query_arrays(nir_shader *shader)
          }
       }
       nir_remove_dead_derefs_impl(impl);
-
       /* Every use of the variable must be a constant, in-range element. */
       bool constant_only = true;
       nir_foreach_block(block, impl) {
@@ -1446,6 +1524,102 @@ m5_rq_alias_copies(nir_function_impl *impl)
    return progress;
 }
 
+/* A dynamically selected element's state is staged through per-operation
+ * scalar shadows: each field is copied in once before the operation and the
+ * fields the operation writes are copied back once after it, so the element
+ * selection costs one select tree per field rather than one per access. */
+struct m5_rq_shadows {
+   nir_function_impl *impl;
+   nir_deref_instr *query;
+   unsigned count;
+   struct {
+      nir_variable *field;
+      nir_variable *shadow;
+   } entries[48];
+};
+
+static nir_deref_instr *
+m5_rq_op_field(nir_builder *b, struct m5_rq_shadows *shadows,
+               nir_variable *field)
+{
+   nir_deref_instr *query = shadows->query;
+   nir_deref_instr *elem = m5_rq_field_deref(b, query, field);
+   if (query->deref_type != nir_deref_type_array ||
+       nir_src_is_const(query->arr.index))
+      return elem;
+   assert(shadows->count < ARRAY_SIZE(shadows->entries));
+   nir_variable *shadow =
+      nir_local_variable_create(shadows->impl, elem->type, field->name);
+   nir_deref_instr *staged = nir_build_deref_var(b, shadow);
+   nir_copy_deref(b, staged, elem);
+   shadows->entries[shadows->count].field = field;
+   shadows->entries[shadows->count].shadow = shadow;
+   shadows->count++;
+   return staged;
+}
+
+/* Whether a lowered operation may write a state field. */
+static bool
+m5_rq_op_writes(nir_intrinsic_op op, const struct m5_rq_state *state,
+                nir_variable *field)
+{
+   bool result = false, candidate = false;
+   for (unsigned i = 0; i < 5; ++i) {
+      result |= field == state->result[i];
+      candidate |= field == state->candidate[i];
+   }
+   switch (op) {
+   case nir_intrinsic_rq_initialize:
+      return true;
+   case nir_intrinsic_rq_proceed:
+      return field == state->active || field == state->started ||
+             field == state->owner || field == state->resident_id ||
+             field == state->cursor || result || candidate ||
+             field == state->batch_completed ||
+             field == state->initial_completion ||
+             field == state->processed || field == state->replay ||
+             field == state->commit_history || field == state->prune_t ||
+             field == state->capture_event;
+   case nir_intrinsic_rq_terminate:
+      return field == state->active;
+   case nir_intrinsic_rq_confirm_intersection:
+   case nir_intrinsic_rq_generate_intersection:
+      return field == state->active || result ||
+             field == state->commit_history || field == state->prune_t;
+   default:
+      return false;
+   }
+}
+
+static void
+m5_rq_op_writeback(nir_builder *b, struct m5_rq_shadows *shadows,
+                   nir_intrinsic_op op, const struct m5_rq_state *state)
+{
+   for (unsigned i = 0; i < shadows->count; ++i) {
+      if (!m5_rq_op_writes(op, state, shadows->entries[i].field))
+         continue;
+      nir_copy_deref(b,
+         m5_rq_field_deref(b, shadows->query, shadows->entries[i].field),
+         nir_build_deref_var(b, shadows->entries[i].shadow));
+   }
+}
+
+/* Per-query state: one value per logical query, so an array query gets an
+ * array of the field type. The state of a dynamically selected element is
+ * resolved to selects over the element states after lowering
+ * (nir_lower_indirect_derefs_to_if_else_trees over shader temporaries), so
+ * query state never reaches thread-private memory. */
+static nir_variable *
+m5_rq_var(nir_shader *shader, nir_function_impl *impl,
+          const struct m5_rq_state *state, const struct glsl_type *type,
+          const char *name)
+{
+   const struct glsl_type *field = m5_rq_field_type(state->query->type, type);
+   if (state->dynamic)
+      return nir_variable_create(shader, nir_var_shader_temp, field, name);
+   return nir_local_variable_create(impl, field, name);
+}
+
 bool
 agx_nir_lower_m5_ray_query(nir_shader *shader,
                            const struct agx_m5_ray_query_layout *layout)
@@ -1474,6 +1648,9 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
       nir_remove_dead_variables(shader, nir_var_function_temp, NULL);
    struct util_dynarray queries = UTIL_DYNARRAY_INIT;
    struct util_dynarray ops = UTIL_DYNARRAY_INIT;
+   /* Logical queries: scalar query variables plus every element of a query
+    * array. Native slots are assigned per logical query by m5_rq_slot(). */
+   unsigned logical_total = 0;
    nir_foreach_function(f, shader) {
       if (!f->impl)
          continue;
@@ -1487,21 +1664,40 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
             nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
             if (f->impl != impl || !deref)
                do { if (debug_get_bool_option("ASAHI_M5_RQ_REFUSAL_DIAG", false)) fprintf(stderr, "M5-RQ refusal line%d queries=%zu\n", __LINE__, util_dynarray_num_elements(&queries, struct m5_rq_state)); goto unsupported; } while (0);
+            /* A query is a scalar variable or one element of a
+             * one-dimensional query array. */
             nir_deref_instr *root = deref;
-            while (root->deref_type == nir_deref_type_array)
+            if (root->deref_type == nir_deref_type_array)
                root = nir_deref_instr_parent(root);
             if (root->deref_type != nir_deref_type_var ||
-                !root->var->data.ray_query)
+                !root->var->data.ray_query ||
+                (glsl_type_is_array(root->var->type) &&
+                 (glsl_type_is_array(glsl_get_array_element(root->var->type)) ||
+                  glsl_get_length(root->var->type) == 0)) ||
+                (deref != root && !glsl_type_is_array(root->var->type)))
                do { if (debug_get_bool_option("ASAHI_M5_RQ_REFUSAL_DIAG", false)) fprintf(stderr, "M5-RQ refusal line%d queries=%zu\n", __LINE__, util_dynarray_num_elements(&queries, struct m5_rq_state)); goto unsupported; } while (0);
-            bool found = false;
-            util_dynarray_foreach(&queries, struct m5_rq_state, state)
-               found |= state->query == root->var;
-            if (!found) {
+            struct m5_rq_state *owner_state = NULL;
+            util_dynarray_foreach(&queries, struct m5_rq_state, state) {
+               if (state->query == root->var)
+                  owner_state = state;
+            }
+            if (!owner_state) {
                struct m5_rq_state state = {
                   .query = root->var,
-                  .allocation_index = 4 + util_dynarray_num_elements(
-                     &queries, struct m5_rq_state)};
+                  .first_logical = logical_total,
+                  .logical_count = glsl_type_is_array(root->var->type)
+                     ? glsl_get_length(root->var->type) : 1,
+               };
+               logical_total += state.logical_count;
                util_dynarray_append(&queries, state);
+               owner_state = util_dynarray_top_ptr(&queries, struct m5_rq_state);
+            }
+            if (deref != root) {
+               if (!nir_src_is_const(deref->arr.index))
+                  owner_state->dynamic = true;
+               else if (nir_src_as_uint(deref->arr.index) >=
+                        owner_state->logical_count)
+                  do { if (debug_get_bool_option("ASAHI_M5_RQ_REFUSAL_DIAG", false)) fprintf(stderr, "M5-RQ refusal line%d queries=%zu\n", __LINE__, util_dynarray_num_elements(&queries, struct m5_rq_state)); goto unsupported; } while (0);
             }
             switch (intr->intrinsic) {
             case nir_intrinsic_rq_initialize:
@@ -1549,18 +1745,13 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
    }
    if (!util_dynarray_num_elements(&queries, struct m5_rq_state))
       do { if (debug_get_bool_option("ASAHI_M5_RQ_REFUSAL_DIAG", false)) fprintf(stderr, "M5-RQ refusal line%d queries=%zu\n", __LINE__, util_dynarray_num_elements(&queries, struct m5_rq_state)); goto unsupported; } while (0);
-   if (m5_candidate_api() &&
-       (!layout->instance_traversal ||
-        util_dynarray_num_elements(&queries, struct m5_rq_state) >
-           AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES ||
-        glsl_type_is_array(util_dynarray_element(&queries,
-                            struct m5_rq_state, 0)->query->type)))
+   if (m5_candidate_api() && !layout->instance_traversal)
       do { if (debug_get_bool_option("ASAHI_M5_RQ_REFUSAL_DIAG", false)) fprintf(stderr, "M5-RQ refusal line%d queries=%zu\n", __LINE__, util_dynarray_num_elements(&queries, struct m5_rq_state)); goto unsupported; } while (0);
-
-   util_dynarray_foreach(&queries, struct m5_rq_state, state) {
-      if (m5_candidate_api() && glsl_type_is_array(state->query->type))
-         do { if (debug_get_bool_option("ASAHI_M5_RQ_REFUSAL_DIAG", false)) fprintf(stderr, "M5-RQ refusal line%d queries=%zu\n", __LINE__, util_dynarray_num_elements(&queries, struct m5_rq_state)); goto unsupported; } while (0);
-   }
+   /* The ordinary path keeps one native slot per query variable. */
+   if (!m5_candidate_api() &&
+       util_dynarray_num_elements(&queries, struct m5_rq_state) >
+          AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES)
+      do { if (debug_get_bool_option("ASAHI_M5_RQ_REFUSAL_DIAG", false)) fprintf(stderr, "M5-RQ refusal line%d queries=%zu\n", __LINE__, util_dynarray_num_elements(&queries, struct m5_rq_state)); goto unsupported; } while (0);
    if (m5_candidate_api() &&
        util_dynarray_num_elements(&queries, struct m5_rq_state) > 1 &&
        debug_get_bool_option("ASAHI_M5_RQ_INLINE_PACKET", false))
@@ -1572,7 +1763,8 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
     * constant policy that requires candidate traversal. Unknown or mixed
     * policies retain the native path; multiple owners remain ineligible. */
    if (m5_native_opaque() && shader->info.stage == MESA_SHADER_COMPUTE &&
-       query_count == 1 && shader->info.ray_queries == 1) {
+       query_count == 1 && logical_total == 1 &&
+       shader->info.ray_queries == 1) {
       util_dynarray_foreach(&queries, struct m5_rq_state, state) {
          util_dynarray_foreach(&ops, nir_intrinsic_instr *, op) {
             nir_intrinsic_instr *intr = *op;
@@ -1585,74 +1777,72 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
       }
    }
    if (debug_get_bool_option("ASAHI_M5_RQ_CODEGEN_DIAG", false))
-      fprintf(stderr, "M5-RQ codegen queries=%u replay=%u\n", query_count,
-              query_count > 1);
+      fprintf(stderr, "M5-RQ codegen queries=%u logical=%u replay=%u\n",
+              query_count, logical_total, logical_total > 1);
 
+   /* The logical query whose traversal is resident in the shared native
+    * payload. Logical queries can share a native slot, so residency is
+    * tracked here as well as through the published owner token. */
+   nir_variable *resident_logical = NULL;
+   if (m5_candidate_api() && logical_total > 1) {
+      resident_logical = nir_local_variable_create(impl, glsl_uint_type(),
+                                                   "rq_resident_logical");
+      nir_builder init = nir_builder_at(nir_before_impl(impl));
+      nir_store_var(&init, resident_logical, nir_imm_int(&init, ~0u), 1);
+   }
+   bool any_dynamic = false;
    util_dynarray_foreach(&queries, struct m5_rq_state, state) {
-      state->as =
-         nir_local_variable_create(impl,
-            m5_rq_field_type(state->query->type, glsl_uint64_t_type()), "rq_as");
-      state->origin = nir_local_variable_create(
-         impl, m5_rq_field_type(state->query->type,
-            glsl_vector_type(GLSL_TYPE_FLOAT, 3)), "rq_origin");
-      state->direction = nir_local_variable_create(
-         impl, m5_rq_field_type(state->query->type,
-            glsl_vector_type(GLSL_TYPE_FLOAT, 3)), "rq_direction");
-      state->tmin =
-         nir_local_variable_create(impl,
-            m5_rq_field_type(state->query->type, glsl_float_type()), "rq_tmin");
-      state->tmax =
-         nir_local_variable_create(impl,
-            m5_rq_field_type(state->query->type, glsl_float_type()), "rq_tmax");
-      state->mask =
-         nir_local_variable_create(impl,
-            m5_rq_field_type(state->query->type, glsl_uint_type()), "rq_mask");
-      state->flags = nir_local_variable_create(impl,
-         m5_rq_field_type(state->query->type, glsl_uint_type()), "rq_flags");
-      state->active =
-         nir_local_variable_create(impl,
-            m5_rq_field_type(state->query->type, glsl_bool_type()), "rq_active");
+      any_dynamic |= state->dynamic;
+      state->as = m5_rq_var(shader, impl, state, glsl_uint64_t_type(), "rq_as");
+      state->origin = m5_rq_var(shader, impl, state,
+         glsl_vector_type(GLSL_TYPE_FLOAT, 3), "rq_origin");
+      state->direction = m5_rq_var(shader, impl, state,
+         glsl_vector_type(GLSL_TYPE_FLOAT, 3), "rq_direction");
+      state->tmin = m5_rq_var(shader, impl, state, glsl_float_type(), "rq_tmin");
+      state->tmax = m5_rq_var(shader, impl, state, glsl_float_type(), "rq_tmax");
+      state->mask = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_mask");
+      state->flags = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_flags");
+      state->active = m5_rq_var(shader, impl, state, glsl_bool_type(), "rq_active");
       for (unsigned i = 0; i < 5; ++i)
-         state->result[i] =
-            nir_local_variable_create(impl,
-               m5_rq_field_type(state->query->type, glsl_uvec4_type()), "rq_packet");
+         state->result[i] = m5_rq_var(shader, impl, state, glsl_uvec4_type(),
+                                      "rq_packet");
       if (m5_candidate_api()) {
-         state->started = nir_local_variable_create(impl, glsl_bool_type(), "rq_started");
-         state->owner = nir_local_variable_create(impl, glsl_uint_type(), "rq_owner");
-         state->resident_id = nir_local_variable_create(impl, glsl_uint_type(), "rq_resident");
-         state->cursor = nir_local_variable_create(impl, glsl_uint_type(), "rq_cursor");
+         state->started = m5_rq_var(shader, impl, state, glsl_bool_type(), "rq_started");
+         state->owner = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_owner");
+         state->resident_id = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_resident");
+         state->cursor = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_cursor");
          /* Native next consumes same-owner completed queue entries before
           * reading completion. Activation and continuation finish their batch
           * before queue access; only queue exhaustion reads its status. Multiple owners and the
           * unqualified native opaque import keep the ordinary path. */
-         if (query_count == 1 && !state->native_opaque_possible &&
+         if (logical_total == 1 && !state->native_opaque_possible &&
              debug_get_bool_option("ASAHI_M5_RQ_QUEUE_FIRST_PROBE", false))
             state->queue_first =
                !getenv("ASAHI_M5_RQ_ZERO_SPAN_DIAG_ADDRESS");
          /* Each singleton compute query owns its completed candidate batch.
           * Owner switching, graphics layouts and the raw-status recorder keep
           * their existing completion/import path. */
-         if (query_count == 1 && shader->info.stage == MESA_SHADER_COMPUTE &&
+         if (logical_total == 1 && shader->info.stage == MESA_SHADER_COMPUTE &&
              !state->queue_first && !getenv("ASAHI_M5_RQ_ZERO_SPAN_DIAG_ADDRESS"))
-            state->batch_completed = nir_local_variable_create(impl,
+            state->batch_completed = m5_rq_var(shader, impl, state,
                glsl_bool_type(), "rq_batch_completed");
          if (state->native_opaque_possible)
-            state->initial_completion = nir_local_variable_create(impl,
+            state->initial_completion = m5_rq_var(shader, impl, state,
                glsl_bool_type(), "rq_initial_completion");
          /* A single logical query cannot lose its owner to another query.
           * Reinitialization clears traversal state, so there is no candidate
           * prefix to restore. Keep replay state only for multiple owners. */
-         if (query_count > 1) {
-            state->processed = nir_local_variable_create(impl, glsl_uint_type(), "rq_processed");
-            state->replay = nir_local_variable_create(impl, glsl_uint_type(), "rq_replay");
-            state->commit_history = nir_local_variable_create(impl, glsl_uint_type(), "rq_commit_history");
-            state->prune_t = nir_local_variable_create(impl, glsl_float_type(), "rq_prune_t");
+         if (logical_total > 1) {
+            state->processed = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_processed");
+            state->replay = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_replay");
+            state->commit_history = m5_rq_var(shader, impl, state, glsl_uint_type(), "rq_commit_history");
+            state->prune_t = m5_rq_var(shader, impl, state, glsl_float_type(), "rq_prune_t");
          }
          if (m5_model_capture_address())
-            state->capture_event = nir_local_variable_create(impl,
+            state->capture_event = m5_rq_var(shader, impl, state,
                glsl_uint_type(), "rq_capture_event");
          for (unsigned i = 0; i < 5; ++i)
-            state->candidate[i] = nir_local_variable_create(impl,
+            state->candidate[i] = m5_rq_var(shader, impl, state,
                glsl_uvec4_type(), "rq_candidate");
       }
    }
@@ -1667,6 +1857,7 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
       }
       b.cursor = nir_before_instr(&intr->instr);
       nir_deref_instr *query = nir_src_as_deref(intr->src[0]);
+      struct m5_rq_shadows shadows = {.impl = impl, .query = query};
       struct m5_rq_state *state = NULL;
       util_dynarray_foreach(&queries, struct m5_rq_state, candidate) {
          if (candidate->query == nir_deref_instr_get_variable(query)) {
@@ -1675,35 +1866,37 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
          }
       }
       assert(state);
-      nir_deref_instr *as = m5_rq_field_deref(&b, query, state->as);
-      nir_deref_instr *origin = m5_rq_field_deref(&b, query, state->origin);
-      nir_deref_instr *direction = m5_rq_field_deref(&b, query, state->direction);
-      nir_deref_instr *tmin = m5_rq_field_deref(&b, query, state->tmin);
-      nir_deref_instr *tmax = m5_rq_field_deref(&b, query, state->tmax);
-      nir_deref_instr *mask = m5_rq_field_deref(&b, query, state->mask);
-      nir_deref_instr *active = m5_rq_field_deref(&b, query, state->active);
+      nir_deref_instr *as = m5_rq_op_field(&b, &shadows, state->as);
+      nir_deref_instr *origin = m5_rq_op_field(&b, &shadows, state->origin);
+      nir_deref_instr *direction = m5_rq_op_field(&b, &shadows, state->direction);
+      nir_deref_instr *tmin = m5_rq_op_field(&b, &shadows, state->tmin);
+      nir_deref_instr *tmax = m5_rq_op_field(&b, &shadows, state->tmax);
+      nir_deref_instr *mask = m5_rq_op_field(&b, &shadows, state->mask);
+      nir_deref_instr *active = m5_rq_op_field(&b, &shadows, state->active);
       nir_deref_instr *result[5];
       for (unsigned i = 0; i < 5; ++i)
-         result[i] = m5_rq_field_deref(&b, query, state->result[i]);
+         result[i] = m5_rq_op_field(&b, &shadows, state->result[i]);
       nir_deref_instr *started = NULL, *resident_id = NULL, *cursor = NULL, *owner = NULL;
       nir_deref_instr *batch_completed = state->batch_completed
-         ? nir_build_deref_var(&b, state->batch_completed) : NULL;
+         ? m5_rq_op_field(&b, &shadows, state->batch_completed) : NULL;
       nir_deref_instr *candidate[5] = {0};
       nir_deref_instr *initial_completion = state->initial_completion
-         ? nir_build_deref_var(&b, state->initial_completion) : NULL;
+         ? m5_rq_op_field(&b, &shadows, state->initial_completion) : NULL;
+      nir_deref_instr *capture_event = state->capture_event
+         ? m5_rq_op_field(&b, &shadows, state->capture_event) : NULL;
       if (m5_candidate_api()) {
-         started = nir_build_deref_var(&b, state->started);
-         owner = nir_build_deref_var(&b, state->owner);
-         resident_id = nir_build_deref_var(&b, state->resident_id);
-         cursor = nir_build_deref_var(&b, state->cursor);
+         started = m5_rq_op_field(&b, &shadows, state->started);
+         owner = m5_rq_op_field(&b, &shadows, state->owner);
+         resident_id = m5_rq_op_field(&b, &shadows, state->resident_id);
+         cursor = m5_rq_op_field(&b, &shadows, state->cursor);
          for (unsigned i = 0; i < 5; ++i)
-            candidate[i] = nir_build_deref_var(&b, state->candidate[i]);
+            candidate[i] = m5_rq_op_field(&b, &shadows, state->candidate[i]);
       }
-      nir_deref_instr *processed = state->processed ? nir_build_deref_var(&b, state->processed) : NULL;
-      nir_deref_instr *replay = state->replay ? nir_build_deref_var(&b, state->replay) : NULL;
-      nir_deref_instr *history = state->commit_history ? nir_build_deref_var(&b, state->commit_history) : NULL;
-      nir_deref_instr *prune_t = state->prune_t ? nir_build_deref_var(&b, state->prune_t) : NULL;
-      nir_deref_instr *flags = m5_rq_field_deref(&b, query, state->flags);
+      nir_deref_instr *processed = state->processed ? m5_rq_op_field(&b, &shadows, state->processed) : NULL;
+      nir_deref_instr *replay = state->replay ? m5_rq_op_field(&b, &shadows, state->replay) : NULL;
+      nir_deref_instr *history = state->commit_history ? m5_rq_op_field(&b, &shadows, state->commit_history) : NULL;
+      nir_deref_instr *prune_t = state->prune_t ? m5_rq_op_field(&b, &shadows, state->prune_t) : NULL;
+      nir_deref_instr *flags = m5_rq_op_field(&b, &shadows, state->flags);
       nir_def *value = NULL;
       switch (intr->intrinsic) {
       case nir_intrinsic_rq_initialize:
@@ -1711,8 +1904,8 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
             nir_store_deref(&b, started, nir_imm_false(&b), 1);
             if (batch_completed)
                nir_store_deref(&b, batch_completed, nir_imm_false(&b), 1);
-            if (state->capture_event)
-               nir_store_var(&b, state->capture_event, nir_imm_int(&b, 0), 1);
+            if (capture_event)
+               nir_store_deref(&b, capture_event, nir_imm_int(&b, 0), 1);
             /* Cursor index 0; with m5_rq_watertight also a NaN boundary
              * distance key, which matches no candidate distance. */
             nir_store_deref(&b, cursor,
@@ -1779,14 +1972,23 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
          if (m5_candidate_api()) {
             nir_push_if(&b, nir_inot(&b, nir_load_deref(&b, started)));
             nir_store_deref(&b, owner,
-               fresh_query ? nir_enter_query_agx(&b, .base = state->allocation_index)
+               fresh_query ? m5_rq_enter(&b, state, query)
                            : nir_imm_int(&b, 0), 1);
             nir_store_deref(&b, resident_id, nir_load_scs_thread_index_agx(&b), 1);
             nir_pop_if(&b, NULL);
-            m5_model_capture(&b, state, owner, resident_id, cursor, active,
+            m5_model_capture(&b, state, capture_event, owner, resident_id, cursor, active,
                              result[1], 1);
             nir_def *activate = nir_inot(&b, nir_load_deref(&b, started));
-            if (util_dynarray_num_elements(&queries, struct m5_rq_state) > 1) {
+            nir_def *logical = NULL;
+            if (logical_total > 1) {
+               unsigned constant_logical;
+               logical = m5_rq_logical(&b, state, query, &constant_logical);
+               if (!logical)
+                  logical = nir_imm_int(&b, constant_logical);
+               /* Another logical query took the payload since this one
+                * last traversed, possibly through the same native slot. */
+               activate = nir_ior(&b, activate,
+                  nir_ine(&b, nir_load_var(&b, resident_logical), logical));
                nir_def *saved_id = nir_load_deref(&b, resident_id);
                nir_def *driver = nir_iadd(&b,
                   nir_load_preamble(&b, 1, 32, .base = 56),
@@ -1804,6 +2006,8 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
              * committed/candidate data in separate SSA variables. The single
              * query path needs no ownership load or extra activation branch. */
             nir_push_if(&b, activate);
+            if (resident_logical)
+               nir_store_var(&b, resident_logical, logical, 1);
             if (replay) {
                nir_store_deref(&b, replay, nir_load_deref(&b, processed), 1);
                nir_store_deref(&b, prune_t, nir_load_deref(&b, tmax), 1);
@@ -1895,7 +2099,7 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
             nir_pop_if(&b, NULL);
             m5_candidate_next(&b, active, resident_id, cursor, result,
                               tmin, flags, candidate, initial_completion, batch_completed, state->queue_first, more, processed, replay, history, prune_t);
-            m5_model_capture(&b, state, owner, resident_id, cursor, active,
+            m5_model_capture(&b, state, capture_event, owner, resident_id, cursor, active,
                              result[1], 2);
             nir_pop_if(&b, NULL);
             value = nir_load_var(&b, more);
@@ -2070,6 +2274,7 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
       default:
          UNREACHABLE("preflighted M5 query operation");
       }
+      m5_rq_op_writeback(&b, &shadows, intr->intrinsic, state);
       if (value)
          nir_def_rewrite_uses(&intr->def, value);
       nir_instr_remove(&intr->instr);
@@ -2080,6 +2285,11 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
    util_dynarray_fini(&queries);
    shader->info.ray_queries = 0;
    nir_progress(true, impl, nir_metadata_none);
+   if (any_dynamic) {
+      NIR_PASS(_, shader, nir_lower_var_copies);
+      NIR_PASS(_, shader, nir_lower_indirect_derefs_to_if_else_trees,
+               nir_var_shader_temp, ~0u);
+   }
    NIR_PASS(_, shader, nir_lower_global_vars_to_local);
    NIR_PASS(_, shader, nir_lower_vars_to_ssa);
    NIR_PASS(_, shader, nir_opt_dce);

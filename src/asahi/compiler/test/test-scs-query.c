@@ -209,9 +209,9 @@ standard_ray_query(unsigned count, bool array, mesa_shader_stage stage)
    b.shader->info.workgroup_size[0] = 64;
    b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
    b.shader->info.ray_queries = count;
-   nir_variable *queries[8];
-   nir_def *rqs[8];
-   assert(count && count <= 8);
+   nir_variable *queries[16];
+   nir_def *rqs[16];
+   assert(count && count <= 16);
    nir_variable *query_array = array ? nir_local_variable_create(
       b.impl, glsl_array_type(glsl_uint64_t_type(), count, 0), "queries") : NULL;
    if (query_array)
@@ -618,6 +618,13 @@ int main(int argc,char **argv)
  standard_ray_query(8, false, MESA_SHADER_COMPUTE);
  standard_ray_query(4, true, MESA_SHADER_COMPUTE);
  standard_ray_query(8, true, MESA_SHADER_COMPUTE);
+ /* Candidate-API path (kernel stages): more logical queries than native
+  * slots, and dynamically selected query-array elements. */
+ standard_ray_query(9, false, MESA_SHADER_TESS_CTRL);
+ standard_ray_query(12, false, MESA_SHADER_TESS_CTRL);
+ standard_ray_query(2, true, MESA_SHADER_TESS_CTRL);
+ standard_ray_query(8, true, MESA_SHADER_TESS_CTRL);
+ standard_ray_query(16, true, MESA_SHADER_TESS_CTRL);
  for(unsigned mode=0;mode<3;mode++)for(unsigned n=1;n<=4;n++)compile(mode,n,32,0,out);
  compile(0,1,16,0,out);
  for(unsigned mode=1;mode<=2;mode++)for(unsigned width=8;width<=16;width+=8)compile(mode,1,width,0,out);

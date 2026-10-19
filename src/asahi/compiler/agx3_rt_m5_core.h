@@ -34,10 +34,13 @@ struct agx3_rt_m5_intersect_desc {
  * acceleration-structure cases has the same results with either limit;
  * this value is the only difference between the two builds. An earlier
  * note that three or more live queries gave wrong results (rayqueryterminate,
- * 8 live queries) does not reproduce. More than 8 (the any-hit and
- * intersection rayqueryterminate variants with 9, ray_query.misc.
- * dynamic_indexing with 48) stays refused. A hardware bisection build may
- * still override it (-DAGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES=N, N <= 8). */
+ * 8 live queries) does not reproduce. This is the number of native slots the
+ * candidate-API lowering uses: logical queries beyond it share a slot
+ * (agx_nir_m5_ray_query.c, m5_rq_slot), which is how the any-hit and
+ * intersection rayqueryterminate variants (9 live queries) and
+ * ray_query.misc.dynamic_indexing (48 elements, one selected per thread) are
+ * compiled. A hardware bisection build may still override it
+ * (-DAGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES=N, N <= 8). */
 #ifndef AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES
 #define AGX3_RT_M5_MAX_QUALIFIED_LIVE_QUERIES AGX3_RT_M5_MAX_LIVE_QUERIES
 #endif
