@@ -1337,7 +1337,8 @@ static void
 hk_m5_note_push_writes(struct hk_cmd_buffer *cmd, uint32_t count,
                        const VkWriteDescriptorSet *writes)
 {
-   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip))
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   if (!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip))
       return;
 
    for (uint32_t i = 0; i < count; ++i) {
@@ -1357,7 +1358,8 @@ hk_m5_note_push_template(struct hk_cmd_buffer *cmd,
                          const struct vk_descriptor_update_template *template,
                          const void *data)
 {
-   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip))
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   if (!agx_chip_native_agx3(chip) && !agx_chip_g17_m5(chip))
       return;
 
    for (uint32_t i = 0; i < template->entry_count; ++i) {
