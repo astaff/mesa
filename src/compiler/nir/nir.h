@@ -7211,6 +7211,14 @@ typedef enum {
     * ALU, since non-divergence is a decent proxy for uniformity.
     */
    nir_reassociate_scalar_math = (1 << 1),
+
+   /* Within each of the classes above, rank sources that are invariant in
+    * the innermost loop around a chain below the sources varying with it.
+    * The invariant part of the chain is then computed first and can leave
+    * the loop through nir_opt_preamble or loop-invariant code motion, for
+    * example the per-iteration constants of an accumulation.
+    */
+   nir_reassociate_loop_invariant = (1 << 2),
 } nir_reassociate_options;
 
 bool nir_opt_reassociate(nir_shader *shader, nir_reassociate_options opts);
