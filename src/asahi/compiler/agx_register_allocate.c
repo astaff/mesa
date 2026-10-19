@@ -459,9 +459,28 @@ ssa_has_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
           BITSET_TEST(rctx->high_gpr, ssa);
 }
 
+/* Whether a value's bank limit narrows the current register file, mirroring
+ * dest_limit(): the low-bank and log2 bounds are G17P (AGX3B) encodings, and
+ * the seven-bit texture/COPY bound means nothing in a file of 128 halves or
+ * fewer, which is what compute shaders get once the workgroup bounds their
+ * registers. */
+static bool
+ssa_has_binding_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
+{
+   const bool agx3b =
+      rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   const unsigned bound = rctx->bound[RA_GPR];
+
+   return (agx3b && BITSET_TEST(rctx->low_gpr, ssa) &&
+           bound > rctx->tile_gpr_limit) ||
+          (BITSET_TEST(rctx->texture_gpr, ssa) && bound > 128) ||
+          (agx3b && BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
+          BITSET_TEST(rctx->high_gpr, ssa);
+}
+
 static bool
 region_has_bank_constrained_value(const struct ra_ctx *rctx, unsigned base,
-                                  unsigned size)
+                                  unsigned size, bool binding_only)
 {
    for (unsigned reg = reserved_size(rctx->shader);
         reg < rctx->bound[RA_GPR];) {
@@ -474,7 +493,8 @@ region_has_bank_constrained_value(const struct ra_ctx *rctx, unsigned base,
       unsigned width = rctx->ncomps[ssa];
       assert(width && rctx->ssa_to_reg[ssa] == reg);
       if (reg < base + size && reg + width > base &&
-          ssa_has_bank_constraint(rctx, ssa))
+          (binding_only ? ssa_has_binding_bank_constraint(rctx, ssa)
+                        : ssa_has_bank_constraint(rctx, ssa)))
          return true;
 
       reg += width;
@@ -497,8 +517,9 @@ region_has_bank_constrained_value(const struct ra_ctx *rctx, unsigned base,
  * Postcondition: at least one register in the returned region is already free.
  */
 static unsigned
-find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
-                          BITSET_WORD *already_evicted, unsigned cap)
+find_best_region_to_evict_impl(struct ra_ctx *rctx, unsigned size,
+                               BITSET_WORD *already_evicted, unsigned cap,
+                               bool binding_only)
 {
    assert(util_is_power_of_two_or_zero(size) && "precondition");
    assert((rctx->bound[RA_GPR] % size) == 0 &&
@@ -538,7 +559,7 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
       /* Keep constrained values in their assigned bank across live-range
        * splitting. Otherwise a later destination can relocate a valid TEX
        * coordinate above the seven-bit COPY source range. */
-      if (region_has_bank_constrained_value(rctx, base, size))
+      if (region_has_bank_constrained_value(rctx, base, size, binding_only))
          continue;
 
       /* Estimate the number of moves required if we pick this region */
@@ -570,11 +591,29 @@ find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
     * COPY destination.  If nothing fits down there, fall back to the whole
     * file rather than failing allocation outright. */
    if (best_base == ~0u && bound < rctx->bound[RA_GPR])
-      return find_best_region_to_evict(rctx, size, already_evicted, ~0u);
+      return find_best_region_to_evict_impl(rctx, size, already_evicted, ~0u,
+                                            binding_only);
 
-   assert(best_base < rctx->bound[RA_GPR] &&
-          "not enough registers (should have spilled already)");
+   /* ~0 when nothing qualifies; find_best_region_to_evict() relaxes the
+    * search and its caller refuses the shader if that fails too. */
    return best_base;
+}
+
+/* The strict search keeps every value with a bank bit out of eviction, which
+ * is what every shader that allocates today was compiled with. When it finds
+ * nothing -- a compute file of 128 halves whose every region holds a texture
+ * coordinate, all trivially below the seven-bit bound -- retry honouring only
+ * the bounds that narrow this file. Returns ~0 if both fail. */
+static unsigned
+find_best_region_to_evict(struct ra_ctx *rctx, unsigned size,
+                          BITSET_WORD *already_evicted, unsigned cap)
+{
+   unsigned base =
+      find_best_region_to_evict_impl(rctx, size, already_evicted, cap, false);
+   if (base >= rctx->bound[RA_GPR])
+      base = find_best_region_to_evict_impl(rctx, size, already_evicted, cap,
+                                            true);
+   return base;
 }
 
 static void
@@ -808,6 +847,16 @@ unconstrained:
          cap = AGX3_COPY_REG16_DEST_HALVES;
 
       unsigned new_reg = find_best_region_to_evict(rctx, nr, clobbered, cap);
+
+      /* No region can be freed for this value. Never index the register file
+       * with the failure value: refuse the shader through
+       * agx_compile_function_nir()'s normal error path instead, and hand back
+       * an in-range register so allocation can finish. */
+      if (new_reg >= rctx->bound[RA_GPR] ||
+          new_reg + nr > rctx->bound[RA_GPR]) {
+         rctx->shader->ra_failed = true;
+         return reserved_size(rctx->shader);
+      }
 
       /* Blocked registers need to get reassigned. Add them to the worklist. */
       for (unsigned i = 0; i < nr; ++i) {
