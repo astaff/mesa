@@ -12225,7 +12225,8 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       /* A record after the first of a multi-draw republishes the previous
        * record's program with its own draw parameters. */
       const uint64_t pipeline_program =
-         continuing && agx_chip_native_agx3(dev->dev.chip)
+         continuing && (agx_chip_native_agx3(dev->dev.chip) ||
+                        agx_chip_g17_m5(dev->dev.chip))
             ? hk_m5_multi_draw_vertex_program(cmd, hw_vs, linked_hw_vs)
             : hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
 
