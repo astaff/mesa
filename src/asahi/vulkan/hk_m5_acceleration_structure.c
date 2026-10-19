@@ -1353,6 +1353,28 @@ hk_m5_rq_init_fail(struct hk_device *dev, const char *stage, int error)
    return false;
 }
 
+/* Whether the query traversal files ASAHI_M5_RQ_CAPTURE_DIR names are
+ * readable in this process. A container that replaces /usr (Steam's runtime)
+ * may not see them; ray queries are then not offered rather than failing
+ * device creation. */
+bool
+hk_m5_rq_assets_available(void)
+{
+   static const char *const names[] = {
+      "driver-rebase-b3.bin", "user-image.bin", "uniforms.bin",
+   };
+   const char *dir = getenv("ASAHI_M5_RQ_CAPTURE_DIR");
+   if (!dir)
+      return false;
+   for (unsigned i = 0; i < ARRAY_SIZE(names); ++i) {
+      char path[4096];
+      if (snprintf(path, sizeof(path), "%s/%s", dir, names[i]) >= sizeof(path) ||
+          access(path, R_OK))
+         return false;
+   }
+   return true;
+}
+
 static bool
 hk_m5_rq_read(const char *dir, const char *name, void *data, size_t bytes)
 {
@@ -1578,8 +1600,13 @@ hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       }
    }
+   /* Only a device that enables ray queries or ray tracing pipelines runs
+    * the query traversal code, so only such a device loads it. */
    const char *capture = getenv("ASAHI_M5_RQ_CAPTURE_DIR");
-   if (dev->m5_native_as && capture && !hk_m5_rq_init(dev, capture)) {
+   const bool queries = dev->vk.enabled_features.rayQuery ||
+                        dev->vk.enabled_features.rayTracingPipeline;
+   if (dev->m5_native_as && capture && queries &&
+       !hk_m5_rq_init(dev, capture)) {
       hk_device_finish_accel_struct_state(dev);
       return VK_ERROR_INITIALIZATION_FAILED;
    }

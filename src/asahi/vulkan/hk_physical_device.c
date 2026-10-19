@@ -21,6 +21,7 @@
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
+#include "hk_m5_acceleration_structure.h"
 #include "hk_memory_budget_core.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
@@ -1864,7 +1865,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        debug_get_bool_option("ASAHI_M5_NATIVE_AS", false)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
-      supported_extensions.KHR_ray_query = getenv("ASAHI_M5_RQ_CAPTURE_DIR") != NULL;
+      supported_extensions.KHR_ray_query = hk_m5_rq_assets_available();
       /* Explicit pipeline qualification profile; the default remains gated. */
       bool native_rt = supported_extensions.KHR_ray_query &&
          debug_get_bool_option("ASAHI_M5_NATIVE_RT", false);

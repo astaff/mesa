@@ -1,6 +1,8 @@
 #pragma once
 #include "hk_acceleration_structure.h"
 
+bool hk_m5_rq_assets_available(void);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_m5_backend_BuildAccelerationStructuresKHR(
    VkDevice _device, VkDeferredOperationKHR deferredOperation,
