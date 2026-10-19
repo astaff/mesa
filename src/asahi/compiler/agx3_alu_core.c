@@ -4382,6 +4382,47 @@ agx3_alu_unary_m5(enum agx3_funop op, uint16_t dest, uint16_t src,
                             fields, n, out, len);
 }
 
+/*
+ * The gradients are the same f33=3 class as rint/log2/exp2 above (f34 49 and
+ * 50): the destination and source registers, widths, modifiers, saturation
+ * and wait slots sit in the same fields. Native G17G fragment programs use
+ * 16-bit gradients with odd half registers and sources above h127, and wait
+ * on slots 0, 1, 2 and 7 directly. The destination and source share one width
+ * there; no mixed-width gradient was observed, so none is encoded.
+ *
+ * The cache hints keep the canonical gradient values (f11 set, and f27 set
+ * on dfdx only), as the 32-bit low-register encoding always has.
+ */
+bool
+agx3_alu_derivative_m5(bool dfdy, uint16_t dest, uint16_t src, bool half,
+                       bool src_abs, bool src_neg, bool saturate,
+                       uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
+                       uint8_t *len)
+{
+   if (!out || !len || dest >= 256 || src >= 256 ||
+       (!half && ((dest & 1) || (src & 1))) || (wait_mask & ~0xffu))
+      return false;
+
+   struct agx3_field_kv base[8] = {
+      {9, 2}, {10, half ? 1 : 2}, {11, 1}, {25, 2}, {26, half ? 1 : 2},
+      {33, 3}, {34, dfdy ? 50 : 49},
+   };
+   unsigned nbase = 7;
+   if (!dfdy)
+      base[nbase++] = (struct agx3_field_kv){27, 1};
+
+   struct agx3_field_kv fields[13] = {
+      {2, dest}, {18, src}, {14, saturate}, {30, src_abs}, {31, src_neg},
+   };
+   unsigned n = 5;
+   for (unsigned slot = 0; slot < 8; ++slot)
+      if (wait_mask & (1u << slot))
+         fields[n++] = (struct agx3_field_kv){35 + slot, 1};
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3C,
+                            dfdy ? "f32dfdy" : "f32dfdx", 0, base, nbase,
+                            fields, n, out, len);
+}
+
 /* log2/exp2 share independently selected f10 destination and f26 source
  * widths. Full-width forms have all six recovered wait bits; any half-width
  * log2 is currently grounded for no wait and slot 6. */

@@ -41,6 +41,13 @@ bool agx3_alu_unary_m5(enum agx3_funop op, uint16_t dest, uint16_t src,
                        bool dest_cache, uint16_t wait_mask,
                        uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
+/* Native C fragment gradients (f32dfdx/f32dfdy) over the whole register
+ * file, at 32 or 16 bits. */
+bool agx3_alu_derivative_m5(bool dfdy, uint16_t dest, uint16_t src, bool half,
+                            bool src_abs, bool src_neg, bool saturate,
+                            uint16_t wait_mask,
+                            uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
+
 /* Native G17P population count of a scalar ushort or uint, with post-RA
  * source lifetime and producer waits. */
 /* Native M5 bit reversal. A half source is zero-extended before reversing

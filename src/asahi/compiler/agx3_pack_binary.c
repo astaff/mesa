@@ -848,6 +848,27 @@ agx3_emit_funop(struct util_dynarray *emission, enum agx_isa_encoding enc,
              agx3_append(emission, bytes, len);
    }
 
+   if (enc == AGX_ISA_ENCODING_AGX3C &&
+       (op == AGX3_FUNOP_DFDX || op == AGX3_FUNOP_DFDY)) {
+      if (I->nr_dests != 1 || I->nr_srcs != 1)
+         return false;
+
+      const agx_index dest = I->dest[0], src = I->src[0];
+      if (!agx3_src_is_register(dest) || dest.memory ||
+          !agx3_src_is_register(src) || src.memory ||
+          agx_channels(dest) != 1 || agx_channels(src) != 1 ||
+          dest.size != src.size ||
+          (dest.size != AGX_SIZE_16 && dest.size != AGX_SIZE_32))
+         return false;
+
+      uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+      return agx3_alu_derivative_m5(op == AGX3_FUNOP_DFDY, dest.value,
+                                    src.value, dest.size == AGX_SIZE_16,
+                                    src.abs, src.neg, I->saturate, wait_mask,
+                                    bytes, &len) &&
+             agx3_append(emission, bytes, len);
+   }
+
    if (I->nr_dests != 1 || I->nr_srcs != 1 ||
        I->dest[0].type == AGX_INDEX_NULL ||
        !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
