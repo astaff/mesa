@@ -48,6 +48,7 @@
 #include "hk_private.h"
 #include "asahi/lib/agx_m5_va.h"
 #include "hk_shader.h"
+#include "hk_native_write_class.h"
 #include "hk_g17p_patch.h"
 #include "util/disk_cache.h"
 #include "agx_debug.h"
@@ -1756,6 +1757,17 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       ? vs->only_linked : gfx->linked[MESA_SHADER_VERTEX];
    struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
    const bool mesh = gfx->shaders[MESA_SHADER_MESH] != NULL;
+   struct hk_shader *fs = hk_bound_fs(cmd);
+   hk_m5_accumulate_shader_writes(&cs->m5_shader_writes_memory,
+                                  vs && vs->info.writes_external_memory);
+   hk_m5_accumulate_shader_writes(&cs->m5_shader_writes_memory,
+                                  fs && fs->info.writes_external_memory);
+   if (mesh) {
+      bool task;
+      struct hk_shader *object = hk_native_mesh_object(gfx, &task);
+      hk_m5_accumulate_shader_writes(&cs->m5_shader_writes_memory,
+                                     object->info.writes_external_memory);
+   }
    const bool v2 = dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2;
    struct drm_asahi_render_program_v2 programs[3] = {{0}, {
       .legacy = {.stage = 1,

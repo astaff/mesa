@@ -10,6 +10,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_queue.h"
+#include "hk_native_write_class.h"
 #include "hk_acceleration_structure.h"
 #include "hk_buffer.h"
 
@@ -237,6 +238,10 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
        cs->g17p_primitive_bound <= 4) {
       c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
    }
+
+   if (agx_chip_g17_m5(dev->dev.chip))
+      c->flags |= hk_m5_shader_write_class_flags(dev->dev.params.features,
+                                                cs->m5_shader_writes_memory);
 
    if ((dev->dev.debug & AGX_DBG_NOCLUSTER) &&
        dev->dev.chip != AGX_CHIP_G17P) {
