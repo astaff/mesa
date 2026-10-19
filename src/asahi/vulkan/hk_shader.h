@@ -160,6 +160,8 @@ struct hk_shader_info {
    bool agx3_combined_sampler_valid;
    bool agx3_uses_root;
    bool agx3_gen1_fragment_rq;
+   /* HK_ROOT_READS_* classes of root bytes the shader may read. */
+   uint8_t agx3_root_reads;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;

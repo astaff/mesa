@@ -3418,6 +3418,114 @@ hk_nir_uses_root(const nir_shader *nir)
    return false;
 }
 
+/* The value of an integer offset built from immediates: the descriptor
+ * lowering adds, scales and widens immediates without folding them. */
+static bool
+hk_nir_constant_offset(nir_scalar s, unsigned depth, uint64_t *value)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s)) {
+      *value = nir_scalar_as_uint(s);
+      return true;
+   }
+   if (!depth || !nir_scalar_is_alu(s))
+      return false;
+
+   const nir_op op = nir_scalar_alu_op(s);
+   uint64_t a, b = 0;
+   if (!hk_nir_constant_offset(nir_scalar_chase_alu_src(s, 0), depth - 1, &a))
+      return false;
+   if (nir_op_infos[op].num_inputs == 2 &&
+       !hk_nir_constant_offset(nir_scalar_chase_alu_src(s, 1), depth - 1, &b))
+      return false;
+
+   switch (op) {
+   case nir_op_u2u32:
+   case nir_op_u2u64:
+      *value = a;
+      break;
+   case nir_op_iadd:
+      *value = a + b;
+      break;
+   case nir_op_imul:
+   case nir_op_amul:
+      *value = a * b;
+      break;
+   case nir_op_ishl:
+      *value = a << (b & (s.def->bit_size - 1));
+      break;
+   default:
+      return false;
+   }
+   *value &= BITFIELD64_MASK(s.def->bit_size);
+   return true;
+}
+
+/* The HK_ROOT_READS_* classes of the root bytes one use of load_root_agx can
+ * read: an immediate offset loaded as is falls in the classes of its bytes,
+ * anything else could read any byte. */
+static uint8_t
+hk_nir_root_use_reads(nir_src *use)
+{
+   const uint8_t any = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
+                       HK_ROOT_READS_DYNAMIC_BUFFERS;
+   if (nir_src_is_if(use) ||
+       nir_src_use_instr(use)->type != nir_instr_type_alu)
+      return any;
+
+   nir_alu_instr *add = nir_instr_as_alu(nir_src_use_instr(use));
+   if (add->op != nir_op_iadd)
+      return any;
+
+   const unsigned other = use == &add->src[0].src ? 1 : 0;
+   uint64_t offset;
+   if (!hk_nir_constant_offset(nir_get_scalar(add->src[other].src.ssa,
+                                              add->src[other].swizzle[0]),
+                               8, &offset))
+      return any;
+
+   uint8_t reads = 0;
+   nir_foreach_use_including_if(load_use, &add->def) {
+      if (nir_src_is_if(load_use) ||
+          nir_src_use_instr(load_use)->type != nir_instr_type_intrinsic)
+         return any;
+
+      nir_intrinsic_instr *load =
+         nir_instr_as_intrinsic(nir_src_use_instr(load_use));
+      if ((load->intrinsic != nir_intrinsic_load_global_constant &&
+           load->intrinsic != nir_intrinsic_load_global) ||
+          load_use != &load->src[0])
+         return any;
+
+      reads |= hk_root_reads_of(
+         offset, offset + load->def.num_components * load->def.bit_size / 8);
+   }
+   return reads;
+}
+
+/* hk_shader_info::agx3_root_reads, gathered where hk_nir_uses_root() is. */
+static uint8_t
+hk_nir_root_reads(const nir_shader *nir)
+{
+   uint8_t reads = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_load_root_agx)
+               continue;
+
+            nir_foreach_use_including_if(use,
+                                         &nir_instr_as_intrinsic(instr)->def)
+               reads |= hk_nir_root_use_reads(use);
+         }
+      }
+   }
+
+   return reads;
+}
+
 struct hk_g17p_vertex_preamble_shift {
    unsigned base;
    /* Preamble loads below this half are fixed ABI state, not VBO uniforms. */
@@ -4498,8 +4606,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * no_epilog_discard mask). hk_lower_uvs_index turns those into root
     * accesses, so gather the resource requirement after that pass and before
     * lower_uniforms removes the load_root_agx markers. */
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
+      shader->info.agx3_root_reads = hk_nir_root_reads(nir);
+   }
 
    /* Measure while root markers are still explicit. Uniform lowering loads
     * the root pointer and set bases separately, so retain that prefix too.

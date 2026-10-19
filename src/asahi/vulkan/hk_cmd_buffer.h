@@ -287,6 +287,86 @@ struct hk_upload_stats {
          (cmd)->state.upload_stats.field += (value);                            \
    } while (0)
 
+/* Root bytes the fragment stage reads only through these classes of access,
+ * recorded per shader in hk_shader_info::agx3_root_reads. */
+enum hk_root_reads {
+   /* The root's own address: the shader can then reach any root byte. */
+   HK_ROOT_READS_ADDRESS = BITFIELD_BIT(0),
+   /* Vertex attribute bases, clamps and strides, and the vertex shader's
+    * constant data. */
+   HK_ROOT_READS_VERTEX_INPUT = BITFIELD_BIT(1),
+   HK_ROOT_READS_DYNAMIC_BUFFERS = BITFIELD_BIT(2),
+};
+
+/* Every root byte a draw may republish without the fragment stage observing
+ * it unless the fragment shader reads that class (hk_m5_fragment_root()), as
+ * X(from, to, class) spans in ascending order. The vertex-input spans hold
+ * just their fields: the clamp and stride tables are adjacent and followed by
+ * vertex_outputs, and attrib_base ends the graphics arm. */
+#define HK_ROOT_FRAGMENT_HIDDEN_SPANS(X)                                       \
+   X(root_desc_addr, sets, HK_ROOT_READS_ADDRESS)                              \
+   X(draw.attrib_clamps, draw.vertex_outputs, HK_ROOT_READS_VERTEX_INPUT)      \
+   X(draw.vs_constant_data_addr, draw.fs_constant_data_addr,                   \
+     HK_ROOT_READS_VERTEX_INPUT)                                               \
+   X(draw.attrib_base, push, HK_ROOT_READS_VERTEX_INPUT)                       \
+   X(dynamic_buffers, set_dynamic_buffer_start, HK_ROOT_READS_DYNAMIC_BUFFERS)
+
+/* The HK_ROOT_READS_* classes a read of root bytes [start_B, end_B) falls
+ * in. */
+static inline uint8_t
+hk_root_reads_of(uint64_t start_B, uint64_t end_B)
+{
+   uint8_t reads = 0;
+#define HK_ROOT_CLASSIFY(from, to, class)                                      \
+   if (start_B < hk_root_descriptor_offset(to) &&                              \
+       end_B > hk_root_descriptor_offset(from))                                \
+      reads |= (class);
+   HK_ROOT_FRAGMENT_HIDDEN_SPANS(HK_ROOT_CLASSIFY)
+#undef HK_ROOT_CLASSIFY
+   return reads;
+}
+
+/* Whether two roots agree on every byte outside the hidden spans. */
+static inline bool
+hk_root_matches_for_fragment(const struct hk_root_descriptor_table *a,
+                             const struct hk_root_descriptor_table *b)
+{
+   size_t at = 0;
+#define HK_ROOT_COMPARE_BEFORE(from, to, class)                                \
+   if (memcmp((const uint8_t *)a + at, (const uint8_t *)b + at,                \
+              hk_root_descriptor_offset(from) - at))                           \
+      return false;                                                            \
+   at = hk_root_descriptor_offset(to);
+   HK_ROOT_FRAGMENT_HIDDEN_SPANS(HK_ROOT_COMPARE_BEFORE)
+#undef HK_ROOT_COMPARE_BEFORE
+   return !memcmp((const uint8_t *)a + at, (const uint8_t *)b + at,
+                  sizeof(*a) - at);
+}
+
+static_assert(hk_root_descriptor_offset(draw.attrib_strides) ==
+                    hk_root_descriptor_offset(draw.attrib_clamps) +
+                       sizeof(((struct hk_root_descriptor_table *)0)
+                                 ->draw.attrib_clamps) &&
+                 hk_root_descriptor_offset(draw.vertex_outputs) ==
+                    hk_root_descriptor_offset(draw.attrib_strides) +
+                       sizeof(((struct hk_root_descriptor_table *)0)
+                                 ->draw.attrib_strides),
+              "only the clamp and stride tables precede vertex_outputs");
+static_assert(hk_root_descriptor_offset(draw.fs_constant_data_addr) ==
+                 hk_root_descriptor_offset(draw.vs_constant_data_addr) +
+                    sizeof(uint64_t),
+              "the fragment constant data follows the vertex constant data");
+static_assert(hk_root_descriptor_offset(push) ==
+                 hk_root_descriptor_offset(draw.attrib_base) +
+                    sizeof(((struct hk_root_descriptor_table *)0)
+                              ->draw.attrib_base),
+              "attrib_base ends the graphics arm");
+static_assert(hk_root_descriptor_offset(set_dynamic_buffer_start) ==
+                 hk_root_descriptor_offset(dynamic_buffers) +
+                    sizeof(((struct hk_root_descriptor_table *)0)
+                              ->dynamic_buffers),
+              "the dynamic buffer table is followed by its set starts");
+
 struct hk_descriptor_state {
    bool root_dirty;
    uint64_t generation;
@@ -601,6 +681,12 @@ struct hk_graphics_state {
    uint64_t root_vertex_buffer_generation;
 
    uint64_t root;
+   /* CPU copy of the root uploaded at root (hk_cmd_buffer_upload_root()). */
+   const struct hk_root_descriptor_table *root_cpu;
+   /* The root the fragment program was last published with, and its CPU
+    * copy (hk_m5_fragment_root()). */
+   uint64_t fs_root;
+   const struct hk_root_descriptor_table *fs_root_cpu;
    uint64_t draw_params;
    uint64_t draw_id_ptr;
    uint32_t g17p_draw_params_value[2];

@@ -64,6 +64,8 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
              cmd->state.gfx.root &&
              desc->uploaded_root.gpu != cmd->state.gfx.root)
             cmd->state.gfx.g17p_bind_tail.valid = false;
+         if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+            cmd->state.gfx.root_cpu = desc->uploaded_root.cpu;
          hk_upload_stat(cmd, root_reuses, 1);
          return desc->uploaded_root.gpu;
       }
@@ -72,6 +74,9 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    struct agx_ptr root_ptr = hk_pool_root_alloc(cmd, root_size, 8);
    if (!root_ptr.gpu)
       return 0;
+
+   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+      cmd->state.gfx.root_cpu = root_ptr.cpu;
 
    /* A HAL200 tail built for the old root names it and must be rebuilt
     * before publication. Byte-identical roots keep that identity. */
