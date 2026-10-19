@@ -1510,7 +1510,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
       } else if (image->disjoint) {
          image->planes[plane].offset_B = 0;
       } else if (!hk_image_implicit_plane_range(
-                    implicit_plane_cursor_B, image->planes[plane].layout.size_B,
+                    /* Sparse binds map each plane in whole pages. */
+                    (pCreateInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+                       ? align64(implicit_plane_cursor_B, HK_SPARSE_ALIGN_B)
+                       : implicit_plane_cursor_B,
+                    image->planes[plane].layout.size_B,
                     &image->planes[plane].offset_B, &plane_end_B)) {
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "image plane layout exceeds the address space");
