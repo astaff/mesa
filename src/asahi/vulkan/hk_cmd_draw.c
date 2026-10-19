@@ -6500,6 +6500,7 @@ hk_g17p_read_only_early_reject_in(const struct hk_device *dev,
     * test nor the skipped fragment has a side effect. The all-live prolog
     * also must not inherit an API-mask or cull-distance kill. */
    return agx_native_graphics(&dev->dev) && fs->b.info.writes_sample_mask &&
+          !fs->info.fs.static_tests &&
           !fs->b.info.early_fragment_tests && !fs->info.fs.writes_memory &&
           !fs->info.fs.epilog_key.write_z && !fs->info.fs.epilog_key.write_s &&
           samples == 1 && in->depth_attachment && dyn->ds.depth.test_enable &&
@@ -7238,6 +7239,10 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        (gfx->dirty & HK_DIRTY_OCCLUSION) || desc->root_dirty) {
       const uint16_t no_epilog_discard =
          !epilog_discards && !read_only_early_reject ? UINT16_MAX : 0;
+      /* A main part compiled with the selector folded (AGX3 static state)
+       * always tests; nothing else may then own the tests. */
+      assert(!(fs && fs->info.fs.static_tests && !no_epilog_discard) &&
+             "folded depth/stencil test selector disagrees with the draw");
       const uint16_t alpha_to_coverage = dyn->ms.alpha_to_coverage_enable;
       if (desc->root.draw.no_epilog_discard != no_epilog_discard ||
           desc->root.draw.alpha_to_coverage != alpha_to_coverage) {

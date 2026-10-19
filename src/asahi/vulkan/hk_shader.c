@@ -102,7 +102,13 @@ struct hk_fs_key {
     */
    uint8_t g17p_samples;
 
-   uint8_t pad;
+   /** AGX3: alpha-to-coverage is statically disabled, so no fragment epilog of
+    * this shader discards unless the shader writes depth or stencil
+    * (agx_fs_epilog_may_discard()). The main part then always runs the
+    * depth/stencil tests itself and need not select that at draw time; the
+    * pipeline state also rules out a read-only early reject.
+    */
+   bool static_tests;
 };
 
 struct hk_shader_binary_cache_entry {
@@ -478,6 +484,36 @@ hk_populate_vs_key(struct hk_vs_key *key,
    }
 }
 
+/* The native AGX3B parts (G15, G17P) run a discarding shader's read-only
+ * depth test in the prolog instead (hk_g17p_read_only_early_reject_in()),
+ * with the main part's selector off. Whether a draw takes that path is
+ * draw-time state; these pipeline states rule it out for every draw. */
+static bool
+hk_g17p_static_no_early_reject(const struct vk_graphics_pipeline_state *state)
+{
+   if (state->ms != NULL &&
+       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) &&
+       state->ms->rasterization_samples > 1)
+      return true;
+
+   const struct vk_depth_stencil_state *ds = state->ds;
+   if (ds == NULL)
+      return false;
+
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE) &&
+       !ds->depth.test_enable)
+      return true;
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_WRITE_ENABLE) &&
+       ds->depth.write_enable)
+      return true;
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_COMPARE_OP) &&
+       ds->depth.compare_op == VK_COMPARE_OP_ALWAYS)
+      return true;
+   return !BITSET_TEST(state->dynamic,
+                       MESA_VK_DYNAMIC_DS_DEPTH_BOUNDS_TEST_ENABLE) &&
+          ds->depth.bounds_test.enable;
+}
+
 static void
 hk_populate_fs_key(struct hk_fs_key *key,
                    const struct vk_graphics_pipeline_state *state,
@@ -493,6 +529,13 @@ hk_populate_fs_key(struct hk_fs_key *key,
    if (agx_chip_native_agx3(chip) && state->ms != NULL &&
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->g17p_samples = state->ms->rasterization_samples;
+
+   if (agx_chip_native_agx3(chip) && state->ms != NULL &&
+       !BITSET_TEST(state->dynamic,
+                    MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
+       !state->ms->alpha_to_coverage_enable &&
+       hk_g17p_static_no_early_reject(state))
+      key->static_tests = true;
 
    if (state->pipeline_flags &
        VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)
@@ -2985,6 +3028,19 @@ hk_nir_has_tex(const nir_shader *nir)
    return false;
 }
 
+static bool
+hk_fold_tests_zs(nir_builder *b, nir_intrinsic_instr *intr,
+                 UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_shader_part_tests_zs_agx)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def,
+                   nir_imm_intN_t(b, UINT16_MAX, intr->def.bit_size));
+   return true;
+}
+
 static VkResult
 hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
@@ -3215,6 +3271,24 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
       else
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
+
+      /* With alpha-to-coverage statically off and no depth/stencil export,
+       * no epilog of this shader discards, so on the native AGX3 parts the
+       * main part always owns the depth/stencil tests while no read-only early
+       * reject can apply (hk_g17p_static_no_early_reject()): the draw-time
+       * selector (hk_root_descriptor_table::draw.no_epilog_discard) is all
+       * ones for every draw that can use it. Fold it, leaving the single
+       * unconditional testing coverage update of the native form instead of
+       * a uniform branch between a testing and a killing one. */
+      if (agx_chip_native_agx3(dev->dev.chip) && key && key->fs.static_tests &&
+          !shader->info.fs.epilog_key.write_z &&
+          !shader->info.fs.epilog_key.write_s) {
+         bool folded = false;
+         NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
+                  hk_fold_tests_zs, nir_metadata_control_flow, NULL);
+         shader->info.fs.static_tests = folded;
+      }
+
       if (agx_native_graphics(&dev->dev) &&
           nir->info.fs.early_fragment_tests) {
          bool done = false;
