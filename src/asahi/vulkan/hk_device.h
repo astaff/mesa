@@ -105,6 +105,7 @@ struct hk_gen1_as_slot {
    struct vk_acceleration_structure *as;
    uint32_t next_free;
 };
+struct hk_frame_anatomy;
 
 struct hk_device {
    struct vk_device vk;
@@ -114,6 +115,9 @@ struct hk_device {
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
    struct agxdecode_ctx *decode_ctx;
+   /* Opt-in frame anatomy profiler (hk_frame_anatomy.h); NULL unless the
+    * HK_FRAME_ANATOMY environment variable is set. */
+   struct hk_frame_anatomy *frame_anatomy;
 
    struct hk_descriptor_table occlusion_queries;
    struct hk_sampler_heap samplers;

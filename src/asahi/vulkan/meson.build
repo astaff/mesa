@@ -99,6 +99,8 @@ hk_files = files(
   'hk_execution_allowance.h',
   'hk_queue.c',
   'hk_queue.h',
+  'hk_frame_anatomy.c',
+  'hk_frame_anatomy.h',
   'hk_sampler.c',
   'hk_sampler.h',
   'hk_shader.c',

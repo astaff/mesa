@@ -338,6 +338,10 @@ struct hk_bg_eot {
       struct agx_counts_packed counts;
       uint64_t rsrc_spec;
    };
+   /* Frame anatomy profiler (hk_frame_anatomy.h): per-RT op summary of the
+    * program. Written only while HK_FRAME_ANATOMY is set; otherwise zero and
+    * never read. Not part of any hardware or kernel structure. */
+   uint8_t anatomy_ops[HK_MAX_RTS];
 };
 
 /* BG/EOT programs are self-addressed and may reference command-buffer pool
@@ -391,6 +395,10 @@ struct hk_render_registers {
       struct hk_bg_eot main;
       struct hk_bg_eot partial;
    } eot;
+
+   /* Frame anatomy profiler only: bit i set when colour attachment i's image
+    * layout is compressed. Zero unless HK_FRAME_ANATOMY is set. */
+   uint8_t color_compressed_mask;
 };
 
 struct hk_rendering_state {

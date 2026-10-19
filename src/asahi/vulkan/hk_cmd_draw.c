@@ -33,6 +33,7 @@
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
 #include "hk_native_vertex_template.h"
+#include "hk_frame_anatomy.h"
 #include "asahi/lib/agx_vdm_mesh_core.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -2608,10 +2609,14 @@ unsupported:
    return (struct hk_bg_eot){0};
 }
 
+/* anatomy_ops: NULL, or HK_MAX_RTS bytes receiving the frame anatomy
+ * profiler's per-RT summary of the key this program is built from. */
 static struct hk_bg_eot
-hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
-                bool store, bool partial_render, bool incomplete_render_area,
-                struct hk_g17p_bg_eot_cache_entry *cache)
+hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                        bool store, bool partial_render,
+                        bool incomplete_render_area,
+                        struct hk_g17p_bg_eot_cache_entry *cache,
+                        uint8_t *anatomy_ops)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
@@ -2721,6 +2726,20 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
             key.op[i] = AGX_BG_LOAD;
          else if (clear)
             key.op[i] = AGX_BG_CLEAR;
+      }
+   }
+
+   if (unlikely(anatomy_ops)) {
+      /* Profiler only. The key ops below are what every chip path builds
+       * from; the M5 single-RT path additionally treats a DONT_CARE load
+       * with no op as a clear, visible in the log as hw '-' with API 'D'. */
+      for (unsigned i = 0; i < HK_MAX_RTS; ++i) {
+         const VkRenderingAttachmentInfo *att =
+            i < info->colorAttachmentCount ? &info->pColorAttachments[i] : NULL;
+         const bool present = att && att->imageView != VK_NULL_HANDLE;
+         anatomy_ops[i] = hk_frame_anatomy_encode_op(
+            present, key.op[i], present ? att->loadOp : 0,
+            present ? att->storeOp : 0);
       }
    }
 
@@ -2924,6 +2943,27 @@ hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    }
 
    return ret;
+}
+
+static struct hk_bg_eot
+hk_build_bg_eot(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                bool store, bool partial_render, bool incomplete_render_area,
+                struct hk_g17p_bg_eot_cache_entry *cache)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (likely(!dev->frame_anatomy)) {
+      return hk_build_bg_eot_program(cmd, info, store, partial_render,
+                                     incomplete_render_area, cache, NULL);
+   }
+
+   /* Frame anatomy profiler: carry the per-RT op summary with the program,
+    * so a stream reports the main or partial variant it actually uses. */
+   uint8_t ops[HK_MAX_RTS] = {0};
+   struct hk_bg_eot program = hk_build_bg_eot_program(
+      cmd, info, store, partial_render, incomplete_render_area, cache, ops);
+   memcpy(program.anatomy_ops, ops, sizeof(ops));
+   return program;
 }
 
 static void
@@ -4045,6 +4085,19 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
    hk_attachment_init(&render->depth_att, pRenderingInfo->pDepthAttachment);
    hk_attachment_init(&render->stencil_att, pRenderingInfo->pStencilAttachment);
+
+   if (unlikely(dev->frame_anatomy)) {
+      /* Frame anatomy profiler: compression state of each colour target. */
+      for (uint32_t i = 0; i < render->color_att_count; i++) {
+         const struct hk_image_view *view = render->color_att[i].iview;
+         if (!view)
+            continue;
+         const struct hk_image *image =
+            container_of(view->vk.image, struct hk_image, vk);
+         if (image->planes[view->planes[0].image_plane].layout.compressed)
+            render->cr.color_compressed_mask |= BITFIELD_BIT(i);
+      }
+   }
 
    for (uint32_t i = 0; i < render->color_att_count; i++) {
       hk_merge_render_iview(render, render->color_att[i].iview, false);

@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_device.h"
+#include "hk_frame_anatomy.h"
 
 #include "hk_acceleration_structure.h"
 
@@ -1044,6 +1045,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->external_bos.counts = UTIL_DYNARRAY_INIT;
    dev->external_bos.list = UTIL_DYNARRAY_INIT;
 
+   /* Opt-in profiler; never fails device creation. */
+   hk_frame_anatomy_init(dev);
+
    if (init_diag)
       hk_device_init_diag(pdev, dev, "success", VK_SUCCESS, 0);
    return VK_SUCCESS;
@@ -1119,6 +1123,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_destroy_internal_shaders(dev, &dev->prolog_epilog, true);
 
    vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
+
+   /* Retire pending profiler records while the queue syncobjs exist. */
+   hk_frame_anatomy_finish(dev);
 
    vk_foreach_queue_safe(iter, &dev->vk) {
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);

@@ -22,6 +22,7 @@
 #include "agx_vdm_hal200_bind_tail_core.h"
 #include "decode.h"
 #include "hk_cmd_buffer.h"
+#include "hk_frame_anatomy.h"
 #include "hk_device.h"
 #include "hk_drm_render_core.h"
 #include "hk_drm_prior_core.h"
@@ -478,7 +479,8 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
 static VkResult
 queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
                     struct drm_asahi_submit *submit, unsigned command_count,
-                    unsigned ring_idx, const uint64_t prior_base[2])
+                    unsigned ring_idx, const uint64_t prior_base[2],
+                    struct hk_frame_anatomy_submit *anatomy)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -552,6 +554,10 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
       bool has_in_syncs = first ||
          (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS);
       bool has_out_syncs = last;
+
+      /* Profiler: barriers of this chunk exactly as rebased above. */
+      if (unlikely(anatomy))
+         hk_frame_anatomy_note_barriers(anatomy, cmdbuf, base_offs, offs);
 
       struct drm_asahi_submit submit_ioctl = {
          .flags = submit->flags,
@@ -1182,6 +1188,13 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       .timeline_value = ++queue->drm.timeline_value,
    };
 
+   /* Opt-in frame anatomy profiler (HK_FRAME_ANATOMY): NULL unless enabled
+    * and this submit is sampled, so the hooks below cost one NULL test. */
+   struct hk_frame_anatomy_submit *anatomy =
+      unlikely(dev->frame_anatomy)
+         ? hk_frame_anatomy_begin_submit(dev, queue, command_count)
+         : NULL;
+
    /* Now setup the command structs */
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
@@ -1230,6 +1243,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS),
                           completed)) {
       util_dynarray_fini(&payload);
+      if (unlikely(anatomy))
+         hk_frame_anatomy_end_submit(anatomy, dev, queue, VK_ERROR_DEVICE_LOST);
       return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
    }
 
@@ -1300,6 +1315,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                /* The header size is 16 bits; never let it truncate. */
                if (cs->compute_resources.size > UINT16_MAX) {
                   util_dynarray_fini(&payload);
+                  if (unlikely(anatomy))
+                     hk_frame_anatomy_end_submit(anatomy, dev, queue,
+                                                 VK_ERROR_DEVICE_LOST);
                   return vk_device_set_lost(
                      &dev->vk, "M5 compute resource list too large (%u bytes)",
                      cs->compute_resources.size);
@@ -1320,6 +1338,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             cmd.legacy.flags |= hk_as_build_flags(dev->dev.chip,
                                                   dev->dev.params.features,
                                                   cs->as_build);
+            if (unlikely(anatomy))
+               hk_frame_anatomy_compute(anatomy, dev, cs, &cmd.legacy, i,
+                                        nr_vdm + nr_cdm, payload.size);
             /* Native ray queries exist only on kernels that accept the
              * extended command (hk_g17p_rt_enabled). */
             assert(!cs->gen1_native_rq || dev->gen1_native_rq);
@@ -1380,6 +1401,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                /* The header size is 16 bits; never let it truncate. */
                if (cs->render_resources.size + tile_bytes > UINT16_MAX) {
                   util_dynarray_fini(&payload);
+                  if (unlikely(anatomy))
+                     hk_frame_anatomy_end_submit(anatomy, dev, queue,
+                                                 VK_ERROR_DEVICE_LOST);
                   return vk_device_set_lost(
                      &dev->vk, "M5 render resource list too large (%u bytes)",
                      cs->render_resources.size);
@@ -1418,6 +1442,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                 (cs->sync.barrier[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
                  cs->sync.prior[HK_SYNC_VDM] != 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+            if (unlikely(anatomy))
+               hk_frame_anatomy_render(anatomy, dev, cs, &cmd.legacy, i,
+                                       nr_vdm + nr_cdm, payload.size);
             header.size = hk_drm_render_command_size(
                agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
                queue->sync.exact_prior);
@@ -1470,13 +1497,20 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       .cmdbuf = (uint64_t)(uintptr_t)(payload.data),
    };
 
+   /* Profiler: "edges" timestamp claims happen in the final payload. */
+   if (unlikely(anatomy))
+      hk_frame_anatomy_prepare(anatomy, dev, payload.data, payload.size);
+
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
+      if (unlikely(anatomy))
+         hk_frame_anatomy_note_barriers(anatomy, payload.data, 0, payload.size);
       result =
          queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx);
    } else {
       result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
-                                   queue->drm.virt_ring_idx, prior_base);
+                                   queue->drm.virt_ring_idx, prior_base,
+                                   anatomy);
    }
    if (cumulative_signals) {
       /* The kernel can publish an error fence even when submission fails.
@@ -1488,6 +1522,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    }
 
    util_dynarray_fini(&payload);
+
+   if (unlikely(anatomy))
+      hk_frame_anatomy_end_submit(anatomy, dev, queue, result);
 
    return result;
 }
