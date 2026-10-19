@@ -2290,9 +2290,18 @@ hk_host_as_init(struct hk_device *dev)
    simple_mtx_init(&dev->host_as.lock, mtx_plain);
    dev->host_as.lock_ready = true;
 
+   /* hk_queue_init() takes the priority of queue index_in_family from
+    * pQueuePriorities unless a global priority is chained. This queue has no
+    * priority array of HK_HOST_AS_QUEUE_INDEX + 1 entries, so chain the
+    * class the 1.0 priority maps to instead. */
    const float priority = 1.0f;
+   const VkDeviceQueueGlobalPriorityCreateInfoKHR priority_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+      .globalPriority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+   };
    const VkDeviceQueueCreateInfo queue_info = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .pNext = &priority_info,
       .queueFamilyIndex = family,
       .queueCount = HK_HOST_AS_QUEUE_INDEX + 1,
       .pQueuePriorities = &priority,
