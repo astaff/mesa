@@ -617,6 +617,7 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                       uint32_t query)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
@@ -734,6 +735,7 @@ hk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                            uint32_t index)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
 
    hk_cmd_begin_end_query(cmd, pool, query, index, flags, false);
@@ -744,6 +746,7 @@ hk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
                          uint32_t query, uint32_t index)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
 
    hk_cmd_begin_end_query(cmd, pool, query, index, 0, true);

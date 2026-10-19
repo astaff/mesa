@@ -115,6 +115,7 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                 const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_event, event, _event);
 
    perf_debug(cmd, "Set event");
@@ -131,6 +132,7 @@ hk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                   VkPipelineStageFlags2 stageMask)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_event, event, _event);
 
    perf_debug(cmd, "Reset event");
@@ -152,6 +154,7 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
                   const VkDependencyInfo *pDependencyInfos)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_clears(cmd);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Wait events");
 

@@ -194,6 +194,12 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
                       const VkImageSubresourceRange *pRanges)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(hk_image, image, _image);
+
+   const VkClearValue value = {.color = *pColor};
+   if (hk_defer_clear(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, &value,
+                      rangeCount, pRanges))
+      return;
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
@@ -210,6 +216,13 @@ hk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image,
                              const VkImageSubresourceRange *pRanges)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(hk_image, image, _image);
+
+   const VkClearValue value = {.depthStencil = *pDepthStencil};
+   if (rangeCount == 1 &&
+       hk_defer_clear(cmd, image, pRanges[0].aspectMask, &value, rangeCount,
+                      pRanges))
+      return;
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
