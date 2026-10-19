@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "util/macros.h"
 #include "vulkan/vulkan_core.h"
 
 struct hk_device;
@@ -48,6 +49,14 @@ uint8_t hk_frame_anatomy_encode_op(bool present, unsigned hw_op,
 
 void hk_frame_anatomy_init(struct hk_device *dev);
 void hk_frame_anatomy_finish(struct hk_device *dev);
+
+/* One free-form "N <text>" line about a recording-time decision (not tied to
+ * a sampled submit). Nothing unless the profiler is enabled; at most
+ * HK_FRAME_ANATOMY_NOTES (default HK_FA_NOTE_LIMIT) lines per device, so a
+ * hot path cannot flood the log; the end line counts the dropped ones. */
+#define HK_FA_NOTE_LIMIT 4096
+void hk_frame_anatomy_note(struct hk_device *dev, const char *fmt, ...)
+   PRINTFLIKE(2, 3);
 
 /* Returns NULL unless this submit is sampled. */
 struct hk_frame_anatomy_submit *

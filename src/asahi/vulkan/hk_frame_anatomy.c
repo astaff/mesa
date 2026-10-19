@@ -21,6 +21,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,7 +97,35 @@ struct hk_frame_anatomy {
    /* Records in flight, FIFO; their slots form a contiguous ring span. */
    uint32_t ring_head, ring_count;
    struct util_dynarray pending; /* struct hk_frame_anatomy_rec */
+
+   /* Free-form notes written so far and dropped at the limit
+    * (hk_frame_anatomy_note); the limit is HK_FRAME_ANATOMY_NOTES. */
+   uint32_t notes, notes_dropped, note_limit;
 };
+
+void
+hk_frame_anatomy_note(struct hk_device *dev, const char *fmt, ...)
+{
+   struct hk_frame_anatomy *fa = dev->frame_anatomy;
+   if (likely(!fa))
+      return;
+
+   simple_mtx_lock(&fa->lock);
+   if (fa->notes < fa->note_limit) {
+      va_list ap;
+      va_start(ap, fmt);
+      fputs("N ", fa->file);
+      vfprintf(fa->file, fmt, ap);
+      va_end(ap);
+      if (++fa->notes == fa->note_limit)
+         fputs(" (note limit reached)", fa->file);
+      fputc('\n', fa->file);
+      fflush(fa->file);
+   } else {
+      fa->notes_dropped++;
+   }
+   simple_mtx_unlock(&fa->lock);
+}
 
 uint8_t
 hk_frame_anatomy_encode_op(bool present, unsigned hw_op,
@@ -269,6 +298,9 @@ hk_frame_anatomy_init(struct hk_device *dev)
 
    int64_t every = debug_get_num_option("HK_FRAME_ANATOMY_EVERY", 200);
    fa->every = every > 0 ? (uint64_t)every : 1;
+   int64_t notes = debug_get_num_option("HK_FRAME_ANATOMY_NOTES",
+                                        HK_FA_NOTE_LIMIT);
+   fa->note_limit = notes > 0 ? (uint32_t)MIN2(notes, INT32_MAX) : 0;
 
    const char *ts = os_get_option("HK_FRAME_ANATOMY_TS");
    fa->ts_mode = HK_FA_TS_ALL;
@@ -355,8 +387,9 @@ hk_frame_anatomy_finish(struct hk_device *dev)
    const unsigned left =
       util_dynarray_num_elements(&fa->pending, struct hk_frame_anatomy_rec);
    fprintf(fa->file,
-           "# end submits=%" PRIu64 " sampled=%" PRIu64 " unretired=%u\n",
-           fa->submit_seq, fa->sampled, left);
+           "# end submits=%" PRIu64 " sampled=%" PRIu64
+           " unretired=%u notes=%u dropped=%u\n",
+           fa->submit_seq, fa->sampled, left, fa->notes, fa->notes_dropped);
    fflush(fa->file);
    simple_mtx_unlock(&fa->lock);
 

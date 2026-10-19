@@ -3496,8 +3496,9 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
 
    /* The instance is one ordinary render stream with draws, with no
     * pre/post-graphics streams, heap use or timestamps attached. */
-   if (!agx_chip_native_agx3(dev->dev.chip) || cmd->in_meta ||
-       cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
+   if ((!agx_chip_native_agx3(dev->dev.chip) &&
+        !agx_chip_g17_m5(dev->dev.chip)) ||
+       cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
        cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
        cmd->uses_heap || cs->timestamp.start.handle ||
        cs->timestamp.end.handle)
@@ -3635,10 +3636,21 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
       return;
    case HK_M5_MERGE_DEP_ORDERED:
       if (!m->ordered)
+         hk_frame_anatomy_note(hk_cmd_buffer_device(cmd),
+                               "pass-merge ordered: %s barrier src=0x%" PRIx64
+                               " dst=0x%" PRIx64 " dst_access=0x%" PRIx64,
+                               what, (uint64_t)src, (uint64_t)dst,
+                               (uint64_t)dst_access);
       m->ordered = true;
       return;
    case HK_M5_MERGE_DEP_END:
       m->valid = false;
+      hk_frame_anatomy_note(hk_cmd_buffer_device(cmd),
+                            "pass-merge end: %s barrier src=0x%" PRIx64
+                            " dst=0x%" PRIx64 " dst_access=0x%" PRIx64
+                            " with a layout transition or ownership transfer",
+                            what, (uint64_t)src, (uint64_t)dst,
+                            (uint64_t)dst_access);
       return;
    }
 }
@@ -3964,6 +3976,16 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
             info->layerCount != prev->layer_count ||
             info->viewMask != prev->view_mask ||
             info->colorAttachmentCount != prev->color_att_count) {
+      hk_frame_anatomy_note(
+         dev,
+         "pass-merge end: geometry %d,%d %ux%u layers=%u views=0x%x rts=%u -> "
+         "%d,%d %ux%u layers=%u views=0x%x rts=%u",
+         prev->area.offset.x, prev->area.offset.y, prev->area.extent.width,
+         prev->area.extent.height, prev->layer_count, prev->view_mask,
+         prev->color_att_count, info->renderArea.offset.x,
+         info->renderArea.offset.y, info->renderArea.extent.width,
+         info->renderArea.extent.height, info->layerCount, info->viewMask,
+         info->colorAttachmentCount);
       return false;
    }
 
@@ -3985,6 +4007,8 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    }
 
    if (why) {
+      hk_frame_anatomy_note(dev, "pass-merge end: %s%s%s", slot ? slot : "",
+                            slot ? " " : "", why);
       return false;
    }
 
@@ -3994,6 +4018,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    if (ordered) {
       why = hk_m5_ordered_refusal(cmd, info, prev, cs);
       if (why) {
+         hk_frame_anatomy_note(dev, "pass-merge end: ordered, %s", why);
          return false;
       }
    }
@@ -4043,6 +4068,9 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
       cmd->state.gfx.descriptors.root_dirty = true;
    }
 
+   hk_frame_anatomy_note(dev, "pass-merge continue: %ux%u draws_before=%u%s",
+                         render->cr.width, render->cr.height, cs->stats.cmds,
+                         ordered ? " ordered" : "");
    perf_debug(cmd, "Continuing the previous render pass instance");
    return true;
 }
