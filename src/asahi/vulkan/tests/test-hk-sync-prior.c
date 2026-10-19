@@ -408,6 +408,29 @@ test_chain_first_skips_empty_buffers(void)
    }
 }
 
+/* Native ray tracing sends the extended compute command, which only a
+ * kernel advertising both the exact-prior layout and ray query state parses.
+ * Anything less keeps ray tracing off. */
+static void
+test_rt_kernel_gate(void)
+{
+   struct agx_device *dev = test_alloc(sizeof(*dev));
+   dev->chip = AGX_CHIP_G17P;
+   dev->params.features = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
+                          DRM_ASAHI_FEATURE_RENDER_RAY_QUERY;
+   T("rt on with exact prior and ray query", hk_g17p_rt_enabled(dev));
+   dev->params.features = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+   T("rt off without ray query", !hk_g17p_rt_enabled(dev));
+   dev->params.features = DRM_ASAHI_FEATURE_RENDER_RAY_QUERY;
+   T("rt off without exact prior", !hk_g17p_rt_enabled(dev));
+   dev->params.features = 0;
+   T("rt off on a kernel without either", !hk_g17p_rt_enabled(dev));
+   dev->chip = AGX_CHIP_G13G;
+   dev->params.features = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
+                          DRM_ASAHI_FEATURE_RENDER_RAY_QUERY;
+   T("rt off outside G17P", !hk_g17p_rt_enabled(dev));
+}
+
 int
 main(void)
 {
@@ -418,6 +441,7 @@ main(void)
    test_compute_clear_layer_preservation();
    test_pass_software_graphics_dependencies();
    test_chain_first_skips_empty_buffers();
+   test_rt_kernel_gate();
    /* Each matching destination retains the exact old source prefix, including
     * reuse of a recording and independent physical destinations on the queue. */
    struct hk_queue *q = new_queue(true);

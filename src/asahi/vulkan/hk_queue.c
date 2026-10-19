@@ -1211,7 +1211,10 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             asahi_append_compute_attachments(dev, &payload, cs);
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
             asahi_fill_cdm_command(dev, cs, &cmd.legacy);
-            if(cs->gen1_native_rq) {
+            /* Native ray queries exist only on kernels that accept the
+             * extended command (hk_g17p_rt_enabled). */
+            assert(!cs->gen1_native_rq || dev->gen1_native_rq);
+            if (cs->gen1_native_rq && dev->gen1_native_rq) {
                header.size=sizeof(cmd);
                cmd.scs_layout=hk_gen1_ray_query_scs_layout(dev);
                cmd.intersection_pool=dev->gen1_rq_ift->va->addr;
