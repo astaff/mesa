@@ -252,6 +252,19 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
             agx_can_fold_half_uniform(ins, defs)))
          continue;
 
+      /* M5's f32 add takes at most one half register (f32 + f16, or a half
+       * plus a minifloat immediate); two half registers into an f32 result
+       * have no encoding. Keep the second widening explicit. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          ins->op == AGX_OPCODE_FADD && ins->nr_srcs == 2 &&
+          ins->dest[0].size == AGX_SIZE_32 && src.size == AGX_SIZE_32 &&
+          def->src[0].type == AGX_INDEX_NORMAL &&
+          def->src[0].size == AGX_SIZE_16) {
+         const agx_index other = ins->src[1 - s];
+         if (other.type == AGX_INDEX_NORMAL && other.size == AGX_SIZE_16)
+            continue;
+      }
+
       /* FLTNORM and RGB10A2 packing have only captured f32 sources. Keep
        * the explicit widening used by linked half-width fragment outputs
        * before normalized packing. */
