@@ -1331,7 +1331,7 @@ hk_descriptor_type_has_image_view(VkDescriptorType type)
           type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
 }
 
-/* M5 render pass continuation: the image views a graphics push descriptor
+/* AGX3 render pass continuation: the image views a graphics push descriptor
  * update writes (hk_m5_pass_merge_note_push()). */
 static void
 hk_m5_note_push_writes(struct hk_cmd_buffer *cmd, uint32_t count,

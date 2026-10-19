@@ -3462,7 +3462,7 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
 }
 
 /*
- * M5 render pass continuation.
+ * AGX3 render pass continuation.
  *
  * Two consecutive render pass instances on the same attachments, where the
  * second loads what the first stored and nothing but state binding and

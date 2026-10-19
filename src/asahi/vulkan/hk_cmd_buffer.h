@@ -2060,7 +2060,7 @@ hk_stat_enabled(uint64_t addr)
    return addr != AGX_SCRATCH_PAGE_ADDRESS;
 }
 
-/* M5 render pass continuation (hk_cmd_draw.c): a pipeline barrier recorded
+/* AGX3 render pass continuation (hk_cmd_draw.c): a pipeline barrier recorded
  * while an ended instance is still continuable decides whether the next one
  * may continue in its stream. */
 void hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
