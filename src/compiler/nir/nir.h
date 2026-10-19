@@ -7085,6 +7085,7 @@ typedef enum {
 
 bool nir_opt_if(nir_shader *shader, nir_opt_if_options options);
 bool nir_opt_if_empty_then(nir_shader *shader);
+bool nir_opt_if_merge(nir_shader *shader);
 
 bool nir_opt_intrinsics(nir_shader *shader);
 
