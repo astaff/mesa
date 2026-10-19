@@ -434,13 +434,15 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
          view->planes[0].storage_pbe_valid;
       supported = hk_native_pbe_supported(generation) || native_basic;
       /* A readable native texture does not require a writable PBE. In
-       * particular, linear storage views have a valid texture descriptor
-       * even when the native PBE packer cannot represent their layout.
+       * particular, linear and multisampled storage views have a valid
+       * texture descriptor even when the native PBE packer cannot represent
+       * their layout.
        * Keep imageLoad/imageSize bound to that view instead of replacing
        * both halves with a null descriptor because stores are unsupported.
        */
       texture_supported = supported ||
-         (generation == 9 && view->plane_count == 1);
+         (hk_descriptor_generation_is_agx3(generation) &&
+          view->plane_count == 1);
       if (texture_supported) {
          /* Storage images are always single plane */
          assert(view->plane_count == 1);
