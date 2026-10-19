@@ -4420,7 +4420,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    hk_pack_zls_control(&render->cr.zls_control_partial, z_layout, s_layout,
                        attach_z, attach_s, incomplete_render_area, true);
 
-   const bool agx3 = agx_chip_native_agx3(dev->dev.chip);
+   const bool agx3 = agx_chip_native_agx3(dev->dev.chip) ||
+                     agx_chip_g17_m5(dev->dev.chip);
    render->zls_precise = agx3 && z_layout != NULL;
    render->g17p_zls_touched = 0;
    render->g17p_zls_written = 0;
