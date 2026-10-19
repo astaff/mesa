@@ -200,12 +200,14 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
           info->mipLevels == 1;
 }
 
-/* G17P colour images shared through DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED.
+/* G17P and M5 colour images shared through
+ * DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED.
  *
  * The modifier is the sharing contract. With one level, one layer and one
  * sample, the G17P (legacy AIL policy) compressed allocation is a function of
  * the format's block size and the extent alone: GPU tiling, the image, then
- * its metadata, in one memory plane. Exporter and importer therefore derive
+ * its metadata, in one memory plane. The M5 allocation (AIL_LAYOUT_POLICY_M5
+ * and its metadata, one memory plane) is too. Exporter and importer therefore derive
  * the same layout, and import already follows the modifier through
  * hk_map_compression(). The packets that read and write it are the ones the
  * private policy above uses for single-level colour images: the compressed
@@ -238,7 +240,8 @@ hk_g17p_shared_compression_shape(enum agx_chip chip, VkFormat format,
       VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
       VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
-   return chip == AGX_CHIP_G17P && type == VK_IMAGE_TYPE_2D &&
+   return (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
+          type == VK_IMAGE_TYPE_2D &&
           !(flags & ~allowed_flags) && !(usage & ~allowed_usage) &&
           hk_g17p_compression_color_format(format);
 }

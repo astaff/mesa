@@ -417,7 +417,7 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 
    /* AGX3 compresses only what its policies in hk_g17p_compression.h
     * admitted (allow_agx3). The private policy excludes images shared through
-    * external memory; G17P shares colour images compressed only through the
+    * external memory; G17P and M5 share colour images compressed only through the
     * GPU_TILED_COMPRESSED modifier (hk_g17p_shared_compression_eligible()),
     * which is all hk_can_compress_format() advertises on AGX3. */
    if (hk_descriptor_generation_is_agx3(
@@ -608,8 +608,8 @@ hk_can_compress_format(const struct agx_device *dev, VkFormat format)
     *
     * Likewise, we do not set flags as flags only disable compression.
     *
-    * On AGX3 only G17P advertises the modifier, for the colour formats it
-    * shares compressed (hk_g17p_shared_compression_supported()).
+    * On AGX3 only G17P and M5 advertise the modifier, for the colour formats
+    * they share compressed (hk_g17p_shared_compression_supported()).
     */
    const bool g17p_shared = hk_g17p_shared_compression_supported(
       dev, format, VK_IMAGE_TYPE_2D, 0, 0, NULL);
@@ -837,7 +837,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    const bool g17p_compressed =
-      pdev->dev.chip == AGX_CHIP_G17P &&
+      (pdev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(pdev->dev.chip)) &&
       pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
       drm_mod_info &&
       drm_mod_info->drmFormatModifier ==
@@ -1403,16 +1403,16 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
                           mod_explicit_info->pPlaneLayouts[0].rowPitch, pitch_B);
    }
 
-   /* G17P shares compressed colour images only in the shape both sides
+   /* G17P and M5 share compressed colour images only in the shape both sides
     * allocate identically (hk_g17p_shared_compression_eligible()). */
    if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
-       dev->dev.chip == AGX_CHIP_G17P &&
+       (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
        !(hk_g17p_shared_compression_supported(
             &dev->dev, pCreateInfo->format, pCreateInfo->imageType,
             pCreateInfo->flags, pCreateInfo->usage, pCreateInfo->pNext) &&
          hk_g17p_shared_compression_eligible(dev->dev.chip, 0, pCreateInfo)))
       return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
-                       "compressed modifier on an ineligible G17P image");
+                       "compressed modifier on an ineligible image");
 
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(pCreateInfo->format);

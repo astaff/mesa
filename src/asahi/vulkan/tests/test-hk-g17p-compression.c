@@ -369,11 +369,12 @@ check_shared(void)
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
    CHECK(SHARED(base));
 
-   /* G17P only, plane 0 only. */
+   /* G17P and M5 only, plane 0 only. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_g17p_shared_compression_eligible((enum agx_chip)chip, 0,
                                                 &base) ==
-            (chip == AGX_CHIP_G17P));
+            (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
+             chip == AGX_CHIP_G17S));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 1, &base));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 0, NULL));
 
