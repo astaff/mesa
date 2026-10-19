@@ -647,11 +647,14 @@ hk_populate_fs_key(struct hk_fs_key *key,
    if (agx_chip_g17_m5(chip) && state->ms != NULL &&
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
-   if (agx_chip_native_agx3(chip) && state->ms != NULL &&
+
+   /* M5 has no read-only early reject to rule out. */
+   if ((agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip)) &&
+       state->ms != NULL &&
        !BITSET_TEST(state->dynamic,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
        !state->ms->alpha_to_coverage_enable &&
-       hk_g17p_static_no_early_reject(state))
+       (agx_chip_g17_m5(chip) || hk_g17p_static_no_early_reject(state)))
       key->static_tests = true;
 
    if (state->pipeline_flags &
@@ -4308,7 +4311,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * ones for every draw that can use it. Fold it, leaving the single
        * unconditional testing coverage update of the native form instead of
        * a uniform branch between a testing and a killing one. */
-      if (agx_chip_native_agx3(dev->dev.chip) && key && key->fs.static_tests &&
+      if ((agx_chip_native_agx3(dev->dev.chip) ||
+           agx_chip_g17_m5(dev->dev.chip)) &&
+          key && key->fs.static_tests &&
           !shader->info.fs.epilog_key.write_z &&
           !shader->info.fs.epilog_key.write_s) {
          bool folded = false;
