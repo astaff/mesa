@@ -13000,8 +13000,24 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * schedule; see agx_nir_opt_sink_loop_sample_uses.c. */
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        nir->info.stage != MESA_SHADER_FRAGMENT &&
-       nir->info.stage != MESA_SHADER_COMPUTE)
+       nir->info.stage != MESA_SHADER_COMPUTE) {
       NIR_PASS(_, nir, agx_nir_opt_sink_loop_sample_uses);
+
+      /* Every control-flow instruction retires the samples in flight, so
+       * also issue the body's unconditional samples ahead of the
+       * side-effect-free conditional blocks before them, then merge the
+       * conditional blocks this leaves adjacent; see
+       * agx_nir_opt_hoist_loop_samples. */
+      bool hoisted = false;
+      NIR_PASS(hoisted, nir, agx_nir_opt_hoist_loop_samples);
+      bool merged = false;
+      if (hoisted)
+         NIR_PASS(merged, nir, nir_opt_if_merge);
+      if (merged) {
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);
