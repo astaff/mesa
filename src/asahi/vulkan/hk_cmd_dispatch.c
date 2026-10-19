@@ -40,6 +40,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* Diagnostic controls, read once: these are consulted per dispatch, and an
+ * uncached getenv() scans the whole environment. */
+DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_compute_loader,
+                           "AGX_M5_VERIFY_COMPUTE_LOADER", false)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_rq_candidate_probe, "ASAHI_M5_RQ_CANDIDATE_PROBE",
+                           false)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_rq_candidate_api, "ASAHI_M5_RQ_CANDIDATE_API",
+                           false)
+
+static inline bool
+hk_m5_rq_candidate_requested(void)
+{
+   return debug_get_option_m5_rq_candidate_probe() ||
+          debug_get_option_m5_rq_candidate_api();
+}
+
 /* EXP-G1b's native access::write argument is a PBE pointer followed by a
  * pointer to this control descriptor, including when it follows a sampled
  * texture in the argument table. It is not the read_write clamp scalar. */
@@ -1752,7 +1769,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        * different sections; neither is the shader's ordinary spill buffer. */
       struct agx_scs_layout_gen2 scs;
       const uint64_t packed = dev->m5_rq_instances
-         ? ((debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_PROBE", false) || debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false))
+         ? (hk_m5_rq_candidate_requested()
                      ? UINT64_C(0x01140000600100e8) /* 276-entry IFT50 tail */
                      : UINT64_C(0x00480000600100e8)) : UINT64_C(0x0028000060000070);
       if (!agx_scs_layout_gen2_init(packed, &scs))
@@ -1846,7 +1863,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             memcpy((uint8_t *)uniforms.cpu + 52*2, &layout, 8);
             memcpy((uint8_t *)uniforms.cpu + 56*2, &driver, 8);
          }
-         if ((debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_PROBE", false) || debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false))) {
+         if (hk_m5_rq_candidate_requested()) {
             /* Fresh query-once native u110..113, separately bound because the
              * captured ordinary profile uses u140 for its per-clique state. */
             uint64_t query_payload = UINT64_C(0x3fffffff00008000);
@@ -1932,7 +1949,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       program.length = loader->length;
       memcpy(program.bytes, loader->bytes, loader->length);
       hk_g17p_patch_plan_apply(&loader->plan, ranges, program.bytes);
-      if (debug_get_bool_option("AGX_M5_VERIFY_COMPUTE_LOADER", false)) {
+      if (debug_get_option_m5_verify_compute_loader()) {
          struct agx3_g17p_graphics_program fresh;
          if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &fresh) ||
              fresh.length != program.length ||
@@ -2032,7 +2049,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->stats.cmds++;
    return;
 refused:
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false)) {
+   if (debug_get_option_m5_launch_debug()) {
       fprintf(stderr, "M5 compute refused: %s stage=%u scratch=%u/%u "
               "gprs=%u staging=%u:%u local=%u preamble=%u "
               "textures=%u samplers=%u heap=%u txf=%u sets=%u "

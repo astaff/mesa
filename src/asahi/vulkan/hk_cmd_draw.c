@@ -93,6 +93,20 @@
 #include "vk_util.h"
 #include "util/set.h"
 
+/* Diagnostic controls, read once: these are consulted per draw or
+ * render pass, and an uncached getenv() scans the whole environment. */
+DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_tile_loader, "AGX_M5_VERIFY_TILE_LOADER",
+                           false)
+DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_primitive_address,
+                           "ASAHI_MESH_NATIVE_PRIMITIVE_ADDRESS_DIAGNOSTIC",
+                           false)
+DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_m5_wclamp,
+                           "ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC", false)
+DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_raster_enable,
+                           "ASAHI_MESH_NATIVE_RASTER_ENABLE_DIAGNOSTIC", false)
+DEBUG_GET_ONCE_BOOL_OPTION(mesh_pp_tail0, "ASAHI_MESH_PP_TAIL0", false)
+
 #define IS_DIRTY(bit) BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_##bit)
 
 #define IS_SHADER_DIRTY(bit)                                                   \
@@ -2037,7 +2051,7 @@ hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
    program->length = selected->length;
    memcpy(program->bytes, selected->bytes, selected->length);
    hk_g17p_patch_plan_apply(&selected->plan, d->uniform_ranges, program->bytes);
-   if (debug_get_bool_option("AGX_M5_VERIFY_TILE_LOADER", false)) {
+   if (debug_get_option_m5_verify_tile_loader()) {
       struct agx3_g17p_graphics_program fresh;
       if (!agx3_g17g_tile_program_generate(dev->dev.chip, d, store, &fresh) ||
           fresh.length != program->length ||
@@ -2088,7 +2102,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
        * Keep all attachments together on the shared shader resolve path. */
       resolving &= !shader_resolve && !agx_tilebuffer_spills(&render->tilebuffer);
    }
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false)) {
+   if (debug_get_option_m5_launch_debug()) {
       for (unsigned rt = 0; rt < count; ++rt) {
          const struct hk_image_view *view = render->color_att[rt].iview;
          fprintf(stderr, "M5 MRT attachment %u: format=%u selector=%#x "
@@ -2188,7 +2202,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       for (unsigned i = 0; i < active_count; ++i) {
          const unsigned rt = active[i];
          arguments[1 + i] = agx_tilebuffer_offset_B(&key->tib, rt);
-         if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false)) {
+         if (debug_get_option_m5_launch_debug()) {
             fprintf(stderr, "M5 MRT EOT argument rt=%u pbe=%#" PRIx64
                             " offset=%" PRIu64 " descriptor=", rt,
                     pbes + i * sizeof(descriptors[0]), arguments[1 + i]);
@@ -2260,7 +2274,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||
        program.length > capacity)
       goto unsupported;
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false)) {
+   if (debug_get_option_m5_launch_debug()) {
       fprintf(stderr, "M5 MRT %s count=%u sampleB=%u tile=%u gprs=%u D=%u "
                       "shader=%#" PRIx64 " mainSize=%u ioto=",
               store ? "EOT" : "BG", count, key->tib.sample_size_B,
@@ -2301,7 +2315,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          ? UINT64_C(0xffff800000000000) : UINT64_C(0xffff800000000040),
    };
 unsupported:
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
+   if (debug_get_option_m5_launch_debug())
       mesa_loge("M5 MRT admission: store=%u shader=%u gprs=%u staging=%u "
                 "scratch=%u preamble=%u push=%u expected=%u txf=%u loads=%u "
                 "attachments=%u samples=%u sampleB=%u tile=%u",
@@ -2382,7 +2396,7 @@ hk_build_m5_empty_bg_eot(struct hk_cmd_buffer *cmd,
    };
 
 unsupported:
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
+   if (debug_get_option_m5_launch_debug())
       mesa_loge("M5 empty BG/EOT admission: store=%u color=%u sampleB=%u "
                 "samples=%u tile=%u layered=%u layers=%u views=%#x spills=%u "
                 "ops=%u%u%u%u%u%u%u%u",
@@ -2586,7 +2600,7 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          ? UINT64_C(0xffff800000000000) : UINT64_C(0xffff800000000040),
    };
 unsupported:
-   if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false)) {
+   if (debug_get_option_m5_launch_debug()) {
       mesa_loge("M5 BG/EOT admission: store=%u partial=%u op=%u attachments=%u "
                 "sampleB=%u samples=%u tile=%u layered=%u spills=%u offsetB=%u "
                 "format=%u viewformat=%u pbe=%u shader=%u gprs=%u "
@@ -7769,26 +7783,16 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       return hk_g17p_bind_tail_refused(__LINE__);
 
    struct agx_ppp_w_clamp_cull2_core w_cull2_record;
-   /* Only G17P mesh draws consult the environment: this runs for every
-    * draw that publishes vertex state. */
-   const bool g17p_mesh = dev->dev.chip == AGX_CHIP_G17P &&
-                          vs->info.stage == MESA_SHADER_MESH;
-   const char *native_mesh_primitive_address =
-      g17p_mesh ? getenv("ASAHI_MESH_NATIVE_PRIMITIVE_ADDRESS_DIAGNOSTIC")
-                : NULL;
    const bool native_mesh_primitive_address_enabled =
-      native_mesh_primitive_address &&
-      !strcmp(native_mesh_primitive_address, "1") &&
       dev->dev.chip == AGX_CHIP_G17P &&
       vs->info.stage == MESA_SHADER_MESH &&
       vs->info.uvs.mesh_primitive_page &&
-      vs->info.mesh.primitive_stride_B != 0;
-   const char *native_mesh_wclamp =
-      g17p_mesh ? getenv("ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC") : NULL;
+      vs->info.mesh.primitive_stride_B != 0 &&
+      debug_get_option_mesh_native_primitive_address();
    const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
-      .w_clamp_raw = native_mesh_wclamp && !strcmp(native_mesh_wclamp, "1") &&
-                     dev->dev.chip == AGX_CHIP_G17P &&
-                     vs->info.stage == MESA_SHADER_MESH
+      .w_clamp_raw = dev->dev.chip == AGX_CHIP_G17P &&
+                     vs->info.stage == MESA_SHADER_MESH &&
+                     debug_get_option_mesh_native_m5_wclamp()
                         ? UINT32_C(0x00840002) : 0,
       /* The generated primitive-ID coefficient needs its rasterizer input
        * enabled as well as the matching VDM producer and output slot. */
@@ -10257,10 +10261,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
             return;
          }
-         const char *native_raster =
-            getenv("ASAHI_MESH_NATIVE_RASTER_ENABLE_DIAGNOSTIC");
-         const bool native_raster_enabled = native_raster &&
-            !strcmp(native_raster, "1");
+         const bool native_raster_enabled =
+            debug_get_option_mesh_native_raster_enable();
          struct agx_vdm_mesh_state_info state = {
             
 
@@ -10306,9 +10308,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             /* Native object->mesh kicks (native726 mesh-object, 0x1ca48
              * bound) set tail[0]; task kicks with the native record do too.
              * Payload-free task kicks without it keep the mesh-only value. */
-            const char *tail0 = getenv("ASAHI_MESH_PP_TAIL0");
             if ((task && hk_m5_task_record(dev->dev.params.features)) ||
-                (tail0 && !strcmp(tail0, "1")))
+                debug_get_option_mesh_pp_tail0())
                state.raw_tail[0] = 1;
          }
          if (!agx_vdm_mesh_state_pack(dev->dev.chip, &state, out)) {
@@ -11716,7 +11717,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       enum agx_primitive topology = cmd->state.gfx.topology;
       if ((!agx_native_graphics(&dev->dev) || agx_is_indirect(draw.b)) &&
           !agx_vdm_draw_supported(dev->dev.chip, draw, topology)) {
-         if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
+         if (debug_get_option_m5_launch_debug())
             mesa_loge("draw admission: indexed=%u indirect=%u size=%u ib=%#llx range=%u arg=%#llx topology=%u",
                       draw.indexed, agx_is_indirect(draw.b), draw.index_size,
                       (unsigned long long)draw.index_buffer, draw.index_buffer_range_B,
