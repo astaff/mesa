@@ -820,6 +820,17 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
            I->op == AGX_OPCODE_ICMP_QUAD_BALLOT))
          continue;
 
+      /* M5's funnel extract takes two word registers. Only a zero-extended
+       * low half shifted out entirely (an immediate shift of 16 or more,
+       * which legalization turns into a bitfield insert) may stay narrow;
+       * keep the explicit extension move for every other half source. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
+          I->op == AGX_OPCODE_EXTR && s < 2 &&
+          !(s == 0 && I->src[2].type == AGX_INDEX_IMMEDIATE &&
+            I->src[2].value >= 16 && I->src[2].value <= 31))
+         continue;
+
       /* The AGX3C saturating add has only a witnessed 32-bit register form
        * (iadd/isub with f53, agx3_pack_binary.c); a zero-extended 16-bit
        * source is refused by the packer. Keep the explicit extension move,
