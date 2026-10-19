@@ -796,11 +796,31 @@ lower_regular_texture(nir_builder *b, nir_instr *instr, void *data)
         tex->sampler_dim == GLSL_SAMPLER_DIM_3D) &&
        nir_tex_instr_src_index(tex, nir_tex_src_min_lod) < 0 &&
        !(tex->backend_flags & AGX_TEXTURE_FLAG_NO_CLAMP)) {
-      /* The size at the fetched level also counts array layers. */
-      const unsigned n = tex->coord_components;
-      nir_def *size = nir_trim_vector(b, nir_get_texture_size(b, tex), n);
-      nir_def *checked = nir_trim_vector(b, coord, n);
-      g17p_txf_oob = nir_bany(b, nir_uge(b, checked, size));
+      /* The size at the fetched level also counts array layers. A constant
+       * zero component lies inside every valid level and layer, so only the
+       * level check below can fail for it; a null descriptor already swizzles
+       * every channel to zero. Skipping those components drops the size query,
+       * which depends on a varying level, from a fetch of texel 0. */
+      if (options->gen10) {
+         nir_def *size = NULL;
+         g17p_txf_oob = nir_imm_false(b);
+         for (unsigned c = 0; c < tex->coord_components; ++c) {
+            if (nir_scalar_is_zero(nir_get_scalar(coord, c)))
+               continue;
+
+            size = size ?: nir_get_texture_size(b, tex);
+            g17p_txf_oob = nir_ior(
+               b, g17p_txf_oob,
+               nir_uge(b, nir_channel(b, coord, c), nir_channel(b, size, c)));
+         }
+      } else {
+         /* Gen9 keeps the whole-vector check: the zero-component skip is
+          * qualified on M5 only. */
+         const unsigned n = tex->coord_components;
+         nir_def *size = nir_trim_vector(b, nir_get_texture_size(b, tex), n);
+         nir_def *checked = nir_trim_vector(b, coord, n);
+         g17p_txf_oob = nir_bany(b, nir_uge(b, checked, size));
+      }
 
       if (has_nonzero_lod(tex)) {
          /* The fetch consumes a 32-bit level, see the end of lower_texture().
