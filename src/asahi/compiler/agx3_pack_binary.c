@@ -10510,8 +10510,18 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                .wait_mask = wait,
             };
             uint8_t bytes[AGX3_FLTNORM_MAX_LENGTH], len = 0;
-            if (!agx3_persp_mul_encode(enc, &desc, bytes, &len) ||
-                !agx3_append(emission, bytes, len))
+            bool ok = agx3_persp_mul_encode(enc, &desc, bytes, &len);
+            if (!ok && wait) {
+               /* The f32mul forms carry waits only up to slot 6, but AGX3C
+                * allocates slots 7 and 8 too. Carry such a wait on an
+                * identity of the destination first, as for other producers
+                * without a wait field for it, then multiply without one. */
+               struct agx3_persp_mul_desc unwaited = desc;
+               unwaited.wait_mask = 0;
+               ok = agx3_retire_result_wait(emission, enc, I, wait) &&
+                    agx3_persp_mul_encode(enc, &unwaited, bytes, &len);
+            }
+            if (!ok || !agx3_append(emission, bytes, len))
                AGX3_REFUSE(I);
             continue;
          }
