@@ -1017,14 +1017,27 @@ lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
          (nir_intrinsic_memory_modes(i)&~nir_var_mem_task_payload)|nir_var_mem_global);
       return true;
    }
+   const bool atomic=i->intrinsic==nir_intrinsic_task_payload_atomic ||
+                     i->intrinsic==nir_intrinsic_task_payload_atomic_swap;
    bool store=i->intrinsic==nir_intrinsic_store_task_payload;
-   if (!store && i->intrinsic!=nir_intrinsic_load_task_payload) return false;
+   if (!store && !atomic && i->intrinsic!=nir_intrinsic_load_task_payload)
+      return false;
    b->cursor=nir_before_instr(&i->instr);
    nir_def *pointer=nir_pack_64_2x32(b,nir_load_mesh_payload_address_agx(b));
    nir_def *offset=i->src[store ? 1 : 0].ssa;
    nir_def *addr=nir_iadd(b,pointer,nir_u2u64(b,
                             nir_iadd_imm(b,offset,nir_intrinsic_base(i)+payload_base)));
-   if (store) {
+   if (atomic) {
+      /* The payload is ordinary memory at the payload address: its atomics
+       * are global atomics there, lowered further like any other. */
+      const nir_atomic_op op=nir_intrinsic_atomic_op(i);
+      nir_def *r=i->intrinsic==nir_intrinsic_task_payload_atomic_swap
+         ? nir_global_atomic_swap(b,i->def.bit_size,addr,i->src[1].ssa,
+                                  i->src[2].ssa,.atomic_op=op)
+         : nir_global_atomic(b,i->def.bit_size,addr,i->src[1].ssa,
+                             .atomic_op=op);
+      nir_def_replace(&i->def,r);
+   } else if (store) {
       nir_store_global(b,i->src[0].ssa,addr,
          .write_mask=nir_intrinsic_write_mask(i),
          .align_mul=nir_intrinsic_align_mul(i),
@@ -1059,9 +1072,9 @@ agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B,
             nir_intrinsic_instr *i=nir_instr_as_intrinsic(in);
             reads |= i->intrinsic==nir_intrinsic_load_task_payload ||
                      i->intrinsic==nir_intrinsic_load_mesh_payload_address_agx;
-            if (i->intrinsic==nir_intrinsic_task_payload_atomic ||
-                i->intrinsic==nir_intrinsic_task_payload_atomic_swap ||
-                i->intrinsic==nir_intrinsic_launch_mesh_workgroups_with_payload_deref)
+            reads |= i->intrinsic==nir_intrinsic_task_payload_atomic ||
+                     i->intrinsic==nir_intrinsic_task_payload_atomic_swap;
+            if (i->intrinsic==nir_intrinsic_launch_mesh_workgroups_with_payload_deref)
                return false;
          }
       }
@@ -1189,6 +1202,8 @@ agx_nir_lower_m5_task(nir_shader *s, unsigned max_payload_B, bool record)
                break;
             case nir_intrinsic_load_task_payload:
             case nir_intrinsic_store_task_payload:
+            case nir_intrinsic_task_payload_atomic:
+            case nir_intrinsic_task_payload_atomic_swap:
                if (!max_payload_B)
                   return false;
                payload_access = true;
