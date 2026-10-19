@@ -886,6 +886,11 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "Pipeline barrier");
 
+   /* M5: a render pass instance that ended may still be continued by the
+    * next one if this dependency is framebuffer-local. */
+   if (unlikely(cmd->state.pass_merge.valid))
+      hk_m5_pass_merge_barrier(cmd, pDependencyInfo);
+
    /* Host availability is recorded against the work already recorded. */
    if (cmd->state.deferred_clear_count &&
        hk_dependency_has_host_read(pDependencyInfo))
@@ -954,6 +959,12 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_cache_flush(dev, flush);
    }
+
+   /* The dependency this barrier recorded is the one a continued instance
+    * applies to its stream (hk_sync_merge_rendering()); a stream it created
+    * or extended still ends the candidacy there. */
+   if (unlikely(cmd->state.pass_merge.valid))
+      cmd->state.pass_merge.sync_epoch = cmd->sync.epoch;
 }
 
 __attribute__((hot)) void

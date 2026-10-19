@@ -280,6 +280,10 @@ struct hk_attachment {
    VkFormat vk_format;
    struct hk_image_view *iview;
 
+   /* The API load and store operations the pass was begun with. */
+   VkAttachmentLoadOp load_op;
+   VkAttachmentStoreOp store_op;
+
    VkResolveModeFlagBits resolve_mode;
    struct hk_image_view *resolve_iview;
 
@@ -799,6 +803,11 @@ struct hk_cs {
    bool gen1_native_fragment_rq;
    bool gen1_native_vertex_rq;
 
+   /* M5: a later render pass instance continues in this stream
+    * (hk_m5_pass_merge_begin()); its draws may not share the stream's
+    * committed sample locations (hk_flush_gfx_state()). */
+   bool m5_continued_pass;
+
    /* Scratch requirements */
    struct {
       union {
@@ -1113,6 +1122,26 @@ struct hk_cmd_buffer {
          struct agx_zls_control_packed zls_control;
          bool process_empty_tiles;
       } pending_z_store;
+      /* M5: the render pass instance that ended last, while the next one may
+       * continue in its render stream instead of storing and reloading the
+       * attachments (hk_m5_pass_merge_begin()). */
+      struct hk_pass_merge_candidate {
+         bool valid;
+         /* The instance's single render stream, where its draws ended and
+          * where its terminator left the stream and chunk. */
+         struct hk_cs *cs;
+         void *resume_current;
+         void *after_current;
+         void *end;
+         /* The tracked state when the instance ended; the next instance may
+          * continue only if none of it moved. */
+         uint32_t next_seq;
+         uint32_t sync_epoch;
+         struct hk_cs *open_cs;
+         void *open_cs_current;
+         /* The render state the instance ended with. */
+         struct hk_rendering_state render;
+      } pass_merge;
    } state;
 
    struct {
@@ -1800,6 +1829,12 @@ hk_stat_enabled(uint64_t addr)
 {
    return addr != AGX_SCRATCH_PAGE_ADDRESS;
 }
+
+/* M5 render pass continuation (hk_cmd_draw.c): a pipeline barrier recorded
+ * while an ended instance is still continuable decides whether the next one
+ * may continue in its stream. */
+void hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
+                              const VkDependencyInfo *info);
 
 void hk_cmd_buffer_begin_graphics(struct hk_cmd_buffer *cmd,
                                   const VkCommandBufferBeginInfo *pBeginInfo);

@@ -314,6 +314,8 @@ hk_attachment_init(struct hk_attachment *att,
       .flags = vk_get_rendering_attachment_flags(info),
       .vk_format = iview->vk.format,
       .iview = iview,
+      .load_op = info->loadOp,
+      .store_op = info->storeOp,
    };
 
    if (info->resolveMode != VK_RESOLVE_MODE_NONE) {
@@ -2205,6 +2207,262 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
       imageblock ? 32768 : 0, agx_native_graphics(&dev->dev) ? 2048 : 0);
 }
 
+/*
+ * M5 render pass continuation.
+ *
+ * Two consecutive render pass instances on the same attachments, where the
+ * second loads what the first stored and nothing but state binding and
+ * framebuffer-local pipeline barriers is recorded between them, are one tile
+ * pass to the hardware. The second instance's draws then continue in the
+ * first instance's render stream, which drops the first instance's store and
+ * the second instance's reload of every attachment, and one command boundary.
+ *
+ * Within one render pass instance the attachment writes of earlier draws are
+ * visible to the attachment operations of later draws, which is exactly what
+ * a framebuffer-local dependency between the two instances asks for: one
+ * whose second scope is the fragment-test and colour-output stages with
+ * attachment accesses only. A dependency whose first scope does not include
+ * the first instance's work (compute, transfer) is a requirement on the
+ * merged stream, applied before it continues (hk_sync_merge_rendering()).
+ * Any other graphics-to-graphics dependency, such as the second instance
+ * sampling what the first stored, needs the store and ends the candidacy
+ * (hk_m5_pass_merge_barrier()). Work recorded between the instances, a
+ * timestamp, or a requirement that would order the stream after a later one
+ * also end it; those are detected through the stream list, the sync epoch
+ * and the stream's own state (hk_m5_pass_merge_begin()).
+ */
+static bool
+hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+
+   /* The instance is one ordinary render stream with draws, with no
+    * pre/post-graphics streams, heap use or timestamps attached. */
+   if (!agx_chip_native_agx3(dev->dev.chip) || cmd->in_meta ||
+       cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
+       cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
+       cmd->uses_heap || cs->timestamp.start.handle ||
+       cs->timestamp.end.handle)
+      return false;
+
+   if (render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                        VK_RENDERING_RESUMING_BIT |
+                        VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))
+      return false;
+
+   /* Single-sample, in-tilebuffer rendering without resolves. */
+   if (render->view_mask || render->tilebuffer.nr_samples > 1 ||
+       agx_tilebuffer_spills(&render->tilebuffer) ||
+       render->g17p_direct_color_resolve)
+      return false;
+
+   unsigned attachments = 0;
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE)
+         return false;
+      attachments += render->color_att[i].iview != NULL;
+   }
+   if (render->depth_att.resolve_mode != VK_RESOLVE_MODE_NONE ||
+       render->stencil_att.resolve_mode != VK_RESOLVE_MODE_NONE)
+      return false;
+   attachments += render->depth_att.iview != NULL;
+   attachments += render->stencil_att.iview != NULL;
+   return attachments > 0;
+}
+
+/* Whether the attachment of a beginning instance continues the one the
+ * ended instance had in the same slot: the same view (or none in both),
+ * loaded, stored the same way, unresolved, with the same flags. */
+static const char *
+hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
+                           const struct hk_attachment *att)
+{
+   const bool present = info != NULL && info->imageView != VK_NULL_HANDLE;
+   if (present != (att->iview != NULL))
+      return "presence";
+   if (!present)
+      return NULL;
+
+   VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
+   if (iview != att->iview)
+      return "view";
+   if (info->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD)
+      return "load op";
+   if (info->storeOp != att->store_op)
+      return "store op";
+   if (info->resolveMode != VK_RESOLVE_MODE_NONE)
+      return "resolve";
+   if (vk_get_rendering_attachment_flags(info) != att->flags)
+      return "flags";
+   return NULL;
+}
+
+/* Whether one barrier of a dependency recorded between the instances is
+ * satisfied by continuing: it does not order the second instance's graphics
+ * work after the first instance's, or it does so only for attachment
+ * operations, which the tile pass orders. */
+static bool
+hk_m5_pass_merge_barrier_local(VkPipelineStageFlags2 src_stages,
+                               VkPipelineStageFlags2 dst_stages,
+                               VkAccessFlags2 dst_access, bool buffer)
+{
+   const VkPipelineStageFlags2 local_stages =
+      VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+   const VkAccessFlags2 local_access =
+      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+      VK_ACCESS_2_COLOR_ATTACHMENT_READ_NONCOHERENT_BIT_EXT;
+
+   const bool from_gfx = hk_sync_kinds_src(src_stages) & HK_SYNC_GFX;
+   const bool to_gfx =
+      hk_sync_kinds_dst(dst_stages) & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG);
+   if (!from_gfx || !to_gfx)
+      return true;
+
+   return !buffer && !(dst_stages & ~local_stages) &&
+          !(dst_access & ~local_access);
+}
+
+void
+hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
+                         const VkDependencyInfo *info)
+{
+   struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
+   if (!m->valid)
+      return;
+
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (!hk_m5_pass_merge_barrier_local(b->srcStageMask, b->dstStageMask,
+                                          b->dstAccessMask, false)) {
+         m->valid = false;
+         return;
+      }
+   }
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (!hk_m5_pass_merge_barrier_local(b->srcStageMask, b->dstStageMask,
+                                          b->dstAccessMask, true)) {
+         m->valid = false;
+         return;
+      }
+   }
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (!hk_m5_pass_merge_barrier_local(b->srcStageMask, b->dstStageMask,
+                                          b->dstAccessMask, false)) {
+         m->valid = false;
+         return;
+      }
+   }
+}
+
+/* Continue the ended instance's render stream with the instance beginning
+ * with info when everything above holds. Returns false, with the candidacy
+ * ended, when the instance begins normally instead. */
+static bool
+hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
+   struct hk_cs *cs = m->cs;
+   const struct hk_rendering_state *prev = &m->render;
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   const char *why = NULL;
+
+   m->valid = false;
+
+   /* Nothing was recorded or ordered since the instance ended: its stream is
+    * still the latest, untouched, no stream was created, the open compute
+    * stream (if any) did not grow, and no dependency, timestamp or pass
+    * bookkeeping changed except through hk_m5_pass_merge_barrier(). */
+   if (cmd->in_meta || cmd->state.deferred_clear_count ||
+       cmd->current_cs.gfx || cmd->current_cs.pre_gfx ||
+       cmd->current_cs.post_gfx || cmd->sync.in_pass ||
+       cmd->sync.pending_start_ts.handle)
+      why = "state";
+   else if (list_is_empty(&cmd->control_streams) ||
+            list_last_entry(&cmd->control_streams, struct hk_cs, node) != cs)
+      why = "later stream";
+   else if (cmd->sync.next_seq != m->next_seq ||
+            cmd->sync.epoch != m->sync_epoch)
+      why = "dependency";
+   else if (cmd->current_cs.cs != m->open_cs ||
+            (m->open_cs && m->open_cs->current != m->open_cs_current))
+      why = "compute";
+   else if (cs->current != m->after_current || cs->end != m->end ||
+            cs->timestamp.start.handle || cs->timestamp.end.handle)
+      why = "stream";
+   else if (info->flags & (VK_RENDERING_SUSPENDING_BIT |
+                           VK_RENDERING_RESUMING_BIT |
+                           VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))
+      why = "flags";
+   else if (memcmp(&info->renderArea, &prev->area, sizeof(info->renderArea)) ||
+            info->layerCount != prev->layer_count ||
+            info->viewMask != prev->view_mask ||
+            info->colorAttachmentCount != prev->color_att_count) {
+      return false;
+   }
+
+   const char *slot = NULL;
+   if (!why) {
+      slot = "depth";
+      why = hk_m5_attachment_continues(info->pDepthAttachment,
+                                       &prev->depth_att);
+   }
+   if (!why) {
+      slot = "stencil";
+      why = hk_m5_attachment_continues(info->pStencilAttachment,
+                                       &prev->stencil_att);
+   }
+   for (uint32_t i = 0; !why && i < info->colorAttachmentCount; ++i) {
+      slot = "color";
+      why = hk_m5_attachment_continues(&info->pColorAttachments[i],
+                                       &prev->color_att[i]);
+   }
+
+   if (why) {
+      return false;
+   }
+
+   /* Reopen the stream where its draws ended; the terminator is emitted
+    * again when the merged instance ends. Until then a continuation stream
+    * may follow it, so it takes the partial end-of-tile program back, as a
+    * stream has when it is created (hk_cs_init_graphics()). */
+   cs->current = m->resume_current;
+   cs->cr.eot.main = prev->cr.eot.partial;
+   cs->g17p_pass_ends = false;
+   cs->m5_continued_pass = true;
+   cmd->current_cs.gfx = cs;
+
+   *render = *prev;
+   render->flags = info->flags;
+
+   hk_sync_merge_rendering(cmd, cs);
+   hk_sync_first_render_stream(cmd, cs);
+
+   /* The per-instance state hk_begin_rendering() resets. */
+   const VkRenderingAttachmentLocationInfoKHR ral_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+      .colorAttachmentCount = info->colorAttachmentCount,
+   };
+   vk_cmd_set_rendering_attachment_locations(&cmd->vk, &ral_info);
+   hk_cmd_buffer_dirty_render_pass(cmd);
+
+   if (cmd->state.gfx.descriptors.root.draw.view_index != 0) {
+      cmd->state.gfx.descriptors.root.draw.view_index = 0;
+      cmd->state.gfx.descriptors.root_dirty = true;
+   }
+
+   perf_debug(cmd, "Continuing the previous render pass instance");
+   return true;
+}
+
 static void
 hk_begin_rendering(VkCommandBuffer commandBuffer,
                    const VkRenderingInfo *pRenderingInfo)
@@ -2212,6 +2470,10 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_rendering_state *render = &cmd->state.gfx.render;
+
+   if (unlikely(cmd->state.pass_merge.valid) &&
+       hk_m5_pass_merge_begin(cmd, pRenderingInfo))
+      return;
 
    memset(render, 0, sizeof(*render));
 
@@ -2825,6 +3087,15 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    struct hk_pending_z_store z_pending = {0};
 
+   /* M5: the next instance may continue in this stream, see
+    * hk_m5_pass_merge_begin(). Where the draws ended and the chunk they
+    * ended in, before the terminator. */
+   struct hk_pass_merge_candidate *merge = &cmd->state.pass_merge;
+   merge->valid = false;
+   const bool continuable = cs && hk_m5_pass_merge_candidate(cmd, cs);
+   void *const resume_current = cs ? cs->current : NULL;
+   void *const end_before = cs ? cs->end : NULL;
+
    if (cs) {
       cs->cr.eot.main = render->cr.eot.main;
       cs->g17p_pass_ends = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
@@ -2865,6 +3136,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
+
+   if (continuable)
+      merge->render = *render;
 
    bool need_resolve = false;
 
@@ -2945,6 +3219,20 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    memset(render, 0, sizeof(*render));
 
    hk_sync_end_rendering(cmd);
+
+   if (continuable && !need_resolve && cs->end == end_before &&
+       !vk_command_buffer_has_error(&cmd->vk)) {
+      merge->cs = cs;
+      merge->resume_current = resume_current;
+      merge->after_current = cs->current;
+      merge->end = cs->end;
+      merge->next_seq = cmd->sync.next_seq;
+      merge->sync_epoch = cmd->sync.epoch;
+      merge->open_cs = cmd->current_cs.cs;
+      merge->open_cs_current =
+         cmd->current_cs.cs ? cmd->current_cs.cs->current : NULL;
+      merge->valid = true;
+   }
 
    if (need_resolve) {
       perf_debug(cmd, "Resolving render pass, colour store op %u",
@@ -8156,6 +8444,31 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
 
          succ = u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
          assert(succ && "can always set tri-state on a new control stream");
+      }
+   }
+
+   /* A render pass instance continued in the previous instance's stream
+    * (hk_m5_pass_merge_begin()) may commit other sample locations than that
+    * stream already holds; a stream holds one set. Such a draw goes to a
+    * continuation stream, as it would have in the instance's own stream. */
+   if (unlikely(cs->m5_continued_pass) && cs->has_sample_locations &&
+       !cmd->in_meta && dyn->ms.rasterization_samples != 0) {
+      const uint64_t ctrl =
+         dyn->ms.sample_locations_enable
+            ? hk_pack_ppp_multisamplectrl(dyn->ms.sample_locations)
+            : hk_default_sample_positions(dyn->ms.rasterization_samples);
+      if (cs->ppp_multisamplectl != ctrl) {
+         perf_debug(cmd, "Splitting continued render for sample locations");
+
+         hk_cmd_buffer_end_graphics(cmd);
+         cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
+         if (!cs)
+            return NULL;
+         if (dbias_selected) {
+            ASSERTED bool succ =
+               u_tristate_set(&cs->cr.dbias_is_int, dbias_is_int);
+            assert(succ && "can always set tri-state on a new control stream");
+         }
       }
    }
 

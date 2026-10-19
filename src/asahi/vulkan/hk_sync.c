@@ -298,7 +298,7 @@ hk_sync_kinds_src(VkPipelineStageFlags2 stages)
    return stage_kinds(stages & ~VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, false);
 }
 
-static uint8_t
+uint8_t
 hk_sync_kinds_dst(VkPipelineStageFlags2 stages)
 {
    /* And in the second scope TOP_OF_PIPE is ALL_COMMANDS, BOTTOM_OF_PIPE is
@@ -354,6 +354,7 @@ void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
 {
+   cmd->sync.epoch++;
    if (!src_kinds || !dst_kinds)
       return;
 
@@ -374,6 +375,7 @@ hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
 {
    struct hk_sync_state *st = &cmd->sync;
    assert(st->in_pass);
+   st->epoch++;
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, src_kinds, NULL, dep);
@@ -467,6 +469,7 @@ hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       dep_max(&cmd->sync.req[d][sq], &dep);
 
    cmd->sync.cs_check_pending = true;
+   cmd->sync.epoch++;
 }
 
 static uint8_t
@@ -501,6 +504,7 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool pre_gfx = compute && slot == &cmd->current_cs.pre_gfx && gfx &&
                         gfx != cs;
    const bool post_gfx = compute && slot == &cmd->current_cs.post_gfx;
+   st->epoch++;
 
    /* Recording order that matches list order. A render reserves the number
     * below its own for the pre-graphics stream inserted ahead of it. */
@@ -730,6 +734,7 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    struct hk_sync_state *st = &cmd->sync;
    struct hk_cs *prev = previous_on_sq(cmd, cs);
    const unsigned sq = hk_sync_sq(cs);
+   st->epoch++;
 
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
       replace_pointer(&st->last[k][sq], cs, prev);
@@ -774,6 +779,7 @@ hk_sync_replace_render(struct hk_cmd_buffer *cmd, struct hk_cs *from,
 {
    assert(from->type == HK_CS_VDM && into->type == HK_CS_CDM);
    assert(cmd->sync.in_pass);
+   cmd->sync.epoch++;
    hk_sync_stream_wait(into, from->sync.dep);
    if (cmd->sync.pass_tile_first == from)
       cmd->sync.pass_tile_first = into;
@@ -788,6 +794,7 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    struct hk_sync_state *st = &cmd->sync;
    const unsigned sq = hk_sync_sq(from);
    assert(sq == hk_sync_sq(into));
+   st->epoch++;
 
    /* A cut at the destination covers its entire earlier subqueue prefix.
     * The destination itself is now ordered by the merged command stream,
@@ -873,6 +880,7 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
 
    const struct agx_timestamp_req req = st->pending_start_ts;
    st->pending_start_ts = (struct agx_timestamp_req){0};
+   st->epoch++;
 
    struct hk_cs *tail = last_stream(cmd);
    if (tail && !tail->timestamp.end.handle) {
@@ -901,6 +909,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    struct hk_sync_state *st = &cmd->sync;
    const uint8_t src_kinds = hk_sync_kinds_src(stage);
    struct hk_cs *gfx = cmd->current_cs.gfx;
+   st->epoch++;
 
    if (st->in_pass && gfx) {
       /* Inside a render pass instance the stamp belongs to the render.
@@ -972,6 +981,7 @@ void
 hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
 {
    struct hk_sync_state *st = &cmd->sync;
+   st->epoch++;
    st->in_pass = true;
    st->pass_start_seq = st->next_seq;
    memset(st->pass_req, 0, sizeof(st->pass_req));
@@ -998,6 +1008,7 @@ void
 hk_sync_end_rendering(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   st->epoch++;
    pass_footprints_commit(cmd);
    st->in_pass = false;
    memset(st->pass_req, 0, sizeof(st->pass_req));
@@ -1007,10 +1018,47 @@ hk_sync_end_rendering(struct hk_cmd_buffer *cmd)
 }
 
 void
+hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   assert(!st->in_pass && cs->type == HK_CS_VDM);
+   assert(cs == list_last_entry(&cmd->control_streams, struct hk_cs, node));
+   st->epoch++;
+
+   /* What a render stream created now would wait on
+    * (hk_sync_stream_created), raised on the reopened one. A cut at the
+    * stream itself is the work before it, which the stream orders
+    * (stream_wait); no cut lies after it, since it is the latest stream. The
+    * instance's own footprints were recorded when it ended, with this same
+    * stream, so the tile-hazard wait it would compute is on itself. */
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ], ta[HK_SYNC_NUM_SQ];
+   req_for_kinds(cmd, cs->sync.kind, dep);
+   req_for_kinds_ta(cmd, cs->sync.kind, ta);
+   stream_wait_frag(cs, dep);
+   hk_sync_stream_wait(cs, ta);
+   if (st->internal_active)
+      hk_sync_stream_wait(cs, st->internal);
+
+   /* As hk_sync_begin_rendering() followed by the creation of cs: the
+    * sequence numbers the instance starts after are those below the
+    * stream's own and its pre-graphics slot. */
+   st->in_pass = true;
+   st->pass_start_seq = cs->sync.seq - 2;
+   memset(st->pass_req, 0, sizeof(st->pass_req));
+   st->pass_vdm = cs;
+   st->resume_pending = false;
+   st->heap_pass = false;
+   st->pass_fp_count = 0;
+   memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
+   st->pass_tile_first = st->pass_tile_last = cs;
+}
+
+void
 hk_sync_heap_used(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
    st->heap_pass = true;
+   st->epoch++;
 
    /* The streams of this pass already created wait like the ones still to
     * come. */
@@ -1026,6 +1074,7 @@ void
 hk_sync_resolve_begin(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   st->epoch++;
    st->internal[HK_SYNC_VDM] = (struct hk_sync_dep){
       .cut = st->last_any[HK_SYNC_VDM],
    };
@@ -1040,6 +1089,7 @@ void
 hk_sync_resolve_end(struct hk_cmd_buffer *cmd)
 {
    struct hk_sync_state *st = &cmd->sync;
+   st->epoch++;
    st->internal_active = false;
    st->internal[0] = (struct hk_sync_dep){0};
    st->internal[1] = (struct hk_sync_dep){0};

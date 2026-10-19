@@ -226,6 +226,11 @@ struct hk_sync_state {
     * requirements before it receives more work. */
    bool cs_check_pending;
 
+   /* Incremented by every operation that changes recorded dependencies or
+    * stream bookkeeping. A reader that cached a decision about the tracked
+    * state compares it to know whether anything happened since. */
+   uint32_t epoch;
+
    /* A meta helper selected an exact stream; do not replace it. */
    bool pin_cs;
 
@@ -271,6 +276,8 @@ void hk_sync_reset(struct hk_cmd_buffer *cmd);
 
 /* Stage masks to stream kinds, for a first synchronization scope. */
 uint8_t hk_sync_kinds_src(VkPipelineStageFlags2 stages);
+/* And for a second synchronization scope. */
+uint8_t hk_sync_kinds_dst(VkPipelineStageFlags2 stages);
 
 /* Union of the scopes of every barrier in a dependency. */
 void hk_sync_dependency_kinds(const VkDependencyInfo *info, uint8_t *src,
@@ -327,6 +334,13 @@ void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
 void hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming);
 void hk_sync_first_render_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_end_rendering(struct hk_cmd_buffer *cmd);
+
+/* A new render pass instance continues in cs, the render stream of the
+ * instance that just ended, instead of a stream of its own: the stream takes
+ * on the requirements a render stream created now would, and the pass
+ * bookkeeping starts as if cs had just been created for the instance. The
+ * caller guarantees cs is the latest stream of the command buffer. */
+void hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_heap_used(struct hk_cmd_buffer *cmd);
 
 /* Tile hazards: a written attachment of the pass instance being begun, then
