@@ -3615,6 +3615,13 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
        !hk_deferred_clear_image_whole(image, range_count, ranges, aspects))
       return false;
 
+   /* The deferred clear overwrites the whole image, whether it becomes a
+    * load-op clear or a fill: a pending store of it is dead. */
+   if (cmd->state.pending_z_store.cs &&
+       cmd->state.pending_z_store.image == image &&
+       (aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+      hk_kill_pending_z_store(cmd);
+
    /* A later clear of the same image replaces the earlier one. */
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
@@ -3645,8 +3652,26 @@ void
 hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
                                uint64_t size)
 {
-   if (!cmd->state.deferred_clear_count)
+   /* The same holds for the depth image of a pending store. */
+   const struct hk_image *z_image = cmd->state.pending_z_store.cs
+                                       ? cmd->state.pending_z_store.image
+                                       : NULL;
+   if (z_image) {
+      for (unsigned p = 0; p < z_image->plane_count; ++p) {
+         const uint64_t base = z_image->planes[p].addr;
+         const uint64_t end = base + z_image->planes[p].layout.size_B;
+         if (!base || (addr < end && base < addr + size)) {
+            cmd->state.pending_z_store.cs = NULL;
+            break;
+         }
+      }
+   }
+
+   if (!cmd->state.deferred_clear_count) {
+      if (cmd->state.pending_z_store.cs)
+         cmd->state.deferred_clear_hold = true;
       return;
+   }
 
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       const struct hk_image *image = cmd->state.deferred_clear[i].image;
@@ -3665,6 +3690,8 @@ hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
 void
 hk_flush_deferred_clears(struct hk_cmd_buffer *cmd)
 {
+   /* Whatever observes the deferred clears may also read a pending store. */
+   cmd->state.pending_z_store.cs = NULL;
    cmd->state.deferred_clear_hold = false;
    if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
       return;

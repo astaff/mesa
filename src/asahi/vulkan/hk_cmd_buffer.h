@@ -386,6 +386,14 @@ struct hk_rendering_state {
     * hk_g17p_zls_elide()). */
    bool g17p_zls_elide_ok;
    bool g17p_depth_touched;
+
+   /* AGX3 dead depth store: the "only" ZLS word with the depth store
+    * dropped, and whether the pass processes empty tiles without that store,
+    * for a later pass that makes the store dead (hk_take_pending_z_store()).
+    * Valid when no_z_store_ok. */
+   bool no_z_store_ok;
+   bool process_empty_tiles_without_z;
+   struct agx_zls_control_packed zls_control_only_no_z_store;
 };
 
 struct hk_index_buffer_state {
@@ -1093,6 +1101,18 @@ struct hk_cmd_buffer {
       bool deferred_clear_flushing;
       /* Recording a buffer-only command that does not touch their memory. */
       bool deferred_clear_hold;
+
+      /* AGX3: the last render pass instance stored a whole depth-only image
+       * that nothing recorded since may have read. A later instance that
+       * clears the whole image, or does not care about its contents, makes
+       * that store dead (hk_take_pending_z_store()). Kept across exactly the
+       * commands deferred clears survive (deferred_clear_hold). */
+      struct hk_pending_z_store {
+         struct hk_cs *cs;
+         const struct hk_image *image;
+         struct agx_zls_control_packed zls_control;
+         bool process_empty_tiles;
+      } pending_z_store;
    } state;
 
    struct {
@@ -1505,6 +1525,17 @@ void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd);
 uint32_t hk_default_sample_positions(unsigned nr_samples);
 
 void hk_flush_deferred_clears(struct hk_cmd_buffer *cmd);
+
+/* The depth image of the pending store is overwritten as a whole before
+ * anything read it: the store is dead (see hk_take_pending_z_store()). */
+static inline void
+hk_kill_pending_z_store(struct hk_cmd_buffer *cmd)
+{
+   struct hk_pending_z_store *p = &cmd->state.pending_z_store;
+   p->cs->cr.zls_control = p->zls_control;
+   p->cs->cr.process_empty_tiles = p->process_empty_tiles;
+   p->cs = NULL;
+}
 void hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
                                     uint64_t size);
 bool hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
@@ -1521,10 +1552,14 @@ static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
 {
-   /* Any recorded work may read an image with a deferred clear. */
+   /* Any recorded work may read an image with a deferred clear, or the
+    * depth image of a pending store. */
    if (unlikely(cmd->state.deferred_clear_count) &&
        !cmd->state.deferred_clear_flushing && !cmd->state.deferred_clear_hold)
       hk_flush_deferred_clears(cmd);
+   if (unlikely(cmd->state.pending_z_store.cs) &&
+       !cmd->state.deferred_clear_hold)
+      cmd->state.pending_z_store.cs = NULL;
 
    if (vk_command_buffer_has_error(&cmd->vk))
       return NULL;
