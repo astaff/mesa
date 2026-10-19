@@ -529,6 +529,19 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       stream_wait_frag(cs, dep);
       hk_sync_stream_wait(cs, ta);
    } else {
+      /* A render that continues an earlier instance across an ordered
+       * dependency (hk_cs::m5_ordered) holds that instance's work, which the
+       * dependency's source scope names. Its pre-graphics stream sits before
+       * it and cannot wait on it. That instance wrote no memory but its
+       * attachments and the continuation's own writes end the render first
+       * (hk_m5_ordered_refusal()), so what the pre-graphics work reads is
+       * already final; it waits on everything positioned before it. */
+      if (pre_gfx && gfx->m5_ordered) {
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+            if (dep[sq].cut && dep[sq].cut->sync.seq >= cs->sync.seq)
+               dep[sq].cut = latest_before(cmd, sq, cs);
+         }
+      }
       hk_sync_stream_wait(cs, dep);
    }
 

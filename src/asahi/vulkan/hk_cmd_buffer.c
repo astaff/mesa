@@ -35,6 +35,7 @@
 #include "util/cache_ops.h"
 #include "util/log.h"
 #include "util/hash_table.h"
+#include "util/set.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
 
@@ -205,6 +206,8 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    hk_free_resettable_cmd_buffer(cmd);
    util_dynarray_fini(&cmd->large_bos);
    free(cmd->retained_set);
+   if (cmd->m5_pushed_images)
+      _mesa_set_destroy(cmd->m5_pushed_images, NULL);
    util_dynarray_fini(&cmd->sync_pass_records);
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&pool->vk.alloc, cmd);
@@ -296,6 +299,8 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->geom_instance_count = 0;
    cmd->uses_heap = false;
    hk_sync_reset(cmd);
+   if (cmd->m5_pushed_images)
+      _mesa_set_clear(cmd->m5_pushed_images, NULL);
 
    memset(&cmd->state, 0, sizeof(cmd->state));
    for (unsigned i = 0; i < HK_G17P_BG_EOT_CACHE_ENTRIES; ++i)
@@ -1112,6 +1117,7 @@ hk_CmdBindDescriptorSets2KHR(
 
    if (pBindDescriptorSetsInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
        VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) {
+      hk_m5_pass_merge_note_set_bind(cmd);
       hk_bind_descriptor_sets(cmd, &cmd->state.gfx.descriptors,
                               pBindDescriptorSetsInfo);
    }
@@ -1185,12 +1191,70 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
    return desc->push[set];
 }
 
+/* Whether a descriptor of this type names an image view. */
+static inline bool
+hk_descriptor_type_has_image_view(VkDescriptorType type)
+{
+   return type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+}
+
+/* M5 render pass continuation: the image views a graphics push descriptor
+ * update writes (hk_m5_pass_merge_note_push()). */
+static void
+hk_m5_note_push_writes(struct hk_cmd_buffer *cmd, uint32_t count,
+                       const VkWriteDescriptorSet *writes)
+{
+   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip))
+      return;
+
+   for (uint32_t i = 0; i < count; ++i) {
+      if (!hk_descriptor_type_has_image_view(writes[i].descriptorType))
+         continue;
+      for (uint32_t j = 0; j < writes[i].descriptorCount; ++j) {
+         VK_FROM_HANDLE(hk_image_view, iview,
+                        writes[i].pImageInfo[j].imageView);
+         if (iview)
+            hk_m5_pass_merge_note_push(cmd, iview);
+      }
+   }
+}
+
+static void
+hk_m5_note_push_template(struct hk_cmd_buffer *cmd,
+                         const struct vk_descriptor_update_template *template,
+                         const void *data)
+{
+   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip))
+      return;
+
+   for (uint32_t i = 0; i < template->entry_count; ++i) {
+      const struct vk_descriptor_template_entry *entry = &template->entries[i];
+      if (!hk_descriptor_type_has_image_view(entry->type))
+         continue;
+      for (uint32_t j = 0; j < entry->array_count; ++j) {
+         const VkDescriptorImageInfo *info =
+            (const void *)((const uint8_t *)data + entry->offset +
+                           j * entry->stride);
+         VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
+         if (iview)
+            hk_m5_pass_merge_note_push(cmd, iview);
+      }
+   }
+}
+
 static void
 hk_push_descriptor_set(struct hk_cmd_buffer *cmd,
                        struct hk_descriptor_state *desc,
                        const VkPushDescriptorSetInfoKHR *info)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+
+   if (desc == &cmd->state.gfx.descriptors)
+      hk_m5_note_push_writes(cmd, info->descriptorWriteCount,
+                             info->pDescriptorWrites);
 
    struct hk_push_descriptor_set *push_set =
       hk_cmd_push_descriptors(cmd, desc, info->set);
@@ -1266,6 +1330,10 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
 
    struct hk_descriptor_set_layout *set_layout = vk_to_hk_descriptor_set_layout(
       pipeline_layout->set_layouts[pPushDescriptorSetWithTemplateInfo->set]);
+
+   if (desc == &cmd->state.gfx.descriptors)
+      hk_m5_note_push_template(cmd, template,
+                               pPushDescriptorSetWithTemplateInfo->pData);
 
    hk_push_descriptor_set_update_template(
       push_set, set_layout, template,

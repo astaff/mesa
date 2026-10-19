@@ -83,6 +83,7 @@
 #include "vk_shader.h"
 #include "vk_standard_sample_locations.h"
 #include "vk_util.h"
+#include "util/set.h"
 
 #define IS_DIRTY(bit) BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_##bit)
 
@@ -316,6 +317,7 @@ hk_attachment_init(struct hk_attachment *att,
       .iview = iview,
       .load_op = info->loadOp,
       .store_op = info->storeOp,
+      .layout = info->imageLayout,
    };
 
    if (info->resolveMode != VK_RESOLVE_MODE_NONE) {
@@ -2224,12 +2226,15 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
  * attachment accesses only. A dependency whose first scope does not include
  * the first instance's work (compute, transfer) is a requirement on the
  * merged stream, applied before it continues (hk_sync_merge_rendering()).
- * Any other graphics-to-graphics dependency, such as the second instance
- * sampling what the first stored, needs the store and ends the candidacy
- * (hk_m5_pass_merge_barrier()). Work recorded between the instances, a
- * timestamp, or a requirement that would order the stream after a later one
- * also end it; those are detected through the stream list, the sync epoch
- * and the stream's own state (hk_m5_pass_merge_begin()).
+ * Any other graphics-to-graphics dependency without a layout transition or
+ * queue family transfer, up to ALL_COMMANDS -> ALL_COMMANDS with every memory
+ * access, makes the continuation "ordered": it is taken only where the merged
+ * pass is memory-equivalent to the two instances by construction
+ * (hk_m5_ordered_refusal(), hk_m5_ordered_draw_hazard()). Work recorded
+ * between the instances, a timestamp, or a requirement that would order the
+ * stream after a later one end the candidacy; those are detected through
+ * the stream list, the sync epoch and the stream's own state
+ * (hk_m5_pass_merge_begin()).
  */
 static bool
 hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
@@ -2298,14 +2303,30 @@ hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
    return NULL;
 }
 
-/* Whether one barrier of a dependency recorded between the instances is
- * satisfied by continuing: it does not order the second instance's graphics
- * work after the first instance's, or it does so only for attachment
- * operations, which the tile pass orders. */
-static bool
-hk_m5_pass_merge_barrier_local(VkPipelineStageFlags2 src_stages,
-                               VkPipelineStageFlags2 dst_stages,
-                               VkAccessFlags2 dst_access, bool buffer)
+/* How one barrier of a dependency recorded between the instances relates to
+ * continuing the first instance's stream with the second. */
+enum hk_m5_merge_dep {
+   /* It does not order the second instance's graphics work after the first
+    * instance's, or only for attachment operations, which the tile pass
+    * orders. */
+   HK_M5_MERGE_DEP_LOCAL,
+   /* It orders the second instance's work after the first instance's beyond
+    * attachment operations (up to ALL_COMMANDS -> ALL_COMMANDS with every
+    * memory access). One tile pass runs the second instance's vertex work
+    * before the first instance's fragment work and stores the attachments
+    * only at its end, so this holds only for a merge that is
+    * memory-equivalent by construction, see hk_m5_ordered_refusal(). */
+   HK_M5_MERGE_DEP_ORDERED,
+   /* A layout transition or queue family ownership transfer between two
+    * graphics scopes: never continued across. */
+   HK_M5_MERGE_DEP_END,
+};
+
+static enum hk_m5_merge_dep
+hk_m5_pass_merge_dependency(VkPipelineStageFlags2 src_stages,
+                            VkPipelineStageFlags2 dst_stages,
+                            VkAccessFlags2 dst_access, bool buffer,
+                            bool transition)
 {
    const VkPipelineStageFlags2 local_stages =
       VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
@@ -2322,44 +2343,262 @@ hk_m5_pass_merge_barrier_local(VkPipelineStageFlags2 src_stages,
    const bool to_gfx =
       hk_sync_kinds_dst(dst_stages) & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG);
    if (!from_gfx || !to_gfx)
-      return true;
+      return HK_M5_MERGE_DEP_LOCAL;
 
-   return !buffer && !(dst_stages & ~local_stages) &&
-          !(dst_access & ~local_access);
+   if (!buffer && !(dst_stages & ~local_stages) &&
+       !(dst_access & ~local_access))
+      return HK_M5_MERGE_DEP_LOCAL;
+
+   return transition ? HK_M5_MERGE_DEP_END : HK_M5_MERGE_DEP_ORDERED;
+}
+
+static void
+hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
+                          VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
+                          VkAccessFlags2 dst_access, bool buffer,
+                          bool transition)
+{
+   struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
+   if (!m->valid)
+      return;
+
+   switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
+                                       transition)) {
+   case HK_M5_MERGE_DEP_LOCAL:
+      return;
+   case HK_M5_MERGE_DEP_ORDERED:
+      if (!m->ordered)
+      m->ordered = true;
+      return;
+   case HK_M5_MERGE_DEP_END:
+      m->valid = false;
+      return;
+   }
 }
 
 void
 hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
                          const VkDependencyInfo *info)
 {
-   struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
-   if (!m->valid)
-      return;
-
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
-      if (!hk_m5_pass_merge_barrier_local(b->srcStageMask, b->dstStageMask,
-                                          b->dstAccessMask, false)) {
-         m->valid = false;
-         return;
-      }
+      hk_m5_pass_merge_classify(cmd, "memory", b->srcStageMask,
+                                b->dstStageMask, b->dstAccessMask, false,
+                                false);
    }
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
-      if (!hk_m5_pass_merge_barrier_local(b->srcStageMask, b->dstStageMask,
-                                          b->dstAccessMask, true)) {
-         m->valid = false;
-         return;
-      }
+      hk_m5_pass_merge_classify(
+         cmd, "buffer", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
+         true, b->srcQueueFamilyIndex != b->dstQueueFamilyIndex);
    }
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
-      if (!hk_m5_pass_merge_barrier_local(b->srcStageMask, b->dstStageMask,
-                                          b->dstAccessMask, false)) {
-         m->valid = false;
+      hk_m5_pass_merge_classify(
+         cmd, "image", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
+         false,
+         b->oldLayout != b->newLayout ||
+            b->srcQueueFamilyIndex != b->dstQueueFamilyIndex);
+   }
+}
+
+/* Whether the image of an attachment view may hold the attachment's contents
+ * through a different resource: an aliased image (only defined across
+ * VK_IMAGE_CREATE_ALIAS_BIT) or sparse bindings. */
+static bool
+hk_m5_attachment_image_aliasable(const struct hk_image_view *iview)
+{
+   return iview && (iview->vk.image->create_flags &
+                    (VK_IMAGE_CREATE_ALIAS_BIT |
+                     VK_IMAGE_CREATE_SPARSE_BINDING_BIT));
+}
+
+/* Whether an image may be one of the attachments of the open instance. */
+static bool
+hk_m5_image_is_attachment(const struct hk_rendering_state *render,
+                          const struct vk_image *image)
+{
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      if (render->color_att[i].iview &&
+          render->color_att[i].iview->vk.image == image)
+         return true;
+   }
+   return (render->depth_att.iview &&
+           render->depth_att.iview->vk.image == image) ||
+          (render->stencil_att.iview &&
+           render->stencil_att.iview->vk.image == image);
+}
+
+/* Whether an attachment of the continuing instance may be in a rendering
+ * feedback loop: its contents read through a descriptor during the pass,
+ * which only works from memory the first instance has not stored yet. */
+static const char *
+hk_m5_ordered_attachment_refusal(const VkRenderingAttachmentInfo *info,
+                                 const struct hk_attachment *att)
+{
+   if (!info || info->imageView == VK_NULL_HANDLE)
+      return NULL;
+   if (info->imageLayout != att->layout)
+      return "layout";
+   if (info->imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT)
+      return "feedback loop layout";
+   if (att->flags & VK_RENDERING_ATTACHMENT_INPUT_ATTACHMENT_FEEDBACK_BIT_KHR)
+      return "input attachment feedback";
+   const VkAttachmentFeedbackLoopInfoEXT *loop = vk_find_struct_const(
+      info->pNext, ATTACHMENT_FEEDBACK_LOOP_INFO_EXT);
+   if (loop && loop->feedbackLoopEnable)
+      return "feedback loop";
+   if (hk_m5_attachment_image_aliasable(att->iview))
+      return "aliasable image";
+   return NULL;
+}
+
+/*
+ * An ordered continuation (HK_M5_MERGE_DEP_ORDERED) is memory-equivalent to
+ * the two instances when:
+ *
+ *  - the first instance's stream wrote no memory but its attachments: no
+ *    graphics program in it writes external memory (storage buffers and
+ *    images, atomics, transform feedback), and it has no pre/post-graphics
+ *    streams (hk_m5_pass_merge_candidate()). The second instance's vertex
+ *    work, which the tile pass runs before the first instance's fragment
+ *    work, then reads what it would have read after it;
+ *  - the second instance writes no memory but its attachments either, so
+ *    nothing the first instance reads can change under it; every draw of the
+ *    continuation is checked (hk_m5_ordered_draw_hazard()) and the stream
+ *    ends before one that could;
+ *  - no shader of the second instance can read the attachments' memory,
+ *    which the first instance's store would have written and the merged
+ *    pass writes only at its end: the attachments are in the same layouts in
+ *    both instances, none is in a feedback loop, none can alias another
+ *    resource, no descriptor set (whose contents this command buffer cannot
+ *    see) is bound for graphics, and no graphics push descriptor recorded so
+ *    far names an attachment image; later ones end the stream
+ *    (hk_m5_pass_merge_note_push(), hk_m5_pass_merge_note_set_bind()).
+ *
+ * Attachment accesses themselves are ordered by the tile pass, as for a
+ * framebuffer-local dependency.
+ */
+static const char *
+hk_m5_ordered_refusal(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                      const struct hk_rendering_state *prev,
+                      const struct hk_cs *cs)
+{
+   const struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+
+   if (cs->m5_shader_writes_memory)
+      return "first instance writes memory";
+   if (cmd->state.gfx.xfb_enabled)
+      return "transform feedback";
+   if (cmd->state.conditional.active)
+      return "conditional rendering";
+
+   const char *why =
+      hk_m5_ordered_attachment_refusal(info->pDepthAttachment,
+                                       &prev->depth_att);
+   if (!why)
+      why = hk_m5_ordered_attachment_refusal(info->pStencilAttachment,
+                                             &prev->stencil_att);
+   for (uint32_t i = 0; !why && i < info->colorAttachmentCount; ++i)
+      why = hk_m5_ordered_attachment_refusal(&info->pColorAttachments[i],
+                                             &prev->color_att[i]);
+   if (why)
+      return why;
+
+   for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
+      if (desc->sets[s] && !(desc->push_active & BITFIELD_BIT(s)))
+         return "descriptor set bound";
+   }
+
+   if (cmd->m5_pushed_images) {
+      set_foreach(cmd->m5_pushed_images, entry) {
+         if (hk_m5_image_is_attachment(prev, entry->key))
+            return "attachment pushed as a descriptor";
+      }
+   }
+
+   return NULL;
+}
+
+void
+hk_m5_pass_merge_end_ordered(struct hk_cmd_buffer *cmd, const char *reason)
+{
+   struct hk_cs *cs = cmd->current_cs.gfx;
+   if (likely(!cs || !cs->m5_ordered))
+      return;
+
+   perf_debug(cmd, "Ending an ordered render continuation: %s", reason);
+   cmd->state.m5_ordered_split = false;
+   hk_cmd_buffer_end_graphics(cmd);
+}
+
+void
+hk_m5_pass_merge_note_push(struct hk_cmd_buffer *cmd,
+                           struct hk_image_view *iview)
+{
+   struct vk_image *image = iview->vk.image;
+   if (!(image->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
+       !(image->stencil_usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
+      return;
+
+   if (!cmd->m5_pushed_images) {
+      cmd->m5_pushed_images = _mesa_pointer_set_create(NULL);
+      if (!cmd->m5_pushed_images) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
          return;
       }
    }
+   _mesa_set_add(cmd->m5_pushed_images, image);
+
+   struct hk_cs *cs = cmd->current_cs.gfx;
+   if (unlikely(cs && cs->m5_ordered) &&
+       hk_m5_image_is_attachment(&cmd->state.gfx.render, image))
+      cmd->state.m5_ordered_split = true;
+}
+
+void
+hk_m5_pass_merge_note_set_bind(struct hk_cmd_buffer *cmd)
+{
+   struct hk_cs *cs = cmd->current_cs.gfx;
+   if (unlikely(cs && cs->m5_ordered))
+      cmd->state.m5_ordered_split = true;
+}
+
+/* Whether the next draw recorded into an ordered continuation could break
+ * its memory equivalence (hk_m5_ordered_refusal()): it ends the stream
+ * first, and the draw continues in a new stream ordered after it. */
+static const char *
+hk_m5_ordered_draw_hazard(struct hk_cmd_buffer *cmd)
+{
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+
+   if (cmd->state.m5_ordered_split)
+      return "descriptor update";
+   if (gfx->xfb_enabled)
+      return "transform feedback";
+
+   /* Software and mesh stages run user programs in pre-graphics compute,
+    * ahead of the whole merged pass; adjacency is materialised there too. */
+   if (gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
+       gfx->shaders[MESA_SHADER_MESH])
+      return "software or mesh stages";
+   if (mesa_prim_has_adjacency(vk_topology_to_mesa(
+          cmd->vk.dynamic_graphics_state.ia.primitive_topology)))
+      return "adjacency";
+
+   for (unsigned stage = 0; stage < ARRAY_SIZE(gfx->shaders); ++stage) {
+      struct hk_api_shader *api = gfx->shaders[stage];
+      if (!api)
+         continue;
+      hk_foreach_variant(api, v) {
+         if (v->info.writes_external_memory)
+            return "shader writes memory";
+      }
+   }
+   return NULL;
 }
 
 /* Continue the ended instance's render stream with the instance beginning
@@ -2430,6 +2669,16 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
       return false;
    }
 
+   /* An ordered dependency, or one recorded before an earlier continuation
+    * of this stream, needs the merged pass to be memory-equivalent. */
+   const bool ordered = m->ordered || cs->m5_ordered;
+   if (ordered) {
+      why = hk_m5_ordered_refusal(cmd, info, prev, cs);
+      if (why) {
+         return false;
+      }
+   }
+
    /* Reopen the stream where its draws ended; the terminator is emitted
     * again when the merged instance ends. Until then a continuation stream
     * may follow it, so it takes the partial end-of-tile program back, as a
@@ -2438,6 +2687,8 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    cs->cr.eot.main = prev->cr.eot.partial;
    cs->g17p_pass_ends = false;
    cs->m5_continued_pass = true;
+   cs->m5_ordered = ordered;
+   cmd->state.m5_ordered_split = false;
    cmd->current_cs.gfx = cs;
 
    *render = *prev;
@@ -3231,6 +3482,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       merge->open_cs = cmd->current_cs.cs;
       merge->open_cs_current =
          cmd->current_cs.cs ? cmd->current_cs.cs->current : NULL;
+      merge->ordered = false;
       merge->valid = true;
    }
 
@@ -4093,6 +4345,18 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
    cmd->vk.last_graphics_pipeline = NULL;
 
    cmd->state.gfx.shaders[stage] = shader;
+
+   /* Whether a bound graphics program writes memory, for render pass
+    * continuation (hk_m5_ordered_refusal()). */
+   bool writes = false;
+   for (unsigned s = 0; s < ARRAY_SIZE(cmd->state.gfx.shaders); ++s) {
+      struct hk_api_shader *api = cmd->state.gfx.shaders[s];
+      if (!api)
+         continue;
+      hk_foreach_variant(api, v)
+         writes |= v->info.writes_external_memory;
+   }
+   cmd->state.gfx.shaders_write_memory = writes;
    cmd->state.gfx.shaders_dirty |= BITFIELD_BIT(stage);
 
    if (stage == MESA_SHADER_FRAGMENT)
@@ -8402,9 +8666,24 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       return NULL;
    }
 
+   /* An ordered render continuation (hk_m5_pass_merge_begin()) ends before a
+    * draw that could break its memory equivalence; the draw goes to a
+    * continuation stream ordered after the whole merged pass. Meta draws
+    * inside the pass (attachment clears) neither write memory nor read the
+    * attachments through it. */
+   if (unlikely(cmd->current_cs.gfx && cmd->current_cs.gfx->m5_ordered) &&
+       !cmd->in_meta) {
+      const char *hazard = hk_m5_ordered_draw_hazard(cmd);
+      if (hazard)
+         hk_m5_pass_merge_end_ordered(cmd, hazard);
+   }
+
    struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, false /* compute */);
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
+
+   if (cs)
+      cs->m5_shader_writes_memory |= gfx->shaders_write_memory;
 
    if (!cs)
       return NULL;
@@ -9892,6 +10171,7 @@ hk_draw_indirect_count(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    VK_FROM_HANDLE(hk_buffer, count_buffer, countBuffer);
 
    perf_debug(cmd, "Draw indirect count");
+   hk_m5_pass_merge_end_ordered(cmd, "indirect count draw");
 
    assert((stride % 4) == 0 && "aligned");
 
@@ -9948,6 +10228,7 @@ hk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_buffer, counter, counterBuffer);
 
    perf_debug(cmd, "Draw indirect byte count");
+   hk_m5_pass_merge_end_ordered(cmd, "indirect byte count draw");
 
    const uint64_t draw =
       hk_pool_alloc(cmd, sizeof(VkDrawIndirectCommand), 4).gpu;
@@ -9991,6 +10272,8 @@ hk_begin_end_xfb(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
 
+   /* The counter copies write application buffers ahead of the render. */
+   hk_m5_pass_merge_end_ordered(cmd, "transform feedback");
    gfx->xfb_enabled = begin;
 
    /* If we haven't reserved XFB offsets yet for the command buffer, do so. */
@@ -10067,6 +10350,8 @@ hk_CmdBeginConditionalRenderingEXT(
    const VkConditionalRenderingBeginInfoEXT *pConditionalRenderingBegin)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   /* Predicated draws patch their records in pre-graphics compute. */
+   hk_m5_pass_merge_end_ordered(cmd, "conditional rendering");
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_buffer, buffer, pConditionalRenderingBegin->buffer);
    struct hk_conditional_render_state *conditional =

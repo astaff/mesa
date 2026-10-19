@@ -3041,6 +3041,35 @@ hk_fold_tests_zs(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* Whether a function writes external memory, by the predicate
+ * nir_shader_gather_info uses, following any remaining direct calls. */
+static bool
+hk_nir_function_writes_external_memory(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_intrinsic_writes_external_memory(nir_instr_as_intrinsic(instr)))
+            return true;
+         if (instr->type == nir_instr_type_call) {
+            nir_function *callee = nir_instr_as_call(instr)->callee;
+            if (callee->impl &&
+                hk_nir_function_writes_external_memory(callee->impl))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+/* Transform feedback counts as a write before its buffer-store lowering. */
+static bool
+hk_shader_writes_external_memory(nir_shader *nir)
+{
+   return nir->info.has_transform_feedback_varyings ||
+          hk_nir_function_writes_external_memory(nir_shader_get_entrypoint(nir));
+}
+
 static VkResult
 hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
@@ -3050,6 +3079,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_xfb_info *xfb_info, unsigned set_count,
                uint8_t static_set_mask)
 {
+   const bool writes_external_memory = hk_shader_writes_external_memory(nir);
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
    bool default_layer = true;
@@ -3616,6 +3646,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       shader->info.fs.g17p_samples = MAX2(backend_key.fs.nr_samples, 1);
 
    shader->info.stage = sw_stage;
+   shader->info.writes_external_memory = writes_external_memory;
    shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
    shader->info.cull_distance_array_size = nir->info.cull_distance_array_size;
    shader->b.info.outputs = outputs;

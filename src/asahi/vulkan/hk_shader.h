@@ -134,6 +134,9 @@ struct hk_shader_info {
     */
    bool g17p_default_layer_zero;
 
+   /* External API memory writes (stores, atomics, transform feedback). */
+   bool writes_external_memory;
+
    /* The bounded G17P graphics/compute path lowers one Gen9 combined
     * image/sampler to native texture/sampler state 0. Command recording joins
     * the bound descriptor set and native sampler heap into those CProg slots.
