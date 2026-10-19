@@ -340,6 +340,74 @@ test_pass_software_graphics_dependencies(void)
    hk_sync_end_rendering(cmd);
 }
 
+/* Kernels without per-command input syncs attach the ioctl's waits to the
+ * first command only, so every later command is chained onto it. The first
+ * command belongs to the first command buffer that emits a stream: chaining
+ * onto a subqueue with no earlier command gives the kernel a barrier it
+ * rejects with EINVAL. */
+static void
+test_chain_first_skips_empty_buffers(void)
+{
+   for (unsigned exact = 0; exact < 2; ++exact) {
+      struct hk_queue *q = new_queue(exact);
+      struct hk_cmd_buffer *empty = new_cmd();
+      struct hk_cmd_buffer *a = new_cmd();
+      struct hk_cmd_buffer *b = new_cmd();
+      struct hk_cs *compute = add(a, true);
+      struct hk_cs *render = add(b, false);
+      struct hk_cmd_buffer *ecr[] = {empty, a, b};
+      T("chain [empty, compute, render]",
+        hk_sync_resolve_submit(q, ecr, 3, false, true, 0));
+      T("chain first command has no barrier",
+        compute->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+           compute->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
+      T("chain no barrier on VDM before any render",
+        render->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+      T("chain render follows the first compute",
+        render->sync.barrier[HK_SYNC_CDM] == 1);
+      T("chain vertex half matches",
+        render->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+           render->sync.barrier_ta[HK_SYNC_CDM] == 1);
+
+      q = new_queue(exact);
+      empty = new_cmd();
+      a = new_cmd();
+      b = new_cmd();
+      render = add(a, false);
+      compute = add(b, true);
+      struct hk_cmd_buffer *erc[] = {empty, a, b};
+      T("chain [empty, render, compute]",
+        hk_sync_resolve_submit(q, erc, 3, false, true, 0));
+      T("chain no barrier on CDM before any compute",
+        compute->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           compute->sync.barrier[HK_SYNC_VDM] == 1 &&
+           render->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+           render->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE);
+
+      /* Unchanged when the first command buffer has work. */
+      q = new_queue(exact);
+      a = new_cmd();
+      b = new_cmd();
+      compute = add(a, true);
+      render = add(b, false);
+      struct hk_cmd_buffer *cr[] = {a, b};
+      T("chain [compute, render]",
+        hk_sync_resolve_submit(q, cr, 2, false, true, 0));
+      T("chain [compute, render] render follows compute",
+        compute->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+           render->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+           render->sync.barrier[HK_SYNC_CDM] == 1);
+
+      /* No command at all: nothing to chain. */
+      q = new_queue(exact);
+      struct hk_cmd_buffer *ee[] = {new_cmd(), new_cmd()};
+      T("chain without commands",
+        hk_sync_resolve_submit(q, ee, 2, false, true, 0) &&
+           q->sync.submitted[HK_SYNC_VDM] == 0 &&
+           q->sync.submitted[HK_SYNC_CDM] == 0);
+   }
+}
+
 int
 main(void)
 {
@@ -349,6 +417,7 @@ main(void)
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
    test_pass_software_graphics_dependencies();
+   test_chain_first_skips_empty_buffers();
    /* Each matching destination retains the exact old source prefix, including
     * reuse of a recording and independent physical destinations on the queue. */
    struct hk_queue *q = new_queue(true);

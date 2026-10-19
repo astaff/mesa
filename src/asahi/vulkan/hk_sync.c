@@ -1425,14 +1425,17 @@ hk_sync_resolve_submit(struct hk_queue *queue,
     * command that does not already follow the first one transitively gets
     * an explicit wait on it. Waits are prefixes, so following any command
     * that follows the first is enough. */
-   if (chain_first || first_cdm_is_flush) {
-      const unsigned first_sq = first_cdm_is_flush ? HK_SYNC_CDM
-                                : count && !list_is_empty(
-                                              &cmdbufs[0]->control_streams)
-                                   ? hk_sync_sq(list_first_entry(
-                                        &cmdbufs[0]->control_streams,
-                                        struct hk_cs, node))
-                                   : HK_SYNC_VDM;
+   /* The first command is the first stream of the first command buffer that
+    * emits any: command buffers without streams (barrier-only or empty) send
+    * nothing to the kernel. Without any command there is nothing to chain. */
+   int first_sq = first_cdm_is_flush ? HK_SYNC_CDM : -1;
+   for (unsigned i = 0; first_sq < 0 && i < count; ++i) {
+      if (!list_is_empty(&cmdbufs[i]->control_streams))
+         first_sq = hk_sync_sq(list_first_entry(&cmdbufs[i]->control_streams,
+                                                struct hk_cs, node));
+   }
+
+   if ((chain_first || first_cdm_is_flush) && first_sq >= 0) {
       /* covered[sq]: the lowest index on sq of a command that follows the
        * first command, 0 if none yet. A wait on prefix b of subqueue d
        * follows the first command when covered[d] is within that prefix. */
