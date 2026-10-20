@@ -470,6 +470,9 @@ struct agx_batch {
    struct agx_varyings_vs linked_varyings;
 
    struct agx_draw_uniforms uniforms;
+
+   /* Last immutable root upload, owned by this batch's pool. */
+   const struct agx_draw_uniforms *uploaded_uniforms;
    struct agx_stage_uniforms stage_uniforms[MESA_SHADER_STAGES];
 
    /* Heap descriptor if dynamic allocation is required */
@@ -668,6 +671,14 @@ struct agx_context {
       struct agx_linked_shader *gs_copy;
    } linked;
    uint32_t dirty;
+
+   /* ASAHI_MESA_DEBUG=perf, accumulated until PIPE_FLUSH_END_OF_FRAME. */
+   struct {
+      uint64_t frame;
+      uint64_t draws;
+      uint64_t vs_emits;
+      uint64_t query_waits;
+   } perf;
 
    /* Heap for dynamic memory allocation for geometry/tessellation shaders */
    struct pipe_resource *heap;
@@ -1196,6 +1207,7 @@ void agx_sync_writer(struct agx_context *ctx, struct agx_resource *rsrc,
 void agx_sync_readers(struct agx_context *ctx, struct agx_resource *rsrc,
                       const char *reason);
 void agx_sync_batch(struct agx_context *ctx, struct agx_batch *batch);
+bool agx_poll_batch(struct agx_context *ctx, struct agx_batch *batch);
 void agx_sync_all(struct agx_context *ctx, const char *reason);
 void agx_sync_batch_for_reason(struct agx_context *ctx, struct agx_batch *batch,
                                const char *reason);

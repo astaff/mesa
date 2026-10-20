@@ -6467,7 +6467,10 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
       ppp_updates++;
    }
 
-   if (agx_native_graphics(dev) || IS_DIRTY(VS) || varyings_dirty) {
+   /* HAL200 retains the vertex state update independently of its bind tail
+    * and per-draw selector, just as the older VDM retains VS state. The old
+    * immutable uniform upload remains valid until vertex inputs change. */
+   if (IS_DIRTY(VS) || varyings_dirty) {
       struct agx_vdm_state_vertex_shader_word_0_packed counts;
       agx_pack(&counts, VDM_STATE_VERTEX_SHADER_WORD_0, cfg) {
          cfg.uniform_register_count = vs->b.info.push_count;
@@ -6535,6 +6538,9 @@ agx_encode_state(struct agx_batch *batch, uint8_t *out,
          memset(out, 0, 4);
          out += 4;
       }
+
+      if (unlikely(dev->debug & AGX_DBG_PERF))
+         ctx->perf.vs_emits++;
    }
 
    if (agx_native_graphics(dev))
@@ -8356,7 +8362,31 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
             &batch->pool, ctx->poly_stipple, sizeof(ctx->poly_stipple), 4);
       }
 
+      const struct agx_draw_uniforms *old_root = batch->uploaded_uniforms;
       agx_upload_uniforms(batch);
+
+      /* Keep the old immutable upload for unchanged vertex inputs, including
+       * fragment-only root updates. The unconditional native VS update used
+       * to cover root inputs not represented by VS dirty bits. Compare the
+       * ranges actually consumed by the hardware VS so query/statistic and
+       * indirect table pointer changes cannot leave it reading stale data. */
+      if (agx_native_graphics(agx_device(pctx->screen)) && !IS_DIRTY(VS) &&
+          old_root) {
+         struct agx_compiled_shader *hw_vs = ctx->gs ? ctx->gs->gs_copy : ctx->vs;
+         for (unsigned i = 0; i < hw_vs->push_range_count; ++i) {
+            const struct agx_push_range *push = &hw_vs->push[i];
+            if (push->table != AGX_SYSVAL_TABLE_ROOT)
+               continue;
+
+            assert((size_t)push->offset + push->length * 2 <= sizeof(*old_root));
+            if (memcmp((const uint8_t *)old_root + push->offset,
+                       (const uint8_t *)batch->uploaded_uniforms + push->offset,
+                       push->length * 2) != 0) {
+               ctx->dirty |= AGX_DIRTY_VS;
+               break;
+            }
+         }
+      }
    }
 
    struct pipe_draw_info info_gs;
@@ -8478,12 +8508,14 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    uint32_t draw_state_offset = 0;
    /* Native HAL200 indirect records always carry a draw-state selector.
-    * Republish state if the API issues an otherwise state-clean indirect
-    * draw; retaining a stale compact selector is not safe across batches. */
-   if (agx_native_graphics(dev) && indirect && !ctx->dirty)
-      ctx->dirty |= AGX_DIRTY_PRIM;
+    * A state-clean indirect draw needs only its bind tail and selector;
+    * dirtying PRIM would also relink varyings and rebuild the VS program. */
    uint8_t *out =
-      agx_encode_state(batch, batch->vdm.current, &draw_state_offset);
+      agx_native_graphics(dev) && indirect && !ctx->dirty
+         ? agx_g17p_emit_bind_state(batch, batch->vdm.current,
+                                    ctx->gs ? ctx->gs->gs_copy : ctx->vs,
+                                    &draw_state_offset)
+         : agx_encode_state(batch, batch->vdm.current, &draw_state_offset);
    if (!out)
       return;
 
@@ -8543,6 +8575,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    assert(batch == agx_get_batch(ctx) && "batch should not change under us");
 
    batch->draws++;
+
+   if (unlikely(dev->debug & AGX_DBG_PERF))
+      ctx->perf.draws++;
 
    /* The scissor/zbias arrays are indexed with 16-bit integers, imposigin a
     * maximum of UINT16_MAX descriptors. Flush if the next draw would overflow

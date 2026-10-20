@@ -77,6 +77,7 @@ agx_upload_uniforms(struct agx_batch *batch)
          : 0;
 
    memcpy(root_ptr.cpu, &batch->uniforms, sizeof(batch->uniforms));
+   batch->uploaded_uniforms = root_ptr.cpu;
 }
 
 void

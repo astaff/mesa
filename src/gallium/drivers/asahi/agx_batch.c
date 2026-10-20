@@ -163,6 +163,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_resolve_preserve = key->resolve != NULL;
    batch->seqnum = ++ctx->batches.seqnum;
    batch->g17p_fragment_program = 0;
+   batch->uploaded_uniforms = NULL;
    batch->g17p_emrt_heap = 0;
    batch->g17p_fragment_shader = NULL;
    batch->g17p_fragment_linked = NULL;
@@ -1381,6 +1382,27 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    /* Try to clean up up to two batches, to keep memory usage down */
    if (agx_cleanup_batches(ctx) >= 0)
       agx_cleanup_batches(ctx);
+}
+
+bool
+agx_poll_batch(struct agx_context *ctx, struct agx_batch *batch)
+{
+   /* Polling must never submit an active batch. A query may have writers in
+    * several slots, so retire only the completed submitted writer here. */
+   if (agx_batch_is_active(batch))
+      return false;
+
+   if (!agx_batch_is_submitted(batch))
+      return true;
+
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   int ret = drmSyncobjWait(dev->fd, &batch->syncobj, 1, 0, 0, NULL);
+   assert(!ret || ret == -ETIME);
+   if (ret)
+      return false;
+
+   agx_batch_cleanup(ctx, batch, false);
+   return true;
 }
 
 void

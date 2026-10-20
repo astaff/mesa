@@ -198,8 +198,12 @@ sync_query_writers(struct agx_context *ctx, struct agx_query *query,
                    const char *reason)
 {
    for (unsigned i = 0; i < AGX_MAX_BATCHES; ++i) {
-      if (query->writer_generation[i] == ctx->batches.generation[i])
+      if (query->writer_generation[i] == ctx->batches.generation[i] &&
+          !agx_poll_batch(ctx, &ctx->batches.slots[i])) {
+         if (unlikely(agx_device(ctx->base.screen)->debug & AGX_DBG_PERF))
+            ctx->perf.query_waits++;
          agx_sync_batch_for_reason(ctx, &ctx->batches.slots[i], reason);
+      }
    }
 }
 
@@ -207,7 +211,8 @@ static bool
 is_query_busy(struct agx_context *ctx, struct agx_query *query)
 {
    for (unsigned i = 0; i < AGX_MAX_BATCHES; ++i) {
-      if (query->writer_generation[i] == ctx->batches.generation[i])
+      if (query->writer_generation[i] == ctx->batches.generation[i] &&
+          !agx_poll_batch(ctx, &ctx->batches.slots[i]))
          return true;
    }
 
@@ -389,8 +394,10 @@ agx_get_query_result(struct pipe_context *pctx, struct pipe_query *pquery,
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
 
-   /* TODO: Honour `wait` */
-   sync_query_writers(ctx, query, "Reading query results");
+   if (wait)
+      sync_query_writers(ctx, query, "Reading query results");
+   else if (is_query_busy(ctx, query))
+      return false;
 
    uint64_t *ptr = query->ptr.cpu;
    uint64_t value = *ptr;
