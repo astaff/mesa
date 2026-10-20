@@ -181,12 +181,17 @@ static void matrix(bool old_or_mutation) {
  (void)old_or_mutation;
 }
 #define THREADS 32
-static atomic_uint ready,go;
+static uint ready,go;
+static pthread_mutex_t start_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t start_cond=PTHREAD_COND_INITIALIZER;
 struct worker {struct poly_heap *heap; uint size,chip,batch; uint64_t result; bool success;};
 static void *compete(void *arg) {
  struct worker *p=arg;uchar in[16];memset(in,0x47,sizeof(in));
  VkDrawIndexedIndirectCommand cmd={64,1,1,0,0};
- atomic_fetch_add(&ready,1);while(!atomic_load(&go)) sched_yield();
+ assert(!pthread_mutex_lock(&start_lock));ready++;
+ assert(!pthread_cond_broadcast(&start_cond));
+ while(!go) assert(!pthread_cond_wait(&start_cond,&start_lock));
+ assert(!pthread_mutex_unlock(&start_lock));
  repair(p->heap,&cmd,in,2*(1u<<p->size),p->size,AGX_PRIMITIVE_POINTS,p->chip,p->batch);
  p->result=captured.index_buffer;p->success=captured.b.count[0]==64;
  return NULL;
@@ -195,13 +200,16 @@ static void parallel(void) {
  for(uint batch=0;batch<2;batch++) for(uint chip=0;chip<3;chip++) for(uint size=0;size<3;size++) {
   uchar storage[4096];memset(storage,0xcd,sizeof(storage));uint span=64*(1u<<size);
   struct poly_heap h={storage,16,16+7*span};reset_status();
-  atomic_store(&ready,0);atomic_store(&go,0);
+  ready=go=0;
   struct worker workers[THREADS];pthread_t threads[THREADS];
   for(uint i=0;i<THREADS;i++) {
    workers[i]=(struct worker){.heap=&h,.size=size,.chip=chip,.batch=batch};
    assert(!pthread_create(&threads[i],NULL,compete,&workers[i]));
   }
-  while(atomic_load(&ready)!=THREADS) sched_yield();atomic_store(&go,1);
+  assert(!pthread_mutex_lock(&start_lock));
+  while(ready!=THREADS) assert(!pthread_cond_wait(&start_cond,&start_lock));
+  go=1;assert(!pthread_cond_broadcast(&start_cond));
+  assert(!pthread_mutex_unlock(&start_lock));
   uint winners=0;
   for(uint i=0;i<THREADS;i++) assert(!pthread_join(threads[i],NULL));
   for(uint i=0;i<THREADS;i++) if(workers[i].success) {
