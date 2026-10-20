@@ -1,4 +1,7 @@
 /*
+ * Copyright 2024 Alyssa Rosenzweig
+ * Copyright 2024 Valve Corporation
+ * Copyright 2022 Collabora Ltd. and Red Hat Inc.
  * Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  */
