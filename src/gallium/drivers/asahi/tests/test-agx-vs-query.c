@@ -67,7 +67,8 @@ create_vs(struct pipe_context *pctx, bool vertex_id)
       MESA_SHADER_VERTEX, &agx_nir_options, "VS dirty tracking");
    nir_def *pos = nir_imm_vec4(&b, 0, 0, 0, 1);
    if (vertex_id) {
-      nir_def *id = nir_u2f32(&b, nir_load_vertex_id(&b));
+      nir_def *id = nir_u2f32(
+         &b, nir_iadd(&b, nir_load_vertex_id(&b), nir_load_base_instance(&b)));
       pos = nir_vec4(&b, id, id, nir_imm_float(&b, 0), nir_imm_float(&b, 1));
    }
    nir_store_output(&b, pos, nir_imm_int(&b, 0), .base = 0, .write_mask = 0xf,
@@ -247,6 +248,7 @@ check_vs(struct pipe_context *pctx)
    CHECK(ctx->batch == first && ctx->perf.vs_emits == emits + 2);
 
    pctx->flush(pctx, NULL, PIPE_FLUSH_END_OF_FRAME);
+   CHECK(!ctx->any_faults);
    CHECK(ctx->perf.frame == 1 && ctx->perf.draws == 0 &&
          ctx->perf.vs_emits == 0);
    draw(pctx);
@@ -386,6 +388,8 @@ main(int argc, char **argv)
    bool ok = argc == 2 && (strcmp(argv[1], "vs") == 0 ? check_vs(pctx)
                                                       : check_queries(pctx));
    busy = false;
+   pctx->flush(pctx, NULL, 0);
+   ok &= !agx_context(pctx)->any_faults;
    pctx->destroy(pctx);
    screen->destroy(screen);
    glsl_type_singleton_decref();
