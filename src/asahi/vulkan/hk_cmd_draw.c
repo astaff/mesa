@@ -96,6 +96,7 @@
 /* Diagnostic controls, read once: these are consulted per draw or
  * render pass, and an uncached getenv() scans the whole environment. */
 DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_msaa_pass_merge, "ASAHI_M5_MSAA_PASS_MERGE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_tile_loader, "AGX_M5_VERIFY_TILE_LOADER",
                            false)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_primitive_address,
@@ -3479,6 +3480,22 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
       (agx_native_graphics(&dev->dev) || m5) ? 2048 : 0);
 }
 
+/* Compressed multisample attachment continuation is qualified separately. */
+static bool
+hk_m5_merge_view_compressed(const struct hk_image_view *view)
+{
+   if (!view)
+      return false;
+
+   const struct hk_image *image =
+      container_of(view->vk.image, struct hk_image, vk);
+   for (unsigned p = 0; p < image->plane_count; ++p) {
+      if (image->planes[p].layout.compressed)
+         return true;
+   }
+   return false;
+}
+
 /*
  * AGX3 render pass continuation.
  *
@@ -3511,6 +3528,11 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   const unsigned samples = render->tilebuffer.nr_samples;
+   const bool msaa = samples > 1;
+   const bool msaa_enabled = msaa && dev->dev.chip == AGX_CHIP_G17S &&
+      (samples == 2 || samples == 4) &&
+      debug_get_option_m5_msaa_pass_merge();
 
    /* The instance is one ordinary render stream with draws, with no
     * pre/post-graphics streams, heap use or timestamps attached. */
@@ -3519,28 +3541,56 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
        cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
        cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
        cmd->uses_heap || cs->timestamp.start.handle ||
-       cs->timestamp.end.handle)
+       cs->timestamp.end.handle) {
+      if (msaa_enabled)
+         hk_frame_anatomy_note(dev,
+            "MSAA pass merge refused: pre=%u post=%u heap=%u draws=%u timestamp=%u",
+            cmd->current_cs.pre_gfx != NULL, cmd->current_cs.post_gfx != NULL,
+            cmd->uses_heap, cs->stats.cmds,
+            cs->timestamp.start.handle != 0 || cs->timestamp.end.handle != 0);
       return false;
+   }
 
    if (render->flags & (VK_RENDERING_SUSPENDING_BIT |
                         VK_RENDERING_RESUMING_BIT |
                         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT))
       return false;
 
-   /* Single-sample, in-tilebuffer rendering without resolves. */
-   if (render->view_mask || render->tilebuffer.nr_samples > 1 ||
+   /* In-tilebuffer rendering without resolves. Multisample continuation
+    * keeps the existing per-sample partial store and reload programs. */
+   if (render->view_mask || (msaa && !msaa_enabled) ||
        agx_tilebuffer_spills(&render->tilebuffer) ||
        render->g17p_direct_color_resolve)
       return false;
+   if (msaa && (render->layer_count != 1 || cs->tib.nr_samples != samples))
+      return false;
+   if (msaa) {
+      for (unsigned i = 0; i < render->color_att_count; ++i) {
+         if (hk_m5_merge_view_compressed(render->color_att[i].iview))
+            return false;
+      }
+      if (hk_m5_merge_view_compressed(render->depth_att.iview) ||
+          hk_m5_merge_view_compressed(render->stencil_att.iview))
+         return false;
+   }
 
    unsigned attachments = 0;
    for (unsigned i = 0; i < render->color_att_count; ++i) {
       if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE)
          return false;
+      if (msaa && render->color_att[i].iview &&
+          render->color_att[i].iview->vk.image->samples != samples)
+         return false;
       attachments += render->color_att[i].iview != NULL;
    }
    if (render->depth_att.resolve_mode != VK_RESOLVE_MODE_NONE ||
        render->stencil_att.resolve_mode != VK_RESOLVE_MODE_NONE)
+      return false;
+   if (msaa &&
+       ((render->depth_att.iview &&
+         render->depth_att.iview->vk.image->samples != samples) ||
+        (render->stencil_att.iview &&
+         render->stencil_att.iview->vk.image->samples != samples)))
       return false;
    attachments += render->depth_att.iview != NULL;
    attachments += render->stencil_att.iview != NULL;
@@ -3552,7 +3602,8 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
  * loaded, stored the same way, unresolved, with the same flags. */
 static const char *
 hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
-                           const struct hk_attachment *att)
+                           const struct hk_attachment *att,
+                           unsigned expected_samples)
 {
    const bool present = info != NULL && info->imageView != VK_NULL_HANDLE;
    if (present != (att->iview != NULL))
@@ -3563,6 +3614,12 @@ hk_m5_attachment_continues(const VkRenderingAttachmentInfo *info,
    VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
    if (iview != att->iview)
       return "view";
+   if (expected_samples > 1) {
+      if (iview->vk.image->samples != expected_samples)
+         return "sample count";
+      if (info->imageLayout != att->layout)
+         return "layout";
+   }
    if (info->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD)
       return "load op";
    if (info->storeOp != att->store_op)
@@ -3635,6 +3692,12 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
    struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
    if (!m->valid)
       return;
+   if (m->render.tilebuffer.nr_samples > 1 && transition) {
+      m->valid = false;
+      hk_frame_anatomy_note(hk_cmd_buffer_device(cmd),
+                            "MSAA pass merge ended by a layout or ownership transition");
+      return;
+   }
 
    /* hk performs no work for a layout transition: of an image that is not an
     * attachment of the candidate and cannot alias one, it only orders the
@@ -4011,17 +4074,20 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    if (!why) {
       slot = "depth";
       why = hk_m5_attachment_continues(info->pDepthAttachment,
-                                       &prev->depth_att);
+                                       &prev->depth_att,
+                                       prev->tilebuffer.nr_samples);
    }
    if (!why) {
       slot = "stencil";
       why = hk_m5_attachment_continues(info->pStencilAttachment,
-                                       &prev->stencil_att);
+                                       &prev->stencil_att,
+                                       prev->tilebuffer.nr_samples);
    }
    for (uint32_t i = 0; !why && i < info->colorAttachmentCount; ++i) {
       slot = "color";
       why = hk_m5_attachment_continues(&info->pColorAttachments[i],
-                                       &prev->color_att[i]);
+                                       &prev->color_att[i],
+                                       prev->tilebuffer.nr_samples);
    }
 
    if (why) {
