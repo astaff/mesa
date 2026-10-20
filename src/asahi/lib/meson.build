@@ -245,6 +245,15 @@ if with_tests
   )
 endif
 
+if with_tests
+  test('vbo_robustness', executable('vbo_robustness_test',
+    files('tests/test-vbo-robustness.c'),
+    include_directories : [inc_asahi, inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil, idep_agx_pack, idep_libagx_shaders_h],
+    link_with : [libasahi_lib, libasahi_compiler, libasahi_layout]),
+    suite : ['asahi'])
+endif
+
 if dep_iokit.found()
   libasahi_wrap = shared_library(
     'wrap',
