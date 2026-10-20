@@ -72,6 +72,7 @@ hk_files = files(
   'hk_nir_widen_16bit_varyings.c',
   'hk_nir_widen_16bit_varyings.h',
   'hk_native_descriptor.h',
+  'hk_native_vertex_template.h',
   'hk_native_descriptor_pack.c',
   'hk_native_descriptor_pack.h',
   'hk_native_sampler.c',
@@ -335,6 +336,14 @@ libhk = static_library(
   dependencies : [hk_deps],
   gnu_symbol_visibility : 'hidden',
 )
+
+if with_tests
+  test('hk_tes_query', executable('hk_tes_query_test', files('tests/test-hk-tes-query.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
+endif
 
 libvulkan_asahi = shared_library(
   'vulkan_asahi',

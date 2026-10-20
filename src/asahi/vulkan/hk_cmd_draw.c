@@ -29,6 +29,7 @@
 #include "agx_vdm_hal200_direct_draw_core.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
+#include "hk_native_vertex_template.h"
 #include "asahi/lib/agx_vdm_mesh_core.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -7619,14 +7620,13 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                          : AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_NONINDEXED)
          : (draw.indexed ? AGX_VDM_STATE_UPDATE_DRAW_DIRECT_INDEXED
                          : AGX_VDM_STATE_UPDATE_DRAW_DIRECT_NONINDEXED);
-   /* RenderPipeline+0x2f0 is populated from isRasterizationEnabled; the
-    * selected template carries 0x30 when this is false on pre-HAL300.
-    * Software XFB stores live in the raster variant's vertex program, so it
-    * must use the live vertex template even when Vulkan discards
-    * rasterization.  The independently packed HAL200 PPP discard bits still
-    * suppress fragments. */
-   const bool rasterization_enabled =
-      !hk_rast_discard(cmd) || hk_g17p_xfb_vertex_side_effects(cmd, hw_vs);
+   /* RenderPipeline+0x2f0 selects the native vertex template. TES and GS
+    * raster variants can write external memory just like API vertex shaders
+    * and software XFB. Keep that program live when rasterization is discarded;
+    * the independently packed PPP discard bits still suppress fragments. */
+   const bool rasterization_enabled = hk_native_vertex_template_enabled(
+      hk_rast_discard(cmd), hw_vs->info.writes_external_memory,
+      hk_g17p_xfb_vertex_side_effects(cmd, hw_vs));
 
    /* Every encoder input except the pipeline address, which occupies only
     * the two-word pipeline pair at bytes 8..15 (agx_vdm_state_update_pack())
