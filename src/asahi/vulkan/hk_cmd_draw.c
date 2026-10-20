@@ -2686,6 +2686,15 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
     * stream has when it is created (hk_cs_init_graphics()). */
    cs->current = m->resume_current;
    cs->cr.eot.main = prev->cr.eot.partial;
+   /* EndRendering may have elided untouched depth/stencil planes or replaced
+    * the forced intermediate stores with the final store operations. A later
+    * draw in this continued stream can use those planes, and a split can need
+    * their stores again. Restore the recording state along with the EOT. The
+    * final EndRendering still elides the whole stream if it remains untouched.
+    */
+   cs->cr.depth = prev->cr.depth;
+   cs->cr.stencil = prev->cr.stencil;
+   cs->cr.zls_control = prev->cr.zls_control;
    cs->g17p_pass_ends = false;
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
