@@ -832,8 +832,13 @@ agx_robust_index_copy(GLOBAL uint8_t *dst, CONST uint8_t *src,
 }
 
 static inline uint32_t
-agx_robust_index_clamped_count(uint32_t requested, uint32_t available)
+agx_robust_index_clamped_count(uint32_t requested, uint32_t available,
+                                enum agx_primitive topology)
 {
+   /* Repeated zero indices are visible points, not degenerate primitives. */
+   if (topology == AGX_PRIMITIVE_POINTS)
+      return requested;
+
    const uint32_t limit =
       available > 0xffffffffu - 32
          ? 0xffffffffu

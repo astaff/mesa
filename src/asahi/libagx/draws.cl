@@ -239,12 +239,12 @@ libagx_draw_robust_index_impl(
       uint in_size_B = agx_indices_to_B(in_size_el, index_size);
 
       /* After a small number of zeroes at the end, extra zeroes cannot change
-       * rendering since they will duplicate the same degenerate primitive many
-       * times. Therefore we clamp the number of zeroes we need to extend with.
-       * This makes the memset constant time.
+       * triangle/line rendering: they duplicate degenerate primitives. Clamp
+       * the number of zeroes we need to extend with for those topologies.
+       * Point lists retain every requested zero index.
        */
       draw.b.count[0] =
-         agx_robust_index_clamped_count(draw.b.count[0], in_size_el);
+         agx_robust_index_clamped_count(draw.b.count[0], in_size_el, topology);
 
       uint out_size_el = draw.b.count[0];
       uint out_size_B = 0, alloc_size_B = 0;

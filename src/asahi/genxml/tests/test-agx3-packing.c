@@ -557,10 +557,20 @@ test_agx3_live_vdm_draw(void)
 
    /* The shadow-buffer calculation must never wrap either the 32-index
     * extension limit or the byte allocation passed to the GPU heap. */
-   CHECK_EQ(agx_robust_index_clamped_count(64, UINT32_MAX - 16), 64);
-   CHECK_EQ(agx_robust_index_clamped_count(UINT32_MAX, UINT32_MAX - 16),
+   CHECK_EQ(agx_robust_index_clamped_count(64, UINT32_MAX - 16,
+                                          AGX_PRIMITIVE_TRIANGLES), 64);
+   CHECK_EQ(agx_robust_index_clamped_count(UINT32_MAX, UINT32_MAX - 16,
+                                          AGX_PRIMITIVE_TRIANGLES),
             UINT32_MAX);
-   CHECK_EQ(agx_robust_index_clamped_count(100, 12), 44);
+   CHECK_EQ(agx_robust_index_clamped_count(100, 12,
+                                          AGX_PRIMITIVE_TRIANGLES), 44);
+   /* With one accessible index, a 64-point draw still emits 64 points:
+    * zero-index points affect blending and occlusion even when coincident. */
+   CHECK_EQ(agx_robust_index_clamped_count(64, 1, AGX_PRIMITIVE_POINTS), 64);
+   CHECK_EQ(agx_robust_index_clamped_count(100, 12, AGX_PRIMITIVE_POINTS), 100);
+   CHECK_EQ(agx_robust_index_clamped_count(0, 1, AGX_PRIMITIVE_POINTS), 0);
+   CHECK_EQ(agx_robust_index_clamped_count(UINT32_MAX, 1,
+                                          AGX_PRIMITIVE_POINTS), UINT32_MAX);
    uint32_t payload_B = 0, allocation_B = 0;
    CHECK_EQ(agx_robust_index_shadow_sizes(
                (UINT32_MAX - 15) >> AGX_INDEX_SIZE_U32,
