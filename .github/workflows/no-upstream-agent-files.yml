@@ -1,0 +1,21 @@
+name: no-upstream-agent-files
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/workflows
+      - name: Refuse upstream AI-assistant instruction files
+        run: |
+          found=$(git ls-tree -r --name-only HEAD | grep -iE '(^|/)(agents?|claude|gemini|codex)\.md$|copilot-instructions\.md$|\.cursorrules$|\.clinerules$|\.windsurfrules$' || true)
+          if [ -n "$found" ]; then
+            echo "Upstream AI-assistant instruction files must not be carried here:"
+            echo "$found"
+            exit 1
+          fi
