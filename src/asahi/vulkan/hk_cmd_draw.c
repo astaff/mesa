@@ -9898,14 +9898,17 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
  * to do in hk_draw_impl() / hk_flush_gfx_state() /
  * hk_flush_dynamic_state_slow() except their own publication: no dirty
  * dynamic, shader, link, root, descriptor or vertex-buffer state, and none of
- * the transformed, robust, conditional, statistics, multiview, split or trace
- * paths.  That is every record after the first of an indexed-indirect
- * multi-draw.  In that state the general path reduces to exactly the sequence
+ * the transformed, conditional, statistics, multiview, split or trace paths.
+ * Ordinary emission also excludes robustness. In that state the general path
+ * reduces to exactly the sequence
  * in hk_g17p_emit_indirect_record() -- stream space, the record's draw
  * parameters, the vertex-program publication (hk_agx3_publish_vertex_state())
  * when the vertex shader reads draw parameters, then the draw record
- * (hk_g17p_emit_draw()) -- so records are emitted directly, byte for byte
- * what the general path emits.
+ * (hk_g17p_emit_draw()) -- so ordinary records are emitted directly, byte for
+ * byte what the general path emits. With allow_robust, the first record has
+ * already queued a repair job for this API multi-draw. The same proof admits
+ * later records' state publication followed by a reserved repair slot instead
+ * (hk_emit_robust_index); no other compute work or stream split intervenes.
  *
  * The check reads no per-record value except the indirect address, and
  * emitting a record changes none of what it reads, so a multi-draw checks it
@@ -10146,6 +10149,9 @@ hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
                           uint32_t draw_count, uint32_t stride)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!agx_native_graphics(&dev->dev) || draw_count <= 1)
+      return false;
+
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    struct hk_addr_range buf = gfx->index.buffer;
@@ -10153,8 +10159,9 @@ hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
       agx_draw_indexed_indirect(buffer, buf.addr, buf.range, 0, 0);
    hk_g17p_normalize_indirect_draw(cmd, &first);
 
-   if (!agx_native_graphics(&dev->dev) || draw_count <= 1 ||
-       gfx->render.view_mask || gfx->shaders[MESA_SHADER_GEOMETRY] ||
+   if (gfx->render.view_mask || dyn->rs.depth_bias.enable ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        mesa_prim_has_adjacency(
           vk_topology_to_mesa(dyn->ia.primitive_topology)) ||
