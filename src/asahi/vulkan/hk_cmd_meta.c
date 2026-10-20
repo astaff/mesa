@@ -4423,7 +4423,7 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
    for (uint32_t i = 0; i < attachmentCount; ++i) {
       if (pAttachments[i].aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT |
                                         VK_IMAGE_ASPECT_STENCIL_BIT))
-         hk_g17p_note_depth_clear(cmd);
+         hk_g17p_note_depth_clear(cmd, pAttachments[i].aspectMask);
    }
 
    struct hk_meta_save save;

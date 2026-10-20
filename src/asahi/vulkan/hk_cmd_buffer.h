@@ -412,13 +412,13 @@ struct hk_rendering_state {
    struct agx_zls_control_packed zls_control_only, zls_control_last;
    const void *zls_first_cs;
 
-   /* Preserve untouched NONE/NONE attachments, and (HK_G17P_ZLS_ELIDE_
-    * UNTOUCHED, default on) LOAD/STORE ones. The pass may drop its
-    * depth/stencil attachment from every control stream when no draw or
-    * clear in it tests, writes, bounds-tests or clears depth/stencil (see
-    * hk_g17p_zls_elide()). */
-   bool g17p_zls_elide_ok;
-   bool g17p_depth_touched;
+   /* Track depth and stencil independently: an untouched aspect can be
+    * removed from every stream even when the other aspect is cleared or
+    * used. NONE/NONE aspects must retain their memory contents; eliding
+    * untouched LOAD/STORE aspects also avoids redundant traffic.
+    */
+   VkImageAspectFlags g17p_zls_elide_mask;
+   VkImageAspectFlags g17p_zls_touched;
 
    /* AGX3 dead depth store: the "only" ZLS word with the depth store
     * dropped, and whether the pass processes empty tiles without that store,
@@ -1648,7 +1648,8 @@ hk_pool_vdm_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 
 bool hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 /* A depth/stencil clear touched the pass's attachment (ZLS elision). */
-void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd);
+void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd,
+                              VkImageAspectFlags aspects);
 
 uint32_t hk_default_sample_positions(unsigned nr_samples);
 

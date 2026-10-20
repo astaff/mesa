@@ -2111,42 +2111,60 @@ static inline void
 hk_g17p_note_depth_use(struct hk_cmd_buffer *cmd)
 {
    struct hk_rendering_state *render = &cmd->state.gfx.render;
-   if (likely(!render->g17p_zls_elide_ok) || render->g17p_depth_touched)
+   if (likely(!render->g17p_zls_elide_mask))
       return;
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
    if (dyn->ds.depth.test_enable || dyn->ds.depth.write_enable ||
-       dyn->ds.depth.bounds_test.enable || dyn->ds.stencil.test_enable)
-      render->g17p_depth_touched = true;
+       dyn->ds.depth.bounds_test.enable)
+      render->g17p_zls_touched |= VK_IMAGE_ASPECT_DEPTH_BIT;
+   if (dyn->ds.stencil.test_enable)
+      render->g17p_zls_touched |= VK_IMAGE_ASPECT_STENCIL_BIT;
 }
 
 void
-hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd)
+hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
 {
-   cmd->state.gfx.render.g17p_depth_touched = true;
+   cmd->state.gfx.render.g17p_zls_touched |= aspects;
 }
 
-/* Returns whether the pass's depth/stencil attachment was dropped. */
-static bool
-hk_g17p_zls_elide(struct hk_cmd_buffer *cmd)
+/* Drop each untouched plane independently. Using stencil must not let an
+ * intermediate stream store uninitialized depth from a NONE/NONE attachment,
+ * and using depth must not do the same to an untouched stencil attachment.
+ */
+static void
+hk_g17p_zls_elide(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
 {
    struct hk_rendering_state *render = &cmd->state.gfx.render;
-   if (!render->g17p_zls_elide_ok || render->g17p_depth_touched ||
-       !render->zls_first_cs)
-      return false;
+   if (!aspects || !render->zls_first_cs)
+      return;
    bool found = false;
    list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
       if (cs == render->zls_first_cs)
          found = true;
       if (!found || cs->type != HK_CS_VDM)
          continue;
-      /* An absent attachment must also have zero layer strides. The
-       * kernel rejects a nonzero stride with a zero base address. */
-      memset(&cs->cr.depth, 0, sizeof(cs->cr.depth));
-      memset(&cs->cr.stencil, 0, sizeof(cs->cr.stencil));
-      memset(&cs->cr.zls_control, 0, sizeof(cs->cr.zls_control));
+      agx_unpack(NULL, &cs->cr.zls_control, ZLS_CONTROL, control);
+      /* An absent attachment must also have zero layer strides. */
+      if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+         memset(&cs->cr.depth, 0, sizeof(cs->cr.depth));
+         control.z_load = control.z_store = false;
+         control.z_load_compress = control.z_store_compress = false;
+         control.z_load_tiling = control.z_store_tiling = 0;
+         control.z_format = 0;
+         control.z_resolve = false;
+      }
+      if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+         memset(&cs->cr.stencil, 0, sizeof(cs->cr.stencil));
+         control.s_load = control.s_store = false;
+         control.s_load_compress = control.s_store_compress = false;
+         control.s_load_tiling = control.s_store_tiling = 0;
+         control.s_resolve = false;
+      }
+      agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
+         cfg = control;
+      }
    }
-   return true;
 }
 
 static void
@@ -3046,18 +3064,19 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
    const bool agx3 = agx_chip_native_agx3(dev->dev.chip);
    render->zls_precise = agx3 && z_layout != NULL;
-   render->g17p_depth_touched = false;
-   const bool preserve_none = hk_g17p_zls_attachment_none(attach_z) &&
-                              hk_g17p_zls_attachment_none(attach_s);
-   render->g17p_zls_elide_ok =
-      agx3 &&
-      (preserve_none ||
-       !(render->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) &&
-      (z_layout != NULL || s_layout != NULL) &&
-      !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                         VK_RENDERING_RESUMING_BIT)) &&
-      hk_g17p_zls_attachment_elidable(attach_z) &&
-      hk_g17p_zls_attachment_elidable(attach_s);
+   render->g17p_zls_touched = 0;
+   render->g17p_zls_elide_mask = 0;
+   if (agx3 && !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                                 VK_RENDERING_RESUMING_BIT))) {
+      const bool secondary =
+         render->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+      if (z_layout && hk_g17p_zls_attachment_elidable(attach_z) &&
+          (!secondary || hk_g17p_zls_attachment_none(attach_z)))
+         render->g17p_zls_elide_mask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (s_layout && hk_g17p_zls_attachment_elidable(attach_s) &&
+          (!secondary || hk_g17p_zls_attachment_none(attach_s)))
+         render->g17p_zls_elide_mask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+   }
    if (render->zls_precise) {
       hk_pack_zls_control_final(&render->zls_control_only, z_layout,
                                 s_layout, attach_z, attach_s,
@@ -3364,7 +3383,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     * untouched planes from the whole pass even then: NONE/NONE attachments
     * must not retain a forced store of uninitialized tile contents.
     */
-   const bool zls_elided = hk_g17p_zls_elide(cmd);
+   const VkImageAspectFlags zls_elided =
+      render->g17p_zls_elide_mask & ~render->g17p_zls_touched;
 
    if (cs) {
       cs->cr.eot.main = render->cr.eot.main;
@@ -3373,8 +3393,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       /* Precise depth store: see hk_pack_zls_control_final(). A
        * suspended pass continues in a later command buffer, which reloads
        * depth, so it keeps the forced store. An elided pass has no
-       * depth/stencil to store. */
-      if (render->zls_precise && !zls_elided &&
+       * depth/stencil to store after the per-aspect elision below. */
+      if (render->zls_precise &&
           !(render->flags & VK_RENDERING_SUSPENDING_BIT)) {
          cs->cr.zls_control = cs == render->zls_first_cs
                                  ? render->zls_control_only
@@ -3386,7 +3406,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       const struct hk_image_view *z_view = render->depth_att.iview;
       const struct hk_image *z_image =
          z_view ? container_of(z_view->vk.image, struct hk_image, vk) : NULL;
-      if (render->no_z_store_ok && !zls_elided && !cmd->in_meta &&
+      if (render->no_z_store_ok &&
+          !(zls_elided & VK_IMAGE_ASPECT_DEPTH_BIT) && !cmd->in_meta &&
           cs == render->zls_first_cs && cs->stats.cmds > 0 &&
           !render->view_mask &&
           !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
@@ -3402,6 +3423,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
          };
       }
    }
+
+   /* Apply after the final control word, including already closed streams. */
+   hk_g17p_zls_elide(cmd, zls_elided);
 
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
