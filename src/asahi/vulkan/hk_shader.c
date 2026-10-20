@@ -4547,6 +4547,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                      hk_g17p_saturate_layer_viewport,
                      nir_metadata_control_flow, NULL);
          }
+         if (sw_stage == MESA_SHADER_VERTEX && agx_chip_g17_m5(dev->dev.chip))
+            NIR_PASS(_, nir, agx_nir_preserve_position_order);
          hk_lower_hw_vs(nir, shader, kill_psiz,
                         agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
                         default_layer, sw_stage == MESA_SHADER_VERTEX);

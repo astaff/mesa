@@ -7830,6 +7830,86 @@ agx_nir_has_alu64(const nir_shader *nir, nir_op opcode)
    return false;
 }
 
+struct agx_position_order_state {
+   struct set *seen;
+   struct util_dynarray todo;
+};
+
+static void
+agx_position_order_add(struct agx_position_order_state *state, nir_def *def)
+{
+   if (_mesa_set_search(state->seen, def))
+      return;
+   _mesa_set_add(state->seen, def);
+   util_dynarray_append(&state->todo, def);
+}
+
+static bool
+agx_position_order_src(nir_src *src, void *data)
+{
+   agx_position_order_add(data, src->ssa);
+   return true;
+}
+
+static void
+agx_position_order_control(struct agx_position_order_state *state,
+                           nir_block *block)
+{
+   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
+      if (node->type == nir_cf_node_if)
+         agx_position_order_add(state, nir_cf_node_as_if(node)->condition.ssa);
+   }
+}
+
+/* Preserve the source addition order of position, including shared operands.
+ * A depth-only link must not reassociate its position differently merely
+ * because a color link also uses an intermediate as a varying. Contracting
+ * a multiply/add remains allowed; no other output is made invariant here. */
+bool
+agx_nir_preserve_position_order(nir_shader *nir)
+{
+   struct agx_position_order_state state = {
+      .seen = _mesa_pointer_set_create(NULL),
+   };
+   util_dynarray_init(&state.todo, NULL);
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_store_output &&
+                nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_POS) {
+               agx_position_order_add(&state, intr->src[0].ssa);
+               agx_position_order_control(&state, block);
+            }
+         }
+      }
+   }
+
+   while (util_dynarray_num_elements(&state.todo, nir_def *)) {
+      nir_def *def = util_dynarray_pop(&state.todo, nir_def *);
+      nir_instr *instr = nir_def_instr(def);
+      if (instr->type == nir_instr_type_alu) {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         unsigned flags = nir_op_valid_fp_math_ctrl(
+            alu->op, nir_fp_no_reassoc | nir_fp_no_transform);
+         progress |= (alu->fp_math_ctrl & flags) != flags;
+         alu->fp_math_ctrl |= flags;
+      } else if (instr->type == nir_instr_type_phi) {
+         nir_foreach_phi_src(src, nir_instr_as_phi(instr))
+            agx_position_order_control(&state, src->pred);
+      }
+      if (instr->block)
+         agx_position_order_control(&state, instr->block);
+      nir_foreach_src(instr, agx_position_order_src, &state);
+   }
+   util_dynarray_fini(&state.todo);
+   _mesa_set_destroy(state.seen, NULL);
+   return progress;
+}
+
 bool
 agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                      unsigned bit_size, unsigned num_components,

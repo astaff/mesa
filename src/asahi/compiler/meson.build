@@ -220,6 +220,7 @@ if with_tests
          'test/test-agx3-scs.cpp',
          'test/test-agx3-register-copy.cpp',
          'test/test-agx3-uniform-alu.cpp',
+         'test/test-position-order.cpp',
          'test/test-mixed-uniform-alu.cpp',
          'test/test-agx3-integer-fusion.cpp',
          'test/test-agx3-integer-lowering.cpp',
