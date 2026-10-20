@@ -4166,7 +4166,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
           * their producer even for a whole-tile render area: an earlier
           * attachment clear may have been lowered to compute. */
          preserve_loaded_color[nr_written] =
-            dev->dev.chip == AGX_CHIP_G17P &&
+            (dev->dev.chip == AGX_CHIP_G17P ||
+             agx_chip_g17_m5(dev->dev.chip)) &&
             pRenderingInfo->pColorAttachments[i].loadOp ==
                VK_ATTACHMENT_LOAD_OP_LOAD;
          written[nr_written++] = render->color_att[i].iview;
