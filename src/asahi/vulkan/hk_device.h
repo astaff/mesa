@@ -139,6 +139,8 @@ struct hk_device {
    struct list_head gen1_as_free_chunks[2];
    uint32_t gen1_as_free_chunk_count[2];
    struct agx_bo *gen1_rq_code, *gen1_rq_ift;
+   /* Immutable generated user image, shared by all query launches. */
+   struct agx_bo *gen1_rq_state;
    struct agx_va *gen1_rq_code_alias;
    struct agx_bo *gen1_vertex_directory;
    struct agx_va *gen1_vertex_directory_va;

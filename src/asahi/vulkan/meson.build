@@ -123,6 +123,26 @@ if with_tests
     suite : ['asahi'],
   )
 
+  test(
+    'hk_gen1_query_state',
+    executable(
+      'hk_gen1_query_state_test',
+      files('tests/test-hk-gen1-query-state.c', 'hk_gen1_query_state.c',
+            '../lib/agx_scs_layout.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+        inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_libagx,
+        idep_libagx_shaders_h, idep_agx_pack,
+        idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+      ],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
   # Unused recording functions require section garbage collection so the
   # test can link the production resolver without the rest of the driver.
   if ld_args_gc_sections.length() > 0

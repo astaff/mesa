@@ -1198,6 +1198,8 @@ hk_gen1_rq_finish(struct hk_device *dev)
    if(dev->gen1_rq_code_alias)agx_va_free(&dev->dev,dev->gen1_rq_code_alias,false);
    agx_bo_unreference(&dev->dev,dev->gen1_rq_code);
    agx_bo_unreference(&dev->dev,dev->gen1_rq_ift);
+   agx_bo_unreference(&dev->dev, dev->gen1_rq_state);
+   dev->gen1_rq_state = NULL;
    free(dev->gen1_rq_maps);free(dev->gen1_rq_user_image);
    dev->gen1_rq_maps=NULL;dev->gen1_rq_user_image=NULL;
    dev->gen1_rq_code=NULL;dev->gen1_rq_ift=NULL;
@@ -1582,6 +1584,41 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
    dev->gen1_native_fragment_rq = dev->gen1_rq_candidates &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
    dev->gen1_native_graphics_rq = dev->gen1_native_fragment_rq;
+   if (dev->gen1_native_rq && !capture &&
+       !getenv("ASAHI_G17P_RQ_BODIES_PATH")) {
+      /* Finalize after selecting the candidate profile: the initial image
+       * was generated before gen1_rq_instances/candidates were enabled.
+       * Neither the generated intersectors nor the query lowering stores to
+       * this image. SCS stacks are allocated separately by the kernel, and
+       * hk_gen1_upload_as_table() owns the writable AS query bank.
+       * Preserve the full legacy extent (including zero padding) here.
+       */
+      struct agx_scs_layout_gen2 scs;
+      ASSERTED bool valid = agx_scs_layout_gen1_init(
+         hk_gen1_ray_query_scs_layout(dev), &scs);
+      assert(valid);
+      const uint64_t size = MAX2(UINT64_C(0x60000),
+                                ALIGN_POT((uint64_t)scs.end[12], 0x4000));
+      const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
+      dev->gen1_rq_state = agx_bo_create(&dev->dev, size, 0x4000,
+         AGX_BO_READONLY | (cached ? AGX_BO_WRITEBACK : 0),
+         "Gen1 ray query user image");
+      if (!dev->gen1_rq_state) {
+         hk_gen1_rq_finish(dev);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      uint8_t *state = agx_bo_map(dev->gen1_rq_state);
+      if (!state) {
+         hk_gen1_rq_finish(dev);
+         return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
+      }
+      memcpy(state, dev->gen1_rq_user_image, 0x60000);
+      if (size > 0x60000)
+         memset(state + 0x60000, 0, size - 0x60000);
+      agx_scs_layout_gen1_parameters(&scs, state + 0x4000);
+      if (cached)
+         util_flush_range(state, size);
+   }
    if (dev->g17p_native_as) {
       simple_mtx_init(&dev->gen1_as_lock, mtx_plain);
       util_dynarray_init(&dev->gen1_ases, NULL);
