@@ -1270,6 +1270,7 @@ bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
+void agx_ra_without_remat(agx_context *ctx);
 bool agx3_is_async(const agx_instr *I);
 unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);

@@ -271,6 +271,17 @@ hk_pack_native_pbe(unsigned generation,
       !legacy->unk_mipmapped &&
       (legacy->samples == AGX_SAMPLE_COUNT_2 ||
        legacy->samples == AGX_SAMPLE_COUNT_4);
+   const bool compressed_msaa_rgba16 =
+      generation == 10 &&
+      legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
+      legacy->layout == AGX_LAYOUT_GPU &&
+      legacy->channels == AGX_CHANNELS_R16G16B16A16 &&
+      (legacy->type == AGX_TEXTURE_TYPE_FLOAT ||
+       legacy->type == AGX_TEXTURE_TYPE_UINT) && !legacy->srgb &&
+      legacy->layers == 1 && legacy->level == 0 && legacy->levels == 1 &&
+      !legacy->unk_mipmapped &&
+      (legacy->samples == AGX_SAMPLE_COUNT_2 ||
+       legacy->samples == AGX_SAMPLE_COUNT_4);
    if ((!layered && !multisample &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        (legacy->layout == AGX_LAYOUT_LINEAR &&
@@ -286,13 +297,15 @@ hk_pack_native_pbe(unsigned generation,
                        legacy->samples != AGX_SAMPLE_COUNT_4 &&
                        !(generation == 10 && legacy->samples == AGX_SAMPLE_COUNT_8))
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
-       (legacy->compressed && !compressed_2d && !compressed_msaa_r32_uint) ||
+       (legacy->compressed && !compressed_2d && !compressed_msaa_r32_uint &&
+                          !compressed_msaa_rgba16) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && legacy->layers != 1) ||
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
                         legacy->unk_mipmapped ||
-                        (legacy->compressed && !compressed_msaa_r32_uint))) ||
+                        (legacy->compressed && !compressed_msaa_r32_uint &&
+                          !compressed_msaa_rgba16))) ||
        (legacy->extended != legacy->compressed) ||
        (legacy->layout == AGX_LAYOUT_LINEAR || interchange
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4

@@ -391,6 +391,10 @@ vk_image_usage_to_format_features(VkImageUsageFlagBits usage_flag)
    }
 }
 
+/* Enable the validated multisample color layouts on G17S. */
+DEBUG_GET_ONCE_NUM_OPTION(m5_msaa_color_compression,
+                         "ASAHI_M5_MSAA_COLOR_COMPRESSION", 6)
+
 static bool
 hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
                 unsigned width, unsigned height, unsigned samples,
@@ -1195,6 +1199,9 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
     * AGX3 chips stay plain until their packets are recovered. */
    const bool m5_storage = hk_m5_storage_compression_eligible(dev, plane, info);
    bool allow_agx3 =
+      hk_m5_msaa_color_compression_eligible(
+         dev->chip, plane, info,
+         debug_get_option_m5_msaa_color_compression()) ||
       hk_m5_depth_msaa_compression_eligible(
          dev->chip, plane, info, dev->params.features,
          debug_get_option_m5_depth_msaa_compression()) ||

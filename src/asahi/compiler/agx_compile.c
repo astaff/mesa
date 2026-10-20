@@ -10118,10 +10118,11 @@ m5_lower_predicated_load(nir_builder *b, nir_intrinsic_instr *intr,
 }
 
 static bool
-agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
+agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
-                         struct agx_shader_info *out, unsigned *offset_out)
+                         struct agx_shader_info *out, unsigned *offset_out,
+                         bool disable_remat, bool *retry_without_remat)
 {
    const unsigned initial_binary_size = binary->size;
    if (agx_isa_is_agx3(key->dev.encoding) &&
@@ -10432,7 +10433,19 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
          agx_replace_src(I, 0, agx_emit_collect(&b, channels, parts));
       }
    }
-   AGX_PASS(ctx, agx_ra);
+   if (disable_remat)
+      AGX_PASS(ctx, agx_ra_without_remat);
+   else
+      AGX_PASS(ctx, agx_ra);
+
+   /* The occupancy rematerialization attempt has already modified AIR.
+    * Discard the entire context; changing its budget cannot undo spills. */
+   if (retry_without_remat && ctx->remat_fallback_spilled) {
+      *retry_without_remat = true;
+      binary->size = initial_binary_size;
+      ralloc_free(ctx);
+      return false;
+   }
    if (ctx->ra_failed) {
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
@@ -10690,6 +10703,56 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    *offset_out = offset;
    ralloc_free(ctx);
    return true;
+}
+
+/* Retry eligible preambles without changing scratch admission or launch rules. */
+static bool
+agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
+                         struct agx_shader_key *key,
+                         struct util_dynarray *binary,
+                         struct agx_shader_info *out, unsigned *offset_out)
+{
+   const bool eligible =
+      impl->function->is_preamble && nir->info.stage == MESA_SHADER_FRAGMENT &&
+      key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      (key->g17p_native_uniforms || key->agx3_native_cprog) &&
+      debug_get_bool_option("ASAHI_M5_CPROG_REMAT_RETRY", true);
+   if (!eligible)
+      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
+                                             offset_out, false, NULL);
+
+   /* Preserve all compiler-owned state, including earlier main code/rodata.
+    * The first attempt owns a deep NIR clone and a fresh AIR context. */
+   nir_shader *attempt = nir_shader_clone(NULL, nir);
+   if (!attempt)
+      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
+                                             offset_out, false, NULL);
+
+   nir_function_impl *attempt_impl = NULL;
+   nir_foreach_function_with_impl(func, candidate, attempt) {
+      if (func->is_preamble) {
+         assert(attempt_impl == NULL);
+         attempt_impl = candidate;
+      }
+   }
+   assert(attempt_impl != NULL);
+   const struct agx_shader_info saved_info = *out;
+   const struct agx_shader_key saved_key = *key;
+   const size_t saved_size = binary->size;
+   bool retry = false;
+   bool success = agx_compile_function_nir_attempt(
+      attempt, attempt_impl, key, binary, out, offset_out, false, &retry);
+   ralloc_free(attempt);
+   if (!retry)
+      return success;
+
+   assert(!success && binary->size == saved_size);
+   *out = saved_info;
+   *key = saved_key;
+   binary->size = saved_size;
+   /* Exactly one retry. Real full-budget spills retain the old refusal. */
+   return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
+                                          offset_out, true, NULL);
 }
 
 /*

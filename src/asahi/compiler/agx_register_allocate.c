@@ -2821,8 +2821,8 @@ pair_peer_publication_consumed_early(agx_context *ctx, unsigned value)
    return found;
 }
 
-void
-agx_ra(agx_context *ctx)
+static void
+agx_ra_impl(agx_context *ctx, bool disable_remat)
 {
    ctx->uniforms_written = agx_has_uniform_store(ctx);
    agx_lower_agx3b_atomic_returns(ctx);
@@ -2989,7 +2989,7 @@ agx_ra(agx_context *ctx)
    /* If we need multiple waves, see if we can rematerialize constants to save
     * waves. If we only have a single wave regardless, this is pointless.
     */
-   if (effective_demand > agx_round_registers(1) && !spilling) {
+   if (!disable_remat && effective_demand > agx_round_registers(1) && !spilling) {
       unsigned effective_demand_remat = agx_calc_register_demand(ctx, true);
 
       /* Worst-case assume we need 6 16-bit registers for constants, for a
@@ -3551,4 +3551,17 @@ agx_ra(agx_context *ctx)
    free(sizes);
    free(classes);
    free(visited);
+}
+
+void
+agx_ra(agx_context *ctx)
+{
+   agx_ra_impl(ctx, false);
+}
+
+/* Retry from a fresh compiler context, retaining the original full budget. */
+void
+agx_ra_without_remat(agx_context *ctx)
+{
+   agx_ra_impl(ctx, true);
 }

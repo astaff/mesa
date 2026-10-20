@@ -4596,6 +4596,12 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       perf_debug(cmd, "eMRT render pass");
 
       for (unsigned i = 0; i < render->color_att_count; ++i) {
+         /* Resident targets retain compression. Only memory-backed targets
+          * need their compressed contents converted before shader stores.
+          */
+         if (agx_chip_g17_m5(dev->dev.chip) && !render->tilebuffer.spilled[i])
+            continue;
+
          struct hk_image_view *view = render->color_att[i].iview;
          if (view) {
             if (!view->planes[0].emrt_pbe_valid) {
@@ -4634,19 +4640,45 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                unsigned layer = view->vk.base_array_layer;
                uint64_t base = hk_image_base_address(image, image_plane);
 
-               struct libagx_decompress_images imgs;
-               memcpy(&imgs.compressed, &view->planes[plane].emrt_texture,
-                      sizeof(imgs.compressed));
-               memcpy(&imgs.uncompressed, &view->planes[plane].emrt_pbe,
-                      sizeof(imgs.uncompressed));
-
                struct agx_grid grid =
                   agx_3d(ail_metadata_width_tl(layout, level) * 32,
                          ail_metadata_height_tl(layout, level), layer_count);
 
-               libagx_decompress(cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX,
-                                 layout, layer, level, base,
-                                 hk_pool_upload(cmd, &imgs, sizeof(imgs), 64));
+               if (agx_chip_g17_m5(dev->dev.chip)) {
+                  if (layout->format != PIPE_FORMAT_R16G16B16A16_FLOAT ||
+                      (layout->sample_count_sa != 2 &&
+                       layout->sample_count_sa != 4) ||
+                      layout->depth_px != 1 || layout->levels != 1 ||
+                      !dev->sampled_images.base_va || !dev->samplers.table.bo ||
+                      view->planes[plane].emrt_read_heap_index >=
+                         dev->sampled_images.alloc) {
+                     vk_command_buffer_set_error(&cmd->vk,
+                                                 VK_ERROR_FEATURE_NOT_PRESENT);
+                     return;
+                  }
+                  const struct ail_tile tile = layout->tilesize_el[level];
+                  libagx_m5_decompress_rgba16f(
+                     cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX,
+                     dev->sampled_images.base_va,
+                     dev->samplers.table.bo->va->addr,
+                     base + layout->metadata_offset_B,
+                     base + ail_get_layer_level_B(layout, layer, level),
+                     view->planes[plane].emrt_read_heap_index,
+                     ail_metadata_width_tl(layout, level),
+                     ail_metadata_height_tl(layout, level),
+                     align(layout->width_px, tile.width_el),
+                     tile.width_el, tile.height_el,
+                     util_logbase2(layout->sample_count_sa) - 1);
+               } else {
+                  struct libagx_decompress_images imgs;
+                  memcpy(&imgs.compressed, &view->planes[plane].emrt_texture,
+                         sizeof(imgs.compressed));
+                  memcpy(&imgs.uncompressed, &view->planes[plane].emrt_pbe,
+                         sizeof(imgs.uncompressed));
+                  libagx_decompress(cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX,
+                                    layout, layer, level, base,
+                                    hk_pool_upload(cmd, &imgs, sizeof(imgs), 64));
+               }
             }
          }
       }

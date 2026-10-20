@@ -647,6 +647,50 @@ check_m5_depth_msaa(void)
                                             capability, true, true));
 }
 
+static void
+check_m5_msaa_diagnostic(void)
+{
+   const VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   VkImageCreateInfo i = image(VK_FORMAT_R16G16B16A16_SFLOAT, 3024, 1964, 1,
+                               usage);
+   for (unsigned samples = 1; samples <= 8; samples *= 2) {
+      i.samples = (VkSampleCountFlagBits)samples;
+      for (unsigned enabled = 0; enabled < 8; enabled++) {
+         const bool expected = (samples == 2 || samples == 4) &&
+                               (enabled & samples);
+         CHECK(hk_m5_msaa_color_compression_eligible(
+                  AGX_CHIP_G17S, 0, &i, enabled) == expected);
+      }
+   }
+   i.samples = VK_SAMPLE_COUNT_4_BIT;
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; chip++)
+      CHECK(hk_m5_msaa_color_compression_eligible(
+               (enum agx_chip)chip, 0, &i, 4) == (chip == AGX_CHIP_G17S));
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 1, &i, 4));
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, NULL, 4));
+   VkImageCreateInfo c = i;
+   c.pNext = &i;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.arrayLayers = 2;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.mipLevels = 2;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.format = VK_FORMAT_R8G8B8A8_UNORM;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.extent.width = 15;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+   c = i; c.imageType = VK_IMAGE_TYPE_3D;
+   CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c, 4));
+}
+
 int
 main(void)
 {
@@ -663,6 +707,7 @@ main(void)
    check_shared();
    check_m5_depth();
    check_m5_color();
+   check_m5_msaa_diagnostic();
    check_m5_depth_msaa();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;

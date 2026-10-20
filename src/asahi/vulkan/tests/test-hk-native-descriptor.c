@@ -479,6 +479,70 @@ check_layered_multisample_pbe(void)
 }
 
 static void
+check_compressed_msaa_pbe(void)
+{
+   /* Independent offline constructor outputs, including the metadata
+    * extension, for a 3024x1964 RGBA16F surface. */
+   const uint64_t expected[2][4] = {
+      {UINT64_C(0x2003d58bcfe48ca4), UINT64_C(0x8000000001234500),
+       UINT64_C(0x4567800), 0},
+      {UINT64_C(0x2403d58bcfe48ca4), UINT64_C(0x8000000001234500),
+       UINT64_C(0x4567800), 0},
+   };
+   const uint64_t expected_read[2][4] = {
+      {UINT64_C(0x203d58bcf6888ca4), UINT64_C(0x8000000001234500),
+       UINT64_C(0x4567800), 0},
+      {UINT64_C(0x243d58bcf6888ca4), UINT64_C(0x8000000001234500),
+       UINT64_C(0x4567800), 0},
+   };
+   struct AGX_PBE semantic = {
+      AGX_PBE_header,
+      .dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED,
+      .layout = AGX_LAYOUT_GPU,
+      .channels = AGX_CHANNELS_R16G16B16A16,
+      .type = AGX_TEXTURE_TYPE_FLOAT,
+      .swizzle_r = AGX_CHANNEL_R, .swizzle_g = AGX_CHANNEL_G,
+      .swizzle_b = AGX_CHANNEL_B, .swizzle_a = AGX_CHANNEL_A,
+      .width = 3024, .height = 1964,
+      .buffer = UINT64_C(0x12345000),
+      .compressed = true, .extended = true,
+      .acceleration_buffer = UINT64_C(0x45678000),
+   };
+   struct hk_native_pbe_descriptor packed;
+   for (unsigned i = 0; i < 2; i++) {
+      semantic.samples = i ? AGX_SAMPLE_COUNT_4 : AGX_SAMPLE_COUNT_2;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
+      assert(!memcmp(&packed, expected[i], sizeof(expected[i])));
+      assert(!hk_pack_native_pbe(9, &packed, &semantic));
+      const struct AGX_TEXTURE read = {
+         AGX_TEXTURE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED,
+         .layout = AGX_LAYOUT_GPU,
+         .channels = AGX_CHANNELS_R16G16B16A16,
+         .type = AGX_TEXTURE_TYPE_FLOAT,
+         .swizzle_r = AGX_CHANNEL_R, .swizzle_g = AGX_CHANNEL_G,
+         .swizzle_b = AGX_CHANNEL_B, .swizzle_a = AGX_CHANNEL_A,
+         .width = 3024, .height = 1964, .depth = 1,
+         .address = UINT64_C(0x12345000),
+         .compressed = true, .extended = true,
+         .acceleration_buffer = UINT64_C(0x45678000),
+         .samples = i ? AGX_SAMPLE_COUNT_4 : AGX_SAMPLE_COUNT_2,
+      };
+      struct hk_native_texture_descriptor read_packed;
+      assert(hk_pack_native_texture(10, &read_packed, &read));
+      assert(!memcmp(&read_packed, expected_read[i], sizeof(expected_read[i])));
+   }
+   semantic.samples = AGX_SAMPLE_COUNT_8;
+   assert(!hk_pack_native_pbe(10, &packed, &semantic));
+   semantic.samples = AGX_SAMPLE_COUNT_4;
+   semantic.acceleration_buffer = 0;
+   assert(!hk_pack_native_pbe(10, &packed, &semantic));
+   semantic.acceleration_buffer = UINT64_C(0x45678000);
+   semantic.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED;
+   assert(!hk_pack_native_pbe(10, &packed, &semantic));
+}
+
+static void
 check_captured_rgba8_lossless_pbe(void)
 {
    struct AGX_PBE p = {AGX_PBE_header};
@@ -1738,6 +1802,7 @@ main(void)
       semantic.levels = 2;
       assert(!hk_pack_native_pbe(10, &packed, &semantic));
    }
+   check_compressed_msaa_pbe();
    check_captured_rgba8_lossless_pbe();
    puts("honeykrisp native descriptor geometry/policy: passed");
    return 0;

@@ -334,6 +334,32 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
           hk_g17p_compression_color_format(info->format);
 }
 
+/* Qualified multisample metadata shapes. The sample mask retains an
+ * explicit diagnostic opt-out. Sharing and aliasing flags are not admitted.
+ */
+static inline bool
+hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
+                                     const VkImageCreateInfo *info,
+                                     unsigned enabled_samples)
+{
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   return chip == AGX_CHIP_G17S && plane == 0 && info && !info->pNext &&
+          !info->flags && info->imageType == VK_IMAGE_TYPE_2D &&
+          info->extent.depth == 1 && info->extent.width >= 16 &&
+          info->extent.height >= 16 && info->arrayLayers == 1 &&
+          info->mipLevels == 1 &&
+          info->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+          (info->samples == VK_SAMPLE_COUNT_2_BIT ||
+           info->samples == VK_SAMPLE_COUNT_4_BIT) &&
+          (enabled_samples & info->samples) &&
+          info->tiling == VK_IMAGE_TILING_OPTIMAL &&
+          (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+          !(info->usage & ~allowed_usage);
+}
+
 /* M5 lossless compression of depth attachments.
  *
  * The native HAL300 framebuffer setup sets ZLS control bits 2 and

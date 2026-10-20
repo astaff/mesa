@@ -292,6 +292,9 @@ remap_variant(nir_function *func, unsigned variant, const char *target)
 static bool
 target_supports_program(const char *target, const nir_function *func)
 {
+   if (!strcmp(func->name, "libagx_m5_decompress_rgba16f"))
+      return !strcmp(target, "g17g");
+
    if (!strcmp(target, "g17g") &&
        !strncmp(func->name, "libagx_d3d12_", strlen("libagx_d3d12_")))
       return false;
@@ -467,6 +470,19 @@ rebase_preamble_for_agx3(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* This helper consumes native heap indices, not descriptor byte offsets. */
+static bool
+lower_m5_decompress_load(nir_builder *b, nir_intrinsic_instr *intr,
+                          UNUSED void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+   if (intr->intrinsic == nir_intrinsic_bindless_image_agx) {
+      nir_src_rewrite(&intr->src[0], nir_u2u64(b, intr->src[0].ssa));
+      return true;
+   }
+   return false;
+}
+
 static nir_def *
 load_kernel_input(nir_builder *b, unsigned num_components, unsigned bit_size,
                   unsigned offset_B)
@@ -626,6 +642,12 @@ main(int argc, char **argv)
                         lower_g17p_interleave, nir_metadata_control_flow,
                         NULL);
                key.reserved_preamble += AGX_ABI_AGX3_PRECOMP_ARG_HALFS;
+            }
+
+            if (!strcmp(libfunc->name, "libagx_m5_decompress_rgba16f")) {
+               key.g17p_texture_uniform_base = AGX_ABI_AGX3_PRECOMP_ARG_HALFS;
+               NIR_PASS(_, clone, nir_shader_intrinsics_pass,
+                        lower_m5_decompress_load, nir_metadata_none, NULL);
             }
 
             uint16_t printf_uniform = 0;
