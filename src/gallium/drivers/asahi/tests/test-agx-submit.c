@@ -32,8 +32,13 @@ inspect_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
    if (submit->out_sync_count == 1) {
       first_output = syncs[submit->in_sync_count].handle;
       CHECK(first_output);
-   } else if (first_output) {
-      CHECK(syncs[submit->in_sync_count - 1].handle == first_output);
+   } else {
+      CHECK(syncs[submit->in_sync_count].sync_type == DRM_ASAHI_SYNC_SYNCOBJ);
+      CHECK(syncs[submit->in_sync_count + 1].sync_type ==
+            DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ);
+      CHECK(syncs[submit->in_sync_count + 1].timeline_value != 0);
+      if (first_output)
+         CHECK(syncs[submit->in_sync_count - 1].handle == first_output);
    }
    unsigned prefix[2] = {0};
    const uint8_t *data = (void *)(uintptr_t)submit->cmdbuf;
@@ -67,7 +72,7 @@ inspect_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 
 static void
 run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
-          bool fail)
+          bool fail, unsigned bo_count)
 {
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
@@ -78,28 +83,29 @@ run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
    /* Sparse, large handles used to allocate gigabytes or overflow growth.
     * These BOs retain a caller reference, so retirement never frees them. */
    struct agx_va va = {.addr = 0x4000};
-   struct agx_bo bos[2] = {
-      {.handle = 7, .refcnt = 1, .va = &va},
-      {.handle = UINT32_MAX - 1, .refcnt = 1, .va = &va},
-   };
-   for (unsigned i = 0; i < ARRAY_SIZE(bos); i++) {
+   struct agx_bo bos[129] = {0};
+   CHECK(bo_count <= ARRAY_SIZE(bos));
+   for (unsigned i = 0; i < bo_count; i++) {
+      bos[i].handle = i ? UINT32_MAX - i : 7;
+      bos[i].refcnt = 1;
+      bos[i].va = &va;
       bos[i].writer = agx_bo_writer(ctx->queue_id + 1, ctx->dummy_syncobj);
       agx_batch_add_bo(batch, &bos[i]);
       agx_batch_add_bo(batch, &bos[i]);
       CHECK(bos[i].refcnt == 2);
    }
-   CHECK(batch->bo_list.set->entries == 2);
-   CHECK(util_dynarray_num_elements(&batch->bo_list.list, struct agx_bo *) == 2);
-   CHECK(batch->bo_list.list.capacity < 1024);
-   CHECK(batch->bo_list.set->size < 1024);
+   CHECK(batch->bo_list.set->entries == bo_count);
+   CHECK(util_dynarray_num_elements(&batch->bo_list.list, struct agx_bo *) == bo_count);
+   CHECK(batch->bo_list.list.capacity <= MAX2(64, bo_count * 2 * sizeof(void *)));
+   CHECK(batch->bo_list.set->size < MAX2(32, bo_count * 4));
 
-   /* Two BO inputs, an explicit acquire, and a cross-context timeline input
+   /* BO inputs, an explicit acquire, and a cross-context timeline input
     * fill the capacity including both outputs and the split fallback fence. */
    ctx->in_sync_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
    CHECK(ctx->in_sync_fd >= 0);
    p_atomic_set(&screen->flush_wait_seqid, p_atomic_inc_return(&screen->flush_cur_seqid));
    calls = computes = renders = first_output = 0;
-   expected_inputs = 4;
+   expected_inputs = bo_count + 2;
    fail_submit = fail;
    memset(&ctx->submit_perf, 0, sizeof(ctx->submit_perf));
    struct drm_asahi_cmd_compute c = {0};
@@ -116,7 +122,8 @@ run_batch(struct pipe_context *pctx, bool compute, bool render, bool split,
    CHECK(fail ? ctx->flush_last_seqid == last_seqid :
                 ctx->flush_last_seqid > last_seqid);
    agx_sync_all(ctx, "submit test retirement");
-   CHECK(bos[0].refcnt == 1 && bos[1].refcnt == 1);
+   for (unsigned i = 0; i < bo_count; i++)
+      CHECK(bos[i].refcnt == 1);
    pctx->flush(pctx, NULL, 0);
    CHECK(ctx->submit_perf.submits == 0 && ctx->submit_perf.batches == 0);
 }
@@ -138,13 +145,14 @@ main(void)
    dev->debug |= AGX_DBG_PERF;
    dev->ops.submit = inspect_submit;
    /* Each scenario gets a fresh context, including after injected failure. */
-   for (unsigned scenario = 0; scenario < 5; scenario++) {
+   for (unsigned scenario = 0; scenario < 7; scenario++) {
       struct pipe_context *pctx = screen->context_create(screen, NULL, 0);
       CHECK(pctx);
       run_batch(pctx, scenario != 0, scenario != 1,
-                scenario == 3, scenario == 4);
+                scenario == 3, scenario == 4,
+                scenario == 5 ? 129 : scenario == 6 ? 0 : 2);
       if (scenario == 2)
-         run_batch(pctx, true, true, false, false);
+         run_batch(pctx, true, true, false, false, 2);
       pctx->destroy(pctx);
    }
    screen->destroy(screen);
