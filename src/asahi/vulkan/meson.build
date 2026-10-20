@@ -11,6 +11,7 @@ hk_files = files(
   'hk_buffer_view.h',
   'hk_bvh.h',
   'hk_cmd_buffer.c',
+  'hk_cmd_upload.c',
   'hk_cmd_buffer.h',
   'hk_conditional_render_core.h',
   'hk_cmd_lifetime.c',
@@ -328,4 +329,19 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+endif
+
+if with_tests
+  hk_cpu_upload_bench = executable(
+    'hk-cpu-upload-bench',
+    files('tests/hk_cpu_upload_bench.c'),
+    include_directories : [
+      inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm, include_directories('.'),
+    ],
+    dependencies : [hk_deps],
+    link_with : [libhk, libasahi_lib, libasahi_layout, libasahi_compiler],
+    gnu_symbol_visibility : 'hidden',
+  )
+  test('hk_cpu_upload', hk_cpu_upload_bench, args : ['1'], suite : ['asahi'])
 endif

@@ -4363,20 +4363,6 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
       BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
 }
 
-static uint64_t
-hk_upload_constant_data(struct hk_cmd_buffer *cmd, struct hk_shader *s)
-{
-   if (!s || s->data_size == 0)
-      return 0;
-
-   uint64_t addr =
-      hk_pool_upload(cmd, s->data_ptr, s->data_size, HK_MIN_UBO_ALIGNMENT);
-   if (!addr)
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-
-   return addr;
-}
-
 static void
 hk_flush_shaders(struct hk_cmd_buffer *cmd)
 {
@@ -4448,10 +4434,10 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
     * immutable data address actually changes.  In particular, equivalent
     * shader objects must not clone the root and invalidate both native IOTO
     * programs merely because their API handles differ. */
-   const uint64_t vs_constant_data_addr = hk_upload_constant_data(
-      cmd, hk_any_variant(gfx->shaders[MESA_SHADER_VERTEX]));
+   const uint64_t vs_constant_data_addr = hk_cmd_upload_constants(
+      cmd, hk_any_variant(gfx->shaders[MESA_SHADER_VERTEX]), MESA_SHADER_VERTEX);
    const uint64_t fs_constant_data_addr =
-      hk_upload_constant_data(cmd, fs);
+      hk_cmd_upload_constants(cmd, fs, MESA_SHADER_FRAGMENT);
    if (desc->root.draw.vs_constant_data_addr != vs_constant_data_addr) {
       desc->root.draw.vs_constant_data_addr = vs_constant_data_addr;
       desc->root_dirty = true;
@@ -8034,13 +8020,9 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             gfx->draw_params += offsetof(VkDrawIndirectCommand, firstVertex);
          }
       } else {
-         uint32_t params[] = {
-            draw.indexed ? draw.index_bias : draw.start,
-            draw.start_instance,
-         };
-         memcpy(gfx->g17p_draw_params_value, params, sizeof(params));
-         gfx->g17p_draw_params_host_valid = true;
-         gfx->draw_params = hk_pool_upload(cmd, params, sizeof(params), 4);
+         hk_cmd_upload_draw_params(cmd,
+                                   draw.indexed ? draw.index_bias : draw.start,
+                                   draw.start_instance);
       }
    } else {
       gfx->draw_params = 0;
@@ -8048,13 +8030,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    if (sw_vs->b.info.uses_draw_id) {
-      gfx->g17p_draw_id_value = draw_id;
-      gfx->g17p_draw_id_host_valid = true;
-      /* Uploaded as a whole dword: the native G17P uniform range that
-       * publishes it is loaded in 32-bit units, so a two-byte allocation
-       * would leave the upper half of the loaded dword reading whatever
-       * followed it in the pool. The shader only consumes the low half. */
-      gfx->draw_id_ptr = hk_pool_upload(cmd, &draw_id, 4, 4);
+      hk_cmd_upload_draw_id(cmd, draw_id);
    } else {
       gfx->draw_id_ptr = 0;
       gfx->g17p_draw_id_host_valid = false;
@@ -9424,6 +9400,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          continue;
 
       cs->stats.calls++;
+      hk_upload_stat(cmd, draws, 1);
 
       if (geom || tess) {
          ccs =
@@ -9709,6 +9686,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
    cs->current += AGX_VDM_MESH_DISPATCH_LENGTH;
 
    cs->stats.calls++;
+   hk_upload_stat(cmd, draws, 1);
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
@@ -9986,11 +9964,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       gfx->g17p_draw_params_host_valid = false;
 
       if (sw_vs->b.info.uses_draw_id) {
-         /* The general path uploads the whole 32-bit draw index. */
-         const uint32_t draw_id_word = draw_id;
-         gfx->g17p_draw_id_value = draw_id_word;
-         gfx->g17p_draw_id_host_valid = true;
-         gfx->draw_id_ptr = hk_pool_upload(cmd, &draw_id_word, 4, 4);
+         hk_cmd_upload_draw_id(cmd, draw_id);
       } else {
          gfx->draw_id_ptr = 0;
          gfx->g17p_draw_id_host_valid = false;
@@ -10034,6 +10008,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       return;
 
    cs->stats.calls++;
+   hk_upload_stat(cmd, draws, 1);
    if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
                           tail_emitted))
       return;

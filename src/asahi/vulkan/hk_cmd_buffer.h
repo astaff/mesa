@@ -257,6 +257,21 @@ static_assert(sizeof(((struct hk_root_descriptor_table *)0)->cs) <=
 #define hk_root_descriptor_offset(member)                                      \
    offsetof(struct hk_root_descriptor_table, member)
 
+/* Counts only these CPU upload paths, enabled by ASAHI_MESA_DEBUG=perf. */
+struct hk_upload_stats {
+   uint64_t draws, descriptor_binds, descriptor_noops;
+   uint64_t root_uploads, root_bytes, root_reuses;
+   uint64_t draw_param_uploads, draw_param_bytes, draw_param_reuses;
+   uint64_t draw_id_uploads, draw_id_bytes, draw_id_reuses;
+   uint64_t constant_uploads, constant_bytes, constant_reuses;
+};
+
+#define hk_upload_stat(cmd, field, value)                                      \
+   do {                                                                       \
+      if (unlikely(hk_cmd_buffer_device(cmd)->dev.debug & AGX_DBG_PERF))         \
+         (cmd)->state.upload_stats.field += (value);                            \
+   } while (0)
+
 struct hk_descriptor_state {
    bool root_dirty;
    uint64_t generation;
@@ -1110,6 +1125,7 @@ struct hk_cmd_buffer {
    bool g17p_pristine;
 
    struct {
+      struct hk_upload_stats upload_stats;
       struct hk_graphics_state gfx;
       struct hk_compute_state cs;
       struct hk_ray_tracing_state rt;
@@ -1928,6 +1944,14 @@ void hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
 
 void hk_meta_resolve_rendering(struct hk_cmd_buffer *cmd,
                                const VkRenderingInfo *pRenderingInfo);
+
+void hk_cmd_upload_draw_params(struct hk_cmd_buffer *cmd, uint32_t first,
+                               uint32_t first_instance);
+void hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id);
+uint64_t hk_cmd_upload_constants(struct hk_cmd_buffer *cmd,
+                                 const struct hk_shader *shader,
+                                 mesa_shader_stage stage);
+void hk_cmd_print_upload_stats(struct hk_cmd_buffer *cmd);
 
 uint64_t hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
                                    VkPipelineBindPoint bind_point);

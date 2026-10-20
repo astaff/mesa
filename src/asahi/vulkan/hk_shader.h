@@ -201,6 +201,8 @@ struct hk_shader {
 
    const void *data_ptr;
    uint32_t data_size;
+   /* Process-unique identity of the immutable payload, shared by cache clones. */
+   uint64_t constant_data_id;
 
    /* BO for any uploaded shader part */
    /* Code heap chunk holding the binary, at bo_offset. */

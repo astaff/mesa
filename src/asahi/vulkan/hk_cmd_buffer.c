@@ -468,17 +468,6 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
 }
 
-static struct agx_ptr
-hk_pool_root_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
-                   uint32_t alignment)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_native_graphics(&dev->dev))
-      return hk_pool_alloc(cmd, size, alignment);
-
-   return hk_pool_alloc_from(cmd, &cmd->uploader.root, size, alignment,
-                             HK_CMD_BO_ROOT);
-}
 
 struct agx_ptr
 hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
@@ -829,6 +818,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_cmd_buffer_publish_cached_uploads(cmd);
    hk_cmd_buffer_publish_root_uploads(cmd);
 
+   hk_cmd_print_upload_stats(cmd);
    return vk_command_buffer_end(&cmd->vk);
 }
 
@@ -1106,6 +1096,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    desc->root_dirty |= root_changed ||
       !hk_g17p_can_retain_descriptor_root(cmd, desc);
    desc->generation++;
+   hk_upload_stat(cmd, descriptor_binds, 1);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1340,51 +1331,6 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       pPushDescriptorSetWithTemplateInfo->pData);
 }
 
-__attribute__((hot)) uint64_t
-hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
-                          VkPipelineBindPoint bind_point)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
-   struct hk_root_descriptor_table *root = &desc->root;
-
-   struct agx_ptr root_ptr = hk_pool_root_alloc(cmd, sizeof(*root), 8);
-
-   /* A HAL200 tail built for the old root names it and must be rebuilt
-    * before publication. */
-   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
-       cmd->state.gfx.root && root_ptr.gpu != cmd->state.gfx.root)
-      cmd->state.gfx.g17p_bind_tail.valid = false;
-   if (!root_ptr.gpu)
-      return 0;
-
-   root->root_desc_addr = root_ptr.gpu;
-   root->printf_buffer_address = dev->dev.printf_buffer_address;
-   root->sampler_heap_address =
-      dev->samplers.table.bo && dev->samplers.table.bo->va
-         ? dev->samplers.table.bo->va->addr
-         : 0;
-
-   /* Dynamic buffers past the highest one ever bound are read by no bound
-    * layout: copy the table around them. */
-   const size_t head_B = hk_root_descriptor_offset(dynamic_buffers) +
-                         desc->dynamic_buffer_end * sizeof(root->dynamic_buffers[0]);
-   const size_t tail_B = hk_root_descriptor_offset(set_dynamic_buffer_start);
-   memcpy(root_ptr.cpu, root, head_B);
-   memcpy((uint8_t *)root_ptr.cpu + tail_B, (const uint8_t *)root + tail_B,
-          sizeof(*root) - tail_B);
-
-   /* Cached G17P roots need explicit CPU-to-GPU publication. Clean just this
-    * table now; vkEndCommandBuffer completes all recorded root cleans with a
-    * single fence before submission can consume them. */
-   if (agx_native_graphics(&dev->dev) && util_has_cache_ops()) {
-      util_flush_range_no_fence(root_ptr.cpu, head_B);
-      util_flush_range_no_fence((uint8_t *)root_ptr.cpu + tail_B,
-                                sizeof(*root) - tail_B);
-   }
-
-   return root_ptr.gpu;
-}
 
 static uint64_t
 hk_upload_native_spilled_rt_descs(struct hk_cmd_buffer *cmd)

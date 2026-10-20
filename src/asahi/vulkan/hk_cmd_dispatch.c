@@ -1388,8 +1388,8 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    if (!internal_graphics && s->data_size != 0) {
-      const uint64_t constant_data = hk_pool_upload(
-         cmd, s->data_ptr, s->data_size, HK_MIN_UBO_ALIGNMENT);
+      const uint64_t constant_data =
+         hk_cmd_upload_constants(cmd, s, MESA_SHADER_COMPUTE);
       if (!constant_data) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          return;

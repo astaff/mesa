@@ -14,6 +14,7 @@
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
 #include "hk_nir_border_index.h"
 #include "util/u_debug.h"
+#include "util/u_atomic.h"
 
 #include "hk_nir_ray_tracing.h"
 #include "hk_nir_forward_image_stores.h"
@@ -2364,6 +2365,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 static VkResult
 hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 {
+   /* Allocator addresses can be recycled after a shader is destroyed while
+    * earlier commands still own an upload of its constants. Do not key those
+    * uploads by a shader or malloc pointer. This is not serialized. */
+   static uint64_t next_constant_data_id;
+   if (shader->data_size && !shader->constant_data_id)
+      shader->constant_data_id = p_atomic_inc_return(&next_constant_data_id);
+
    if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
       /* TODO: Do we wnat to compact? Revisit when we rework prolog/epilogs. */
       size_t size = shader->b.info.binary_size;
