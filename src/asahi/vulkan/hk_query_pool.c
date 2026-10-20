@@ -160,6 +160,9 @@ hk_query_report_map(struct hk_device *dev, struct hk_query_pool *pool,
       uint64_t *queries = (uint64_t *)agx_bo_map(dev->occlusion_queries.bo);
       uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
 
+      if (oq_index[query] == LIBAGX_QUERY_INDEX_UNUSED)
+         return NULL;
+
       return (struct hk_query_report *)&queries[oq_index[query]];
    } else {
       return (void *)((char *)agx_bo_map(pool->bo) +
@@ -407,10 +410,10 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
          (uint64_t)num_queries * sizeof(uint32_t));
    }
    if (pool->oq_queries) {
-      for (uint32_t i = 0; i < num_queries; ++i) {
-         hk_drm_attachment_set_add(&cs->compute_attachments,
-            hk_query_report_addr(dev, pool, first_index + i), sizeof(uint64_t));
-      }
+      /* A later-recorded command may assign a counter before this reset runs. */
+      hk_drm_attachment_set_add(&cs->compute_attachments,
+         dev->occlusion_queries.bo->va->addr,
+         (uint64_t)AGX_MAX_OCCLUSION_QUERIES * sizeof(uint64_t));
    } else {
       hk_drm_attachment_set_add(&cs->compute_attachments,
          hk_query_report_addr(dev, pool, first_index),
@@ -484,8 +487,9 @@ host_zero_queries(struct hk_device *dev, struct hk_query_pool *pool,
          value = set_available ? 0 : LIBAGX_QUERY_UNAVAILABLE;
       }
 
-      for (unsigned j = 0; j < hk_reports_per_query(pool); ++j) {
-         reports[j].value = value;
+      if (reports) {
+         for (unsigned j = 0; j < hk_reports_per_query(pool); ++j)
+            reports[j].value = value;
       }
    }
 }
@@ -575,23 +579,12 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
 
    uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
    assert(oq_index || !occlusion_queries);
-
-   for (unsigned i = 0; i < occlusion_queries; ++i) {
-      uint64_t zero = 0;
-      unsigned index;
-
-      VkResult result = hk_descriptor_table_add(
-         dev, &dev->occlusion_queries, &zero, sizeof(uint64_t), &index);
-
-      if (result != VK_SUCCESS) {
-         hk_DestroyQueryPool(device, hk_query_pool_to_handle(pool), pAllocator);
-         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-      }
-
-      /* We increment as we go so we can clean up properly if we run out */
-      assert(pool->oq_queries < occlusion_queries);
-      oq_index[pool->oq_queries++] = index;
-   }
+   /* Applications may reserve far more queries than they use. Keep the pool's
+    * logical indices independent of the finite hardware counter heap, and
+    * assign a counter only when a command needs one. */
+   if (occlusion_queries)
+      memset(oq_index, 0xff, occlusion_queries * sizeof(*oq_index));
+   pool->oq_queries = occlusion_queries;
 
    if (pCreateInfo->flags & VK_QUERY_POOL_CREATE_RESET_BIT_KHR)
       host_zero_queries(dev, pool, 0, pool->vk.query_count, false);
@@ -614,7 +607,8 @@ hk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
    uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
 
    for (unsigned i = 0; oq_index && i < pool->oq_queries; ++i) {
-      hk_descriptor_table_remove(dev, &dev->occlusion_queries, oq_index[i]);
+      if (oq_index[i] != LIBAGX_QUERY_INDEX_UNUSED)
+         hk_descriptor_table_remove(dev, &dev->occlusion_queries, oq_index[i]);
    }
 
    if (pool->handle)
@@ -712,6 +706,30 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    }
 }
 
+static VkResult
+hk_ensure_occlusion_query(struct hk_device *dev, struct hk_query_pool *pool,
+                          uint32_t query)
+{
+   uint16_t *entry = &hk_pool_oq_index_ptr(pool)[query];
+   if (p_atomic_read(entry) != LIBAGX_QUERY_INDEX_UNUSED)
+      return VK_SUCCESS;
+
+   const uint64_t zero = 0;
+   unsigned index;
+   VkResult result = hk_descriptor_table_add(
+      dev, &dev->occlusion_queries, &zero, sizeof(zero), &index);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Different command buffers may record the same query concurrently. Publish
+    * one initialized counter and return any redundant allocation to the heap. */
+   uint16_t previous =
+      p_atomic_cmpxchg(entry, LIBAGX_QUERY_INDEX_UNUSED, (uint16_t)index);
+   if (previous != LIBAGX_QUERY_INDEX_UNUSED)
+      hk_descriptor_table_remove(dev, &dev->occlusion_queries, index);
+   return VK_SUCCESS;
+}
+
 static void
 hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                        uint32_t query, uint32_t index,
@@ -723,6 +741,11 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_OCCLUSION: {
       assert(query < pool->oq_queries);
+      VkResult result = hk_ensure_occlusion_query(dev, pool, query);
+      if (result != VK_SUCCESS) {
+         vk_command_buffer_set_error(&cmd->vk, result);
+         return;
+      }
 
       if (end) {
          cmd->state.gfx.occlusion.mode = AGX_VISIBILITY_MODE_NONE;
@@ -986,8 +1009,9 @@ hk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
                                    flags | VK_QUERY_RESULT_PARTIAL_BIT);
          continue;
       }
-      if (!hk_query_write_cpu_result(dst, &src[0].value, reports, available,
-                                     flags))
+      const uint64_t zero = 0;
+      if (!hk_query_write_cpu_result(dst, src ? &src[0].value : &zero,
+                                     reports, available, flags))
          status = VK_NOT_READY;
    }
 
@@ -1051,6 +1075,16 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
                        (queryCount - 1))) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return;
+      }
+
+      /* The copy reads each counter through the pool's index table. Assign
+       * the counters now even if their producers have not been recorded. */
+      for (uint32_t i = 0; pool->oq_queries && i < queryCount; i++) {
+         VkResult result = hk_ensure_occlusion_query(dev, pool, firstQuery + i);
+         if (result != VK_SUCCESS) {
+            vk_command_buffer_set_error(&cmd->vk, result);
+            return;
+         }
       }
 
       struct libagx_copy_query_g17p_args info = {
