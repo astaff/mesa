@@ -16,6 +16,60 @@
 #include "agx_test.h"
 #include "util/u_debug.h"
 
+TEST(AGX3UniformALU, PackedUniformLoadPointerBoundaries)
+{
+   const bool enabled =
+      debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+   struct test_case {
+      enum agx_isa_encoding encoding;
+      unsigned low, high;
+      bool modified, admitted;
+   };
+   const test_case cases[] = {
+      {AGX_ISA_ENCODING_AGX3C, 252, 254, false, true},
+      {AGX_ISA_ENCODING_AGX3C, 256, 258, false, true},
+      {AGX_ISA_ENCODING_AGX3C, 448, 450, false, true},
+      {AGX_ISA_ENCODING_AGX3C, 476, 478, false, true},
+      {AGX_ISA_ENCODING_AGX3C, 508, 510, false, true},
+      {AGX_ISA_ENCODING_AGX3C, 512, 514, false, false},
+      {AGX_ISA_ENCODING_AGX3C, 250, 252, false, false},
+      {AGX_ISA_ENCODING_AGX3C, 448, 452, false, false},
+      {AGX_ISA_ENCODING_AGX3C, 450, 448, false, false},
+      {AGX_ISA_ENCODING_AGX3C, 448, 450, true, false},
+      {AGX_ISA_ENCODING_AGX3B, 448, 450, false, false},
+   };
+   for (const auto &t : cases) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = t.encoding;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_index pointer = agx_temp(b->shader, AGX_SIZE_64);
+      agx_instr *collect = agx_collect_to(b, pointer, 2);
+      collect->src[0] = agx_uniform(t.low, AGX_SIZE_32);
+      collect->src[0].neg = t.modified;
+      collect->src[1] = agx_uniform(t.high, AGX_SIZE_32);
+      agx_instr *load = agx_device_load_to(
+         b, agx_temp(b->shader, AGX_SIZE_32), pointer, agx_immediate(0),
+         AGX_FORMAT_I32, 1, 0, false);
+      agx_optimizer_forward(b->shader);
+      if (enabled && t.admitted) {
+         EXPECT_EQ(load->src[0].type, AGX_INDEX_UNIFORM);
+         EXPECT_EQ(load->src[0].value, t.low);
+         EXPECT_EQ(load->src[0].size, AGX_SIZE_64);
+      } else {
+         EXPECT_EQ(load->src[0].type, AGX_INDEX_NORMAL);
+         EXPECT_EQ(load->src[0].value, pointer.value);
+      }
+      ralloc_free(mem);
+   }
+   EXPECT_FALSE(agx_instr_accepts_uniform(AGX_ISA_ENCODING_AGX3C,
+      AGX_OPCODE_DEVICE_STORE, 1, 448, AGX_SIZE_64));
+   EXPECT_FALSE(agx_instr_accepts_uniform(AGX_ISA_ENCODING_AGX3C,
+      AGX_OPCODE_ATOMIC, 1, 448, AGX_SIZE_64));
+}
+
 static uint32_t
 uniform_difference_zero_bits(bool relax)
 {

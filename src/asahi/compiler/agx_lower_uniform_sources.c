@@ -13,8 +13,8 @@
 
 /*
  * Not all instructions can take uniforms. Memory instructions can take
- * uniforms, but only for their base (first) source and only in the
- * low-half of the uniform file.
+ * uniforms for their base source. Most forms use the lower half of the
+ * uniform file; M5 device loads also accept aligned bases in the upper half.
  *
  * This pass lowers invalid uniforms.
  */
@@ -30,7 +30,11 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
    bool is_64 = size == AGX_SIZE_64;
    /* AGX3 memory bases address four-half uniform groups. A pointer packed
     * at a two-half boundary must be copied to a GPR pair before use. */
-   bool memory_base = !high &&
+   const bool m5_high_load_base =
+      encoding == AGX_ISA_ENCODING_AGX3C && op == AGX_OPCODE_DEVICE_LOAD &&
+      size == AGX_SIZE_64 && value <= 508 &&
+      debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true);
+   bool memory_base = (!high || m5_high_load_base) &&
       (encoding == AGX_ISA_ENCODING_AGX2 || !(value & 3));
 
    switch (op) {

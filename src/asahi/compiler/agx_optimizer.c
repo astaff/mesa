@@ -776,6 +776,32 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
 
       if (def == NULL)
          continue; /* happens for phis in loops */
+
+      /* Preserve a pointer assembled from adjacent uniform words instead of
+       * materializing its two words in registers. M5 loads can address the
+       * complete uniform file with an aligned 64-bit base. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          I->op == AGX_OPCODE_DEVICE_LOAD && s == 0 &&
+          src.size == AGX_SIZE_64 && agx_channels(src) == 1 &&
+          !src.abs && !src.neg && !src.memory &&
+          def->op == AGX_OPCODE_COLLECT && def->nr_srcs == 2 &&
+          def->nr_dests == 1 && def->dest[0].size == AGX_SIZE_64 &&
+          agx_channels(def->dest[0]) == 1 && !def->dest[0].memory &&
+          !def->saturate &&
+          debug_get_bool_option("ASAHI_M5_HIGH_UNIFORM_LOAD", true)) {
+         const agx_index lo = def->src[0], hi = def->src[1];
+         if (lo.type == AGX_INDEX_UNIFORM && hi.type == AGX_INDEX_UNIFORM &&
+             lo.size == AGX_SIZE_32 && hi.size == AGX_SIZE_32 &&
+             agx_channels(lo) == 1 && agx_channels(hi) == 1 &&
+             !lo.abs && !lo.neg && !lo.memory &&
+             !hi.abs && !hi.neg && !hi.memory &&
+             !(lo.value & 3) && hi.value == lo.value + 2 &&
+             agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s,
+                                       lo.value, AGX_SIZE_64)) {
+            agx_replace_src(I, s, agx_uniform(lo.value, AGX_SIZE_64));
+            continue;
+         }
+      }
       if (def->op != AGX_OPCODE_MOV)
          continue;
 
