@@ -1475,6 +1475,12 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       pPushDescriptorSetWithTemplateInfo->pData);
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_memo, "ASAHI_M5_FRAGMENT_ROOT_MEMO",
+                           true)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_shadow,
+                           "ASAHI_M5_FRAGMENT_ROOT_SHADOW", true)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_fragment_root_shadow,
+                           "ASAHI_M5_VERIFY_FRAGMENT_ROOT_SHADOW", false)
 
 static uint64_t
 hk_upload_native_spilled_rt_descs(struct hk_cmd_buffer *cmd)
@@ -3172,6 +3178,31 @@ refused:
    return 0;
 }
 
+/* Read the uncached mappings only for this opt-in validation oracle. Keep
+ * its temporary snapshot and checks out of the normal recording path. */
+__attribute__((cold, noinline)) static void
+hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
+{
+   struct hk_root_fragment_snapshot reference;
+   if (gfx->root_cpu) {
+      hk_root_fragment_snapshot_store(&reference, gfx->root_cpu);
+      if (gfx->root_fragment_snapshot_cpu != gfx->root_cpu ||
+          memcmp(&reference, &gfx->root_fragment_snapshot, sizeof(reference))) {
+         mesa_loge("M5 current root snapshot mismatch");
+         abort();
+      }
+   }
+   if (gfx->fs_root_cpu) {
+      hk_root_fragment_snapshot_store(&reference, gfx->fs_root_cpu);
+      if (gfx->fs_root_fragment_snapshot_cpu != gfx->fs_root_cpu ||
+          memcmp(&reference, &gfx->fs_root_fragment_snapshot,
+                 sizeof(reference))) {
+         mesa_loge("M5 prior root snapshot mismatch");
+         abort();
+      }
+   }
+}
+
 /* The root the M5 fragment program of s follows. A root republished only
  * for bytes the fragment shader cannot read -- a per-draw dynamic offset of a
  * vertex-stage uniform buffer, a vertex buffer bind -- keeps the program the
@@ -3182,17 +3213,14 @@ static uint64_t
 hk_m5_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
-                          HK_ROOT_READS_DYNAMIC_BUFFERS;
+   const bool shadow = debug_get_option_m5_fragment_root_shadow();
 
-   if (gfx->fs_root && gfx->fs_root != gfx->root && gfx->root_cpu &&
-       !(s->info.agx3_root_reads & hidden) &&
-       hk_root_matches_for_fragment(gfx->fs_root_cpu, gfx->root_cpu))
-      return gfx->fs_root;
+   if (unlikely(shadow && debug_get_option_m5_verify_fragment_root_shadow()))
+      hk_m5_verify_fragment_root_shadow(gfx);
 
-   gfx->fs_root = gfx->root;
-   gfx->fs_root_cpu = gfx->root_cpu;
-   return gfx->root;
+   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads,
+                                     debug_get_option_m5_fragment_root_memo(),
+                                     shadow);
 }
 
 static uint64_t

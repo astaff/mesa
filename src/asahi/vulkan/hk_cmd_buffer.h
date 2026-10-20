@@ -343,6 +343,40 @@ hk_root_matches_for_fragment(const struct hk_root_descriptor_table *a,
                   sizeof(*a) - at);
 }
 
+/* Build the same visible-byte sequence as hk_root_matches_for_fragment().
+ * Keeping this derived from the shared span list includes future root fields
+ * and padding without duplicating the root ABI. */
+#define HK_ROOT_FRAGMENT_SUBTRACT(from, to, class)                             \
+   -(hk_root_descriptor_offset(to) - hk_root_descriptor_offset(from))
+enum {
+   HK_ROOT_FRAGMENT_VISIBLE_SIZE = sizeof(struct hk_root_descriptor_table)
+      HK_ROOT_FRAGMENT_HIDDEN_SPANS(HK_ROOT_FRAGMENT_SUBTRACT),
+};
+#undef HK_ROOT_FRAGMENT_SUBTRACT
+
+struct hk_root_fragment_snapshot {
+   uint8_t bytes[HK_ROOT_FRAGMENT_VISIBLE_SIZE];
+};
+
+static inline void
+hk_root_fragment_snapshot_store(struct hk_root_fragment_snapshot *snapshot,
+                                const struct hk_root_descriptor_table *root)
+{
+   size_t at = 0, out = 0;
+#define HK_ROOT_FRAGMENT_COPY(from, to, class)                                 \
+   do {                                                                        \
+      const size_t size = hk_root_descriptor_offset(from) - at;                \
+      memcpy(snapshot->bytes + out, (const uint8_t *)root + at, size);         \
+      out += size;                                                             \
+      at = hk_root_descriptor_offset(to);                                      \
+   } while (0);
+   HK_ROOT_FRAGMENT_HIDDEN_SPANS(HK_ROOT_FRAGMENT_COPY)
+#undef HK_ROOT_FRAGMENT_COPY
+   memcpy(snapshot->bytes + out, (const uint8_t *)root + at,
+          sizeof(*root) - at);
+   assert(out + sizeof(*root) - at == sizeof(snapshot->bytes));
+}
+
 static_assert(hk_root_descriptor_offset(draw.attrib_strides) ==
                     hk_root_descriptor_offset(draw.attrib_clamps) +
                        sizeof(((struct hk_root_descriptor_table *)0)
@@ -687,6 +721,18 @@ struct hk_graphics_state {
     * copy (hk_m5_fragment_root()). */
    uint64_t fs_root;
    const struct hk_root_descriptor_table *fs_root_cpu;
+
+   /* A successful equality check between the immutable root snapshots at
+    * fs_root and this address. Cleared whenever fs_root is replaced. */
+   uint64_t fs_root_checked_root;
+
+   /* CPU-cached copies of exactly the fragment-visible published bytes. The
+    * pointer keys name the immutable GPU-mapped copies, never their contents. */
+   struct hk_root_fragment_snapshot root_fragment_snapshot;
+   struct hk_root_fragment_snapshot fs_root_fragment_snapshot;
+   const struct hk_root_descriptor_table *root_fragment_snapshot_cpu;
+   const struct hk_root_descriptor_table *fs_root_fragment_snapshot_cpu;
+
    uint64_t draw_params;
    uint64_t draw_id_ptr;
    uint32_t g17p_draw_params_value[2];
@@ -884,6 +930,59 @@ struct hk_graphics_state {
    struct vk_vertex_input_state _dynamic_vi;
    struct vk_sample_locations_state _dynamic_sl;
 };
+
+/* The CPU source is mutable. Snapshot its visible bytes at publication,
+ * before copying into the immutable GPU-mapped root. */
+static inline void
+hk_root_fragment_snapshot_publish(struct hk_graphics_state *gfx,
+                                  const struct hk_root_descriptor_table *cpu,
+                                  const struct hk_root_descriptor_table *source)
+{
+   hk_root_fragment_snapshot_store(&gfx->root_fragment_snapshot, source);
+   gfx->root_fragment_snapshot_cpu = cpu;
+}
+
+/* Select the same immutable root as the fresh byte comparison. Hidden reads
+ * always use the current root; snapshots and the positive identity memo only
+ * accelerate the equality check for shaders that cannot observe those bytes. */
+static inline uint64_t
+hk_m5_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
+                           bool use_memo, bool use_shadow)
+{
+   const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
+                          HK_ROOT_READS_DYNAMIC_BUFFERS;
+
+   const bool shadow = use_shadow &&
+                       gfx->root_fragment_snapshot_cpu == gfx->root_cpu &&
+                       gfx->fs_root_fragment_snapshot_cpu == gfx->fs_root_cpu;
+
+   if (gfx->fs_root && gfx->fs_root != gfx->root && gfx->root_cpu &&
+       !(root_reads & hidden) &&
+       ((use_memo && gfx->fs_root_checked_root &&
+         gfx->fs_root_checked_root == gfx->root) ||
+        (shadow
+            ? !memcmp(&gfx->fs_root_fragment_snapshot,
+                      &gfx->root_fragment_snapshot,
+                      sizeof(gfx->root_fragment_snapshot))
+            : hk_root_matches_for_fragment(gfx->fs_root_cpu, gfx->root_cpu)))) {
+      if (use_memo)
+         gfx->fs_root_checked_root = gfx->root;
+      return gfx->fs_root;
+   }
+
+   if (use_shadow && gfx->root_cpu &&
+       gfx->root_fragment_snapshot_cpu == gfx->root_cpu) {
+      gfx->fs_root_fragment_snapshot = gfx->root_fragment_snapshot;
+      gfx->fs_root_fragment_snapshot_cpu = gfx->root_cpu;
+   } else {
+      gfx->fs_root_fragment_snapshot_cpu = NULL;
+   }
+
+   gfx->fs_root_checked_root = 0;
+   gfx->fs_root = gfx->root;
+   gfx->fs_root_cpu = gfx->root_cpu;
+   return gfx->root;
+}
 
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;

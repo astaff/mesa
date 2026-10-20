@@ -228,6 +228,26 @@ if with_tests
   endif
 
   test(
+    'hk_root_fragment',
+    executable(
+      'hk_root_fragment_test',
+      files('tests/test-hk-root-fragment.c'),
+      include_directories : [
+        include_directories('.'),
+        inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+        inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_libagx,
+        idep_libagx_shaders_h, idep_agx_pack,
+        idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+      ],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_render_resource_span',
     executable(
       'hk_render_resource_span_test',
