@@ -9227,9 +9227,96 @@ hk_draw_primitive_bound(const struct hk_cmd_buffer *cmd,
    return primitives * draw->b.count[1];
 }
 
+/* Scoped to one API multi-draw. There is no pending repair across API
+ * commands, barriers, or render stream changes. */
+struct hk_robust_index_batch {
+   struct agx_ptr jobs;
+   uint32_t count;
+   struct hk_cs *cs;
+   struct agx_draw draw;
+};
+
+static void
+hk_flush_robust_index_batch(struct hk_cmd_buffer *cmd,
+                            struct hk_robust_index_batch *batch)
+{
+   if (!batch->count || vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct agx_draw *draw = &batch->draw;
+   libagx_draw_robust_index_batch(cmd, agx_1d(32 * batch->count),
+                                  AGX_BARRIER_ALL | AGX_PREGFX, batch->jobs.gpu,
+                                  hk_heap(cmd), draw->index_buffer,
+                                  draw->index_buffer_range_B, draw->restart,
+                                  agx_chip_record_family(dev->dev.chip),
+                                  cmd->state.gfx.topology, draw->index_size);
+   batch->cs->stats.robust_index_dispatches++;
+   batch->cs->stats.robust_index_batches++;
+   batch->count = 0;
+}
+
+static void
+hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     struct agx_draw draw, enum agx_primitive topology,
+                     bool tail_emitted, struct hk_robust_index_batch *batch)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   uint32_t draw_state_offset = 0;
+   if (agx_native_graphics(&dev->dev) && tail_emitted) {
+      struct agx_ptr draw_state = hk_pool_vdm_alloc(cmd, 8, 4);
+      if (!draw_state.cpu ||
+          !hk_g17p_upload_draw_indices(
+             draw_state.cpu, 8, draw_state.gpu, cs->scissor.size,
+             cs->depth_bias.size,
+             MAX2(cmd->vk.dynamic_graphics_state.vp.viewport_count, 1),
+             &draw_state_offset)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+   }
+
+   size_t size_B = libagx_draw_robust_index_vdm_size(
+      agx_chip_record_family(dev->dev.chip), tail_emitted);
+   uint64_t target = hk_cs_alloc_for_indirect(cs, size_B);
+
+   uint64_t empty_draw_jump = 0;
+   if (agx_native_graphics(&dev->dev)) {
+      const uint64_t compact = hk_g17p_vdm_compact(cmd, target + size_B);
+      if (!compact || compact >= (UINT64_C(1) << 40)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      empty_draw_jump = compact;
+   }
+
+   const struct libagx_robust_index_draw job = {
+      .vdm = target,
+      .command = draw.b.ptr,
+      .empty_draw_jump = empty_draw_jump,
+      .draw_state_offset = draw_state_offset,
+      .render_state_emitted = tail_emitted,
+   };
+   cs->stats.robust_index_draws++;
+   if (batch) {
+      assert(batch->count == 0 || batch->cs == cs);
+      ((struct libagx_robust_index_draw *)batch->jobs.cpu)[batch->count++] =
+         job;
+      batch->cs = cs;
+      batch->draw = draw;
+   } else {
+      libagx_draw_robust_index(
+         cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX, target, hk_heap(cmd),
+         draw.b.ptr, draw.index_buffer, draw.index_buffer_range_B, draw.restart,
+         agx_chip_record_family(dev->dev.chip), topology, draw_state_offset,
+         tail_emitted, empty_draw_jump, draw.index_size);
+      cs->stats.robust_index_dispatches++;
+   }
+}
+
 static __attribute__((hot)) void
-hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
-             struct agx_draw draw_)
+hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
+             struct hk_robust_index_batch *batch)
 {
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -9555,49 +9642,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
             return;
          }
 
-         uint32_t draw_state_offset = 0;
-         if (agx_native_graphics(&dev->dev) &&
-             g17p_native_bind_tail_emitted) {
-            struct agx_ptr draw_state = hk_pool_vdm_alloc(cmd, 8, 4);
-            if (!draw_state.cpu ||
-                !hk_g17p_upload_draw_indices(
-                   draw_state.cpu, 8, draw_state.gpu, cs->scissor.size,
-                   cs->depth_bias.size,
-                   MAX2(cmd->vk.dynamic_graphics_state.vp.viewport_count, 1),
-                   &draw_state_offset)) {
-               vk_command_buffer_set_error(&cmd->vk,
-                                           VK_ERROR_FEATURE_NOT_PRESENT);
-               return;
-            }
-         }
-
-         size_t size_B = libagx_draw_robust_index_vdm_size(
-            agx_chip_record_family(dev->dev.chip),
-            g17p_native_bind_tail_emitted);
-         uint64_t target = hk_cs_alloc_for_indirect(cs, size_B);
-
-         uint64_t empty_draw_jump = 0;
-         if (agx_native_graphics(&dev->dev)) {
-            const uint64_t compact =
-               hk_g17p_vdm_compact(cmd, target + size_B);
-            if (!compact || compact >= (UINT64_C(1) << 40)) {
-               vk_command_buffer_set_error(&cmd->vk,
-                                           VK_ERROR_OUT_OF_DEVICE_MEMORY);
-               return;
-            }
-            empty_draw_jump = compact;
-         }
-
-         libagx_draw_robust_index(cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX,
-                                  target, hk_heap(cmd), draw.b.ptr,
-                                  draw.index_buffer, draw.index_buffer_range_B,
-                                  draw.restart,
-                                  agx_chip_record_family(dev->dev.chip),
-                                  topology,
-                                  draw_state_offset,
-                                  g17p_native_bind_tail_emitted,
-                                  empty_draw_jump,
-                                  draw.index_size);
+         hk_emit_robust_index(cmd, cs, draw, topology,
+                              g17p_native_bind_tail_emitted, batch);
       } else {
          if (agx_native_graphics(&dev->dev)) {
             if (!hk_g17p_emit_draw(cmd, cs, out, draw, topology,
@@ -9617,7 +9663,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
 static __attribute__((hot)) void
 hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw)
 {
-   hk_draw_impl(cmd, draw_id, draw);
+   hk_draw_impl(cmd, draw_id, draw, NULL);
 }
 
 static void
@@ -9867,7 +9913,8 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
  */
 static bool
 hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
-                                  const struct agx_draw *draw)
+                                  const struct agx_draw *draw,
+                                  bool allow_robust)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -9914,7 +9961,7 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
            draw->index_size != AGX_INDEX_SIZE_U16 &&
            draw->index_size != AGX_INDEX_SIZE_U32) ||
           !draw->index_buffer ||
-          hk_needs_index_robustness(cmd, &robust_draw, NULL))
+          (!allow_robust && hk_needs_index_robustness(cmd, &robust_draw, NULL)))
          return false;
    }
 
@@ -9925,7 +9972,8 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
 static void
 hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
                              struct agx_draw draw, bool republishes,
-                             bool continuing)
+                             bool continuing,
+                             struct hk_robust_index_batch *batch)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -10010,9 +10058,12 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
 
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
-   if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
-                          tail_emitted))
+   if (batch) {
+      hk_emit_robust_index(cmd, cs, draw, gfx->topology, tail_emitted, batch);
+   } else if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
+                                 tail_emitted)) {
       return;
+   }
    hk_g17p_note_layer_zero_draw(cmd, cs);
    cs->stats.cmds++;
 }
@@ -10030,15 +10081,15 @@ hk_draw_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
        * nothing recorded since. */
       const bool continuing = *eligible > 0;
       if (*eligible < 0) {
-         *eligible = hk_g17p_indirect_records_eligible(cmd, &normalized)
-                        ? 1 : -1;
+         *eligible =
+            hk_g17p_indirect_records_eligible(cmd, &normalized, false) ? 1 : -1;
       }
       /* A zero indirect address is refused by the general path. */
       if (*eligible > 0 && normalized.b.ptr &&
           !vk_command_buffer_has_error(&cmd->vk)) {
-         hk_g17p_emit_indirect_record(
-            cmd, draw_id, normalized, hk_gfx_republishes_render_state(cmd),
-            continuing);
+         hk_g17p_emit_indirect_record(cmd, draw_id, normalized,
+                                      hk_gfx_republishes_render_state(cmd),
+                                      continuing, NULL);
          return;
       }
    }
@@ -10085,6 +10136,70 @@ hk_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
                           drawCount, stride);
 }
 
+/* The first record derives/flushes state through the general path. Once it
+ * has reached robustness, no helper follows it. Later records can join only
+ * when the existing indirect-record proof rules out all other compute work
+ * and stream splits. Otherwise publish the first repair before falling back.
+ * This also covers DrawIndexedIndirectCount after its count predication. */
+static bool
+hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
+                          uint32_t draw_count, uint32_t stride)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct hk_addr_range buf = gfx->index.buffer;
+   struct agx_draw first =
+      agx_draw_indexed_indirect(buffer, buf.addr, buf.range, 0, 0);
+   hk_g17p_normalize_indirect_draw(cmd, &first);
+
+   if (!agx_native_graphics(&dev->dev) || draw_count <= 1 ||
+       gfx->render.view_mask || gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       mesa_prim_has_adjacency(
+          vk_topology_to_mesa(dyn->ia.primitive_topology)) ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       gfx->descriptors.root.draw.pipeline_stats_flags ||
+       !hk_needs_index_robustness(cmd, &first, NULL))
+      return false;
+
+   /* maxDrawIndirectCount is UINT16_MAX; the grid has exactly one 32-lane
+    * workgroup per record and neither the byte allocation nor grid wraps. */
+   assert(draw_count <= UINT16_MAX);
+   struct hk_robust_index_batch batch = {
+      .jobs = hk_pool_alloc(
+         cmd, (size_t)draw_count * sizeof(struct libagx_robust_index_draw), 8),
+   };
+   if (!batch.jobs.cpu)
+      return true;
+
+   hk_draw_impl(cmd, 0, first, &batch);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return true;
+
+   const bool eligible =
+      batch.count == 1 && hk_g17p_indirect_records_eligible(cmd, &first, true);
+   if (!eligible)
+      hk_flush_robust_index_batch(cmd, &batch);
+
+   for (uint32_t i = 1; i < draw_count; ++i) {
+      struct agx_draw draw = first;
+      draw.b.ptr = buffer + (uint64_t)stride * i;
+      if (eligible) {
+         hk_g17p_emit_indirect_record(
+            cmd, i, draw, hk_gfx_republishes_render_state(cmd), i > 1, &batch);
+      } else {
+         hk_draw(cmd, i, draw);
+      }
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return true;
+   }
+
+   hk_flush_robust_index_batch(cmd, &batch);
+   return true;
+}
+
 static void
 hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
                                uint32_t drawCount, uint32_t stride)
@@ -10107,6 +10222,9 @@ hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
       assert(stride % 4 == 0);
       assert(stride >= sizeof(VkDrawIndexedIndirectCommand));
    }
+
+   if (hk_g17p_draw_robust_multi(cmd, buffer, drawCount, stride))
+      return;
 
    int eligible = agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ? -1 : 0;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {

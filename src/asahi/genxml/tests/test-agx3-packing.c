@@ -1050,6 +1050,53 @@ test_agx3_cdm_stream_terminate(void)
 }
 
 static void
+test_robust_index_shadow(void)
+{
+   /* Exercise the actual host/device copy routine lane by lane. Short and
+    * unaligned inputs used to underflow the vector-copy length, and uint32
+    * extensions longer than 32 bytes were only partly initialized. */
+   for (unsigned size = AGX_INDEX_SIZE_U8; size <= AGX_INDEX_SIZE_U32; ++size) {
+      const unsigned width = 1u << size;
+      CHECK_EQ(agx_robust_index_available(UINT32_MAX, 128, size), 0);
+      CHECK_EQ(agx_robust_index_available(0x80000000u, 128, size), 0);
+      CHECK_EQ(agx_robust_index_available(3, 3 * width, size), 0);
+      CHECK_EQ(agx_robust_index_available(3, 4 * width - 1, size), 0);
+      CHECK_EQ(agx_robust_index_available(3, 5 * width - 1, size), 1);
+
+      struct agx_draw wrapped =
+         agx_draw_indexed(UINT32_MAX, 1, 1, 0, 0, 0x1000, 128, size, false);
+      CHECK_EQ(agx_direct_draw_overreads_indices(wrapped), true);
+      wrapped.start = 0x80000000u;
+      wrapped.b.count[0] = 1;
+      CHECK_EQ(agx_direct_draw_overreads_indices(wrapped), true);
+
+      for (unsigned offset = 0; offset < 16; ++offset) {
+         for (unsigned available = 1; available <= 33; ++available) {
+            uint8_t src[512], dst[512];
+            for (unsigned i = 0; i < sizeof(src); ++i)
+               src[i] = 1 + (i % 253);
+            for (unsigned extra = 1; extra <= 32; ++extra) {
+               memset(dst, 0xcd, sizeof(dst));
+               const unsigned in_B = available * width;
+               const unsigned out_B = (available + extra) * width;
+               for (unsigned lane = 0; lane < 32; ++lane)
+                  agx_robust_index_copy(dst + 16, src + offset, in_B, out_B,
+                                        lane);
+
+               for (unsigned i = 0; i < sizeof(dst); ++i) {
+                  const uint8_t expected = i < 16 || i >= 16 + out_B ? 0xcd
+                                           : i < 16 + in_B
+                                              ? src[offset + i - 16]
+                                              : 0;
+                  CHECK_EQ(dst[i], expected);
+               }
+            }
+         }
+      }
+   }
+}
+
+static void
 test_xfb_vertex_count(void)
 {
    CHECK_EQ(agx_xfb_vertex_count(0, 0, 32), 0);
@@ -1088,6 +1135,7 @@ main(void)
    test_agx3_cdm_substream_barrier();
    test_agx3_cdm_secondary_barrier();
    test_agx3_cdm_stream_terminate();
+   test_robust_index_shadow();
    test_xfb_vertex_count();
 
    printf("agx3 packing: all %u checks passed\n", checks);

@@ -893,6 +893,8 @@ struct hk_cs {
       uint32_t calls, cmds, flushes, merged;
       uint64_t query_copy_dispatches, query_copy_queries, query_copy_counters;
       uint64_t query_reset_dispatches, query_reset_queries, query_reset_flushes;
+      uint32_t robust_index_draws, robust_index_dispatches,
+         robust_index_batches;
    } stats;
 
    /* Timestamp writes: the start of the command (compute start, render
@@ -1073,6 +1075,9 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    a->stats.calls += b->stats.calls;
    a->stats.cmds += b->stats.cmds;
    a->stats.flushes += b->stats.flushes;
+   a->stats.robust_index_draws += b->stats.robust_index_draws;
+   a->stats.robust_index_dispatches += b->stats.robust_index_dispatches;
+   a->stats.robust_index_batches += b->stats.robust_index_batches;
    a->stats.merged++;
    a->stats.query_copy_dispatches += b->stats.query_copy_dispatches;
    a->stats.query_copy_queries += b->stats.query_copy_queries;

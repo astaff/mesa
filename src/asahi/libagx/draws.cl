@@ -191,57 +191,6 @@ libagx_draw_without_adj(global VkDrawIndirectCommand *out,
    }
 }
 
-/* Precondition: len must be < the group size */
-static void
-libagx_memcpy_small(global uchar *dst, constant uchar *src, uint len, uint tid)
-{
-   if (tid < len) {
-      dst[tid] = src[tid];
-   }
-}
-
-static void
-libagx_memcpy_aligned_uint4(global uint *dst, constant uint *src, uint len,
-                            uint tid, uint group_size)
-{
-   for (uint i = tid; i < len; i += group_size) {
-      vstore4(vload4(i, src), i, dst);
-   }
-}
-
-static void
-libagx_memcpy_to_aligned(global uint *dst, constant uchar *src, uint len,
-                         uint tid, uint group_size)
-{
-   /* Copy a few bytes at the start */
-   uint start_unaligned = ((uintptr_t)src) & 3;
-   if (start_unaligned) {
-      uint need = 4 - start_unaligned;
-      libagx_memcpy_small((global uchar *)dst, src, need, tid);
-      src += need;
-      len -= need;
-   }
-
-   /* Copy a few bytes at the end */
-   uint end_unaligned = len & 0xf;
-   len -= end_unaligned;
-   libagx_memcpy_small(((global uchar *)dst) + len, src + len, end_unaligned,
-                       tid);
-
-   /* Now both src and dst are word-aligned, and len is 16-aligned */
-   libagx_memcpy_aligned_uint4(dst, (constant uint *)src, len / 16, tid,
-                               group_size);
-}
-
-/* Precondition: len must be < the group size */
-static void
-libagx_memset_small(global uchar *dst, uchar b, int len, uint tid)
-{
-   if (tid < len) {
-      dst[tid] = b;
-   }
-}
-
 /*
  * AGX does not implement robustBufferAccess2 semantics for
  * index buffers, where out-of-bounds indices read as zero. When we
@@ -253,18 +202,17 @@ libagx_memset_small(global uchar *dst, uchar b, int len, uint tid)
  * access occurs. Otherwise we could use a hardware indirect draw, rather than
  * generating VDM words directly in shader.
  *
- * TODO: Handle multiple draws in parallel.
+ * A workgroup repairs one draw; the batch entry point assigns independent
+ * records to workgroups, retaining a single publication barrier at the end.
  */
-KERNEL(32)
-libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
-                         constant VkDrawIndexedIndirectCommand *cmd,
-                         uint64_t in_buf_ptr, uint32_t in_buf_range_B,
-                         ushort restart, enum agx_chip chip,
-                         enum agx_primitive topology,
-                         uint32_t draw_state_context_offset,
-                         uint32_t render_state_emitted,
-                         uint64_t empty_draw_jump,
-                         enum agx_index_size index_size__3)
+static void
+libagx_draw_robust_index_impl(
+   global uint32_t *vdm, global struct poly_heap *heap,
+   constant VkDrawIndexedIndirectCommand *cmd, uint64_t in_buf_ptr,
+   uint32_t in_buf_range_B, ushort restart, enum agx_chip chip,
+   enum agx_primitive topology, uint32_t draw_state_context_offset,
+   uint32_t render_state_emitted, uint64_t empty_draw_jump,
+   enum agx_index_size index_size__3)
 {
    uint tid = get_sub_group_local_id();
    bool first = tid == 0;
@@ -274,7 +222,9 @@ libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
       cmd->indexCount, cmd->instanceCount, cmd->firstIndex, cmd->vertexOffset,
       cmd->firstInstance, in_buf_ptr, in_buf_range_B, index_size, restart);
 
-   if (agx_indices_to_B(cmd->firstIndex, index_size) >= in_buf_range_B) {
+   uint in_size_el =
+      agx_robust_index_available(cmd->firstIndex, in_buf_range_B, index_size);
+   if (in_size_el == 0) {
       /* If the entire draw is out-of-bounds, skip it. We handle this specially
        * for both performance and to avoid integer wrapping issues in the main
        * code path (where cmd->firstIndex could get treated as a negative).
@@ -282,12 +232,10 @@ libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
       draw.index_buffer = AGX_ZERO_PAGE_ADDRESS;
       draw.index_buffer_range_B = 4;
       draw.start = 0;
-   } else if (agx_direct_draw_overreads_indices(draw)) {
+   } else if (cmd->indexCount > in_size_el) {
       uint start_B = agx_indices_to_B(draw.start, draw.index_size);
       constant void *in_buf =
          (constant void *)(draw.index_buffer + start_B);
-      uint in_size_el =
-         (draw.index_buffer_range_B - start_B) >> draw.index_size;
       uint in_size_B = agx_indices_to_B(in_size_el, index_size);
 
       /* After a small number of zeroes at the end, extra zeroes cannot change
@@ -309,10 +257,20 @@ libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
        * address into cached machine code, so make overflow memory-safe here:
        * every lane observes the same atomic allocation and an exhausted heap
        * emits an empty indexed draw instead of touching an invalid address. */
-      uint padded_offs = 0;
+      uint padded_offs = 0xffffffffu;
       if (first && size_valid) {
-         padded_offs = atomic_fetch_add(
-            (volatile global atomic_uint *)(&heap->bottom), alloc_size_B);
+         /* Failed parallel allocations must not wrap bottom and reuse a
+          * successful draw's storage. Reserve only while the whole span fits. */
+         volatile global atomic_uint *bottom =
+            (volatile global atomic_uint *)(&heap->bottom);
+         uint offset = atomic_load(bottom);
+         while (poly_heap_allocation_fits(offset, alloc_size_B, heap->size)) {
+            if (atomic_compare_exchange_weak(bottom, &offset,
+                                             offset + alloc_size_B)) {
+               padded_offs = offset;
+               break;
+            }
+         }
       }
 
       padded_offs = sub_group_broadcast(padded_offs, 0);
@@ -331,14 +289,7 @@ libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
          draw.index_buffer_range_B = out_size_B;
          draw.start = 0;
 
-         /* Clone the index buffer. The destination is aligned as a
-          * post-condition of the heap allocation above. */
-         libagx_memcpy_to_aligned((global uint *)padded, in_buf, in_size_B,
-                                  tid, 32);
-
-         /* Extend with up to 32 zeroes with a small memset */
-         libagx_memset_small(padded + in_size_B, 0, out_size_B - in_size_B,
-                             tid);
+         agx_robust_index_copy(padded, in_buf, in_size_B, out_size_B, tid);
       }
    }
 
@@ -347,6 +298,40 @@ libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
                                 draw_state_context_offset,
                                 render_state_emitted != 0, empty_draw_jump);
    }
+}
+
+/* The single-draw entry point retains the existing dispatch ABI. */
+KERNEL(32)
+libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
+                         constant VkDrawIndexedIndirectCommand *cmd,
+                         uint64_t in_buf_ptr, uint32_t in_buf_range_B,
+                         ushort restart, enum agx_chip chip,
+                         enum agx_primitive topology,
+                         uint32_t draw_state_context_offset,
+                         uint32_t render_state_emitted,
+                         uint64_t empty_draw_jump,
+                         enum agx_index_size index_size__3)
+{
+   libagx_draw_robust_index_impl(
+      vdm, heap, cmd, in_buf_ptr, in_buf_range_B, restart, chip, topology,
+      draw_state_context_offset, render_state_emitted, empty_draw_jump,
+      index_size__3);
+}
+
+KERNEL(32)
+libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
+                               global struct poly_heap *heap,
+                               uint64_t in_buf_ptr, uint32_t in_buf_range_B,
+                               ushort restart, enum agx_chip chip,
+                               enum agx_primitive topology,
+                               enum agx_index_size index_size__3)
+{
+   constant struct libagx_robust_index_draw *draw = draws + get_group_id(0);
+   libagx_draw_robust_index_impl(
+      (global uint32_t *)draw->vdm, heap,
+      (constant VkDrawIndexedIndirectCommand *)draw->command, in_buf_ptr,
+      in_buf_range_B, restart, chip, topology, draw->draw_state_offset,
+      draw->render_state_emitted, draw->empty_draw_jump, index_size__3);
 }
 
 /*

@@ -1256,8 +1256,14 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             nr_cdm++;
          } else {
             assert(cs->type == HK_CS_VDM);
-            perf_debug(cmdbuf, "%u: Submitting VDM with %u API draws, %u draws",
-                       i, cs->stats.calls, cs->stats.cmds);
+            perf_debug(cmdbuf,
+                       "%u: Submitting VDM with %u API draws, %u draws, "
+                       "robust_index_draws=%u robust_index_dispatches=%u "
+                       "robust_index_batches=%u",
+                       i, cs->stats.calls, cs->stats.cmds,
+                       cs->stats.robust_index_draws,
+                       cs->stats.robust_index_dispatches,
+                       cs->stats.robust_index_batches);
             assert(cs->stats.cmds > 0 || cs->cr.process_empty_tiles ||
                    cs->timestamp.end.handle || cs->timestamp.start.handle);
 

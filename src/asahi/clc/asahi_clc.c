@@ -317,6 +317,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_draw_indirect_byte_count") ||
           !strcmp(func->name, "libagx_conditional_render") ||
           !strcmp(func->name, "libagx_draw_robust_index") ||
+          !strcmp(func->name, "libagx_draw_robust_index_batch") ||
           !strcmp(func->name, "libagx_unroll_restart") ||
           !strcmp(func->name, "libagx_gs_setup_indirect") ||
           !strcmp(func->name, "libagx_prefix_sum_geom") ||
