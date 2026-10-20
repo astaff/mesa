@@ -22,6 +22,38 @@ ineligible after the first draw, its repair is published before the remaining
 draws use the general path. Single-record API calls retain one repair dispatch
 each. This change does not coalesce separate API calls across barriers.
 
+## Shadow allocation failure
+
+A partial index-buffer overread needs a shadow allocation. If its size cannot
+be represented or the bounded CAS reservation cannot fit, the repair kernel
+sets the device-owned printf/abort buffer's sticky abort word. Both single and
+batch entrypoints receive this address at dispatch time. No device address is
+embedded in cached machine code. Empty-instance draws require no shadow.
+
+The kernel initializes a safe empty VDM continuation so execution can finish
+without an invalid index-buffer access. This continuation represents an
+execution failure: the existing `vk_check_printf_status()` contract reports
+`VK_ERROR_DEVICE_LOST` through host completion waits and status polls, including
+already-available query results. Later heap reclamation and successful draws
+do not clear the failure. Initial asynchronous submission success is not a
+successful execution result. No deliberate GPU fault or new kernel ABI is used.
+
+The CPU regression executes the extracted production repair body, single and
+batch wrappers, and the actual abort/status consumers. It covers all index
+widths, legacy/native selectors, points and line/triangle topologies, size and
+reservation boundaries, no-allocation cases, and competing workgroups. It
+retains the exact prior silent-empty failure and failure-publication, point-count
+and query-status negative controls:
+
+```
+python3 src/asahi/vulkan/tests/robust-index-exhaustion.py --output /path/to/evidence
+```
+
+This requires Clang with address/undefined sanitizers and pthreads. Its emitter
+and transport are shims and its subgroup lanes run serially. It does not prove
+GPU execution, completion ordering, or visibility of the abort word on hardware.
+Pressure and successful-rendering qualification remain required on each target.
+
 ## Host checks
 
 Build both Gallium Asahi and Honeykrisp with `-Dbuild-tests=true`, then run:

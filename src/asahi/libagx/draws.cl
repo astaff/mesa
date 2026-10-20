@@ -208,6 +208,7 @@ libagx_draw_without_adj(global VkDrawIndirectCommand *out,
 static void
 libagx_draw_robust_index_impl(
    global uint32_t *vdm, global struct poly_heap *heap,
+   global uint32_t *printf_buffer,
    constant VkDrawIndexedIndirectCommand *cmd, uint64_t in_buf_ptr,
    uint32_t in_buf_range_B, ushort restart, enum agx_chip chip,
    enum agx_primitive topology, uint32_t draw_state_context_offset,
@@ -232,7 +233,7 @@ libagx_draw_robust_index_impl(
       draw.index_buffer = AGX_ZERO_PAGE_ADDRESS;
       draw.index_buffer_range_B = 4;
       draw.start = 0;
-   } else if (cmd->indexCount > in_size_el) {
+   } else if (cmd->instanceCount != 0 && cmd->indexCount > in_size_el) {
       uint start_B = agx_indices_to_B(draw.start, draw.index_size);
       constant void *in_buf =
          (constant void *)(draw.index_buffer + start_B);
@@ -251,12 +252,8 @@ libagx_draw_robust_index_impl(
       bool size_valid = agx_robust_index_shadow_sizes(
          out_size_el, index_size, &out_size_B, &alloc_size_B);
 
-      /* Allocate memory for the shadow index buffer.  The general geometry
-       * allocator reports overflow through the AGX2 printf/abort ABI.  This
-       * G17P-capable precompiled kernel cannot bake a process-local printf
-       * address into cached machine code, so make overflow memory-safe here:
-       * every lane observes the same atomic allocation and an exhausted heap
-       * emits an empty indexed draw instead of touching an invalid address. */
+      /* Reserve only a representable span. Failed reservations leave bottom
+       * unchanged, so parallel draws cannot reuse a successful allocation. */
       uint padded_offs = 0xffffffffu;
       if (first && size_valid) {
          /* Failed parallel allocations must not wrap bottom and reuse a
@@ -277,14 +274,22 @@ libagx_draw_robust_index_impl(
       bool allocated =
          size_valid &&
          poly_heap_allocation_fits(padded_offs, alloc_size_B, heap->size);
-      global uchar *padded = heap->base + padded_offs;
-
       if (!allocated) {
+         /* Match nir_lower_printf's abort word. The address is a runtime
+          * argument, never embedded in cached code. vk_check_printf_status()
+          * turns this sticky execution failure into VK_ERROR_DEVICE_LOST.
+          * Finish the VDM continuation safely instead of halting before it is
+          * initialized; an empty draw alone is not successful robustness.
+          */
+         if (first)
+            atomic_store((volatile global atomic_uint *)(printf_buffer + 1), 1);
+
          draw.b.count[0] = 0;
          draw.index_buffer = AGX_ZERO_PAGE_ADDRESS;
          draw.index_buffer_range_B = 4;
          draw.start = 0;
       } else {
+         global uchar *padded = heap->base + padded_offs;
          draw.index_buffer = (uintptr_t)padded;
          draw.index_buffer_range_B = out_size_B;
          draw.start = 0;
@@ -300,9 +305,10 @@ libagx_draw_robust_index_impl(
    }
 }
 
-/* The single-draw entry point retains the existing dispatch ABI. */
+/* Both entrypoints publish failures through the device-owned abort buffer. */
 KERNEL(32)
 libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
+                         global uint32_t *printf_buffer,
                          constant VkDrawIndexedIndirectCommand *cmd,
                          uint64_t in_buf_ptr, uint32_t in_buf_range_B,
                          ushort restart, enum agx_chip chip,
@@ -313,14 +319,15 @@ libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
                          enum agx_index_size index_size__3)
 {
    libagx_draw_robust_index_impl(
-      vdm, heap, cmd, in_buf_ptr, in_buf_range_B, restart, chip, topology,
-      draw_state_context_offset, render_state_emitted, empty_draw_jump,
+      vdm, heap, printf_buffer, cmd, in_buf_ptr, in_buf_range_B, restart, chip,
+      topology, draw_state_context_offset, render_state_emitted, empty_draw_jump,
       index_size__3);
 }
 
 KERNEL(32)
 libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
                                global struct poly_heap *heap,
+                               global uint32_t *printf_buffer,
                                uint64_t in_buf_ptr, uint32_t in_buf_range_B,
                                ushort restart, enum agx_chip chip,
                                enum agx_primitive topology,
@@ -328,7 +335,7 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
 {
    constant struct libagx_robust_index_draw *draw = draws + get_group_id(0);
    libagx_draw_robust_index_impl(
-      (global uint32_t *)draw->vdm, heap,
+      (global uint32_t *)draw->vdm, heap, printf_buffer,
       (constant VkDrawIndexedIndirectCommand *)draw->command, in_buf_ptr,
       in_buf_range_B, restart, chip, topology, draw->draw_state_offset,
       draw->render_state_emitted, draw->empty_draw_jump, index_size__3);

@@ -868,7 +868,10 @@ hk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
          status = VK_NOT_READY;
    }
 
-   return status;
+   /* Availability can already be set when entering this call. Check GPU abort
+    * status after observing it too, including robust-index allocation failure. */
+   VkResult device_status = vk_device_check_status(&dev->vk);
+   return device_status == VK_SUCCESS ? status : device_status;
 }
 
 static void

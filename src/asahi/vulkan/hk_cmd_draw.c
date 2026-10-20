@@ -9247,7 +9247,9 @@ hk_flush_robust_index_batch(struct hk_cmd_buffer *cmd,
    const struct agx_draw *draw = &batch->draw;
    libagx_draw_robust_index_batch(cmd, agx_1d(32 * batch->count),
                                   AGX_BARRIER_ALL | AGX_PREGFX, batch->jobs.gpu,
-                                  hk_heap(cmd), draw->index_buffer,
+                                  hk_heap(cmd),
+                                  dev->dev.printf_buffer_address,
+                                  draw->index_buffer,
                                   draw->index_buffer_range_B, draw->restart,
                                   agx_chip_record_family(dev->dev.chip),
                                   cmd->state.gfx.topology, draw->index_size);
@@ -9307,7 +9309,8 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    } else {
       libagx_draw_robust_index(
          cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX, target, hk_heap(cmd),
-         draw.b.ptr, draw.index_buffer, draw.index_buffer_range_B, draw.restart,
+         dev->dev.printf_buffer_address, draw.b.ptr, draw.index_buffer,
+         draw.index_buffer_range_B, draw.restart,
          agx_chip_record_family(dev->dev.chip), topology, draw_state_offset,
          tail_emitted, empty_draw_jump, draw.index_size);
       cs->stats.robust_index_dispatches++;
