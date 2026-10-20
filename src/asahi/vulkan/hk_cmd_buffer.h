@@ -276,6 +276,11 @@ struct hk_descriptor_state {
    bool root_dirty;
    uint64_t generation;
    struct hk_root_descriptor_table root;
+   /* Immutable command-buffer storage; reset with descriptor state. Only the
+    * uploaded head and tail are compared, excluding unused dynamic slots. */
+   struct agx_ptr uploaded_root;
+   uint64_t uploaded_root_generation;
+   uint8_t uploaded_dynamic_buffer_end;
 
    /* One past the highest root.dynamic_buffers entry any bind wrote. Later
     * entries are unread by every bound layout and stay out of uploads. */
@@ -1126,6 +1131,9 @@ struct hk_cmd_buffer {
 
    struct {
       struct hk_upload_stats upload_stats;
+      struct {
+         uint64_t id, addr;
+      } constant_data[MESA_SHADER_STAGES];
       struct hk_graphics_state gfx;
       struct hk_compute_state cs;
       struct hk_ray_tracing_state rt;

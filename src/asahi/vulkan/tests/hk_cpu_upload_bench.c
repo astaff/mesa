@@ -149,6 +149,101 @@ correctness(struct fixture *f)
    reset(f);
 }
 
+static void
+reuse_correctness(struct fixture *f)
+{
+   struct hk_cmd_buffer *cmd = &f->cmd;
+   struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
+   const uint64_t generation = desc->generation;
+   desc->root_dirty = false;
+   desc->sets_dirty = 0;
+   bind(f, 16, VK_SHADER_STAGE_ALL_GRAPHICS);
+   CHECK(desc->generation == generation && !desc->root_dirty && !desc->sets_dirty);
+   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+   CHECK(desc->generation == generation + 1 && desc->root_dirty);
+
+   uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+   cmd->state.gfx.root = root;
+   cmd->state.gfx.g17p_bind_tail.valid = true;
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+   CHECK(cmd->state.gfx.g17p_bind_tail.valid);
+   const size_t head = hk_root_descriptor_offset(dynamic_buffers) +
+      desc->dynamic_buffer_end * sizeof(desc->root.dynamic_buffers[0]);
+   const size_t tail = hk_root_descriptor_offset(set_dynamic_buffer_start);
+   memset((uint8_t *)desc->uploaded_root.cpu + head, 0xa5, tail - head);
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+   /* Restoring descriptor state can return to an older cached root. */
+   cmd->state.gfx.root = root + 8;
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == root);
+   CHECK(!cmd->state.gfx.g17p_bind_tail.valid);
+   cmd->state.gfx.root = root;
+
+   const uint64_t compute = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   CHECK(compute != root);
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) == compute);
+   /* Test both sides of the omitted dynamic-buffer region. */
+   desc->root.push[3] = 42;
+   uint64_t changed = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(changed != root);
+   CHECK(((struct hk_root_descriptor_table *)f->root_map)->push[3] == 0);
+   root = changed;
+   f->dev.dev.printf_buffer_address = 0x700000;
+   changed = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   CHECK(changed != root);
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) == changed);
+   root = changed;
+   desc->dynamic_buffer_end++;
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
+   f->dev.dev.printf_buffer_address = 0;
+
+   /* CPU-decoded descriptors deliberately keep their publication path. */
+   f->fs_api->variants[0].info.agx3_combined_sampler_valid = true;
+   root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   const uint64_t before = desc->generation;
+   desc->root_dirty = false;
+   bind(f, 32, VK_SHADER_STAGE_ALL_GRAPHICS);
+   CHECK(desc->generation == before + 1 && desc->root_dirty);
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS) != root);
+   f->fs_api->variants[0].info.agx3_combined_sampler_valid = false;
+
+   hk_cmd_upload_draw_params(cmd, 7, 3);
+   const uint64_t params = cmd->state.gfx.draw_params;
+   hk_cmd_upload_draw_params(cmd, 7, 3);
+   CHECK(cmd->state.gfx.draw_params == params);
+   hk_cmd_upload_draw_params(cmd, 7, 4);
+   CHECK(cmd->state.gfx.draw_params != params);
+   hk_cmd_upload_draw_id(cmd, 1234);
+   const uint64_t id = cmd->state.gfx.draw_id_ptr;
+   hk_cmd_upload_draw_id(cmd, 1234);
+   CHECK(cmd->state.gfx.draw_id_ptr == id);
+
+   const uint64_t data = hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX);
+   CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX) == data);
+   CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_COMPUTE) != data);
+   /* A new shader may occupy the same malloc address. Its unique payload ID
+    * must force a new immutable upload without changing the earlier bytes. */
+   const uint8_t *old = (uint8_t *)f->main_map + data - 0x100000;
+   CHECK(old[0] == 0);
+   f->constants[0] = 99;
+   f->vs.constant_data_id = 3;
+   CHECK(hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX) != data);
+   CHECK(old[0] == 0);
+   f->constants[0] = 0;
+   f->vs.constant_data_id = 1;
+
+   reset(f);
+   CHECK(cmd->state.gfx.descriptors.uploaded_root.gpu == 0);
+   CHECK(cmd->state.constant_data[MESA_SHADER_VERTEX].id == 0);
+   CHECK(!cmd->state.gfx.g17p_draw_params_host_valid);
+   hk_cmd_upload_draw_params(cmd, 7, 3);
+   hk_cmd_upload_constants(cmd, &f->vs, MESA_SHADER_VERTEX);
+   CHECK(cmd->state.upload_stats.draw_param_uploads == 1);
+   CHECK(cmd->state.upload_stats.constant_uploads == 1);
+   reset(f);
+}
+
 static uint64_t
 now_ns(void)
 {
@@ -188,6 +283,19 @@ run(struct fixture *f, const char *name, unsigned change_every, unsigned batches
       CHECK(f->cmd.vk.record_result == VK_SUCCESS);
    }
    const uint64_t elapsed = now_ns() - start;
+   const uint64_t changes = (15 / change_every) + 1;
+   CHECK(totals.draws == (uint64_t)batches * 16);
+   CHECK(totals.descriptor_binds == totals.draws);
+   CHECK(totals.descriptor_noops == (16 - changes) * batches);
+   CHECK(f->cmd.state.gfx.descriptors.generation == changes);
+   CHECK(totals.root_uploads == changes * batches);
+   CHECK(totals.root_reuses == (16 - changes) * batches);
+   CHECK(totals.draw_param_uploads == changes * batches);
+   CHECK(totals.draw_param_reuses == (16 - changes) * batches);
+   CHECK(totals.draw_id_uploads == changes * batches);
+   CHECK(totals.draw_id_reuses == (16 - changes) * batches);
+   CHECK(totals.constant_uploads == (uint64_t)batches * 2);
+   CHECK(totals.constant_reuses == (uint64_t)batches * 30);
    f->cmd.state.upload_stats = totals;
    printf("%s batches=%u draws=%" PRIu64 " ns_per_draw=%.2f\n", name, batches,
           totals.draws, (double)elapsed / totals.draws);
@@ -204,6 +312,7 @@ main(int argc, char **argv)
    CHECK(batches && batches <= 1000000);
    struct fixture *f = fixture();
    correctness(f);
+   reuse_correctness(f);
    run(f, "identical", 16, batches);
    run(f, "change_every_4", 4, batches);
    run(f, "change_every_draw", 1, batches);

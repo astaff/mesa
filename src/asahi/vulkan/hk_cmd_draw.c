@@ -8002,12 +8002,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   /* If the vertex shader uses draw parameters, vertex uniforms are dirty every
-    * draw. Fragment uniforms are unaffected.
-    *
-    * For a direct draw, we upload the draw parameters as-if indirect to
-    * avoid keying to indirectness.
-    */
+   /* Direct draws use an immutable parameter block, reused while the values
+    * match. Indirect draws always retain the execution-time GPU pointer. */
    if (gfx->linked[MESA_SHADER_VERTEX]->b.uses_base_param) {
       if (agx_is_indirect(draw.b)) {
          gfx->draw_params = draw.b.ptr;

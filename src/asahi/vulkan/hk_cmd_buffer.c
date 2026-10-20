@@ -1033,6 +1033,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
       pipeline_layout->dynamic_descriptor_offset[info->firstSet];
 
    bool root_changed = false;
+   bool binding_changed = false;
    uint32_t next_dyn_offset = 0;
    for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
       unsigned s = i + info->firstSet;
@@ -1040,6 +1041,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
 
       if (desc->sets[s] != set ||
           (desc->push_active & BITFIELD_BIT(s))) {
+         binding_changed = true;
          if (set != NULL) {
             root_changed |= desc->root.sets[s] != hk_descriptor_set_addr(set);
             desc->root.sets[s] = hk_descriptor_set_addr(set);
@@ -1088,15 +1090,20 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    }
    assert(dyn_buffer_start <= HK_MAX_DYNAMIC_BUFFERS);
    assert(next_dyn_offset <= info->dynamicOffsetCount);
+   root_changed |= desc->dynamic_buffer_end < dyn_buffer_start;
    desc->dynamic_buffer_end = MAX2(desc->dynamic_buffer_end, dyn_buffer_start);
 
-   /* Preserve all descriptor bookkeeping even if the root's immutable bytes
-    * can be reused.  Other paths keep the prior unconditional invalidation.
-    */
-   desc->root_dirty |= root_changed ||
-      !hk_g17p_can_retain_descriptor_root(cmd, desc);
-   desc->generation++;
    hk_upload_stat(cmd, descriptor_binds, 1);
+   const bool retain_root = hk_g17p_can_retain_descriptor_root(cmd, desc);
+   if (!root_changed && !binding_changed && retain_root) {
+      hk_upload_stat(cmd, descriptor_noops, 1);
+      return;
+   }
+
+   /* CPU-decoded descriptor programs retain their conservative invalidation:
+    * their inputs can change in set memory without changing its address. */
+   desc->root_dirty |= root_changed || !retain_root;
+   desc->generation++;
 }
 
 VKAPI_ATTR void VKAPI_CALL

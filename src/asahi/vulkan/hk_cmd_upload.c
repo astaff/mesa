@@ -25,17 +25,6 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
    struct hk_root_descriptor_table *root = &desc->root;
 
-   struct agx_ptr root_ptr = hk_pool_root_alloc(cmd, sizeof(*root), 8);
-
-   /* A HAL200 tail built for the old root names it and must be rebuilt
-    * before publication. */
-   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
-       cmd->state.gfx.root && root_ptr.gpu != cmd->state.gfx.root)
-      cmd->state.gfx.g17p_bind_tail.valid = false;
-   if (!root_ptr.gpu)
-      return 0;
-
-   root->root_desc_addr = root_ptr.gpu;
    root->printf_buffer_address = dev->dev.printf_buffer_address;
    root->sampler_heap_address =
       dev->samplers.table.bo && dev->samplers.table.bo->va
@@ -43,10 +32,38 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
          : 0;
 
    /* Dynamic buffers past the highest one ever bound are read by no bound
-    * layout: copy the table around them. */
+    * layout. Never read the uninitialized hole in an earlier upload. */
    const size_t head_B = hk_root_descriptor_offset(dynamic_buffers) +
-                         desc->dynamic_buffer_end * sizeof(root->dynamic_buffers[0]);
+      desc->dynamic_buffer_end * sizeof(root->dynamic_buffers[0]);
    const size_t tail_B = hk_root_descriptor_offset(set_dynamic_buffer_start);
+   /* CPU-decoded descriptor programs use a new root identity to invalidate
+    * their native program caches, even when only set memory changed. */
+   if (agx_native_graphics(&dev->dev) && desc->uploaded_root.gpu &&
+       desc->generation == desc->uploaded_root_generation &&
+       desc->dynamic_buffer_end == desc->uploaded_dynamic_buffer_end) {
+      root->root_desc_addr = desc->uploaded_root.gpu;
+      if (memcmp(desc->uploaded_root.cpu, root, head_B) == 0 &&
+          memcmp((const uint8_t *)desc->uploaded_root.cpu + tail_B,
+                 (const uint8_t *)root + tail_B, sizeof(*root) - tail_B) == 0) {
+         if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
+             cmd->state.gfx.root &&
+             desc->uploaded_root.gpu != cmd->state.gfx.root)
+            cmd->state.gfx.g17p_bind_tail.valid = false;
+         hk_upload_stat(cmd, root_reuses, 1);
+         return desc->uploaded_root.gpu;
+      }
+   }
+
+   struct agx_ptr root_ptr = hk_pool_root_alloc(cmd, sizeof(*root), 8);
+   if (!root_ptr.gpu)
+      return 0;
+
+   /* A HAL200 tail built for the old root names it and must be rebuilt
+    * before publication. Byte-identical roots keep that identity. */
+   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
+       cmd->state.gfx.root && root_ptr.gpu != cmd->state.gfx.root)
+      cmd->state.gfx.g17p_bind_tail.valid = false;
+   root->root_desc_addr = root_ptr.gpu;
    memcpy(root_ptr.cpu, root, head_B);
    memcpy((uint8_t *)root_ptr.cpu + tail_B, (const uint8_t *)root + tail_B,
           sizeof(*root) - tail_B);
@@ -60,6 +77,9 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
                                 sizeof(*root) - tail_B);
    }
 
+   desc->uploaded_root = root_ptr;
+   desc->uploaded_root_generation = desc->generation;
+   desc->uploaded_dynamic_buffer_end = desc->dynamic_buffer_end;
    hk_upload_stat(cmd, root_uploads, 1);
    hk_upload_stat(cmd, root_bytes, head_B + sizeof(*root) - tail_B);
    return root_ptr.gpu;
@@ -67,16 +87,26 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
 
 uint64_t
 hk_cmd_upload_constants(struct hk_cmd_buffer *cmd, const struct hk_shader *s,
-                        UNUSED mesa_shader_stage stage)
+                        mesa_shader_stage stage)
 {
    if (!s || !s->data_size)
       return 0;
+
+   assert(stage < MESA_SHADER_STAGES);
+   const bool native = agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev);
+   if (native && s->constant_data_id &&
+       cmd->state.constant_data[stage].id == s->constant_data_id) {
+      hk_upload_stat(cmd, constant_reuses, 1);
+      return cmd->state.constant_data[stage].addr;
+   }
 
    uint64_t addr = hk_pool_upload(cmd, s->data_ptr, s->data_size,
                                   HK_MIN_UBO_ALIGNMENT);
    if (!addr)
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    else {
+      cmd->state.constant_data[stage].id = s->constant_data_id;
+      cmd->state.constant_data[stage].addr = addr;
       hk_upload_stat(cmd, constant_uploads, 1);
       hk_upload_stat(cmd, constant_bytes, s->data_size);
    }
@@ -89,9 +119,19 @@ hk_cmd_upload_draw_params(struct hk_cmd_buffer *cmd, uint32_t first,
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    uint32_t params[] = {first, first_instance};
+   if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
+       gfx->g17p_draw_params_host_valid && gfx->draw_params &&
+       memcmp(gfx->g17p_draw_params_value, params, sizeof(params)) == 0) {
+      hk_upload_stat(cmd, draw_param_reuses, 1);
+      return;
+   }
+
+   const uint64_t addr = hk_pool_upload(cmd, params, sizeof(params), 4);
+   gfx->g17p_draw_params_host_valid = addr != 0;
+   gfx->draw_params = addr;
+   if (!addr)
+      return;
    memcpy(gfx->g17p_draw_params_value, params, sizeof(params));
-   gfx->g17p_draw_params_host_valid = true;
-   gfx->draw_params = hk_pool_upload(cmd, params, sizeof(params), 4);
    hk_upload_stat(cmd, draw_param_uploads, 1);
    hk_upload_stat(cmd, draw_param_bytes, sizeof(params));
 }
@@ -100,10 +140,19 @@ void
 hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
+       gfx->g17p_draw_id_host_valid && gfx->draw_id_ptr &&
+       gfx->g17p_draw_id_value == draw_id) {
+      hk_upload_stat(cmd, draw_id_reuses, 1);
+      return;
+   }
+
    gfx->g17p_draw_id_value = draw_id;
-   gfx->g17p_draw_id_host_valid = true;
    /* Native uniform DMA reads a whole dword, including the high half. */
    gfx->draw_id_ptr = hk_pool_upload(cmd, &draw_id, sizeof(draw_id), 4);
+   gfx->g17p_draw_id_host_valid = gfx->draw_id_ptr != 0;
+   if (!gfx->draw_id_ptr)
+      return;
    hk_upload_stat(cmd, draw_id_uploads, 1);
    hk_upload_stat(cmd, draw_id_bytes, sizeof(draw_id));
 }
