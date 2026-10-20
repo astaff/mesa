@@ -100,7 +100,11 @@ particular verify short unaligned shadows, uint32 zero padding beyond byte 32,
 empty-record state/link handling, and distinct jobs that allocate shadows at
 the same time. Monitor GPU faults and allocation failures. Exercise heap
 exhaustion separately: it must not wrap the allocator or overlap successful
-reservations; the existing empty-draw exhaustion fallback is retained.
+reservations, and completed host waits/polls must report `VK_ERROR_DEVICE_LOST`
+instead of successful empty output. Check the abort word's GPU-to-host visibility
+and persistence across later successful draws and heap reclamation. Also qualify
+the single-draw fallback on M1/M2; host chip selectors do not prove its execution.
+Zero-count and zero-instance controls must remain successful without allocating.
 
 ## Counters and performance A/B/C (pending)
 
