@@ -435,6 +435,9 @@ struct agx_batch {
    struct pipe_framebuffer_state key;
    uint64_t seqnum;
    uint32_t syncobj;
+   /* Failed waits retain these fences and all batch resources until exit. */
+   uint32_t failed_syncobjs[2];
+   bool submit_quarantined;
    uint32_t draws;
 
    /* Executable storage is owned by this batch's pipeline pool. */
@@ -781,6 +784,7 @@ struct agx_context {
    struct agx_bg_eot_cache bg_eot;
 
    bool any_faults;
+   bool submit_quarantined;
 
    /* Work since the previous Gallium flush, including hazard-driven submits. */
    struct {
@@ -975,6 +979,8 @@ struct agx_screen {
    struct agx_device dev;
    struct disk_cache *disk_cache;
 
+   /* Atomic: a context with unknown completion keeps the device alive. */
+   bool submit_quarantined;
    struct agx_bo *rodata;
 
    /* Shared timeline syncobj and value to serialize flushes across contexts */

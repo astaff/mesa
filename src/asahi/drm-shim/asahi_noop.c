@@ -1592,7 +1592,8 @@ asahi_ioctl_submit_unlocked(int fd, unsigned long request, void *arg)
             return -ENOENT;
          }
 
-         if (submit->in_sync_count > 0 && submit->out_sync_count == 2)
+         /* A private publication fence may follow the batch outputs. */
+         if (submit->in_sync_count > 0 && submit->out_sync_count >= 2)
             synchronized_render_submits++;
          const struct asahi_g17p_stream_memory memory = {
             .data = (void *)(intptr_t)fd,

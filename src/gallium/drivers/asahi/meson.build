@@ -151,6 +151,47 @@ if with_tests and with_tools.contains('drm-shim')
       libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
     ],
   )
+  asahi_submit_retirement_test = executable(
+    'asahi-submit-retirement',
+    files('tests/test-agx-submit-retirement.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+  )
+  foreach scenario : [
+    ['split-pending', '0'],
+    ['split-completed', '1'],
+    ['mixed-pending', '2'],
+    ['mixed-completed', '3'],
+    ['first-ioctl-failure', '4'],
+    ['prepublication-no-fence', '5'],
+    ['stale-output-generation', '6'],
+    ['completed-error-fence', '7'],
+    ['first-ioctl-partial', '8'],
+    ['split-wait-error', '9'],
+    ['mixed-wait-error', '10'],
+    ['publication-probe-error', '11'],
+    ['interrupted-wait', '12'],
+  ]
+    test(
+      'asahi-g17p-submit-retirement-' + scenario[0],
+      prog_python,
+      args : [files('tests/run-shim.py'), libasahi_noop_drm_shim,
+              asahi_submit_retirement_test, scenario[1]],
+      env : ['ASAHI_SHIM_CHIP=g17p'],
+      suite : ['asahi'],
+    )
+  endforeach
+
   foreach chip : ['g13g', 'g17p']
     test(
       'asahi-' + chip + '-gallium-submit',

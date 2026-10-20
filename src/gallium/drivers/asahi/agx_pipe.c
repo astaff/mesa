@@ -1769,6 +1769,8 @@ agx_destroy_context(struct pipe_context *pctx)
     * ensure everything is cleaned up properly.
     */
    agx_sync_all(ctx, "destroy context");
+   if (ctx->submit_quarantined)
+      return;
 
    if (pctx->stream_uploader)
       u_upload_destroy(pctx->stream_uploader);
@@ -2512,6 +2514,12 @@ static void
 agx_destroy_screen(struct pipe_screen *pscreen)
 {
    struct agx_screen *screen = agx_screen(pscreen);
+
+   /* Unknown completion cannot be repaired by tearing down userspace owners.
+    * Quarantined contexts retain this screen and its device until exit.
+    */
+   if (p_atomic_read(&screen->submit_quarantined))
+      return;
 
    drmSyncobjDestroy(screen->dev.fd, screen->flush_syncobj);
 

@@ -27,7 +27,7 @@ inspect_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 {
    calls++;
    CHECK(submit->in_sync_count == expected_inputs);
-   CHECK(submit->out_sync_count == 1 || submit->out_sync_count == 2);
+   CHECK(submit->out_sync_count == 1 || submit->out_sync_count == 3);
    const struct drm_asahi_sync *syncs = (void *)(uintptr_t)submit->syncs;
    if (submit->out_sync_count == 1) {
       first_output = syncs[submit->in_sync_count].handle;
@@ -37,6 +37,7 @@ inspect_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
       CHECK(syncs[submit->in_sync_count + 1].sync_type ==
             DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ);
       CHECK(syncs[submit->in_sync_count + 1].timeline_value != 0);
+      CHECK(syncs[submit->in_sync_count + 2].sync_type == DRM_ASAHI_SYNC_SYNCOBJ);
       if (first_output)
          CHECK(syncs[submit->in_sync_count - 1].handle == first_output);
    }
