@@ -2314,6 +2314,22 @@ hk_compile_ray_tracing_stages(
    uint32_t i = 0;
 
    for (; i < create_info->stageCount; i++) {
+      const VkPipelineShaderStageCreateInfo *stage_info =
+         create_info->pStages + i;
+
+      /* VK_EXT_shader_module_identifier: a stage given only by its module
+       * identifier can only come from a pipeline cache, and ray-tracing
+       * pipelines are never retrieved from one here. The application asked
+       * for VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT (it is
+       * required with identifiers), so the answer is that the pipeline must
+       * be compiled; there is no SPIR-V to compile it from.
+       */
+      if (stage_info->module == VK_NULL_HANDLE &&
+          !vk_find_struct_const(stage_info->pNext,
+                                SHADER_MODULE_CREATE_INFO) &&
+          vk_pipeline_shader_stage_has_identifier(stage_info))
+         return VK_PIPELINE_COMPILE_REQUIRED;
+
       nir_shader *nir;
       VkResult result = hk_rt_stage_to_nir(dev, pipeline_flags,
                                            create_info->pNext,
