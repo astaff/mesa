@@ -407,6 +407,29 @@ def api_code(old_query=False):
     return code + API_TESTS
 
 
+def end_to_end_code(revision=None):
+    repair = kernels(revision).replace("int main(", "int repair_probe_main(")
+    api = api_code().replace("int main(", "int api_probe_main(")
+    return repair + api + r'''
+int main(void) {
+ struct hk_device d={0};d.vk.debug_output=stderr;d.vk.check_status=hk_check_status;
+ u_printf_init(&d.dev.printf,NULL,status_words);
+ fail_on_complete=false;transport_result=VK_SUCCESS;completion_abort=&status_words[1];
+ for(uint batch=0;batch<2;batch++) for(uint chip=0;chip<3;chip++) for(uint size=0;size<3;size++) {
+  uchar in[16]={0},storage[128];memset(storage,0xcd,sizeof(storage));
+  struct poly_heap h={storage,16,32};VkDrawIndexedIndirectCommand cmd={64,1,1,0,0};
+  reset_status();d.vk.lost=false;
+  repair(&h,&cmd,in,2*(1u<<size),size,AGX_PRIMITIVE_POINTS,chip,batch);
+  VkResult result=hk_GetFenceStatus(&d,NULL);
+  printf("composed batch=%u chip=%u width=%u output=%u abort=%u VkResult=%d\n",
+   batch,chip,1u<<size,captured.b.count[0],status_words[1],result);fflush(stdout);
+  assert(result==VK_ERROR_DEVICE_LOST && d.vk.lost && h.bottom==16);
+ }
+ puts("PASS 18 actual repair-to-Vulkan-status composition cases");return 0;
+}
+'''
+
+
 def run(output, label, code, expected, args=()):
     cfile, exe = output / (label + ".c"), output / label
     cfile.write_text(code)
@@ -463,6 +486,8 @@ def main():
         ("no-empty-guard-control", None, "no-empty-guard", False),
     ]:
         rows.append(run(args.output, label, kernels(rev, mutation), expected))
+    rows.append(run(args.output, "repair-to-api", end_to_end_code(), True))
+    rows.append(run(args.output, "exact-base-to-api", end_to_end_code(BASE), False))
     rows.append(run(args.output, "api-contract", api_code(), True))
     rows.append(run(args.output, "old-query-control", api_code(True), False))
     for batch in range(2):
