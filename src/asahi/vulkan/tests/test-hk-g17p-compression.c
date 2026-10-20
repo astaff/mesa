@@ -566,6 +566,87 @@ check_m5_color(void)
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
 }
 
+static void
+check_m5_depth_msaa(void)
+{
+   _Static_assert(DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION ==
+                     (UINT64_C(1) << 23), "depth capability allocation");
+   const uint64_t capability = DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
+   const uint64_t feature_sets[] = {0, UINT64_C(1) << 15,
+                                  UINT64_C(1) << 16, capability, UINT64_MAX};
+   const VkFormat formats[] = {VK_FORMAT_D32_SFLOAT,
+                               VK_FORMAT_D32_SFLOAT_S8_UINT};
+   const VkImageUsageFlags uses[] = {
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   };
+   for (unsigned f = 0; f < 2; ++f) {
+      for (unsigned n = 2; n <= 4; n *= 2) {
+         for (unsigned u = 0; u < 3; ++u) {
+            VkImageCreateInfo i = image(formats[f], 3024, 1964, 1, uses[u]);
+            i.samples = n;
+            for (unsigned c = 0; c < 5; ++c) {
+               for (unsigned options = 0; options < 4; ++options) {
+                  const bool primary = options & 1, transfer = options & 2;
+                  const bool capable = (feature_sets[c] & capability) != 0;
+                  CHECK(hk_m5_depth_msaa_compression_eligible(
+                           AGX_CHIP_G17S, 0, &i, feature_sets[c], primary) ==
+                        (capable && primary && u < 2));
+                  CHECK(hk_m5_depth_msaa_transfer_eligible(
+                           AGX_CHIP_G17S, 0, &i, feature_sets[c], primary,
+                           transfer) == (capable && primary && transfer && u == 2));
+               }
+            }
+         }
+      }
+   }
+
+   VkImageCreateInfo base = image(VK_FORMAT_D32_SFLOAT_S8_UINT, 17, 19, 1,
+                                 uses[2]);
+   base.samples = VK_SAMPLE_COUNT_4_BIT;
+   for (unsigned bad = 0; bad < 15; ++bad) {
+      VkImageCreateInfo i = base;
+      unsigned plane = 0;
+      switch (bad) {
+      case 0: i.samples = VK_SAMPLE_COUNT_1_BIT; break;
+      case 1: i.samples = VK_SAMPLE_COUNT_8_BIT; break;
+      case 2: i.format = VK_FORMAT_D16_UNORM; break;
+      case 3: i.extent.width = 15; break;
+      case 4: i.extent.height = 15; break;
+      case 5: i.extent.depth = 2; break;
+      case 6: i.arrayLayers = 2; break;
+      case 7: i.mipLevels = 2; break;
+      case 8: i.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; break;
+      case 9: i.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; break;
+      case 10: i.usage |= VK_IMAGE_USAGE_STORAGE_BIT; break;
+      case 11: i.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT; break;
+      case 12: i.tiling = VK_IMAGE_TILING_LINEAR; break;
+      case 13: i.imageType = VK_IMAGE_TYPE_3D; break;
+      case 14: plane = 1; break;
+      }
+      CHECK(!hk_m5_depth_msaa_compression_eligible(AGX_CHIP_G17S, plane,
+                                                 &i, capability, true));
+      CHECK(!hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, plane, &i,
+                                              capability, true, true));
+   }
+   VkImageStencilUsageCreateInfo stencil = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO,
+      .stencilUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   };
+   base.pNext = &stencil;
+   CHECK(hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, 0, &base,
+                                           capability, true, true));
+   stencil.stencilUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+   CHECK(!hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, 0, &base,
+                                            capability, true, true));
+   CHECK(!hk_m5_depth_msaa_transfer_eligible(AGX_CHIP_G17S, 0, NULL,
+                                            capability, true, true));
+}
+
 int
 main(void)
 {
@@ -582,6 +663,7 @@ main(void)
    check_shared();
    check_m5_depth();
    check_m5_color();
+   check_m5_depth_msaa();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }

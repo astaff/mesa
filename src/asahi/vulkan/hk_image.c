@@ -36,6 +36,12 @@
  */
 #define HK_SPARSE_ALIGN_B 65536
 
+DEBUG_GET_ONCE_BOOL_OPTION(m5_depth_msaa_transfer,
+                          "ASAHI_M5_DEPTH_MSAA_TRANSFER", true)
+
+DEBUG_GET_ONCE_BOOL_OPTION(m5_depth_msaa_compression,
+                          "ASAHI_M5_DEPTH_MSAA_COMPRESSION", true)
+
 static VkFormatFeatureFlags2
 hk_get_image_plane_format_features(struct hk_physical_device *pdev,
                                    VkFormat vk_format, VkImageTiling tiling)
@@ -1189,6 +1195,13 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
     * AGX3 chips stay plain until their packets are recovered. */
    const bool m5_storage = hk_m5_storage_compression_eligible(dev, plane, info);
    bool allow_agx3 =
+      hk_m5_depth_msaa_compression_eligible(
+         dev->chip, plane, info, dev->params.features,
+         debug_get_option_m5_depth_msaa_compression()) ||
+      hk_m5_depth_msaa_transfer_eligible(
+         dev->chip, plane, info, dev->params.features,
+         debug_get_option_m5_depth_msaa_compression(),
+         debug_get_option_m5_depth_msaa_transfer()) ||
       m5_storage || hk_g17p_compression_eligible(dev->chip, plane, info) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||

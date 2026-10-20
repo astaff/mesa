@@ -4,6 +4,7 @@
  */
 #pragma once
 #include "asahi/lib/agx_chip.h"
+#include "drm-uapi/asahi_drm.h"
 #include "vulkan/vulkan_core.h"
 #include <stdbool.h>
 #include <string.h>
@@ -388,4 +389,69 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
           !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
           info->extent.height >= 16 &&
           hk_g17p_compression_depth_format(info->format);
+}
+
+/* Stage-one experiment: native ZLS plus texture reads, no PBE destination.
+ * The capability is advertised only by an explicitly enabled private kernel.
+ * Transfer/image-copy and additional image semantics require separate gates.
+ */
+static inline bool
+hk_m5_depth_msaa_compression_eligible(enum agx_chip chip, unsigned plane,
+                                     const VkImageCreateInfo *info,
+                                     uint64_t kernel_features, bool opted_in)
+{
+   const uint64_t capability = DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+   return opted_in && (kernel_features & capability) &&
+          agx_chip_g17_m5(chip) && plane == 0 && info && !info->pNext &&
+          info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
+          info->arrayLayers == 1 && info->mipLevels == 1 &&
+          (info->samples == VK_SAMPLE_COUNT_2_BIT ||
+           info->samples == VK_SAMPLE_COUNT_4_BIT) &&
+          info->tiling == VK_IMAGE_TILING_OPTIMAL && info->flags == 0 &&
+          (info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+          !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
+          info->extent.height >= 16 &&
+          (info->format == VK_FORMAT_D32_SFLOAT ||
+           info->format == VK_FORMAT_D32_SFLOAT_S8_UINT);
+}
+
+/* Private transfer qualification: preserve the stage-one shape and capability
+ * checks while admitting only the complete DS/sampled/transfer usage set.
+ * Stencil stays plain; its sole permitted extension excludes sampled usage.
+ */
+static inline bool
+hk_m5_depth_msaa_transfer_eligible(enum agx_chip chip, unsigned plane,
+                                  const VkImageCreateInfo *info,
+                                  uint64_t kernel_features,
+                                  bool compression_opted_in,
+                                  bool transfer_opted_in)
+{
+   const VkImageUsageFlags usage =
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   if (!compression_opted_in || !transfer_opted_in || !info ||
+       info->usage != usage)
+      return false;
+
+   if (info->pNext) {
+      VkBaseInStructure extension;
+      memcpy(&extension, info->pNext, sizeof(extension));
+      if (info->format != VK_FORMAT_D32_SFLOAT_S8_UINT ||
+          extension.sType != VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO ||
+          extension.pNext)
+         return false;
+      VkImageStencilUsageCreateInfo stencil;
+      memcpy(&stencil, info->pNext, sizeof(stencil));
+      if (stencil.stencilUsage != (usage & ~VK_IMAGE_USAGE_SAMPLED_BIT))
+         return false;
+   }
+
+   VkImageCreateInfo base = *info;
+   base.pNext = NULL;
+   base.usage &= ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                   VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   return hk_m5_depth_msaa_compression_eligible(
+      chip, plane, &base, kernel_features, compression_opted_in);
 }

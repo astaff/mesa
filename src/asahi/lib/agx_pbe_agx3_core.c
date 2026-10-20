@@ -301,9 +301,16 @@ agx_pbe_agx3_2d_multisample_pack(
     * complete packets ground both generations here, and the native 8x packet
     * grounds Gen10's selector 2. Tile profiles are qualified independently.
     */
+   /* Raw 32-bit copy destinations only. Broader compressed MSAA format
+    * admission needs its own constructor and hardware qualification. */
+   const bool compressed_r32_uint = fields &&
+      generation == AGX_PBE_AGX3_GENERATION_10 &&
+      fields->layout == AGX_PBE_LAYOUT_GPU &&
+      fields->channels == 0x21 /* R32 */ && fields->type == 2 /* UINT */ &&
+      !fields->srgb && (samples == 2 || samples == 4);
    if ((generation != AGX_PBE_AGX3_GENERATION_9 &&
         generation != AGX_PBE_AGX3_GENERATION_10) || !fields ||
-       fields->compressed ||
+       (fields->compressed && !compressed_r32_uint) ||
        (samples != 2 && samples != 4 &&
         !(generation == AGX_PBE_AGX3_GENERATION_10 && samples == 8)) ||
        fields->layout == AGX_PBE_LAYOUT_LINEAR ||
