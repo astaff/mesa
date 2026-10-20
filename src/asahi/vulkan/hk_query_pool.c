@@ -730,6 +730,28 @@ hk_ensure_occlusion_query(struct hk_device *dev, struct hk_query_pool *pool,
    return VK_SUCCESS;
 }
 
+bool
+hk_ensure_occlusion_query_for_draw(struct hk_cmd_buffer *cmd)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_query_pool *pool = gfx->occlusion.pending_pool;
+   if (!pool || gfx->occlusion.mode == AGX_VISIBILITY_MODE_NONE)
+      return true;
+
+   uint32_t query = gfx->occlusion.pending_query;
+   VkResult result =
+      hk_ensure_occlusion_query(hk_cmd_buffer_device(cmd), pool, query);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return false;
+   }
+
+   gfx->occlusion.index = hk_pool_oq_index_ptr(pool)[query];
+   gfx->occlusion.pending_pool = NULL;
+   gfx->dirty |= HK_DIRTY_OCCLUSION;
+   return true;
+}
+
 static void
 hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                        uint32_t query, uint32_t index,
@@ -741,10 +763,20 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_OCCLUSION: {
       assert(query < pool->oq_queries);
-      VkResult result = hk_ensure_occlusion_query(dev, pool, query);
-      if (result != VK_SUCCESS) {
-         vk_command_buffer_set_error(&cmd->vk, result);
-         return;
+      if (agx_chip_g17_m5(dev->dev.chip)) {
+         /* A reset precedes each legal query use and zeros any assigned
+          * counter at execution time. An empty Begin/End pair therefore
+          * only needs to publish availability, without reserving a counter. */
+         cmd->state.gfx.occlusion.pending_pool = end ? NULL : pool;
+         cmd->state.gfx.occlusion.pending_query = query;
+      } else {
+         VkResult result = hk_ensure_occlusion_query(dev, pool, query);
+         if (result != VK_SUCCESS) {
+            vk_command_buffer_set_error(&cmd->vk, result);
+            return;
+         }
+         uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
+         cmd->state.gfx.occlusion.index = oq_index[query];
       }
 
       if (end) {
@@ -755,8 +787,6 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                                             : AGX_VISIBILITY_MODE_BOOLEAN;
       }
 
-      uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
-      cmd->state.gfx.occlusion.index = oq_index[query];
       cmd->state.gfx.dirty |= HK_DIRTY_OCCLUSION;
       graphics = true;
       break;

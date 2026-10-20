@@ -344,6 +344,8 @@ hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
           sizeof(prims_generated_query));
    const enum agx_visibility_mode occlusion_mode = gfx->occlusion.mode;
    const uint16_t occlusion_index = gfx->occlusion.index;
+   struct hk_query_pool *occlusion_pending_pool = gfx->occlusion.pending_pool;
+   const uint32_t occlusion_pending_query = gfx->occlusion.pending_query;
 
    memset(gfx, 0, sizeof(*gfx));
    gfx->render = render_save;
@@ -356,6 +358,8 @@ hk_cmd_invalidate_graphics_state(struct hk_cmd_buffer *cmd)
           sizeof(prims_generated_query));
    gfx->occlusion.mode = occlusion_mode;
    gfx->occlusion.index = occlusion_index;
+   gfx->occlusion.pending_pool = occlusion_pending_pool;
+   gfx->occlusion.pending_query = occlusion_pending_query;
 
    /* Every bound stage is gone, so vk_graphics_pipeline_cmd_bind() must not
     * elide the application's rebind of the pipeline it last saw (often the
@@ -10674,6 +10678,10 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return NULL;
    }
+
+   if (unlikely(gfx->occlusion.pending_pool) &&
+       !hk_ensure_occlusion_query_for_draw(cmd))
+      return NULL;
 
    /* An ordered render continuation (hk_m5_pass_merge_begin()) ends before a
     * draw that could break its memory equivalence; the draw goes to a

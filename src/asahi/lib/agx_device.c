@@ -1242,8 +1242,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    /* Keep captured addresses unavailable to ordinary allocations between
     * capture and replay. Reserve after all fixed firmware/alias holes, and
-    * only for G17P using the common allocator; other winsyses own their VA. */
-   if (agx_chip_native_agx3(dev->chip)) {
+    * for native AGX3 and M5 using the common allocator; other winsyses own their VA. */
+   if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip)) {
       dev->replay_heap_initialized = agx_capture_replay_heap_init(
          &dev->main_heap, &dev->replay_heap, user_size);
       if (!dev->replay_heap_initialized) {

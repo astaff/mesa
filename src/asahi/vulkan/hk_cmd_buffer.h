@@ -785,6 +785,11 @@ struct hk_graphics_state {
        * There can only be one active at a time (hardware contraint).
        */
       uint16_t index;
+
+      /* On M5, an empty query needs only its logical availability word.
+       * Assign its physical counter when the first draw needs it. */
+      struct hk_query_pool *pending_pool;
+      uint32_t pending_query;
    } occlusion;
 
    /* Fast linked shader data structures */
@@ -2410,6 +2415,7 @@ uint64_t hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd,
 
 void hk_queue_write(struct hk_cmd_buffer *cmd, uint64_t address, uint32_t value,
                     bool after_gfx);
+bool hk_ensure_occlusion_query_for_draw(struct hk_cmd_buffer *cmd);
 
 /* Dispatch the native G17P raw-address fill meta shader into an explicitly
  * selected compute stream.  The target may be the ordinary or post-graphics
