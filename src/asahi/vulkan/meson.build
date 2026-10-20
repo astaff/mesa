@@ -1,6 +1,8 @@
 # Copyright © 2022 Collabora Ltd. and Red Hat Inc.
 # SPDX-License-Identifier: MIT
 hk_files = files(
+  'hk_barrier.c',
+  'hk_barrier.h',
   'hk_acceleration_structure.c',
   'hk_acceleration_structure.h',
   'hk_buffer.c',
@@ -110,6 +112,16 @@ hk_drirc = custom_target(
 )
 
 if with_tests
+  test(
+    'hk_barrier',
+    executable(
+      'hk_barrier_test',
+      files('tests/test-hk-barrier.c', 'hk_barrier.c'),
+      include_directories : [include_directories('.'), inc_include],
+    ),
+    suite : ['asahi'],
+  )
+
   # Unused recording functions require section garbage collection so the
   # test can link the production resolver without the rest of the driver.
   if ld_args_gc_sections.length() > 0

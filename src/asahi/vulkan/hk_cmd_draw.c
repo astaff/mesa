@@ -2732,6 +2732,9 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       cmd, pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT);
 
    render->flags = pRenderingInfo->flags;
+   /* The preceding suspended instance may have written storage memory. */
+   render->barrier_shader_writes =
+      (pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT) != 0;
    render->area = pRenderingInfo->renderArea;
    render->view_mask = pRenderingInfo->viewMask;
    render->layer_count = pRenderingInfo->layerCount;
@@ -8846,6 +8849,8 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    hk_flush_dynamic_state(cmd, cs, draw_id, *draw,
                           ordinary_draw_path || g17p_transformed_path,
                           g17p_native_bind_tail_emitted);
+   cmd->state.gfx.render.barrier_shader_writes |=
+      gfx->shaders_write_memory || gfx->xfb_enabled;
    return cs;
 }
 

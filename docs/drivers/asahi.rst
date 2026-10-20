@@ -3,6 +3,11 @@ Asahi
 
 The Asahi driver aims to provide an OpenGL implementation for the Apple M1.
 
+.. toctree::
+   :maxdepth: 1
+
+   asahi-barriers
+
 Wrap (macOS only)
 -----------------
 

@@ -30,6 +30,7 @@
 #include "asahi/lib/agx_va_runtime_hole.h"
 
 #include "hk_private.h"
+#include "hk_barrier.h"
 #include "hk_conditional_render_core.h"
 #include "hk_shader.h"
 #include "hk_sync.h"
@@ -377,6 +378,10 @@ struct hk_render_registers {
 
 struct hk_rendering_state {
    VkRenderingFlagBits flags;
+
+   /* May have written storage memory/XFB anywhere in this API pass, including
+    * before a physical render split. Used only for conservative barriers. */
+   bool barrier_shader_writes;
 
    VkRect2D area;
    uint32_t layer_count;
@@ -1191,6 +1196,13 @@ struct hk_cmd_buffer {
        * m5_ordered) and a command recorded since may read the instance's
        * attachments through memory; the next draw ends the stream first. */
       bool m5_ordered_split;
+
+      /* Per recording; reported at submission so reused command buffers are
+       * counted each time. Reasons overlap, total counts physical splits. */
+      struct {
+         uint64_t kept, splits;
+         uint64_t reason[HK_BARRIER_SPLIT_COUNT];
+      } barrier_stats;
    } state;
 
    struct {
@@ -1809,7 +1821,8 @@ hk_cmd_buffer_end_compute(struct hk_cmd_buffer *cmd)
  * graphics finalization (for example, a native background clear). */
 bool hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd);
 
-static void
+/* Return whether a physical render was finalized (empty renders can vanish). */
+static bool
 hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.gfx;
@@ -1854,6 +1867,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
     * to queue a free for it again.
     */
    cmd->uses_heap = false;
+   return cs != NULL;
 }
 
 static inline uint64_t

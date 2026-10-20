@@ -522,7 +522,19 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* The recorded requirement for this kind of work. A render's vertex half
     * needs only the part whose destination is not fragment-only. */
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   req_for_kinds(cmd, cs->sync.kind, dep);
+   /* Software vertex work is outside an in-pass fragment-only destination.
+    * Waiting on the current render here would create a cycle after a kept
+    * local barrier. Preserve global requirements, though: internal producers
+    * such as attachment decompression must still follow external writes. */
+   if (compute && slot == &cmd->current_cs.pre_gfx) {
+      req_for_kinds_ta(cmd, cs->sync.kind, dep);
+      u_foreach_bit(k, full_kinds(cs->sync.kind)) {
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+            dep_max(&dep[sq], &st->req[k][sq]);
+      }
+   } else {
+      req_for_kinds(cmd, cs->sync.kind, dep);
+   }
    if (!compute) {
       struct hk_sync_dep ta[HK_SYNC_NUM_SQ];
       req_for_kinds_ta(cmd, cs->sync.kind, ta);

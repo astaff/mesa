@@ -845,28 +845,53 @@ hk_dependency_has_host_read(const VkDependencyInfo *info)
    return false;
 }
 
-/* Whether any barrier in the dependency makes writes visible to later reads.
- * An execution-only dependency (both access masks zero) inside a render pass
- * instance needs no tile store. */
-static bool
-hk_dependency_has_memory_scope(const VkDependencyInfo *info)
+/* Images are compared as whole resources. Subresource-disjoint barriers may
+ * still split, and aliasable/sparse attachments disable the unwritten-image
+ * proof. Never infer disjointness from different Vulkan handles alone.
+ */
+static uint32_t
+hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
 {
-   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
-      if (info->pMemoryBarriers[i].dstAccessMask)
-         return true;
-   }
+   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   VkImage images[HK_MAX_RTS + 2];
+   struct hk_barrier_state state = {
+      .shader_writes = render->barrier_shader_writes,
+      .pre_graphics = cmd->current_cs.pre_gfx != NULL,
+      .post_graphics = cmd->current_cs.post_gfx != NULL,
+      .tilebuffer_spilled = agx_tilebuffer_spills(&render->tilebuffer),
+      .attachments = images,
+   };
+   const struct hk_attachment *attachments[HK_MAX_RTS + 2];
+   unsigned count = 0;
+   for (unsigned i = 0; i < render->color_att_count; ++i)
+      attachments[count++] = &render->color_att[i];
+   attachments[count++] = &render->depth_att;
+   attachments[count++] = &render->stencil_att;
 
-   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
-      if (info->pBufferMemoryBarriers[i].dstAccessMask)
-         return true;
+   bool aliases = false;
+   for (unsigned i = 0; i < count; ++i) {
+      if (!attachments[i]->iview)
+         continue;
+      struct vk_image *image = attachments[i]->iview->vk.image;
+      aliases |= hk_barrier_image_may_alias(
+         image->create_flags, image->tiling, image->external_handle_types);
+      const VkImageAspectFlags aspect =
+         i < render->color_att_count ? VK_IMAGE_ASPECT_COLOR_BIT :
+         i == render->color_att_count ? VK_IMAGE_ASPECT_DEPTH_BIT :
+                                       VK_IMAGE_ASPECT_STENCIL_BIT;
+      if (!hk_barrier_attachment_may_write(
+             attachments[i]->layout, aspect,
+             attachments[i]->clear ? VK_ATTACHMENT_LOAD_OP_CLEAR :
+                                      attachments[i]->load_op,
+             attachments[i]->resolve_mode))
+         continue;
+      /* Do not mark a shared image client_visible while recording in parallel. */
+      images[state.attachment_count++] =
+         (VkImage)(uintptr_t)vk_object_to_u64_handle(&image->base);
    }
+   state.attachments_alias = state.attachment_count && aliases;
 
-   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
-      if (info->pImageMemoryBarriers[i].dstAccessMask)
-         return true;
-   }
-
-   return false;
+   return hk_barrier_classify(info, &state);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -891,28 +916,24 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
        hk_dependency_has_host_read(pDependencyInfo))
       hk_flush_deferred_clears(cmd);
 
-   /* Inside a render pass instance both scopes are limited to that instance
-    * (Vulkan 1.3, 7.6.1: "If vkCmdPipelineBarrier2 is called inside a render
-    * pass instance, the first synchronization scope includes only commands
-    * that occur earlier in submission order within the same subpass" and
-    * likewise for the second). Nothing after the pass learns anything from
-    * it, but software graphics stages on CDM must observe it within the pass.
-    * Input attachments are
-    * lowered to texture loads (nir_lower_input_attachments in hk_shader.c),
-    * so a dependency with a memory scope needs the tile buffer stored and
-    * reloaded, which is a render split. The continuation stream then waits
-    * on the stream it continues, see hk_sync_stream_created. */
+   /* In-pass dependencies stay scoped to the API pass, even when its
+    * physical render must end. Keep local attachment operations in tile
+    * memory; descriptor/input-attachment reads still require a store because
+    * the compiler lowers them to texture fetches. Software vertex work needs
+    * a boundary only when the destination scope can name it.
+    */
    if (cmd->sync.in_pass) {
       uint8_t src_kinds, dst_kinds;
       hk_sync_dependency_kinds(pDependencyInfo, &src_kinds, &dst_kinds);
-      /* Software stages cannot cross an in-pass execution dependency by
-       * extending a stream positioned before its source render. End that
-       * stream too, even if the barrier has no memory access masks. */
-      const bool software_stages = src_kinds && dst_kinds &&
-         (cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx);
-      if ((hk_dependency_has_memory_scope(pDependencyInfo) || software_stages) &&
-          cmd->current_cs.gfx) {
-         hk_cmd_buffer_end_graphics(cmd);
+      const uint32_t reasons = hk_classify_pass_barrier(cmd, pDependencyInfo);
+      if (reasons) {
+         if (hk_cmd_buffer_end_graphics(cmd)) {
+            cmd->state.barrier_stats.splits++;
+            u_foreach_bit(r, reasons)
+               cmd->state.barrier_stats.reason[r]++;
+         }
+      } else if (cmd->current_cs.gfx) {
+         cmd->state.barrier_stats.kept++;
       }
       /* Ending an empty render can replace its clear with a CDM job. Capture
        * the first scope only after that replacement has its physical stream. */

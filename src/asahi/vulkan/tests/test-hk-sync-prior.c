@@ -271,7 +271,12 @@ add_slot(struct hk_cmd_buffer *cmd, struct hk_cs **slot, bool compute)
 {
    struct hk_cs *cs = test_alloc(sizeof(*cs));
    cs->type = compute ? HK_CS_CDM : HK_CS_VDM;
-   list_addtail(&cs->node, &cmd->control_streams);
+   /* Match the real allocator when software work is introduced after the
+    * consuming render has already been opened. */
+   if (slot == &cmd->current_cs.pre_gfx && cmd->current_cs.gfx)
+      list_addtail(&cs->node, &cmd->current_cs.gfx->node);
+   else
+      list_addtail(&cs->node, &cmd->control_streams);
    *slot = cs;
    hk_sync_stream_created(cmd, cs, slot, compute);
    return cs;
@@ -280,6 +285,36 @@ add_slot(struct hk_cmd_buffer *cmd, struct hk_cs **slot, bool compute)
 static void
 test_pass_software_graphics_dependencies(void)
 {
+   struct hk_cmd_buffer *local = new_cmd();
+   hk_sync_begin_rendering(local, false);
+   struct hk_cs *render = add_slot(local, &local->current_cs.gfx, false);
+   hk_sync_pass_barrier(local, HK_SYNC_GFX, HK_SYNC_GFX_FRAG);
+   struct hk_cs *pre = add_slot(local, &local->current_cs.pre_gfx, true);
+   T("software vertex work does not wait on fragment-only destination",
+     !pre->sync.dep[HK_SYNC_VDM].cut);
+   T("render still waits on its new pre-graphics producer",
+     render->sync.dep[HK_SYNC_CDM].cut == pre);
+   hk_sync_end_rendering(local);
+   struct hk_queue *local_queue = new_queue(true);
+   T("local barrier and later software draw resolve without cycle",
+     submit(local_queue, local));
+
+   local = new_cmd();
+   struct hk_cs *external = add(local, false);
+   hk_sync_barrier(local, HK_SYNC_GFX, HK_SYNC_GFX_FRAG);
+   hk_sync_begin_rendering(local, false);
+   render = add_slot(local, &local->current_cs.gfx, false);
+   hk_sync_pass_barrier(local, HK_SYNC_GFX, HK_SYNC_GFX_FRAG);
+   pre = add_slot(local, &local->current_cs.pre_gfx, true);
+   T("pre-graphics producer retains external fragment requirements",
+     pre->sync.dep[HK_SYNC_VDM].cut == external);
+   T("local requirement does not replace producer's external source",
+     pre->sync.dep[HK_SYNC_VDM].cut != render);
+   hk_sync_end_rendering(local);
+   local_queue = new_queue(true);
+   T("external and local requirements resolve without cycle",
+     submit(local_queue, local));
+
    struct hk_cmd_buffer *cmd = new_cmd();
    hk_sync_begin_rendering(cmd, false);
    struct hk_cs *first_pre =

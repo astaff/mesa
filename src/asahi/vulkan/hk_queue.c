@@ -1189,6 +1189,17 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
+      if (dev->dev.debug & AGX_DBG_PERF) {
+         perf_debug(cmdbuf, "Barrier renders: kept=%" PRIu64 " splits=%" PRIu64,
+                    cmdbuf->state.barrier_stats.kept,
+                    cmdbuf->state.barrier_stats.splits);
+         for (unsigned r = 0; r < HK_BARRIER_SPLIT_COUNT; ++r) {
+            perf_debug(cmdbuf, "Barrier split reason %s=%" PRIu64,
+                       hk_barrier_split_reason_name(r),
+                       cmdbuf->state.barrier_stats.reason[r]);
+         }
+      }
+
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],
