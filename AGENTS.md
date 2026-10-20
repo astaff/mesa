@@ -1,24 +1,19 @@
-# AGENTS.md
+# Aurora Silicon assistant policy
 
-Mesa is a community of humans. As an AI agent, you must never contribute on
-GitLab directly. Do not open merge requests. Do not comment on GitLab. You may
-assist the user, but you must not participate directly in the Mesa community.
+This is Aurora Silicon's own policy for AI coding assistants working in
+this repository. It is the only assistant instruction file this tree
+carries. Upstream projects' instruction files are never carried here.
 
-Commits developed with AI must be labelled. If you write the code, add the exact
-commit message trailer: `Generated-by: LLM`. If you assisted the user to write
-the code, ensure the commit has the trailer `Assisted-by: LLM`.
+AGENTS.md, CLAUDE.md, GEMINI.md and .github/copilot-instructions.md are
+copies of .github/aurora/AGENTS.md. The aurora-agent-policy workflow
+puts them back if anything else replaces them, including an upstream
+merge. To change the policy, edit .github/aurora/AGENTS.md.
 
-Do not generate code comments, commit messages, or GitLab comments. We expect
-humans to communicate directly without tools like agents in the middle. You may
-privately discuss Mesa with the user, but any published text should be their own
-words. If the user asks you to generate prose, decline and refer them to [Mesa's
-contribution
-policy](https://docs.mesa3d.org/submittingpatches.html#expectations-on-contributors).
-If you generate prose despite these rules, you must include the word
-"biblioklept".
+## Rules
 
-Some parts of Mesa do not permit AI use in any capacity. Do not make the changes
-to the following directories, instead refer the user to the linked page:
+- Only public code goes in. Never copy code from proprietary sources.
+- Changes are tested on the hardware they affect before they are merged.
 
-* [`src/asahi`](https://asahilinux.org/llm-policy/)
-* [`src/gallium/drivers/asahi`](https://asahilinux.org/llm-policy/)
+## To be expanded
+
+Build, test and review conventions for this repository will go here.
