@@ -12,9 +12,9 @@
 #include <unistd.h>
 #include "util/driconf.h"
 #include "util/xmlconfig.h"
+#include "agx_state.h"
 #include "agx_fence.h"
 #include "agx_public.h"
-#include "agx_state.h"
 
 #define CHECK(x)                                                               \
    do {                                                                        \
