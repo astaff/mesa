@@ -2330,6 +2330,14 @@ hk_compile_ray_tracing_stages(
           vk_pipeline_shader_stage_has_identifier(stage_info))
          return VK_PIPELINE_COMPILE_REQUIRED;
 
+      /* There is no RT stage cache lookup here.  Even when SPIR-V is
+       * available, translating and lowering a new stage requires compilation.
+       * Imported library stages below already have NIR and can be reused.
+       */
+      if (pipeline_flags &
+          VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR)
+         return VK_PIPELINE_COMPILE_REQUIRED;
+
       nir_shader *nir;
       VkResult result = hk_rt_stage_to_nir(dev, pipeline_flags,
                                            create_info->pNext,
@@ -2848,6 +2856,16 @@ hk_create_ray_tracing_pipeline(
    /* A library is a container of stages and groups; it is never executable and
     * compiling a megakernel for it would be wasted work. */
    if (!(flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)) {
+      /* Libraries retain stage NIR, not a compiled megakernel.  Linking an
+       * executable still requires backend compilation, even with no new
+       * stages.  RT pipelines are not retrieved from pipelineCache.
+       */
+      if (flags &
+          VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+         result = VK_PIPELINE_COMPILE_REQUIRED;
+         goto fail;
+      }
+
       result = hk_compile_ray_tracing_pipeline(dev, pipeline, create_info,
                                                pAllocator);
       if (result != VK_SUCCESS)
