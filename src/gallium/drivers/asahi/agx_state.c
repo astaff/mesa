@@ -8362,31 +8362,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
             &batch->pool, ctx->poly_stipple, sizeof(ctx->poly_stipple), 4);
       }
 
-      const struct agx_draw_uniforms *old_root = batch->uploaded_uniforms;
-      agx_upload_uniforms(batch);
-
-      /* Keep the old immutable upload for unchanged vertex inputs, including
-       * fragment-only root updates. The unconditional native VS update used
-       * to cover root inputs not represented by VS dirty bits. Compare the
-       * ranges actually consumed by the hardware VS so query/statistic and
-       * indirect table pointer changes cannot leave it reading stale data. */
-      if (agx_native_graphics(agx_device(pctx->screen)) && !IS_DIRTY(VS) &&
-          old_root) {
-         struct agx_compiled_shader *hw_vs = ctx->gs ? ctx->gs->gs_copy : ctx->vs;
-         for (unsigned i = 0; i < hw_vs->push_range_count; ++i) {
-            const struct agx_push_range *push = &hw_vs->push[i];
-            if (push->table != AGX_SYSVAL_TABLE_ROOT)
-               continue;
-
-            assert((size_t)push->offset + push->length * 2 <= sizeof(*old_root));
-            if (memcmp((const uint8_t *)old_root + push->offset,
-                       (const uint8_t *)batch->uploaded_uniforms + push->offset,
-                       push->length * 2) != 0) {
-               ctx->dirty |= AGX_DIRTY_VS;
-               break;
-            }
-         }
-      }
+      agx_upload_uniforms(batch, ctx->gs ? ctx->gs->gs_copy : ctx->vs);
    }
 
    struct pipe_draw_info info_gs;
@@ -8655,7 +8631,7 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
    }
 
    agx_update_descriptors(batch, cs);
-   agx_upload_uniforms(batch);
+   agx_upload_uniforms(batch, NULL);
 
    struct agx_device *dev = agx_device(ctx->base.screen);
    if (agx_native_graphics(dev)) {

@@ -471,8 +471,9 @@ struct agx_batch {
 
    struct agx_draw_uniforms uniforms;
 
-   /* Last immutable root upload, owned by this batch's pool. */
-   const struct agx_draw_uniforms *uploaded_uniforms;
+   /* CPU snapshot: never read back the write-combined GPU root upload. */
+   struct agx_draw_uniforms vs_root;
+   bool vs_root_valid;
    struct agx_stage_uniforms stage_uniforms[MESA_SHADER_STAGES];
 
    /* Heap descriptor if dynamic allocation is required */
@@ -1099,7 +1100,8 @@ agx_transfer(struct pipe_transfer *p)
 }
 
 void agx_upload_vbos(struct agx_batch *batch);
-void agx_upload_uniforms(struct agx_batch *batch);
+void agx_upload_uniforms(struct agx_batch *batch,
+                         struct agx_compiled_shader *hw_vs);
 
 void agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage);
 

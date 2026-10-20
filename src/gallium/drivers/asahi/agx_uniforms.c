@@ -57,7 +57,8 @@ agx_upload_vbos(struct agx_batch *batch)
 }
 
 void
-agx_upload_uniforms(struct agx_batch *batch)
+agx_upload_uniforms(struct agx_batch *batch,
+                    struct agx_compiled_shader *hw_vs)
 {
    struct agx_context *ctx = batch->ctx;
 
@@ -76,8 +77,34 @@ agx_upload_uniforms(struct agx_batch *batch)
          ? ctx->rast->base.sprite_coord_enable
          : 0;
 
+   if (hw_vs && agx_native_graphics(agx_device(ctx->base.screen))) {
+      /* Keep the old immutable upload for unchanged vertex inputs, including
+       * fragment-only root updates. The unconditional native VS update used
+       * to cover root inputs not represented by VS dirty bits. Compare the
+       * ranges actually consumed by the hardware VS so query/statistic and
+       * indirect table pointer changes cannot leave it reading stale data.
+       * Use cached CPU memory: GPU pool mappings are write-combined. */
+      if (!(ctx->dirty & AGX_DIRTY_VS) && batch->vs_root_valid) {
+         for (unsigned i = 0; i < hw_vs->push_range_count; ++i) {
+            const struct agx_push_range *push = &hw_vs->push[i];
+            if (push->table != AGX_SYSVAL_TABLE_ROOT)
+               continue;
+
+            assert((size_t)push->offset + push->length * 2 <=
+                   sizeof(batch->uniforms));
+            if (memcmp((const uint8_t *)&batch->vs_root + push->offset,
+                       (const uint8_t *)&batch->uniforms + push->offset,
+                       push->length * 2) != 0) {
+               ctx->dirty |= AGX_DIRTY_VS;
+               break;
+            }
+         }
+      }
+      batch->vs_root = batch->uniforms;
+      batch->vs_root_valid = true;
+   }
+
    memcpy(root_ptr.cpu, &batch->uniforms, sizeof(batch->uniforms));
-   batch->uploaded_uniforms = root_ptr.cpu;
 }
 
 void
