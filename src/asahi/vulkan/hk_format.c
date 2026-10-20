@@ -18,10 +18,14 @@
 #include "vk_enum_defines.h"
 #include "vk_format.h"
 
+/* GPU import/export capabilities, not a scanout modifier list.  Display WSI
+ * intersects these with the selected plane's IN_FORMATS; Wayland/X11 use the
+ * modifiers supplied by the compositor/display server.
+ */
 uint64_t agx_best_modifiers[] = {
    DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED,
    DRM_FORMAT_MOD_APPLE_GPU_TILED,
-   DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED,
+   DRM_FORMAT_MOD_APPLE_INTERCHANGE,
    DRM_FORMAT_MOD_LINEAR,
 };
 
@@ -42,7 +46,7 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
 
    /* Interchange: the 32-bit RGBA formats on G17P; never storage or host
     * copies (compressed). */
-   if (mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED) {
+   if (mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
       if (!hk_interchange_format(dev, vk_format))
          return 0;
       return props->optimalTilingFeatures &

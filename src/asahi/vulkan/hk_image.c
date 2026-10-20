@@ -711,7 +711,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
    const bool interchange =
       pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
       drm_mod_info &&
-      drm_mod_info->drmFormatModifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED;
+      drm_mod_info->drmFormatModifier == DRM_FORMAT_MOD_APPLE_INTERCHANGE;
    if (interchange &&
        !hk_interchange_supported(&pdev->dev, pImageFormatInfo->format,
                                  pImageFormatInfo->type, pImageFormatInfo->flags,
@@ -1130,8 +1130,10 @@ modifier_get_score(uint64_t mod)
     * hk_can_compress()), so a compositor's main tranche built from this
     * driver's modifier list is {GPU_TILED, interchange, LINEAR} and must keep
     * choosing GPU_TILED.  Interchange then wins only against LINEAR, i.e. in a
-    * display (scanout) list that cannot take GPU tiling. */
-   case DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED:
+    * display (scanout) list that cannot take GPU tiling.  Such a list must
+    * come from the display plane (IN_FORMATS) or the compositor, never from
+    * the GPU capability list.  A linear-only G17P plane thus stays linear. */
+   case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
       return 3;
 
    case DRM_FORMAT_MOD_APPLE_GPU_TILED:
@@ -1169,7 +1171,7 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
           modifiers[i] == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED)
          continue;
       if (!interchange &&
-          modifiers[i] == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED)
+          modifiers[i] == DRM_FORMAT_MOD_APPLE_INTERCHANGE)
          continue;
 
       uint32_t score = modifier_get_score(modifiers[i]);
@@ -1260,7 +1262,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          mod_explicit_info->drmFormatModifierPlaneCount, image->plane_count);
    }
 
-   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE_COMPRESSED) {
+   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_INTERCHANGE) {
       if (!hk_interchange_create_info(dev, pCreateInfo))
          return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
                           "interchange modifier on an ineligible image");
