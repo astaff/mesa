@@ -1603,6 +1603,15 @@ agx_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
       pctx->screen->fence_reference(pctx->screen, fence, NULL);
       *fence = f;
    }
+
+   if (unlikely(screen->dev.debug & AGX_DBG_PERF)) {
+      perf_debug_ctx(ctx, "Gallium flush: batches=%" PRIu64
+                     " mixed=%" PRIu64 " submits=%" PRIu64
+                     " submit_failures=%" PRIu64 "\n",
+                     ctx->submit_perf.batches, ctx->submit_perf.mixed_batches,
+                     ctx->submit_perf.submits, ctx->submit_perf.failures);
+      memset(&ctx->submit_perf, 0, sizeof(ctx->submit_perf));
+   }
 }
 
 static void

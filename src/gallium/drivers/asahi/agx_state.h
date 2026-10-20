@@ -30,6 +30,7 @@
 #include "util/disk_cache.h"
 #include "util/hash_table.h"
 #include "util/rwlock.h"
+#include "util/set.h"
 #include "util/u_range.h"
 #include "agx_bg_eot.h"
 #include "agx_helpers.h"
@@ -487,12 +488,12 @@ struct agx_batch {
 
    struct agx_sampler_heap sampler_heap;
 
-   /* Resource list requirements, represented as a bit set indexed by BO
-    * handles (GEM handles on Linux, or IOGPU's equivalent on macOS)
+   /* Pointer membership for amortized O(1) insertion, plus a dense BO list
+    * for submission and retirement. Neither allocation depends on GEM handles.
     */
    struct {
-      BITSET_WORD *set;
-      unsigned bit_count;
+      struct set *set;
+      struct util_dynarray list; /* struct agx_bo * */
    } bo_list;
 
    /* If true, this batch contains a shader with a potentially incoherent write
@@ -780,6 +781,11 @@ struct agx_context {
    struct agx_bg_eot_cache bg_eot;
 
    bool any_faults;
+
+   /* Work since the previous Gallium flush, including hazard-driven submits. */
+   struct {
+      uint64_t batches, mixed_batches, submits, failures;
+   } submit_perf;
    struct pipe_device_reset_callback reset;
 
    uint32_t syncobj;
@@ -1139,43 +1145,24 @@ bool agx_nir_lower_g17p_storage_records(nir_shader *shader,
 bool agx_batch_is_active(struct agx_batch *batch);
 bool agx_batch_is_submitted(struct agx_batch *batch);
 
-/* Add a BO to a batch. This needs to be amortized O(1) since it's called in
- * hot paths. To achieve this we model BO lists by bit sets */
-
+/* BO pointers remain stable while the batch holds its reference. */
 static bool
 agx_batch_uses_bo(struct agx_batch *batch, struct agx_bo *bo)
 {
-   if (bo->handle < batch->bo_list.bit_count)
-      return BITSET_TEST(batch->bo_list.set, bo->handle);
-   else
-      return false;
+   return _mesa_set_search(batch->bo_list.set, bo) != NULL;
 }
 
 static inline void
 agx_batch_add_bo_internal(struct agx_batch *batch, struct agx_bo *bo)
 {
-   /* Double the size of the BO list if we run out, this is amortized O(1) */
-   if (unlikely(bo->handle >= batch->bo_list.bit_count)) {
-      const unsigned bits_per_word = sizeof(BITSET_WORD) * 8;
-
-      unsigned bit_count =
-         MAX2(batch->bo_list.bit_count * 2,
-              util_next_power_of_two(ALIGN_POT(bo->handle + 1, bits_per_word)));
-
-      batch->bo_list.set = rerzalloc(
-         batch->ctx, batch->bo_list.set, BITSET_WORD,
-         batch->bo_list.bit_count / bits_per_word, bit_count / bits_per_word);
-      batch->bo_list.bit_count = bit_count;
-   }
-
-   if (BITSET_TEST(batch->bo_list.set, bo->handle))
+   bool found;
+   _mesa_set_search_or_add(batch->bo_list.set, bo, &found);
+   if (found)
       return;
 
-   /* The batch holds a single reference to each BO in the batch, released when
-    * the batch finishes execution.
-    */
+   /* One reference per distinct BO, released when the batch retires. */
+   util_dynarray_append(&batch->bo_list.list, bo);
    agx_bo_reference(bo);
-   BITSET_SET(batch->bo_list.set, bo->handle);
 }
 
 static inline void
@@ -1185,8 +1172,8 @@ agx_batch_add_bo(struct agx_batch *batch, struct agx_bo *bo)
    assert(agx_batch_uses_bo(batch, bo));
 }
 
-#define AGX_BATCH_FOREACH_BO_HANDLE(batch, handle)                             \
-   BITSET_FOREACH_SET(handle, (batch)->bo_list.set, batch->bo_list.bit_count)
+#define AGX_BATCH_FOREACH_BO(batch, entry) \
+   util_dynarray_foreach(&(batch)->bo_list.list, struct agx_bo *, entry)
 
 struct drm_asahi_cmd_compute;
 struct drm_asahi_cmd_render;
