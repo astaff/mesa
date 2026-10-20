@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "hk_nir_lower_gs.h"
 #include "hk_nir_sampler_bias.h"
 #include "hk_gen1_rt_indirect_contract.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
@@ -2019,6 +2020,38 @@ hk_lower_multiview_stage(mesa_shader_stage stage,
    }
 }
 
+/* Select the query ABI from the stage that will execute the query. */
+static struct agx_gen1_ray_query_layout
+hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
+                         VkShaderStageFlags next_stage_mask)
+{
+   return (struct agx_gen1_ray_query_layout){
+      .payload_uniform = dev->gen1_rq_candidates ? 118 : 124,
+      .bvh_uniform = 96,
+      .status_uniform = dev->gen1_rq_candidates ? 128 :
+                        dev->gen1_rq_instances ? 130 : 128,
+      .instance_traversal = dev->gen1_rq_instances,
+      .candidates = dev->gen1_rq_candidates,
+      .as_table_first = dev->gen1_rq_instances ? HK_GEN1_AS_TABLE_AS_SLOTS : 1,
+      .launch_header = dev->gen1_rq_candidates ? 0x210000 : 0x110000,
+      .context_uniform = 160,
+      .as_table_uniform = 164,
+      .fragment_shader = dev->gen1_native_fragment_rq,
+      .graphics_stage = dev->gen1_native_graphics_rq &&
+         ((nir->info.stage == MESA_SHADER_VERTEX &&
+           !(next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                VK_SHADER_STAGE_GEOMETRY_BIT))) ||
+          (nir->info.stage == MESA_SHADER_TESS_EVAL &&
+           !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT))),
+      .compute_kernel = dev->gen1_native_graphics_rq,
+      .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch &&
+                        dev->gen1_vertex_directory != NULL,
+      .diagnostic_features = dev->vk.enabled_features.rayTracingPositionFetch,
+      .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
+         ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
+   };
+}
+
 static void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -2181,31 +2214,17 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * by the time the traversal reads a node through it, and before shared
     * memory is laid out, because the pass introduces shader temporaries that
     * nir_lower_vars_to_ssa still has to promote. */
-   if (nir->info.ray_queries > 0) {
+   /* Poly replays a GS in a hardware vertex shader. Keep native queries until
+    * that split so the raster variant gets the graphics query ABI and Poly
+    * cannot strip stores introduced by query lowering as API side effects.
+    */
+   if (nir->info.ray_queries > 0 &&
+       !(dev->gen1_native_rq && nir->info.stage == MESA_SHADER_GEOMETRY)) {
       if(dev->gen1_native_rq) {
          NIR_PASS(_, nir, nir_opt_ray_queries);
          NIR_PASS(_, nir, nir_opt_ray_query_ranges);
-         const struct agx_gen1_ray_query_layout layout={
-            .payload_uniform=dev->gen1_rq_candidates ? 118 : 124,.bvh_uniform=96,
-            .status_uniform=dev->gen1_rq_candidates ? 128 : dev->gen1_rq_instances ? 130 : 128,
-            .instance_traversal=dev->gen1_rq_instances,.candidates=dev->gen1_rq_candidates,
-            .as_table_first=dev->gen1_rq_instances ? HK_GEN1_AS_TABLE_AS_SLOTS : 1,
-            .launch_header = dev->gen1_rq_candidates ? 0x210000 : 0x110000,
-            .context_uniform=160,.as_table_uniform=164,
-            .fragment_shader=dev->gen1_native_fragment_rq,
-            .graphics_stage = dev->gen1_native_graphics_rq &&
-               ((nir->info.stage == MESA_SHADER_VERTEX &&
-                 !(next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
-                                      VK_SHADER_STAGE_GEOMETRY_BIT))) ||
-                (nir->info.stage == MESA_SHADER_TESS_EVAL &&
-                 !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT))),
-            .compute_kernel = dev->gen1_native_graphics_rq,
-            .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch &&
-                              dev->gen1_vertex_directory != NULL,
-            .diagnostic_features = dev->vk.enabled_features.rayTracingPositionFetch,
-            .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
-               ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
-         };
+         const struct agx_gen1_ray_query_layout layout =
+            hk_gen1_ray_query_layout(dev, nir, next_stage_mask);
          if(!agx_nir_lower_gen1_ray_query(nir,&layout)) {
             mesa_loge("Gen1 native ray query: unsupported shape or operation");
             return;
@@ -4423,8 +4442,21 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
 
-      NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
-               &count_variant->info.gs);
+      struct agx_gen1_ray_query_layout rq_layout =
+         hk_gen1_ray_query_layout(dev, nir, 0);
+      /* The raster replay is always a hardware vertex shader. */
+      rq_layout.graphics_stage = dev->gen1_native_graphics_rq;
+      if (!hk_nir_lower_gs(nir, &count, &rast, &pre_gs,
+                           &count_variant->info.gs,
+                           dev->gen1_native_rq ? &rq_layout : NULL)) {
+         ralloc_free(nir);
+         ralloc_free(count);
+         ralloc_free(rast);
+         ralloc_free(pre_gs);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "Gen1 native GS ray query lowering failed");
+      }
 
       agx_preprocess_nir(count);
       agx_preprocess_nir(rast);

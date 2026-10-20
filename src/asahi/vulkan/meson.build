@@ -60,6 +60,8 @@ hk_files = files(
   'hk_nir_forward_image_stores.c',
   'hk_nir_forward_image_stores.h',
   'hk_nir_lower_descriptors.c',
+  'hk_nir_lower_gs.c',
+  'hk_nir_lower_gs.h',
   'hk_nir_lower_ray_queries.c',
   'hk_nir_lower_robust_image.c',
   'hk_nir_lower_robust_image.h',
@@ -272,6 +274,19 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'hk_gs_ray_query',
+    executable(
+      'hk_gs_ray_query_test',
+      files('tests/test-hk-gs-ray-query.c', 'hk_nir_lower_gs.c'),
+      include_directories : [include_directories('.'), inc_asahi, inc_poly],
+      dependencies : [idep_nir, idep_mesautil, idep_libpoly],
+      link_with : [libpoly_nir, libasahi_compiler],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
   test(
     'hk_sampler_bias',
     executable(
