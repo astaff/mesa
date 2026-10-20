@@ -884,9 +884,15 @@ struct hk_cs {
     * pass, not a part split off or continued. */
    bool g17p_pass_begins, g17p_pass_ends;
 
+   /* Consecutive GPU query resets share one strong flush, at the first
+    * consumer or the end of the stream. G13 never sets this. */
+   bool query_reset_pending;
+
    /* Statistics */
    struct {
       uint32_t calls, cmds, flushes, merged;
+      uint64_t query_copy_dispatches, query_copy_queries, query_copy_counters;
+      uint64_t query_reset_dispatches, query_reset_queries, query_reset_flushes;
    } stats;
 
    /* Timestamp writes: the start of the command (compute start, render
@@ -1068,6 +1074,13 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    a->stats.cmds += b->stats.cmds;
    a->stats.flushes += b->stats.flushes;
    a->stats.merged++;
+   a->stats.query_copy_dispatches += b->stats.query_copy_dispatches;
+   a->stats.query_copy_queries += b->stats.query_copy_queries;
+   a->stats.query_copy_counters += b->stats.query_copy_counters;
+   a->stats.query_reset_dispatches += b->stats.query_reset_dispatches;
+   a->stats.query_reset_queries += b->stats.query_reset_queries;
+   a->stats.query_reset_flushes += b->stats.query_reset_flushes;
+   assert(!a->query_reset_pending && !b->query_reset_pending);
 }
 
 static inline uint64_t
@@ -1155,6 +1168,9 @@ struct hk_cmd_buffer {
       bool deferred_clear_flushing;
       /* Recording a buffer-only command that does not touch their memory. */
       bool deferred_clear_hold;
+
+      /* Suppress consumption of pending resets while recording another reset. */
+      bool query_reset_recording;
 
       /* AGX3: the last render pass instance stored a whole depth-only image
        * that nothing recorded since may have read. A later instance that
@@ -1644,6 +1660,8 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                         VkRenderingAttachmentInfo *depth,
                         VkRenderingAttachmentInfo *stencil);
 
+void hk_flush_query_resets(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
@@ -1725,6 +1743,9 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    }
 
    assert(*ptr != NULL);
+   if (compute && unlikely((*ptr)->query_reset_pending) &&
+       !cmd->state.query_reset_recording)
+      hk_flush_query_resets(cmd, *ptr);
    return *ptr;
 }
 
@@ -1788,6 +1809,8 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
 {
    if (*ptr) {
       struct hk_cs *cs = *ptr;
+      if (unlikely(cs->query_reset_pending))
+         hk_flush_query_resets(cmd, cs);
 
       /* This control stream may write immediates as it ends. Queue the writes
        * now that we're done emitting everything else.
@@ -2145,9 +2168,6 @@ void hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
  * stream until it reaches value. */
 void hk_g17p_meta_wait_addr(struct hk_cmd_buffer *cmd, uint64_t address,
                             uint32_t value);
-void hk_native_meta_copy_query(struct hk_cmd_buffer *cmd, uint64_t destination,
-                               uint64_t source, uint64_t availability,
-                               VkQueryResultFlags flags);
 
 void agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
                          uint64_t attribs_read, struct agx_velem_key *keys);

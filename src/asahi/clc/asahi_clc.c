@@ -281,6 +281,11 @@ remap_variant(nir_function *func, unsigned variant, const char *target)
 static bool
 target_supports_program(const char *target, const nir_function *func)
 {
+   /* The range copy uses the native query command's producer ordering and
+    * volatile WAIT loop. Never select this program for the AGX2/G13 path. */
+   if (!strcmp(func->name, "libagx_copy_query_g17p"))
+      return target_is_native_agx3(target);
+
    /* AGX3 internal programs need both native machine code and the HAL200
     * Ioto/CDM launch contract. Keep unqualified slots NULL and fail closed.
     * Fast clear is required by the qualified G17P compressed color shapes;

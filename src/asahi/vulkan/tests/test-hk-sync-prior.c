@@ -103,6 +103,15 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+/* This fixture never records query resets. */
+void
+hk_flush_query_resets(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   if (cs->query_reset_pending)
+      abort();
+}
+
 /* Record a real full-frame pass with a sparse-mask preservation footprint.
  * Layer ranges describe BG/EOT's physical access, not just enabled views. */
 static struct hk_cs *

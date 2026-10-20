@@ -1216,6 +1216,18 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                i, cs->stats.calls, cs->stats.cmds, cs->stats.flushes,
                cs->stats.merged);
 
+            if (cs->stats.query_copy_dispatches ||
+                cs->stats.query_reset_dispatches) {
+               perf_debug(
+                  cmdbuf,
+                  "query copy: %" PRIu64 " dispatches, %" PRIu64
+                  " queries, %" PRIu64 " counters; reset: %" PRIu64
+                  " dispatches, %" PRIu64 " queries, %" PRIu64 " flushes",
+                  cs->stats.query_copy_dispatches, cs->stats.query_copy_queries,
+                  cs->stats.query_copy_counters, cs->stats.query_reset_dispatches,
+                  cs->stats.query_reset_queries, cs->stats.query_reset_flushes);
+            }
+
             assert(cs->stats.cmds > 0 || cs->stats.flushes > 0 ||
                    cs->timestamp.end.handle || cs->timestamp.start.handle);
 
