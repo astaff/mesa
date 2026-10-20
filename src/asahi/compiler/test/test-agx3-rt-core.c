@@ -22,7 +22,7 @@ static unsigned failures;
 static unsigned checks;
 
 static void
-expect(const char *what, bool ok, const uint8_t *bytes, uint8_t len,
+expect_result(const char *what, bool ok, const uint8_t *bytes, uint8_t len,
        const char *expected_hex)
 {
    char got[2 * AGX3_RT_CORE_MAX_LENGTH + 1] = {0};
@@ -45,7 +45,7 @@ expect(const char *what, bool ok, const uint8_t *bytes, uint8_t len,
 }
 
 static void
-expect_refused(const char *what, bool ok, const uint8_t *bytes, uint8_t len)
+expect_refused_result(const char *what, bool ok, const uint8_t *bytes, uint8_t len)
 {
    checks++;
    if (ok) {
@@ -66,6 +66,22 @@ expect_refused(const char *what, bool ok, const uint8_t *bytes, uint8_t len)
       failures++;
    }
 }
+
+
+/* Each encoder writes len.  Finish that call before reading len for the
+ * comparison; C does not order function argument evaluation.
+ */
+#define expect(what, encode, bytes, len, expected_hex)                          \
+   do {                                                                       \
+      const bool encoded = (encode);                                          \
+      expect_result((what), encoded, (bytes), (len), (expected_hex));           \
+   } while (0)
+
+#define expect_refused(what, encode, bytes, len)                               \
+   do {                                                                       \
+      const bool encoded = (encode);                                          \
+      expect_refused_result((what), encoded, (bytes), (len));                  \
+   } while (0)
 
 int
 main(void)
