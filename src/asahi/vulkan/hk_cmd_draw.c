@@ -3100,8 +3100,16 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                                       ? util_last_bit(render->view_mask)
                                       : render->layer_count;
       const struct hk_image_view *written[2 * HK_MAX_RTS + 2];
+      bool preserve_loaded_color[2 * HK_MAX_RTS + 2] = {false};
       unsigned nr_written = 0;
       for (uint32_t i = 0; i < render->color_att_count; i++) {
+         /* LOAD preserves samples that later draws may not touch. Keep
+          * their producer even for a whole-tile render area: an earlier
+          * attachment clear may have been lowered to compute. */
+         preserve_loaded_color[nr_written] =
+            dev->dev.chip == AGX_CHIP_G17P &&
+            pRenderingInfo->pColorAttachments[i].loadOp ==
+               VK_ATTACHMENT_LOAD_OP_LOAD;
          written[nr_written++] = render->color_att[i].iview;
          written[nr_written++] = render->color_att[i].resolve_iview;
       }
@@ -3117,8 +3125,9 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
             iview->vk.base_array_layer + MAX2(pass_layers, 1),
             u_minify(iview->vk.image->extent.width, level),
             u_minify(iview->vk.image->extent.height, level), render->area,
-            render->view_mask &&
-               render->view_mask != BITFIELD64_MASK(pass_layers));
+            preserve_loaded_color[i] ||
+               (render->view_mask &&
+                render->view_mask != BITFIELD64_MASK(pass_layers)));
       }
       hk_sync_pass_footprints_done(cmd);
    }
