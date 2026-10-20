@@ -2199,7 +2199,67 @@ hk_ray_tracing_pipeline_get_shader(struct vk_pipeline *vk_pipeline,
    return NULL;
 }
 
-static const struct vk_pipeline_ops hk_ray_tracing_pipeline_ops = {
+/* All RT stages are inlined into a single compute megakernel. Report that
+ * executable once, with the API stages it implements rather than COMPUTE. A
+ * library only retains stage NIR and has no executable to enumerate.
+ */
+static VkResult
+hk_rt_pipeline_get_executable_properties(
+   UNUSED struct vk_device *device, struct vk_pipeline *vk_pipeline,
+   uint32_t *executable_count, VkPipelineExecutablePropertiesKHR *properties)
+{
+   struct hk_ray_tracing_pipeline *pipeline =
+      hk_pipeline_to_ray_tracing(vk_pipeline);
+   VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutablePropertiesKHR, out, properties,
+                         executable_count);
+
+   if (pipeline->shader) {
+      vk_outarray_append_typed(VkPipelineExecutablePropertiesKHR, &out, props) {
+         props->stages = pipeline->base.stages;
+         props->subgroupSize = 32;
+         VK_COPY_STR(props->name, "Ray tracing megakernel");
+         VK_COPY_STR(props->description,
+                     "Ray tracing stages inlined into a compute shader");
+      }
+   }
+
+   return vk_outarray_status(&out);
+}
+
+static VkResult
+hk_rt_pipeline_get_executable_statistics(
+   struct vk_device *device, struct vk_pipeline *vk_pipeline,
+   uint32_t executable_index, uint32_t *statistic_count,
+   VkPipelineExecutableStatisticKHR *statistics)
+{
+   struct hk_ray_tracing_pipeline *pipeline =
+      hk_pipeline_to_ray_tracing(vk_pipeline);
+   assert(pipeline->shader && executable_index == 0);
+   const struct vk_shader *shader = &pipeline->shader->vk;
+
+   return shader->ops->get_executable_statistics(
+      device, shader, 0, statistic_count, statistics);
+}
+
+static VkResult
+hk_rt_pipeline_get_internal_representations(
+   struct vk_device *device, struct vk_pipeline *vk_pipeline,
+   uint32_t executable_index, uint32_t *representation_count,
+   VkPipelineExecutableInternalRepresentationKHR *representations)
+{
+   struct hk_ray_tracing_pipeline *pipeline =
+      hk_pipeline_to_ray_tracing(vk_pipeline);
+   assert(pipeline->shader && executable_index == 0);
+   const struct vk_shader *shader = &pipeline->shader->vk;
+
+   return shader->ops->get_executable_internal_representations(
+      device, shader, 0, representation_count, representations);
+}
+
+const struct vk_pipeline_ops hk_ray_tracing_pipeline_ops = {
+   .get_executable_properties = hk_rt_pipeline_get_executable_properties,
+   .get_executable_statistics = hk_rt_pipeline_get_executable_statistics,
+   .get_internal_representations = hk_rt_pipeline_get_internal_representations,
    .destroy = hk_ray_tracing_pipeline_destroy,
    .cmd_bind = hk_ray_tracing_pipeline_cmd_bind,
    .get_shader = hk_ray_tracing_pipeline_get_shader,

@@ -28,6 +28,8 @@
 #include "vk_pipeline.h"
 #include "vk_pipeline_layout.h"
 
+extern const struct vk_pipeline_ops hk_ray_tracing_pipeline_ops;
+
 struct hk_api_shader;
 struct hk_device;
 struct nir_shader;

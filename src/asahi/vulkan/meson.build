@@ -343,6 +343,21 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test(
+    'hk_rt_pipeline_executable',
+    executable(
+      'hk_rt_pipeline_executable_test',
+      files('tests/test-hk-rt-pipeline-executable.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux,
+        inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      link_with : [libhk],
+      dependencies : [hk_deps],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
 endif
 
 libvulkan_asahi = shared_library(
