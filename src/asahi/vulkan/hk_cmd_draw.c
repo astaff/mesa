@@ -3360,10 +3360,15 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    void *const resume_current = cs ? cs->current : NULL;
    void *const end_before = cs ? cs->end : NULL;
 
+   /* An in-pass barrier may have closed the final stream already. Elide
+    * untouched planes from the whole pass even then: NONE/NONE attachments
+    * must not retain a forced store of uninitialized tile contents.
+    */
+   const bool zls_elided = hk_g17p_zls_elide(cmd);
+
    if (cs) {
       cs->cr.eot.main = render->cr.eot.main;
       cs->g17p_pass_ends = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
-      const bool zls_elided = hk_g17p_zls_elide(cmd);
 
       /* Precise depth store: see hk_pack_zls_control_final(). A
        * suspended pass continues in a later command buffer, which reloads
