@@ -386,11 +386,17 @@ snapshot; a consumed root-table pointer moving still requires an update.
 Geometry copy and tessellation evaluation programs use this same hardware
 vertex path.
 
-CPU query reads with ``wait=false`` poll only submitted writers. An active or
-unsignaled writer returns not-ready without submitting work or changing the
-result. Completed writers are retired, including CPU timestamp bookkeeping,
-before reading the result. Blocking reads submit and synchronize only writers
-that remain busy.
+CPU query reads with ``wait=false`` use zero-timeout polls for submitted writers.
+An unsubmitted writer is submitted once for progress, returning not-ready without
+waiting on the CPU or changing the result. Pending submitted writers do not
+flush again. This necessary submission preserves the `GL requirement that
+repeated availability polling eventually succeeds
+<https://registry.khronos.org/OpenGL/specs/gl/glspec46.core.pdf>`_ (section 4.2.3).
+Completed writers retire their CPU timestamp bookkeeping before reading the
+result. Blocking reads synchronize only writers that remain busy. Conditional
+rendering with ``NO_WAIT`` only polls and renders conservatively if unavailable,
+without submitting an active writer. CPU query-buffer fallbacks also honor
+``PIPE_QUERY_WAIT`` and leave an unavailable nonwaiting result untouched.
 
 For offline regression coverage, configure with ``-Dbuild-tests=true`` and
 ``-Dtools=drm-shim``, then run the ``asahi`` Meson test suite. The

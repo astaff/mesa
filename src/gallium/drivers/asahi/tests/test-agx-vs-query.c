@@ -281,22 +281,23 @@ check_queries(struct pipe_context *pctx)
    uint64_t generation = ctx->batches.generation[slot];
    unsigned old_polls = polls, old_waits = waits;
    result.u64 = 0xdeadbeef;
-   CHECK(!pctx->get_query_result(pctx, pq, false, &result));
-   CHECK(result.u64 == 0xdeadbeef && polls == old_polls && waits == old_waits);
-   CHECK(agx_batch_is_active(batch) &&
-         ctx->batches.generation[slot] == generation);
    pctx->render_condition(pctx, pq, false, PIPE_RENDER_COND_NO_WAIT);
    CHECK(agx_render_condition_check_inner(ctx));
    pctx->render_condition(pctx, NULL, false, PIPE_RENDER_COND_WAIT);
-   CHECK(agx_batch_is_active(batch) && waits == old_waits);
+   CHECK(agx_batch_is_active(batch) && waits == old_waits &&
+         polls == old_polls);
 
+   /* Availability must make progress even when the app never calls Flush.
+    * Only the unsubmitted writer is submitted; the result stays untouched. */
    busy = true;
-   pctx->flush(pctx, NULL, 0);
-   CHECK(agx_batch_is_submitted(batch));
+   CHECK(!pctx->get_query_result(pctx, pq, false, &result));
+   CHECK(agx_batch_is_submitted(batch) && result.u64 == 0xdeadbeef);
+   CHECK(waits == old_waits && ctx->batches.generation[slot] == generation);
+   uint64_t seqid = ctx->flush_last_seqid;
    old_polls = polls;
    CHECK(!pctx->get_query_result(pctx, pq, false, &result));
    CHECK(result.u64 == 0xdeadbeef && polls == old_polls + 1 &&
-         waits == old_waits);
+         waits == old_waits && ctx->flush_last_seqid == seqid);
    CHECK(ctx->batches.generation[slot] == generation &&
          ctx->perf.query_waits == 0);
 
@@ -360,6 +361,41 @@ check_queries(struct pipe_context *pctx)
          ctx->batches.generation[second_slot] != second_generation);
    CHECK(waits == old_waits);
    CHECK(result.u64 == agx_gpu_timestamp_to_ns(agx_device(pctx->screen), 400));
+
+   /* The CPU timer-query buffer fallback must also honor PIPE_QUERY_WAIT. */
+   struct pipe_resource *buffer =
+      pipe_buffer_create(pctx->screen, PIPE_BIND_QUERY_BUFFER,
+                         PIPE_USAGE_DEFAULT, sizeof(uint64_t));
+   CHECK(buffer && pctx->begin_query(pctx, pq));
+   draw(pctx);
+   batch = ctx->batch;
+   CHECK(pctx->end_query(pctx, pq));
+   uint64_t marker = 0xdeadbeef, copied;
+   pipe_buffer_write(pctx, buffer, 0, sizeof(marker), &marker);
+   busy = true;
+   pctx->get_query_result_resource(pctx, pq, 0, PIPE_QUERY_TYPE_U64, 0, buffer,
+                                   0);
+   pipe_buffer_read(pctx, buffer, 0, sizeof(copied), &copied);
+   CHECK(copied == marker && agx_batch_is_submitted(batch) &&
+         waits == old_waits);
+   seqid = ctx->flush_last_seqid;
+   pctx->get_query_result_resource(pctx, pq, 0, PIPE_QUERY_TYPE_U64, -1, buffer,
+                                   0);
+   pipe_buffer_read(pctx, buffer, 0, sizeof(copied), &copied);
+   CHECK(copied == 0 && ctx->flush_last_seqid == seqid && waits == old_waits);
+   timestamps[agx_batch_idx(batch)].vtx_start = 10;
+   timestamps[agx_batch_idx(batch)].frag_end = 30;
+   busy = false;
+   pctx->get_query_result_resource(pctx, pq, 0, PIPE_QUERY_TYPE_U64, -1, buffer,
+                                   0);
+   pipe_buffer_read(pctx, buffer, 0, sizeof(copied), &copied);
+   CHECK(copied == 1 && waits == old_waits);
+   pctx->get_query_result_resource(pctx, pq, 0, PIPE_QUERY_TYPE_U64, 0, buffer,
+                                   0);
+   pipe_buffer_read(pctx, buffer, 0, sizeof(copied), &copied);
+   CHECK(copied == agx_gpu_timestamp_to_ns(agx_device(pctx->screen), 20));
+   CHECK(waits == old_waits);
+   pipe_resource_reference(&buffer, NULL);
    pctx->destroy_query(pctx, pq);
    finish_draw(pctx, &s);
    return true;
