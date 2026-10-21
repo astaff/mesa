@@ -1084,10 +1084,9 @@ hk_get_device_properties(const struct agx_device *dev,
        * requires more, because every record address arrives as a device
        * address the shader adds a stride to.
        *
-       * maxRayRecursionDepth is 1, and that is a real limit rather than a
-       * policy: recursion is unrolled into the megakernel at compile time, so
-       * every extra level multiplies the compiled code.  Raising it is a
-       * decision about code size, not a hardware question.
+       * Trace recursion is unrolled into the megakernel at compile time.
+       * Advertise the required minimum of 31; stage functions are cloned at
+       * each reachable depth, so compilation may grow with recursion.
        *
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */
