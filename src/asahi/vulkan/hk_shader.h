@@ -137,6 +137,13 @@ struct hk_shader_info {
    /* External API memory writes (stores, atomics, transform feedback). */
    bool writes_external_memory;
 
+   /* The shader samples, loads, stores or queries texel contents of an image
+    * (any texture instruction or image access, bindless included). On G17P
+    * a render whose pre-rasterization shaders read no image does not order
+    * its vertex half after image-only barriers (hk_sync.h, HK_SYNC_GFX_IMG).
+    */
+   bool reads_images;
+
    /* The bounded G17P graphics/compute path lowers one Gen9 combined
     * image/sampler to native texture/sampler state 0. Command recording joins
     * the bound descriptor set and native sampler heap into those CProg slots.

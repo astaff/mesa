@@ -69,9 +69,19 @@ enum hk_sync_kind {
     * HK_SYNC_GFX ones. Every other graphics destination, and every stream
     * kind, counts as HK_SYNC_GFX. */
    HK_SYNC_GFX_FRAG = 1 << 3,
+
+   /* Destination scopes only: pre-rasterization shaders that read images.
+    * An image barrier can only order the image's own accesses, and a
+    * pre-rasterization stage accesses an image only through a shader that
+    * reads one. On G17P, image barriers therefore name this class (and the
+    * fragment class) where other dependencies name HK_SYNC_GFX: a render's
+    * fragment half always waits on it, its vertex half only once it draws
+    * with a pre-rasterization shader that reads images
+    * (hk_sync_vertex_images). Other chips never record it. */
+   HK_SYNC_GFX_IMG = 1 << 4,
 };
 
-#define HK_SYNC_NUM_KINDS 4
+#define HK_SYNC_NUM_KINDS 5
 
 /* Subqueue index: 0 render (VDM), 1 compute (CDM). */
 enum hk_sync_sq {
@@ -188,6 +198,12 @@ struct hk_sync_stream {
    uint16_t barrier_ta[HK_SYNC_NUM_SQ];
    uint64_t prior_ta[HK_SYNC_NUM_SQ];
    bool ta_split;
+
+   /* For a render: it draws with a pre-rasterization shader that reads
+    * images, so its vertex half also waits on HK_SYNC_GFX_IMG, as of the
+    * dependency epoch vtx_images_epoch. */
+   bool vtx_images;
+   uint32_t vtx_images_epoch;
 };
 
 /* Per-command-buffer state. */
@@ -281,9 +297,11 @@ uint8_t hk_sync_kinds_src(VkPipelineStageFlags2 stages);
 /* And for a second synchronization scope. */
 uint8_t hk_sync_kinds_dst(VkPipelineStageFlags2 stages);
 
-/* Union of the scopes of every barrier in a dependency. */
-void hk_sync_dependency_kinds(const VkDependencyInfo *info, uint8_t *src,
-                              uint8_t *dst);
+/* Union of the scopes of every barrier in a dependency. With image_class,
+ * an image barrier whose second scope names graphics work names
+ * HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG instead of HK_SYNC_GFX. */
+void hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
+                              uint8_t *src, uint8_t *dst);
 
 /* Record an execution dependency: all earlier streams of the source kinds
  * complete before any later stream of the destination kinds starts. */
@@ -297,6 +315,10 @@ void hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
  * then every stream before self), or for a stream still to be created. */
 void hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                      struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
+
+/* The render stream draws with a pre-rasterization shader that reads images:
+ * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
+void hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* Every later stream of the given kinds waits on cs. */
 void hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,

@@ -933,7 +933,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     */
    if (cmd->sync.in_pass) {
       uint8_t src_kinds, dst_kinds;
-      hk_sync_dependency_kinds(pDependencyInfo, &src_kinds, &dst_kinds);
+      hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
+                            &src_kinds, &dst_kinds);
       const uint32_t reasons = hk_classify_pass_barrier(cmd, pDependencyInfo);
       if (reasons) {
          if (hk_cmd_buffer_end_graphics(cmd)) {
@@ -951,7 +952,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    }
 
    uint8_t src_kinds, dst_kinds;
-   hk_sync_dependency_kinds(pDependencyInfo, &src_kinds, &dst_kinds);
+   hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
+                            &src_kinds, &dst_kinds);
 
    /* Compute work that stays in the open compute stream is ordered by the
     * stream itself; what it needs at a barrier is visibility. Every native

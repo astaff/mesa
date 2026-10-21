@@ -33,11 +33,13 @@ dep_max(struct hk_sync_dep *a, const struct hk_sync_dep *b)
 }
 
 /* The destination classes a stream of the given kinds belongs to: graphics
- * work is in both graphics classes (HK_SYNC_GFX_FRAG). */
+ * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). */
 static inline uint8_t
 full_kinds(uint8_t kinds)
 {
-   return kinds & HK_SYNC_GFX ? kinds | HK_SYNC_GFX_FRAG : kinds;
+   return kinds & HK_SYNC_GFX
+             ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
+             : kinds;
 }
 
 /* The requirement on the next stream of the given kinds: the union over the
@@ -50,6 +52,22 @@ req_for_kinds(const struct hk_cmd_buffer *cmd, uint8_t kinds,
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       dep[sq] = (struct hk_sync_dep){0};
       u_foreach_bit(k, full_kinds(kinds)) {
+         dep_max(&dep[sq], &cmd->sync.req[k][sq]);
+         if (cmd->sync.in_pass)
+            dep_max(&dep[sq], &cmd->sync.pass_req[k][sq]);
+      }
+   }
+}
+
+/* The requirement on the next stream of exactly the given destination
+ * classes. */
+static void
+req_for_mask(const struct hk_cmd_buffer *cmd, uint8_t mask,
+             struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      dep[sq] = (struct hk_sync_dep){0};
+      u_foreach_bit(k, mask) {
          dep_max(&dep[sq], &cmd->sync.req[k][sq]);
          if (cmd->sync.in_pass)
             dep_max(&dep[sq], &cmd->sync.pass_req[k][sq]);
@@ -309,8 +327,8 @@ hk_sync_kinds_dst(VkPipelineStageFlags2 stages)
 }
 
 void
-hk_sync_dependency_kinds(const VkDependencyInfo *info, uint8_t *src,
-                         uint8_t *dst)
+hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
+                         uint8_t *src, uint8_t *dst)
 {
    *src = 0;
    *dst = 0;
@@ -327,7 +345,12 @@ hk_sync_dependency_kinds(const VkDependencyInfo *info, uint8_t *src,
 
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       *src |= hk_sync_kinds_src(info->pImageMemoryBarriers[i].srcStageMask);
-      *dst |= hk_sync_kinds_dst(info->pImageMemoryBarriers[i].dstStageMask);
+      /* Graphics work accesses an image in the fragment and attachment
+       * stages or through a shader that reads it (HK_SYNC_GFX_IMG). */
+      uint8_t d = hk_sync_kinds_dst(info->pImageMemoryBarriers[i].dstStageMask);
+      if (image_class && (d & HK_SYNC_GFX))
+         d = (d & ~HK_SYNC_GFX) | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG;
+      *dst |= d;
    }
 }
 
@@ -459,6 +482,20 @@ hk_sync_stream_wait_all(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 }
 
 void
+hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   /* Requirements only grow when the epoch advances. */
+   if (cs->sync.vtx_images && cs->sync.vtx_images_epoch == cmd->sync.epoch)
+      return;
+
+   cs->sync.vtx_images = true;
+   cs->sync.vtx_images_epoch = cmd->sync.epoch;
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   req_for_mask(cmd, HK_SYNC_GFX_IMG, dep);
+   hk_sync_stream_wait(cs, dep);
+}
+
+void
 hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                      uint8_t dst_kinds)
 {
@@ -527,8 +564,19 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * local barrier. Preserve global requirements, though: internal producers
     * such as attachment decompression must still follow external writes. */
    if (compute && slot == &cmd->current_cs.pre_gfx) {
+      /* The pre-graphics work of a pipeline without software
+       * pre-rasterization stages (draw parameter patching, index rewriting,
+       * statistics) reads buffers in the draw-indirect and vertex-input
+       * stages alone: image barriers (HK_SYNC_GFX_IMG) do not order it. */
+      uint8_t classes = full_kinds(cs->sync.kind);
+      if (!cmd->state.gfx.shaders[MESA_SHADER_TESS_CTRL] &&
+          !cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL] &&
+          !cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] &&
+          !cmd->state.gfx.shaders[MESA_SHADER_TASK] &&
+          !cmd->state.gfx.shaders[MESA_SHADER_MESH])
+         classes &= ~HK_SYNC_GFX_IMG;
       req_for_kinds_ta(cmd, cs->sync.kind, dep);
-      u_foreach_bit(k, full_kinds(cs->sync.kind)) {
+      u_foreach_bit(k, classes) {
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
             dep_max(&dep[sq], &st->req[k][sq]);
       }
@@ -1063,6 +1111,13 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    hk_sync_stream_wait(cs, ta);
    if (st->internal_active)
       hk_sync_stream_wait(cs, st->internal);
+   /* The reopened stream's earlier draws read images in its vertex half,
+    * which also runs the continuation's draws. */
+   if (cs->sync.vtx_images) {
+      struct hk_sync_dep img[HK_SYNC_NUM_SQ];
+      req_for_mask(cmd, HK_SYNC_GFX_IMG, img);
+      hk_sync_stream_wait(cs, img);
+   }
 
    /* As hk_sync_begin_rendering() followed by the creation of cs: the
     * sequence numbers the instance starts after are those below the
@@ -1371,7 +1426,9 @@ hk_sync_resolve_submit(struct hk_queue *queue,
              * destination classes, its vertex half on those of its kinds. */
             resolve_one(&ss, sq, &cs->sync.dep[sq], full_kinds(cs->sync.kind),
                         &cs->sync.barrier[sq], &cs->sync.prior[sq]);
-            resolve_one(&ss, sq, &cs->sync.dep_ta[sq], cs->sync.kind,
+            resolve_one(&ss, sq, &cs->sync.dep_ta[sq],
+                        cs->sync.kind |
+                           (cs->sync.vtx_images ? HK_SYNC_GFX_IMG : 0),
                         &cs->sync.barrier_ta[sq], &cs->sync.prior_ta[sq]);
          }
       }

@@ -3128,6 +3128,33 @@ hk_shader_writes_external_memory(nir_shader *nir)
           hk_nir_function_writes_external_memory(nir_shader_get_entrypoint(nir));
 }
 
+/* Whether a shader accesses image texel data: a texture instruction other
+ * than a size or sample-count query, or any image intrinsic other than those
+ * queries. Bindless handles count, so the answer holds for any descriptor. */
+static bool
+hk_shader_reads_images(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               const nir_texop op = nir_instr_as_tex(instr)->op;
+               if (op != nir_texop_txs && op != nir_texop_query_levels &&
+                   op != nir_texop_texture_samples)
+                  return true;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               const char *name = nir_intrinsic_infos[
+                  nir_instr_as_intrinsic(instr)->intrinsic].name;
+               if (strstr(name, "image") && !strstr(name, "_size") &&
+                   !strstr(name, "_samples") && !strstr(name, "descriptor"))
+                  return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 static VkResult
 hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
@@ -3138,6 +3165,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                uint8_t static_set_mask)
 {
    const bool writes_external_memory = hk_shader_writes_external_memory(nir);
+   const bool reads_images = hk_shader_reads_images(nir);
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
    bool default_layer = true;
@@ -3731,6 +3759,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    shader->info.stage = sw_stage;
    shader->info.writes_external_memory = writes_external_memory;
+   shader->info.reads_images = reads_images;
    shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
    shader->info.cull_distance_array_size = nir->info.cull_distance_array_size;
    shader->b.info.outputs = outputs;

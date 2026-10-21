@@ -2053,6 +2053,14 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    hk_reserve_scratch_slow(cmd, cs, s);
 }
 
+/* Whether image barriers of the command buffer order only the vertex work
+ * that reads images (hk_sync.h, HK_SYNC_GFX_IMG). */
+static inline bool
+hk_sync_image_class(const struct hk_cmd_buffer *cmd)
+{
+   return hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P;
+}
+
 /* AGX2 returns its shader-base-relative USC offset.  G17P returns the absolute
  * 48-bit Ioto program VA consumed by HAL200 VDM state. */
 uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,

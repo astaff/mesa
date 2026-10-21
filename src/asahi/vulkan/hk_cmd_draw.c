@@ -9545,6 +9545,27 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 }
 
+/* G17P: a draw whose pre-rasterization shaders may read images orders its
+ * render's vertex half after the image barriers before it (HK_SYNC_GFX_IMG).
+ * Software tessellation, geometry, task and mesh stages are assumed to
+ * read. */
+static inline void
+hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (!hk_sync_image_class(cmd) ||
+       (cs->sync.vtx_images && cs->sync.vtx_images_epoch == cmd->sync.epoch))
+      return;
+
+   const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
+   if (!hw_vs || hw_vs->info.reads_images ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
+       gfx->shaders[MESA_SHADER_MESH])
+      hk_sync_vertex_images(cmd, cs);
+}
+
 static __attribute__((hot)) void
 hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
              struct hk_robust_index_batch *batch)
@@ -9889,6 +9910,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       }
 
       hk_g17p_note_layer_zero_draw(cmd, cs);
+      hk_note_pre_raster_images(cmd, cs);
       cs->stats.cmds++;
    }
 }
@@ -9968,6 +9990,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
 
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
+   hk_note_pre_raster_images(cmd, cs);
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
@@ -10302,6 +10325,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       return;
    }
    hk_g17p_note_layer_zero_draw(cmd, cs);
+   hk_note_pre_raster_images(cmd, cs);
    cs->stats.cmds++;
 }
 
