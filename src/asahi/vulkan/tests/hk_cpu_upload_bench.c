@@ -204,6 +204,18 @@ reuse_correctness(struct fixture *f)
    cs->variants[0].info.root_descriptor_size = small_B;
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) != full);
    CHECK(cd->uploaded_root_size == small_B);
+   /* A retained or adversarial short-prefix value must have no effect on
+    * any other chip, including the native-encoding M3 path. */
+   for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
+      if (chip == AGX_CHIP_G17P)
+         continue;
+      f->dev.dev.chip = chip;
+      CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
+      CHECK(cd->uploaded_root_size == sizeof(cd->root));
+   }
+   f->dev.dev.chip = AGX_CHIP_G17P;
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE));
+   CHECK(cd->uploaded_root_size == small_B);
    cmd->state.cs.shader = NULL;
    free(cs);
    /* Test both sides of the omitted dynamic-buffer region. */
