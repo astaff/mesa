@@ -98,6 +98,26 @@ hk_sync_reset(struct hk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->sync_pass_records);
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(sync_tile_index, "ASAHI_SYNC_TILE_INDEX", true)
+
+#define TILE_BUCKETS 256
+#define TILE_INDEX_NONE UINT32_MAX
+
+/* Buckets only narrow candidates. The full predicate still checks image,
+ * level, layers, preservation and tile overlap after hash collisions. */
+static unsigned
+tile_bucket(const struct hk_sync_footprint *fp)
+{
+   const uintptr_t image = (uintptr_t)fp->image;
+   return ((image >> 4) ^ (image >> 12) ^ (fp->level * 0x9e3779b9u)) &
+          (TILE_BUCKETS - 1);
+}
+
+struct recent_tile_index {
+   uint16_t head[TILE_BUCKETS];
+   uint16_t next[HK_SYNC_RECENT_FOOTPRINTS];
+};
+
 /* Tile hazards: see hk_sync.h. */
 static bool
 footprints_share_tile(const struct hk_sync_footprint *a,
@@ -1299,7 +1319,7 @@ hk_sync_submit_needs_completed(const struct hk_queue *queue,
 
 static uint8_t
 recent_conflict(const struct hk_sync_queue *q, const struct hk_sync_footprint *fp,
-                uint64_t completed)
+                uint64_t completed, const struct recent_tile_index *index)
 {
    if (!recent_may_run(q, completed))
       return false;
@@ -1307,6 +1327,16 @@ recent_conflict(const struct hk_sync_queue *q, const struct hk_sync_footprint *f
    if (q->evicted > completed)
       return BITFIELD_MASK(HK_SYNC_NUM_SQ);
    uint8_t engines = 0;
+   if (index) {
+      for (uint16_t i = index->head[tile_bucket(fp)]; i != UINT16_MAX;
+           i = index->next[i]) {
+         const uint8_t engine = BITFIELD_BIT(q->recent[i].sq);
+         if (!(engines & engine) &&
+             footprints_share_tile(&q->recent[i].fp, fp))
+            engines |= engine;
+      }
+      return engines;
+   }
    const uint32_t n = MIN2(q->recent_count, HK_SYNC_RECENT_FOOTPRINTS);
    for (uint32_t i = 0; i < n; ++i) {
       if (q->recent[i].point > completed &&
@@ -1343,6 +1373,7 @@ struct submit_footprint {
    struct hk_sync_footprint fp;
    hk_sync_value index;
    enum hk_sync_sq sq;
+   uint32_t next_by_image;
 };
 
 /* The barrier and prior fields of one requirement on subqueue sq, with the
@@ -1393,6 +1424,30 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
          if (queue->sync.submitted[sq] > UINT64_MAX - added[sq])
             return false;
+      }
+   }
+
+   bool indexed = debug_get_option_sync_tile_index();
+   if (indexed) {
+      indexed = false;
+      for (unsigned i = 0; i < count && !indexed; ++i) {
+         indexed = util_dynarray_num_elements(
+            &cmdbufs[i]->sync_pass_records, struct hk_sync_pass_record) != 0;
+      }
+   }
+   struct recent_tile_index recent_index;
+   uint32_t submitted_head[TILE_BUCKETS];
+   if (indexed) {
+      memset(&recent_index, 0xff, sizeof(recent_index));
+      memset(submitted_head, 0xff, sizeof(submitted_head));
+      const struct hk_sync_queue *q = &queue->sync;
+      const uint32_t n = MIN2(q->recent_count, HK_SYNC_RECENT_FOOTPRINTS);
+      for (uint32_t i = 0; i < n; ++i) {
+         if (q->recent[i].point <= completed)
+            continue;
+         const unsigned bucket = tile_bucket(&q->recent[i].fp);
+         recent_index.next[i] = recent_index.head[bucket];
+         recent_index.head[bucket] = i;
       }
    }
 
@@ -1465,11 +1520,24 @@ hk_sync_resolve_submit(struct hk_queue *queue,
          if (!rec->first || !rec->last)
             continue;
          hk_sync_value v[HK_SYNC_NUM_SQ] = {HK_SYNC_NONE, HK_SYNC_NONE};
-         util_dynarray_foreach(&submitted, struct submit_footprint, e) {
-            if (e->index > v[e->sq] && footprints_share_tile(&e->fp, &rec->fp))
-               v[e->sq] = e->index;
+         if (indexed) {
+            for (uint32_t j = submitted_head[tile_bucket(&rec->fp)];
+                 j != TILE_INDEX_NONE;) {
+               const struct submit_footprint *e = util_dynarray_element(
+                  &submitted, struct submit_footprint, j);
+               if (e->index > v[e->sq] &&
+                   footprints_share_tile(&e->fp, &rec->fp))
+                  v[e->sq] = e->index;
+               j = e->next_by_image;
+            }
+         } else {
+            util_dynarray_foreach(&submitted, struct submit_footprint, e) {
+               if (e->index > v[e->sq] && footprints_share_tile(&e->fp, &rec->fp))
+                  v[e->sq] = e->index;
+            }
          }
-         const uint8_t recent = recent_conflict(&queue->sync, &rec->fp, completed);
+         const uint8_t recent = recent_conflict(
+            &queue->sync, &rec->fp, completed, indexed ? &recent_index : NULL);
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
             if (v[sq] == HK_SYNC_NONE && (recent & BITFIELD_BIT(sq)))
                v[sq] = 0;
@@ -1481,11 +1549,19 @@ hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_sync_pass_record, rec) {
          if (!rec->last)
             continue;
+         if (indexed && util_dynarray_num_elements(
+               &submitted, struct submit_footprint) >= TILE_INDEX_NONE)
+            indexed = false;
          const struct submit_footprint e = {
             .fp = rec->fp,
             .index = (hk_sync_value)rec->last->sync.index,
             .sq = hk_sync_sq(rec->last),
+            .next_by_image = indexed ? submitted_head[tile_bucket(&rec->fp)]
+                                     : TILE_INDEX_NONE,
          };
+         if (indexed)
+            submitted_head[tile_bucket(&rec->fp)] = util_dynarray_num_elements(
+               &submitted, struct submit_footprint);
          util_dynarray_append(&submitted, e);
       }
 
