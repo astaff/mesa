@@ -3159,12 +3159,12 @@ hk_create_ray_tracing_pipeline(
     * megakernel that traces one level and stops.  Refuse instead: a wrong
     * image is worse than a failed create. */
    if (create_info->maxPipelineRayRecursionDepth > HK_MAX_RAY_RECURSION_DEPTH) {
-      vk_pipeline_free(&dev->vk, pAllocator, &pipeline->base);
-      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+      result = vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "maxPipelineRayRecursionDepth %u exceeds the %u this "
                        "driver advertises",
                        create_info->maxPipelineRayRecursionDepth,
                        HK_MAX_RAY_RECURSION_DEPTH);
+      goto fail;
    }
 
    pipeline->stage_count = create_info->stageCount;
