@@ -23,7 +23,7 @@ extern "C" {
 /* Bump whenever the Honeykrisp shader payload below changes.  Vulkan shader
  * binaries carry this version outside the driver-private blob, so stale
  * layouts are rejected before any fields are consumed. */
-#define HK_AGX3_SHADER_BINARY_VERSION 34u
+#define HK_AGX3_SHADER_BINARY_VERSION 35u
 
 /* API outputs include position. Unlinked shaders additionally reserve a
  * default Layer varying and PointSize, up to eight fixed clip-distance copies,

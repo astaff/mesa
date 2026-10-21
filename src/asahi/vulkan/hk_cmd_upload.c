@@ -25,6 +25,14 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
    struct hk_root_descriptor_table *root = &desc->root;
 
+   size_t root_size = sizeof(*root);
+   if (dev->dev.chip == AGX_CHIP_G17P &&
+       bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+      const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
+      if (s && s->info.root_descriptor_size)
+         root_size = MIN2(root_size, s->info.root_descriptor_size);
+   }
+
    root->printf_buffer_address = dev->dev.printf_buffer_address;
    root->sampler_heap_address =
       dev->samplers.table.bo && dev->samplers.table.bo->va
@@ -33,18 +41,21 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
 
    /* Dynamic buffers past the highest one ever bound are read by no bound
     * layout. Never read the uninitialized hole in an earlier upload. */
-   const size_t head_B = hk_root_descriptor_offset(dynamic_buffers) +
-      desc->dynamic_buffer_end * sizeof(root->dynamic_buffers[0]);
+   const size_t head_B = MIN2(root_size,
+      hk_root_descriptor_offset(dynamic_buffers) +
+      desc->dynamic_buffer_end * sizeof(root->dynamic_buffers[0]));
    const size_t tail_B = hk_root_descriptor_offset(set_dynamic_buffer_start);
    /* CPU-decoded descriptor programs use a new root identity to invalidate
     * their native program caches, even when only set memory changed. */
    if (agx_native_graphics(&dev->dev) && desc->uploaded_root.gpu &&
+       desc->uploaded_root_size == root_size &&
        desc->generation == desc->uploaded_root_generation &&
        desc->dynamic_buffer_end == desc->uploaded_dynamic_buffer_end) {
       root->root_desc_addr = desc->uploaded_root.gpu;
       if (memcmp(desc->uploaded_root.cpu, root, head_B) == 0 &&
-          memcmp((const uint8_t *)desc->uploaded_root.cpu + tail_B,
-                 (const uint8_t *)root + tail_B, sizeof(*root) - tail_B) == 0) {
+          (tail_B >= root_size ||
+           memcmp((const uint8_t *)desc->uploaded_root.cpu + tail_B,
+                  (const uint8_t *)root + tail_B, root_size - tail_B) == 0)) {
          if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
              cmd->state.gfx.root &&
              desc->uploaded_root.gpu != cmd->state.gfx.root)
@@ -54,7 +65,7 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
       }
    }
 
-   struct agx_ptr root_ptr = hk_pool_root_alloc(cmd, sizeof(*root), 8);
+   struct agx_ptr root_ptr = hk_pool_root_alloc(cmd, root_size, 8);
    if (!root_ptr.gpu)
       return 0;
 
@@ -65,23 +76,26 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
       cmd->state.gfx.g17p_bind_tail.valid = false;
    root->root_desc_addr = root_ptr.gpu;
    memcpy(root_ptr.cpu, root, head_B);
-   memcpy((uint8_t *)root_ptr.cpu + tail_B, (const uint8_t *)root + tail_B,
-          sizeof(*root) - tail_B);
+   if (tail_B < root_size)
+      memcpy((uint8_t *)root_ptr.cpu + tail_B, (const uint8_t *)root + tail_B,
+             root_size - tail_B);
 
    /* Cached G17P roots need explicit CPU-to-GPU publication. Clean just this
     * table now; vkEndCommandBuffer completes all recorded root cleans with a
     * single fence before submission can consume them. */
    if (agx_native_graphics(&dev->dev) && util_has_cache_ops()) {
       util_flush_range_no_fence(root_ptr.cpu, head_B);
-      util_flush_range_no_fence((uint8_t *)root_ptr.cpu + tail_B,
-                                sizeof(*root) - tail_B);
+      if (tail_B < root_size)
+         util_flush_range_no_fence((uint8_t *)root_ptr.cpu + tail_B,
+                                  root_size - tail_B);
    }
 
    desc->uploaded_root = root_ptr;
+   desc->uploaded_root_size = root_size;
    desc->uploaded_root_generation = desc->generation;
    desc->uploaded_dynamic_buffer_end = desc->dynamic_buffer_end;
    hk_upload_stat(cmd, root_uploads, 1);
-   hk_upload_stat(cmd, root_bytes, head_B + sizeof(*root) - tail_B);
+   hk_upload_stat(cmd, root_bytes, head_B + (tail_B < root_size ? root_size - tail_B : 0));
    return root_ptr.gpu;
 }
 

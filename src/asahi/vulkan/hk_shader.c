@@ -8,6 +8,7 @@
  */
 #include "hk_shader.h"
 #include "hk_nir_lower_gs.h"
+#include "hk_nir_root_size.h"
 #include "hk_nir_sampler_bias.h"
 #include "hk_gen1_rt_indirect_contract.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
@@ -3493,6 +3494,19 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * lower_uniforms removes the load_root_agx markers. */
    if (agx_native_graphics(&dev->dev))
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
+
+   /* Measure while root markers are still explicit. Uniform lowering loads
+    * the root pointer and set bases separately, so retain that prefix too.
+    * Round up for native uniform/global load granularity. */
+   shader->info.root_descriptor_size = sizeof(struct hk_root_descriptor_table);
+   if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_COMPUTE) {
+      unsigned bytes = hk_nir_root_size(
+         nir, sizeof(struct hk_root_descriptor_table));
+      bytes = MAX2(bytes, hk_root_descriptor_offset(sets) +
+                            set_count * sizeof(uint64_t));
+      shader->info.root_descriptor_size = MIN2(
+         ALIGN_POT(bytes, 16), sizeof(struct hk_root_descriptor_table));
+   }
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
             nir_metadata_control_flow, &root);

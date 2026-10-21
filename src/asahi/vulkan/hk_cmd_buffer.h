@@ -280,6 +280,7 @@ struct hk_descriptor_state {
    /* Immutable command-buffer storage; reset with descriptor state. Only the
     * uploaded head and tail are compared, excluding unused dynamic slots. */
    struct agx_ptr uploaded_root;
+   uint32_t uploaded_root_size;
    uint64_t uploaded_root_generation;
    uint8_t uploaded_dynamic_buffer_end;
 

@@ -143,6 +143,8 @@ struct hk_shader_info {
     */
    bool agx3_combined_sampler_valid;
    bool agx3_uses_root;
+   /* Proven root prefix, including direct uniform set loads; binary v35. */
+   uint32_t root_descriptor_size;
    bool agx3_gen1_fragment_rq;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;

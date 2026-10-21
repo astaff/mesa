@@ -62,6 +62,7 @@ hk_files = files(
   'hk_nir_lower_descriptors.c',
   'hk_nir_lower_gs.c',
   'hk_nir_lower_gs.h',
+  'hk_nir_root_size.c',
   'hk_nir_lower_ray_queries.c',
   'hk_nir_lower_robust_image.c',
   'hk_nir_lower_robust_image.h',
@@ -146,6 +147,10 @@ if with_tests
     suite : ['asahi'],
   )
 
+  test('hk_root_size', executable('hk_root_size_test',
+    files('tests/test-hk-root-size.c', 'hk_nir_root_size.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
   # Unused recording functions require section garbage collection so the
   # test can link the production resolver without the rest of the driver.
   if ld_args_gc_sections.length() > 0

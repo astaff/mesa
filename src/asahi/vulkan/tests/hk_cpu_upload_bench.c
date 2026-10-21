@@ -183,6 +183,29 @@ reuse_correctness(struct fixture *f)
    const uint64_t compute = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
    CHECK(compute != root);
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) == compute);
+   /* A shader switch must not reuse a shorter root allocation. Test the
+    * copied prefix, omitted footer, reuse, expansion and contraction. */
+   struct hk_api_shader *cs = calloc(1, hk_api_shader_size(MESA_SHADER_COMPUTE, false));
+   CHECK(cs);
+   cs->vk.stage = MESA_SHADER_COMPUTE;
+   cmd->state.cs.shader = cs;
+   struct hk_descriptor_state *cd = &cmd->state.cs.descriptors;
+   const size_t small_B = 64;
+   cs->variants[0].info.root_descriptor_size = small_B;
+   cd->root.push[0] = 0x12345678;
+   uint64_t small = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   CHECK(small != compute && cd->uploaded_root_size == small_B);
+   CHECK(memcmp(cd->uploaded_root.cpu, &cd->root, small_B) == 0);
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) == small);
+   cs->variants[0].info.root_descriptor_size = sizeof(cd->root);
+   uint64_t full = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   CHECK(full != small && cd->uploaded_root_size == sizeof(cd->root));
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) == full);
+   cs->variants[0].info.root_descriptor_size = small_B;
+   CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) != full);
+   CHECK(cd->uploaded_root_size == small_B);
+   cmd->state.cs.shader = NULL;
+   free(cs);
    /* Test both sides of the omitted dynamic-buffer region. */
    desc->root.push[3] = 42;
    uint64_t changed = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
