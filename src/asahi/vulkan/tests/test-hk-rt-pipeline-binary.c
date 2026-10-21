@@ -298,6 +298,43 @@ capture(VkPipeline pipeline)
    return binary;
 }
 
+/* Intercept the common entrypoints for negative-chip controls. A sentinel
+ * proves delegation without asking the common runtime to consume an HK RT
+ * object (the very object-layout bug this G17P port repairs). */
+static unsigned classic_delegations;
+VkResult __real_vk_common_CreatePipelineBinariesKHR(
+   VkDevice, const VkPipelineBinaryCreateInfoKHR *,
+   const VkAllocationCallbacks *, VkPipelineBinaryHandlesInfoKHR *);
+VkResult __wrap_vk_common_CreatePipelineBinariesKHR(
+   VkDevice d, const VkPipelineBinaryCreateInfoKHR *ci,
+   const VkAllocationCallbacks *a, VkPipelineBinaryHandlesInfoKHR *out);
+VkResult
+__wrap_vk_common_CreatePipelineBinariesKHR(
+   VkDevice d, const VkPipelineBinaryCreateInfoKHR *ci,
+   const VkAllocationCallbacks *a, VkPipelineBinaryHandlesInfoKHR *out)
+{
+   if (dev.dev.chip != AGX_CHIP_G17P) {
+      classic_delegations++;
+      return VK_NOT_READY;
+   }
+   return __real_vk_common_CreatePipelineBinariesKHR(d, ci, a, out);
+}
+
+VkResult __real_vk_common_GetPipelineKeyKHR(
+   VkDevice, const VkPipelineCreateInfoKHR *, VkPipelineBinaryKeyKHR *);
+VkResult __wrap_vk_common_GetPipelineKeyKHR(
+   VkDevice d, const VkPipelineCreateInfoKHR *ci, VkPipelineBinaryKeyKHR *key);
+VkResult
+__wrap_vk_common_GetPipelineKeyKHR(
+   VkDevice d, const VkPipelineCreateInfoKHR *ci, VkPipelineBinaryKeyKHR *key)
+{
+   if (dev.dev.chip != AGX_CHIP_G17P) {
+      classic_delegations++;
+      return VK_NOT_READY;
+   }
+   return __real_vk_common_GetPipelineKeyKHR(d, ci, key);
+}
+
 int
 main(void)
 {
@@ -309,7 +346,6 @@ main(void)
    dev.vk.physical = &pdev.vk;
    dev.dev.chip = AGX_CHIP_G17P;
    dev.vk.alloc = *vk_default_allocator();
-   dev.dev.chip = AGX_CHIP_G17P;
    dev.vk.robustness_state = (struct vk_pipeline_robustness_state){
       .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
       .uniform_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
@@ -325,6 +361,26 @@ main(void)
    pdev.vk.properties.minSubgroupSize = 32;
    pdev.vk.properties.maxSubgroupSize = 32;
    device = hk_device_to_handle(&dev);
+   for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
+      if (chip == AGX_CHIP_G17P)
+         continue;
+      dev.dev.chip = chip;
+      VkRayTracingPipelineCreateInfoKHR rt = {
+         .sType = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR};
+      VkPipelineCreateInfoKHR ci = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR, .pNext = &rt};
+      VkPipelineBinaryCreateInfoKHR bi = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR,
+         .pPipelineCreateInfo = &ci};
+      VkPipelineBinaryHandlesInfoKHR out = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+      VkPipelineBinaryKeyKHR key = {.sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+      unsigned before = classic_delegations;
+      CHECK(hk_CreatePipelineBinariesKHR(device, &bi, NULL, &out) == VK_NOT_READY);
+      CHECK(hk_GetPipelineKeyKHR(device, &ci, &key) == VK_NOT_READY);
+      CHECK(classic_delegations == before + 2);
+   }
+   dev.dev.chip = AGX_CHIP_G17P;
    layout = vk_pipeline_layout_zalloc(
       &dev.vk, sizeof(*layout),
       &(VkPipelineLayoutCreateInfo){

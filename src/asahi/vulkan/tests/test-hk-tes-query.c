@@ -125,8 +125,8 @@ check_template(bool discard, bool writes, bool xfb)
 
 /* Native TES queries are lowered after Poly selects the execution variant.
  * The pipeline-level layout requests the graphics context; the hardware
- * vertex variant must keep it (a prologue copying four context dwords at
- * +104 before any query) and the CDM variant must take the kernel context
+ * vertex variant must keep it (copying four context dwords at +104
+ * under the active-query guard) and the CDM variant must take the kernel context
  * (two dwords, loaded at the query launch), whatever the layout requested. */
 static void
 check_variant_context(bool hardware, bool null_as)
@@ -204,8 +204,30 @@ check_variant_context(bool hardware, bool null_as)
    }
    CHECK(intersections == 1 && app_stores == 1 && footer_loads == 1);
    CHECK(footer_width == (hardware ? 4 : 2));
-   CHECK(prologue_scs == (hardware ? 1 : 0));
+   CHECK(prologue_scs == 0);
    CHECK(guard_loads == (hardware ? 0 : 1));
+   if (null_as) {
+      bool progress;
+      do {
+         progress = nir_lower_vars_to_ssa(b.shader);
+         progress |= nir_opt_copy_prop(b.shader);
+         progress |= nir_opt_constant_folding(b.shader);
+         progress |= nir_opt_dead_cf(b.shader);
+         progress |= nir_opt_dce(b.shader);
+      } while (progress);
+      unsigned stores = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            CHECK(intr->intrinsic != nir_intrinsic_intersect_ray_gen1_agx);
+            CHECK(intr->intrinsic != nir_intrinsic_store_scs_agx);
+            stores += intr->intrinsic == nir_intrinsic_store_global;
+         }
+      }
+      CHECK(stores == 1);
+   }
    nir_validate_shader(b.shader, "TES query variant context");
    ralloc_free(b.shader);
 }

@@ -477,6 +477,8 @@ if with_tests and ld_args_gc_sections.length() > 0
       link_args : [
         ld_args_gc_sections,
         '-Wl,--wrap=vk_pipeline_shader_stage_to_nir',
+        '-Wl,--wrap=vk_common_CreatePipelineBinariesKHR',
+        '-Wl,--wrap=vk_common_GetPipelineKeyKHR',
         '-Wl,--wrap=hk_compile_shader',
         '-Wl,--wrap=hk_api_shader_destroy',
         '-Wl,--wrap=ralloc_free',

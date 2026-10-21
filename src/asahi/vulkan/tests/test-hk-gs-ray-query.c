@@ -203,7 +203,13 @@ check_atomic_guard(bool native, bool instances)
          }
       }
    }
-   CHECK(atomics == 0 && queries == 0);
+   if (native) {
+      CHECK(atomics == 0 && queries == 0);
+   } else {
+      /* The default/software profile must retain the default Poly side-effect
+       * rules. Its queries have not yet been lowered when Poly runs. */
+      CHECK(atomics == 1 && queries > 0);
+   }
    unsigned swaps = 0, adds = 0;
    nir_foreach_block(block, nir_shader_get_entrypoint(rast)) {
       nir_foreach_instr(instr, block) {
@@ -220,7 +226,7 @@ check_atomic_guard(bool native, bool instances)
       }
    }
    CHECK(swaps == 1 && adds == 1);
-   nir_validate_shader(b.shader, "GS prepass must not claim query election");
+   nir_validate_shader(b.shader, "GS prepass query policy");
    nir_validate_shader(rast, "GS replay retains query election and success");
    if (native)
       CHECK(check_variant(rast, true, true, instances));
