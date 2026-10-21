@@ -82,9 +82,16 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
 }
 
 static void
-hk_get_device_extensions(const struct hk_instance *instance,
+hk_get_device_extensions(const struct agx_device *dev,
+                         const struct hk_instance *instance,
                          struct vk_device_extension_table *ext)
 {
+   /* Keep the upstream AGX2 extension profile until the newly added common
+    * implementations have been qualified there. Native AGX3 keeps its
+    * existing exposure.
+    */
+   const bool native_agx3 = agx_native_graphics(dev);
+
    /*
     * VK_KHR_ray_query and everything it depends on.  Software traversal:
     * grounded end to end in shader ALU and global loads, with no dependence
@@ -195,7 +202,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_swapchain_mutable_format = true,
 #endif
       .KHR_synchronization2 = true,
-      .KHR_unified_image_layouts = true,
+      .KHR_unified_image_layouts = native_agx3,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
       .KHR_vertex_attribute_divisor = true,
@@ -208,7 +215,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
       .EXT_calibrated_timestamps = true,
-      .EXT_conditional_rendering = true,
+      .EXT_conditional_rendering = native_agx3,
       .EXT_color_write_enable = true,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
@@ -240,7 +247,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
-      .EXT_memory_budget = true,
+      .EXT_memory_budget = native_agx3,
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_non_seamless_cube_map = true,
@@ -595,7 +602,7 @@ hk_get_device_features(
        *
        * Video is not supported, so the video half stays false.
        */
-      .unifiedImageLayouts = true,
+      .unifiedImageLayouts = supported_extensions->KHR_unified_image_layouts,
       .unifiedImageLayoutsVideo = false,
 
       /* VK_KHR_vertex_attribute_divisor */
@@ -1783,7 +1790,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       &dispatch_table, &wsi_physical_device_entrypoints, false);
 
    struct vk_device_extension_table supported_extensions;
-   hk_get_device_extensions(instance, &supported_extensions);
+   hk_get_device_extensions(&pdev->dev, instance, &supported_extensions);
    if (hk_g17p_rt_enabled(&pdev->dev)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
