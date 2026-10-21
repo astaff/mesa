@@ -645,7 +645,11 @@ hk_vertex_table_wanted(const struct hk_device *dev,
    return dev->g17p_native_as && dev->gen1_vertex_directory &&
           dev->vk.enabled_features.rayTracingPositionFetch &&
           vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
-          (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR) &&
+          /* Hit-object position fetch is part of invocation reorder and does
+           * not require the position-fetch AS build flag. Retain the same
+           * native vertex table for that feature as for explicit data access. */
+          ((state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR) ||
+           dev->vk.enabled_features.rayTracingInvocationReorder) &&
           state->build_info->geometryCount > 0;
 }
 
