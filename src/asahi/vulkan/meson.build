@@ -442,6 +442,28 @@ if with_tests and ld_args_gc_sections.length() > 0
     ),
     suite : ['asahi'],
   )
+  test(
+    'hk_rt_pipeline_binary',
+    executable(
+      'hk_rt_pipeline_binary_test',
+      files('tests/test-hk-rt-pipeline-binary.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux,
+        inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [hk_deps],
+      link_with : [libhk],
+      link_args : [
+        ld_args_gc_sections,
+        '-Wl,--wrap=vk_pipeline_shader_stage_to_nir',
+        '-Wl,--wrap=hk_compile_shader',
+        '-Wl,--wrap=hk_api_shader_destroy',
+        '-Wl,--wrap=ralloc_free',
+      ],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
 endif
 
 if with_tests

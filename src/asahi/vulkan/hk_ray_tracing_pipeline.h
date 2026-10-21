@@ -49,6 +49,8 @@ struct hk_ray_tracing_pipeline {
 
    struct vk_pipeline_layout *layout;
 
+   uint8_t binary_key[32];
+
    uint32_t stage_count;
    uint32_t group_count;
 
