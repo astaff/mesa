@@ -65,6 +65,8 @@
 #include <stdio.h>
 #include <string.h>
 
+DEBUG_GET_ONCE_BOOL_OPTION(m5_begin_cf_live, "ASAHI_M5_BEGIN_CF_LIVE", true)
+
 struct agx3_branch_fixup {
    agx_block *block;
    off_t offset;
@@ -5927,8 +5929,11 @@ agx3_try_control_flow(struct util_dynarray *emission,
     * would carry its slot across the branch (or a backedge), which needs a
     * predecessor-aware analysis this backend does not have, so it is refused.
     */
+   const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
+      I->op == AGX_OPCODE_BEGIN_CF &&
+      debug_get_option_m5_begin_cf_live();
    if (outstanding != 0 &&
-       (I->op == AGX_OPCODE_BEGIN_CF || is_if || is_while || is_break_if ||
+       ((!live_begin && I->op == AGX_OPCODE_BEGIN_CF) || is_if || is_while || is_break_if ||
         is_else || I->op == AGX_OPCODE_POP_EXEC || is_jump))
       return -1;
 
@@ -9822,7 +9827,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          cf_live |= bit;
       }
 
-      if (agx3_is_cf_op(ordered[i])) {
+      const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
+         ordered[i]->op == AGX_OPCODE_BEGIN_CF &&
+         debug_get_option_m5_begin_cf_live();
+      if (agx3_is_cf_op(ordered[i]) && !live_begin) {
          cf_retired |= cf_live;
          cf_live = 0;
       }
@@ -10092,7 +10100,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
           * than refusing the shader when something is still in flight. */
          uint16_t cf_wait = wait;
          uint16_t cf_outstanding = outstanding_here;
-         if (agx3_is_cf_op(I)) {
+         const bool live_begin = enc == AGX_ISA_ENCODING_AGX3C &&
+            I->op == AGX_OPCODE_BEGIN_CF &&
+            debug_get_option_m5_begin_cf_live();
+         if (agx3_is_cf_op(I) && !live_begin) {
             const uint16_t retire = (uint16_t)(cf_wait | cf_outstanding);
             if (retire != 0) {
                if (!agx3_retire_slots_noop(emission, enc, retire))
