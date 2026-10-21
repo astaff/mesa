@@ -22,6 +22,7 @@
  */
 
 #include "hk_ray_tracing_pipeline.h"
+#include "hk_rt_inlining.h"
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
 
 #include "hk_buffer.h"
