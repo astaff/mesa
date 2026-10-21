@@ -66,6 +66,7 @@
 #include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(m5_begin_cf_live, "ASAHI_M5_BEGIN_CF_LIVE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_scalar_3d_coords, "ASAHI_M5_SCALAR_3D_COORDS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_fs_3d_banks, "ASAHI_M5_FS_3D_BANKS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_texture_result_tokens,
                            "ASAHI_M5_TEXTURE_RESULT_TOKENS", true)
@@ -2323,11 +2324,13 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
     * SMP names a separate staging bank, not those source GPRs. */
    const unsigned max_coord = 128 - (2 * agx_channels(I->src[0]));
    const bool published_shape =
-      enc == AGX_ISA_ENCODING_AGX3B && I->dim == AGX_DIM_2D && !query_lod &&
+      ((enc == AGX_ISA_ENCODING_AGX3B && I->dim == AGX_DIM_2D) ||
+       (enc == AGX_ISA_ENCODING_AGX3C && three_d && !shadow && !offset &&
+        debug_get_option_m5_scalar_3d_coords())) && !query_lod &&
       !I->src[0].memory && !I->src[0].abs && !I->src[0].neg &&
       !I->src[0].cache && !I->src[0].discard &&
       I->src[0].size == AGX_SIZE_32 &&
-      agx_channels(I->src[0]) == (shadow ? 3 : 2) &&
+      agx_channels(I->src[0]) == ((three_d || shadow) ? 3 : 2) &&
       (implicit_lod || immediate_lod) &&
       (agx_is_null(I->src[5]) || (!shadow && immediate_offset)) &&
       (!offset || immediate_offset);
@@ -2740,7 +2743,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
          return agx3_tex_decline(I, __LINE__);
    }
 
-   if (three_d &&
+   if (three_d && !published &&
        (!agx3_tex_stage_copy_hints(
            enc, coord + 4, I->src[0].value + 4, stage_slot, 0,
            enc == AGX_ISA_ENCODING_AGX3C
@@ -9666,7 +9669,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             resources[value] = (struct agx3_resource_value){
                .producer = k - 1,
                .halves = agx_is_null(I->src[scalar ? 2 : 1]) ? 4 : 6,
-               .alignment = 4, .fixed_base = UINT16_MAX,
+               .alignment = enc == AGX_ISA_ENCODING_AGX3C ? 8 : 4,
+               .fixed_base = UINT16_MAX,
             };
          }
          if (agx_texture_resource(I)) {
@@ -10298,7 +10302,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                continue;
             }
             const bool scalar = I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3;
-            if (enc != AGX_ISA_ENCODING_AGX3B || !slot ||
+            const bool m5_scalar = enc == AGX_ISA_ENCODING_AGX3C && scalar &&
+               I->nr_srcs == 3 && !agx_is_null(I->src[2]) &&
+               debug_get_option_m5_scalar_3d_coords();
+            if ((!m5_scalar && enc != AGX_ISA_ENCODING_AGX3B) || !slot ||
                 I->nr_srcs != (scalar ? 3 : 2) ||
                 !I->imm || I->imm > resource_capacity ||
                 !publication_values[I->imm])
@@ -10352,7 +10359,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   last &= next_reg != reg;
                }
                if (!agx3_tex_stage_copy_hints(enc, base + 2 * c, reg, slot, 0,
-                                             src.cache, src.discard && last,
+                                             m5_scalar ? !(src.discard && last)
+                                                       : src.cache,
+                                             src.discard && last,
                                              bytes, &len) ||
                    !agx3_append(emission, bytes, len))
                   AGX3_REFUSE(I);
