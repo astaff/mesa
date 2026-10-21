@@ -519,18 +519,18 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 }
 
 /* M5 lossless storage compression of formats without image atomics: the
- * half-float formats and RG32F have none, and R32F has them only with the
- * float32 image atomic features, so it is compressed only when the device
- * did not enable them (and its views cannot reinterpret it). The
+ * half-float formats, RG32F and RGBA32F have none, and R32F has them only
+ * with the float32 image atomic features, so it is compressed only when the
+ * device did not enable them (and its views cannot reinterpret it). The
  * single-layer/level native read/write packets use the allocator's
  * recovered Gen10 metadata layout, the same layout colour attachments use,
  * so a storage image may also be a colour attachment and a transfer
  * destination: end-of-tile stores, shader image stores, clears and uploads
  * all write it through compressed PBE descriptors. Bits select RGBA16F,
- * RG16F, R16F, R32F and RG32F, respectively; zero retains the uncompressed
- * diagnostic control. */
+ * RG16F, R16F, R32F, RG32F and RGBA32F, respectively; zero retains the
+ * uncompressed diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
-                         "ASAHI_M5_STORAGE_COMPRESSION", 31)
+                         "ASAHI_M5_STORAGE_COMPRESSION", 63)
 
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
@@ -563,6 +563,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       bit = 8;
       break;
    case VK_FORMAT_R32G32_SFLOAT: bit = 16; break;
+   case VK_FORMAT_R32G32B32A32_SFLOAT: bit = 32; break;
    default: return false;
    }
    return debug_get_option_m5_storage_compression() & bit;
