@@ -3059,3 +3059,26 @@ TEST(LegacySamplers, UnpromotedIndexNeedsHeap)
       }
    }
 }
+
+TEST(LegacyFragments, SideEffectsRetainUpstreamLateDepth)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "legacy side effects");
+   b.shader->info.writes_memory = true;
+   nir_store_global(&b, nir_imm_int(&b, 1), nir_imm_int64(&b, 0x1000),
+                    .align_mul = 4);
+   EXPECT_TRUE(agx_nir_lower_frag_sidefx(b.shader, false));
+   EXPECT_NE(b.shader->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_DEPTH), 0u);
+   unsigned never = 0, masks = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic) continue;
+         auto op = nir_instr_as_intrinsic(instr)->intrinsic;
+         never += op == nir_intrinsic_load_depth_never_agx;
+         masks += op == nir_intrinsic_sample_mask_agx;
+      }
+   }
+   EXPECT_EQ(never, 1u);
+   EXPECT_EQ(masks, 0u);
+   ralloc_free(b.shader);
+}

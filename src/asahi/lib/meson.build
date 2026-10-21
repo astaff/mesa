@@ -46,6 +46,7 @@ libasahi_lib_files = files(
   'agx_nir_lower_uvs.c',
   'agx_nir_lower_vbo.c',
   'agx_nir_prolog_epilog.c',
+  'agx_nir_legacy_epilog.c',
   'agx_ppp.h',
   'agx_ppp_hal200_graphics_core.c',
   'agx_ppp_hal200_graphics_core.h',

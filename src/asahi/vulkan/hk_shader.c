@@ -3379,7 +3379,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
          nir_export_agx(&b, mask, .base = AGX_ABI_FOUT_SAMPLE_MASK);
 
-         NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
+         NIR_PASS(_, nir, agx_nir_lower_to_per_sample_agx2);
       }
 
       /* Explicit interpolateAtSample() is not sample shading. Fold its
