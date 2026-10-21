@@ -112,7 +112,13 @@ struct hk_fs_key {
     * depth/stencil tests itself and need not select that at draw time; the
     * pipeline state also rules out a read-only early reject.
     */
-   bool static_tests;
+   bool static_tests : 1;
+
+   /** G17P: complete pipeline state proves that no colour output can be
+    * consumed (no colour attachment, alpha-to-coverage statically off), so
+    * colour stores are pruned before varying linking.
+    */
+   bool discard_color_outputs : 1;
 };
 
 struct hk_shader_binary_cache_entry {
@@ -565,6 +571,71 @@ hk_populate_fs_key(struct hk_fs_key *key,
    const struct vk_multisample_state *ms = state->ms;
    if (ms != NULL && ms->sample_shading_enable)
       key->force_sample_shading = true;
+
+   /* A fragment library without output-interface state may acquire color
+    * attachments later. Alpha-to-coverage also consumes color even without
+    * an attachment, so require it to be statically disabled. */
+   if (chip == AGX_CHIP_G17P && state->rp &&
+       (state->cal || BITSET_TEST(state->dynamic,
+                                   MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP)) &&
+       vk_render_pass_state_has_attachment_info(state->rp) &&
+       state->rp->color_attachment_count == 0 && ms &&
+       !BITSET_TEST(state->dynamic,
+                    MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
+       !ms->alpha_to_coverage_enable)
+      key->discard_color_outputs = true;
+}
+
+static bool
+hk_remove_unused_color_store(UNUSED nir_builder *b, nir_intrinsic_instr *intr,
+                             UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   const unsigned location = nir_intrinsic_io_semantics(intr).location;
+   if (location != FRAG_RESULT_COLOR &&
+       (location < FRAG_RESULT_DATA0 || location > FRAG_RESULT_DATA7))
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+static void
+hk_prune_unused_fragment_colors(nir_shader *nir, const struct hk_fs_key *key)
+{
+   if (!key->discard_color_outputs)
+      return;
+
+   assert(nir->info.stage == MESA_SHADER_FRAGMENT && nir->info.io_lowered);
+   /* An output read may still consume a preceding shader-local write. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_output) {
+               const unsigned loc = nir_intrinsic_io_semantics(intr).location;
+               if (loc == FRAG_RESULT_COLOR ||
+                   (loc >= FRAG_RESULT_DATA0 && loc <= FRAG_RESULT_DATA7))
+                  return;
+            }
+         }
+      }
+   }
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_remove_unused_color_store,
+            nir_metadata_control_flow, NULL);
+
+   bool progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+   } while (progress);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
 
 /* Every enabled device feature that changes a shader's code must be in this
@@ -4244,6 +4315,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       has_key = true;
    }
 
+   if (info->stage == MESA_SHADER_FRAGMENT)
+      hk_prune_unused_fragment_colors(nir, &key_tmp.fs);
+
    bool sample_variants = false;
    if (info->stage == MESA_SHADER_FRAGMENT) {
       /* Coverage updates also embed the raster sample count, even when the
@@ -5080,6 +5154,13 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (last->info.stage <= MESA_SHADER_GEOMETRY)
          NIR_PASS(_, last, nir_remove_outputs, MESA_SHADER_FRAGMENT,
                   BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32), 0);
+   }
+
+   struct hk_fs_key color_key;
+   hk_populate_fs_key(&color_key, state, dev->dev.chip);
+   for (uint32_t i = 0; i < shader_count; i++) {
+      if (shaders[i]->info.stage == MESA_SHADER_FRAGMENT)
+         hk_prune_unused_fragment_colors(shaders[i], &color_key);
    }
 
    nir_opt_varyings_bulk(shaders, shader_count, true, UINT32_MAX, UINT32_MAX,
