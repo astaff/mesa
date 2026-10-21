@@ -4298,7 +4298,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    } else if (sw_stage == MESA_SHADER_VERTEX) {
       key = &key_tmp;
    } else if (sw_stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS(_, nir, poly_nir_lower_tcs, false);
+      NIR_PASS(_, nir, poly_nir_lower_tcs_with_options, false,
+               dev->dev.chip == AGX_CHIP_G17P);
    }
 
    

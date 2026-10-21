@@ -63,6 +63,11 @@ bool poly_nir_lower_gs_with_options(struct nir_shader *gs,
 bool poly_nir_lower_tcs(struct nir_shader *tcs,
                         bool can_ignore_shader_out_barriers);
 
+/* Compact factor addressing is qualified only on G17P. */
+bool poly_nir_lower_tcs_with_options(struct nir_shader *tcs,
+                                     bool can_ignore_shader_out_barriers,
+                                     bool compact_levels);
+
 bool poly_nir_lower_tes(struct nir_shader *tes, bool to_hw_vs);
 
 uint64_t poly_tcs_per_vertex_outputs(const struct nir_shader *nir);
