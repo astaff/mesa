@@ -3480,22 +3480,6 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
       (agx_native_graphics(&dev->dev) || m5) ? 2048 : 0);
 }
 
-/* Compressed multisample attachment continuation is qualified separately. */
-static bool
-hk_m5_merge_view_compressed(const struct hk_image_view *view)
-{
-   if (!view)
-      return false;
-
-   const struct hk_image *image =
-      container_of(view->vk.image, struct hk_image, vk);
-   for (unsigned p = 0; p < image->plane_count; ++p) {
-      if (image->planes[p].layout.compressed)
-         return true;
-   }
-   return false;
-}
-
 /*
  * AGX3 render pass continuation.
  *
@@ -3562,17 +3546,12 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
        agx_tilebuffer_spills(&render->tilebuffer) ||
        render->g17p_direct_color_resolve)
       return false;
+   /* Compressed attachments continue like uncompressed ones: the merged
+    * render keeps the first instance's load and the last instance's store,
+    * and a partial render stores and reloads them as a single instance's
+    * would. */
    if (msaa && (render->layer_count != 1 || cs->tib.nr_samples != samples))
       return false;
-   if (msaa) {
-      for (unsigned i = 0; i < render->color_att_count; ++i) {
-         if (hk_m5_merge_view_compressed(render->color_att[i].iview))
-            return false;
-      }
-      if (hk_m5_merge_view_compressed(render->depth_att.iview) ||
-          hk_m5_merge_view_compressed(render->stencil_att.iview))
-         return false;
-   }
 
    unsigned attachments = 0;
    for (unsigned i = 0; i < render->color_att_count; ++i) {
