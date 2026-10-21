@@ -379,7 +379,7 @@ if with_tests
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
-    link_args : [ld_args_gc_sections, '-Wl,--wrap=util_flush_range']), suite : ['asahi'])
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test(
     'hk_rt_pipeline_executable',
     executable(
@@ -447,7 +447,7 @@ if with_tests and ld_args_gc_sections.length() > 0
       files('tests/test-hk-host-as.c', 'hk_host_as.c'),
       include_directories : [include_directories('.'), inc_include, inc_src],
       dependencies : [hk_deps],
-      link_args : [ld_args_gc_sections]), suite : ['asahi'])
+      link_args : [ld_args_gc_sections, '-Wl,--wrap=util_flush_range']), suite : ['asahi'])
   test('hk_host_as_lifetime', executable('hk_host_as_lifetime_test',
     files('tests/test-hk-host-as-lifetime.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
