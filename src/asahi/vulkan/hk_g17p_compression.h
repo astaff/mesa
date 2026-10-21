@@ -371,8 +371,9 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
  * copy paths write it through its R16/R32_UINT colour alias with the
  * compressed PBE.
  *
- * Admitted: D16_UNORM, D32_SFLOAT and the depth plane of
- * D32_SFLOAT_S8_UINT (stencil stays plain), one layer, one mip, one sample,
+ * Admitted: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT
+ * (stencil is read through its R8_UINT alias and copied through the same
+ * graphics path), one layer, one mip, one sample,
  * a depth attachment, and otherwise only sampled, input-attachment,
  * feedback-loop and transfer usages. Zink marks its depth attachments
  * sample-location compatible and feedback-loop capable, which changes
@@ -382,7 +383,9 @@ static inline bool
 hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
                                  const VkImageCreateInfo *info)
 {
-   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
+   if (!agx_chip_g17_m5(chip) || !info ||
+       (plane != 0 && !(plane == 1 &&
+                        info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
 
    for (const void *next = info->pNext; next;) {

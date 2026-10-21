@@ -470,8 +470,10 @@ check_m5_depth(void)
       for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
          CHECK(hk_m5_depth_compression_eligible((enum agx_chip)chip, 0, &i) ==
                agx_chip_g17_m5((enum agx_chip)chip));
-      /* The stencil plane stays plain. */
-      CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 1, &i));
+      /* Of the second planes, only the single-sample stencil plane of
+       * D32_SFLOAT_S8_UINT is admitted. */
+      CHECK(hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 1, &i) ==
+            (formats[f] == VK_FORMAT_D32_SFLOAT_S8_UINT));
       CHECK(!hk_m5_depth_compression_eligible(AGX_CHIP_G17S, 0, NULL));
       /* Neither policy admits a depth image as colour, nor colour as depth. */
       CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &i));
