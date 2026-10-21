@@ -56,7 +56,9 @@ fetch_ok(enum agx_isa_encoding enc, const struct agx3_tex_fetch_desc *d)
        d->dest >= (enc == AGX_ISA_ENCODING_AGX3C ? 256 : 128) ||
        d->dest + __builtin_popcount(d->mask) * (d->width == AGX3_TEX_W32 ? 2 : 1) > 256 ||
        (d->width == AGX3_TEX_W32 && (d->dest & 1)) ||
-       (d->coord & 3) || d->coord > 60 ||
+       (d->coord & 3) ||
+       d->coord > ((enc == AGX_ISA_ENCODING_AGX3C && d->multisample &&
+                    !d->array) ? 120 : 60) ||
        (!d->mask || d->mask > 15) ||
        d->texture > 15)
       return false;
@@ -73,7 +75,7 @@ fetch_ok(enum agx_isa_encoding enc, const struct agx3_tex_fetch_desc *d)
          (d->array && d->sample) ||
          (enc == AGX_ISA_ENCODING_AGX3C
             ? (!d->staged_sample || (d->coord & 7) ||
-               d->coord > 24)
+               d->coord > (d->array ? 24 : 120))
             : d->coord != (d->array && !d->staged_sample ? 16 : 0)))))
       return false;
 
@@ -2505,7 +2507,7 @@ agx3_tex_stage_ms_sample_at(enum agx_isa_encoding enc, uint16_t bank,
       return false;
    memset(out, 0, AGX3_TEX_MAX_LENGTH);
    *len = 0;
-   if (enc != AGX_ISA_ENCODING_AGX3C || (bank & 7) || bank > 24 ||
+   if (enc != AGX_ISA_ENCODING_AGX3C || (bank & 7) || bank > 120 ||
        src >= 256 || (src & 1) || slot < 1 || slot > 8 ||
        (wait_mask & ~0xffu) || (src_cache && src_discard))
       return false;

@@ -1608,6 +1608,9 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    const unsigned plain_banks = m5 ?
       CLAMP(debug_get_num_option("ASAHI_M5_FETCH_BANKS", 8), 1,
             MIN2(8, 1 + (60 - staging_base) / 8)) : 2;
+   /* Keep independent non-array MS publications in separate operand banks. */
+   const unsigned ms_banks = m5_ms_banks && !ms_array ?
+      CLAMP(debug_get_num_option("ASAHI_M5_MS_FETCH_BANKS", 8), 1, 16) : 4;
    const uint16_t bank_span =
       m5_ms_banks ? 8 : plain_bank ? 2 * agx_channels(I->src[0])
                                  : staging_base + 8;
@@ -1632,7 +1635,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       /* A read with PACK_SMPIR operands occupies halves 0..bank_span. */
       const uint16_t first = banked_read ? staging_base : 0;
       bool placed = false;
-      for (unsigned c = 0; c < (m5_ms_banks ? 4u : plain_bank ? plain_banks : 1u) &&
+      for (unsigned c = 0; c < (m5_ms_banks ? ms_banks : plain_bank ? plain_banks : 1u) &&
                            !placed; ++c) {
          const uint16_t start = first + 8 * c;
          const uint16_t conflict = agx3_staging_conflicts(

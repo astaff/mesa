@@ -167,7 +167,12 @@ TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
    agx_stop(b);
    util_dynarray binary;
    util_dynarray_init(&binary, mem);
-   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   /* Non-array multisample reads take eight operand banks by default; the
+    * fifth read recycles a bank only with the four-bank override. */
+   setenv("ASAHI_M5_MS_FETCH_BANKS", "4", 1);
+   const bool packed = agx3_pack_binary(b->shader, &binary);
+   unsetenv("ASAHI_M5_MS_FETCH_BANKS");
+   ASSERT_TRUE(packed);
    const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
    for (unsigned carrier : {0u, 88u}) {
       uint8_t expected[AGX3_ALU_MAX_LENGTH], length = 0;
