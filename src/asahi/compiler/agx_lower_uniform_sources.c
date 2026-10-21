@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "agx_builder.h"
+#include "util/half_float.h"
 #include "agx_compiler.h"
 #include "agx_debug.h"
 #include "util/u_debug.h"
@@ -329,6 +330,88 @@ agx3_lower_m5_modified_fma_immediates(agx_context *ctx, agx_instr *I)
  * Final physical divergence disables discard hints, and post-optimizer SSA
  * reuse may differ from the original NIR use count. Pack only those operands
  * that cannot use the consuming publisher, after optimization and before RA. */
+DEBUG_GET_ONCE_BOOL_OPTION(m5_fold_constant_lod,
+                           "ASAHI_M5_FOLD_CONSTANT_LOD", true)
+
+static bool
+agx3_m5_exact_lod_immediate(float value, bool explicit_lod, uint8_t *immediate)
+{
+   if (!isfinite(value) || !agx_minifloat_exact(value) ||
+       value * 64.0f < -2048.0f || value * 64.0f > 2047.0f ||
+       (explicit_lod && value < 0.0f))
+      return false;
+
+   const uint8_t imm = agx_minifloat_encode(value);
+   const float decoded = agx_minifloat_decode(imm);
+   const int encoded = (int)(decoded * 64.0f);
+   /* Reject signed zero or fractions lost by the hardware immediate. */
+   if (fui(decoded) != fui(value) ||
+       fui((float)encoded / 64.0f) != fui(value))
+      return false;
+
+   *immediate = imm;
+   return true;
+}
+
+/* Recover an exactly representable immediate before live-parameter
+ * legalization gives a constant a register lifetime. */
+static void
+agx3_fold_m5_constant_lods(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->stage != MESA_SHADER_FRAGMENT ||
+       !debug_get_option_m5_fold_constant_lod())
+      return;
+
+   agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
+   if (!defs)
+      return;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         defs[I->dest[d].value] = I;
+   }
+
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+          (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_3D) ||
+          I->shadow || I->offset || I->sparse || I->query_lod ||
+          I->gather != AGX_GATHER_NONE ||
+          (I->lod_mode != AGX_LOD_MODE_LOD_MIN &&
+           I->lod_mode != AGX_LOD_MODE_AUTO_LOD_BIAS))
+         continue;
+
+      agx_index lod = I->src[1];
+      if (lod.type != AGX_INDEX_NORMAL || lod.abs || lod.neg || lod.memory ||
+          agx_channels(lod) != 1)
+         continue;
+      agx_instr *def = defs[lod.value];
+      if (I->memory_is_packed) {
+         if (!def || def->op != AGX_OPCODE_PACK_SAMPLER_LOD_AGX3 ||
+             def->nr_srcs != 1 || lod.size != AGX_SIZE_32)
+            continue;
+         lod = def->src[0];
+         if (lod.type != AGX_INDEX_NORMAL || lod.abs || lod.neg || lod.memory ||
+             agx_channels(lod) != 1)
+            continue;
+         def = defs[lod.value];
+      }
+      if (!def || def->op != AGX_OPCODE_MOV_IMM ||
+          lod.size != AGX_SIZE_16 || def->nr_dests != 1 ||
+          def->dest[0].size != AGX_SIZE_16 || def->imm > UINT16_MAX)
+         continue;
+
+      uint8_t immediate;
+      if (!agx3_m5_exact_lod_immediate(_mesa_half_to_float(def->imm),
+                                      I->lod_mode == AGX_LOD_MODE_LOD_MIN,
+                                      &immediate))
+         continue;
+
+      I->src[1] = agx_immediate(immediate);
+      I->memory_is_packed = false;
+   }
+   free(defs);
+}
+
 static void
 agx3_lower_m5_live_scalar_lods(agx_context *ctx)
 {
@@ -884,6 +967,8 @@ agx_lower_uniform_sources(agx_context *ctx)
          }
       }
    }
+
+   agx3_fold_m5_constant_lods(ctx);
 
    /* Uniform materialization can also create a scalar LOD SSA source. */
    agx3_lower_m5_live_scalar_lods(ctx);
