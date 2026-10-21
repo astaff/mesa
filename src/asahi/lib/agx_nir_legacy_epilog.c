@@ -337,4 +337,3 @@ agx_nir_fs_epilog_agx2(nir_builder *b, const void *key_)
    b->shader->info.fs.uses_fbfetch_output |= force_translucent;
    b->shader->info.fs.uses_sample_shading = key->link.sample_shading;
 }
-
