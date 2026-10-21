@@ -1486,6 +1486,35 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       }
    }
 
+   /* Upstream AGX2 serializes every hardware command after both preceding
+    * engine prefixes, including work in earlier command buffers/submissions.
+    * Recorded dependencies alone are a looser contract: an implicit transfer
+    * producer or a later meta read may have no edge in that graph. Retain
+    * upstream's ordering on G13/G14 until the relaxed policy is qualified.
+    * Resolve after all stream placement/merging, so no forward wait or cycle
+    * can be introduced by pre-graphics streams created out of list order.
+    */
+   if (queue->sync.serialize) {
+      uint32_t prefix[HK_SYNC_NUM_SQ] = {0, first_cdm_is_flush ? 1 : 0};
+      for (unsigned i = 0; i < count; ++i) {
+         list_for_each_entry(struct hk_cs, cs, &cmdbufs[i]->control_streams,
+                             node) {
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               /* On exact-prior kernels, zero is not the old "all previous
+                * submissions" barrier. Name that engine's queue ordinal.
+                */
+               bool prior = queue->sync.exact_prior && prefix[sq] == 0;
+               cs->sync.barrier[sq] = prior ? DRM_ASAHI_BARRIER_NONE
+                                            : prefix[sq];
+               cs->sync.prior[sq] = prior ? queue->sync.submitted[sq] : 0;
+               cs->sync.barrier_ta[sq] = cs->sync.barrier[sq];
+               cs->sync.prior_ta[sq] = cs->sync.prior[sq];
+            }
+            prefix[hk_sync_sq(cs)]++;
+         }
+      }
+   }
+
    /* A render's vertex half may wait for less than its fragment half only
     * when the kernel orders the halves separately and nothing above raised
     * the whole render's fields afterwards (cross-command-buffer tile hazards

@@ -475,10 +475,76 @@ test_rt_kernel_gate(void)
    T("rt off outside G17P", !hk_g17p_rt_enabled(dev));
 }
 
+/* Compare the compatibility resolver against upstream's command-prefix
+ * contract over every four-command engine mix, command-buffer partition and
+ * both prior encodings. No application barrier is supplied: these are the
+ * implicit execution edges which the native graph intentionally omits. */
+static void
+test_classic_submission_order(void)
+{
+   for (unsigned exact = 0; exact < 2; ++exact) {
+      for (unsigned groups = 1; groups <= 4; groups *= 2) {
+         for (unsigned mix = 0; mix < 16; ++mix) {
+            struct hk_queue *q = new_queue(exact);
+            q->sync.serialize = true;
+            q->sync.submitted[HK_SYNC_VDM] = 7;
+            q->sync.submitted[HK_SYNC_CDM] = 11;
+            struct hk_cmd_buffer *cmds[4];
+            struct hk_cs *streams[4];
+            for (unsigned i = 0; i < groups; ++i)
+               cmds[i] = new_cmd();
+            for (unsigned i = 0; i < 4; ++i)
+               streams[i] = add(cmds[i * groups / 4], mix & (1u << i));
+            T("classic mixed submission", hk_sync_resolve_submit(
+                 q, cmds, groups, false, false, 0));
+            unsigned prefix[2] = {0, 0};
+            const uint64_t base[2] = {7, 11};
+            for (unsigned i = 0; i < 4; ++i) {
+               struct hk_cs *cs = streams[i];
+               struct drm_asahi_cmd_header upstream = agx_cmd_header(
+                  cs->type == HK_CS_CDM, prefix[0], prefix[1]);
+               const unsigned barriers[2] = {upstream.vdm_barrier,
+                                             upstream.cdm_barrier};
+               for (unsigned sq = 0; sq < 2; ++sq) {
+                  bool prior = exact && barriers[sq] == 0;
+                  T("classic upstream prefix", cs->sync.barrier[sq] ==
+                     (prior ? DRM_ASAHI_BARRIER_NONE : barriers[sq]));
+                  T("classic prior ordinal", cs->sync.prior[sq] ==
+                     (prior ? base[sq] : 0));
+                  T("classic tiler ordered", cs->sync.barrier_ta[sq] ==
+                     cs->sync.barrier[sq] && cs->sync.prior_ta[sq] ==
+                     cs->sync.prior[sq]);
+               }
+               T("classic no tiler split", !cs->sync.ta_split);
+               prefix[hk_sync_sq(cs)]++;
+            }
+            struct hk_cmd_buffer *next = new_cmd();
+            struct hk_cs *read = add(next, true);
+            T("classic later read submission", submit(q, next));
+            for (unsigned sq = 0; sq < 2; ++sq) {
+               T("classic earlier submit ordered", exact
+                  ? read->sync.prior[sq] == base[sq] + prefix[sq] &&
+                    read->sync.barrier[sq] == DRM_ASAHI_BARRIER_NONE
+                  : read->sync.prior[sq] == 0 && read->sync.barrier[sq] == 0);
+            }
+         }
+      }
+   }
+   /* The policy is opt-in; native independent streams keep their overlap. */
+   struct hk_queue *q = new_queue(true);
+   struct hk_cmd_buffer *cmd = new_cmd();
+   add(cmd, false);
+   struct hk_cs *compute = add(cmd, true);
+   T("native independent submission", submit(q, cmd));
+   T("native remains unordered", compute->sync.barrier[HK_SYNC_VDM] ==
+      DRM_ASAHI_BARRIER_NONE && compute->sync.prior[HK_SYNC_VDM] == 0);
+}
+
 int
 main(void)
 {
    test_context = ralloc_context(NULL);
+   test_classic_submission_order();
    if (!test_context)
       return EXIT_FAILURE;
    test_multiview_layer_preservation();

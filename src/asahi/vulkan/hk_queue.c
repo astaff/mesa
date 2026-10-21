@@ -1446,6 +1446,8 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
    queue->vk.driver_submit = hk_queue_submit;
    queue->sync.exact_prior =
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
+   queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
+                           dev->dev.params.gpu_generation <= 14;
 
    queue->drm.id = UINT32_MAX;
    queue->drm.virt_ring_idx = drm_priority + 1;
