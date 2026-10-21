@@ -10,7 +10,9 @@ hk_nir_lower_gs(nir_shader *gs, nir_shader **count, nir_shader **rast,
                 nir_shader **pre_gs, struct poly_gs_info *info,
                 const struct agx_gen1_ray_query_layout *rq_layout)
 {
-   poly_nir_lower_gs(gs, count, rast, pre_gs, info);
+   /* rq_layout is supplied only by the G17P native ray-query profile. */
+   poly_nir_lower_gs_with_options(gs, count, rast, pre_gs, info,
+                                  rq_layout != NULL);
 
    if (!rq_layout)
       return true;
