@@ -471,6 +471,14 @@ if with_tests and ld_args_gc_sections.length() > 0
       include_directories : [include_directories('.'), inc_include, inc_src],
       dependencies : [hk_deps],
       link_args : [ld_args_gc_sections, '-Wl,--wrap=util_flush_range']), suite : ['asahi'])
+  test('hk_as_registry', executable('hk_as_registry_test',
+    files('tests/test-hk-as-registry.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections, '-Wl,--wrap=agx_bo_create',
+      '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=_mesa_hash_table_insert']),
+    timeout : 60, suite : ['asahi'])
   test('hk_host_as_lifetime', executable('hk_host_as_lifetime_test',
     files('tests/test-hk-host-as-lifetime.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,

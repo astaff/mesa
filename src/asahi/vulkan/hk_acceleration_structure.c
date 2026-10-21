@@ -94,7 +94,8 @@ static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_bu
 static void hk_agx3_refit_phase(VkCommandBuffer,
    const struct vk_acceleration_structure_build_state *, unsigned);
 
-#define HK_GEN1_AS_ID_LIMIT (1u << 20)
+/* Allow a million distinct BLASes plus a TLAS and the reserved query IDs. */
+#define HK_GEN1_AS_ID_LIMIT (1u << 21)
 #define HK_GEN1_SPARSE_PAGE_BYTES 0x4000u
 
 static uint32_t
@@ -102,6 +103,26 @@ hk_gen1_as_index_to_id(uint32_t index)
 {
    const uint32_t id = index + 1;
    return id < HK_GEN1_AS_TABLE_AS_SLOTS ? id : id + HK_GEN1_RQ_PHYSICAL_SLOTS;
+}
+
+static uint32_t
+hk_gen1_as_id_to_index(uint32_t id)
+{
+   assert(id && (id < HK_GEN1_AS_TABLE_AS_SLOTS ||
+                 id >= HK_GEN1_AS_TABLE_ENTRIES));
+   return id - 1 - (id >= HK_GEN1_AS_TABLE_ENTRIES ?
+                      HK_GEN1_RQ_PHYSICAL_SLOTS : 0);
+}
+
+/* Caller holds gen1_as_lock. No allocation, search or failure on teardown. */
+static void
+hk_gen1_as_free_slot(struct hk_device *dev, uint32_t index)
+{
+   struct hk_gen1_as_slot *slot =
+      util_dynarray_element(&dev->gen1_ases, struct hk_gen1_as_slot, index);
+   slot->as = NULL;
+   slot->next_free = dev->gen1_as_free_head;
+   dev->gen1_as_free_head = index;
 }
 
 static bool
@@ -246,10 +267,10 @@ hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
       return;
    simple_mtx_lock(&dev->gen1_as_lock);
    uint32_t index = 0;
-   util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-      if (*p && (*p)->buffer == buffer)
+   util_dynarray_foreach(&dev->gen1_ases, struct hk_gen1_as_slot, slot) {
+      if (slot->as && slot->as->buffer == buffer)
          hk_gen1_as_publish_address(dev, hk_gen1_as_index_to_id(index),
-                                    hk_gen1_as_bound_va(*p));
+                                    hk_gen1_as_bound_va(slot->as));
       ++index;
    }
    simple_mtx_unlock(&dev->gen1_as_lock);
@@ -278,32 +299,30 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
       return vk_error(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS);
    }
    bool inserted = false;
-   uint32_t index = 0;
    simple_mtx_lock(&dev->gen1_as_lock);
-   if (dev->gen1_rq_live_as_table) {
-      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-         if (!*p) { *p = as; inserted = true; break; }
-         ++index;
-      }
-   }
-   if (!inserted)
-      index = util_dynarray_num_elements(&dev->gen1_ases,
-                                        struct vk_acceleration_structure *);
+   const bool reuse = dev->gen1_as_free_head != UINT32_MAX;
+   const uint32_t index = reuse ? dev->gen1_as_free_head :
+      util_dynarray_num_elements(&dev->gen1_ases, struct hk_gen1_as_slot);
    const uint32_t id = hk_gen1_as_index_to_id(index);
    const bool live_limit = dev->gen1_rq_live_as_table &&
                            id >= HK_GEN1_AS_TABLE_AS_SLOTS;
-   if (!inserted && !live_limit && id < HK_GEN1_AS_ID_LIMIT &&
+   if (!live_limit && id < HK_GEN1_AS_ID_LIMIT &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, id) &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages, id) &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, id)) {
-      struct vk_acceleration_structure **p =
-         util_dynarray_grow(&dev->gen1_ases, struct vk_acceleration_structure *, 1);
-      if (p) { *p = as; inserted = true; }
+      struct hk_gen1_as_slot *slot = reuse ?
+         util_dynarray_element(&dev->gen1_ases, struct hk_gen1_as_slot, index) :
+         util_dynarray_grow(&dev->gen1_ases, struct hk_gen1_as_slot, 1);
+      if (slot) {
+         if (reuse)
+            dev->gen1_as_free_head = slot->next_free;
+         *slot = (struct hk_gen1_as_slot){.as = as};
+         inserted = true;
+      }
    }
    if (inserted && dev->gen1_as_ids &&
        !_mesa_hash_table_insert(dev->gen1_as_ids, as, (void *)(uintptr_t)id)) {
-      *util_dynarray_element(&dev->gen1_ases, struct vk_acceleration_structure *,
-                             index) = NULL;
+      hk_gen1_as_free_slot(dev, index);
       inserted = false;
    }
    if (inserted)
@@ -336,9 +355,10 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
          ? _mesa_hash_table_search(dev->gen1_as_ids, as) : NULL;
       if (entry) {
          const uint32_t id = (uint32_t)(uintptr_t)entry->data;
-         util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-            if (*p == as) { *p = NULL; break; }
-         }
+         const uint32_t index = hk_gen1_as_id_to_index(id);
+         assert(util_dynarray_element(&dev->gen1_ases,
+                     struct hk_gen1_as_slot, index)->as == as);
+         hk_gen1_as_free_slot(dev, index);
          hk_gen1_as_publish_address(dev, id, 0);
          _mesa_hash_table_remove(dev->gen1_as_ids, entry);
       }
@@ -1627,6 +1647,7 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
    if (dev->g17p_native_as) {
       simple_mtx_init(&dev->gen1_as_lock, mtx_plain);
       util_dynarray_init(&dev->gen1_ases, NULL);
+      dev->gen1_as_free_head = UINT32_MAX;
       dev->gen1_as_lock_ready=true;
       dev->gen1_vertex_tables = _mesa_pointer_hash_table_create(NULL);
       dev->gen1_as_ids = _mesa_pointer_hash_table_create(NULL);
@@ -2084,15 +2105,15 @@ hk_gen1_as_address_map(struct hk_cmd_buffer *cmd, uint32_t *count)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    simple_mtx_lock(&dev->gen1_as_lock);
    uint32_t bound = util_dynarray_num_elements(&dev->gen1_ases,
-                                              struct vk_acceleration_structure *);
+                                              struct hk_gen1_as_slot);
    struct agx_ptr map = hk_pool_alloc(cmd,
       MAX2(bound, 1) * sizeof(struct libagx_gen1_as_address), 16);
    *count = 0;
    if (map.cpu) {
       struct libagx_gen1_as_address *entries = map.cpu;
       uint32_t index = 0;
-      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, as) {
-         uint64_t address = *as ? hk_gen1_as_bound_va(*as) : 0;
+      util_dynarray_foreach(&dev->gen1_ases, struct hk_gen1_as_slot, slot) {
+         uint64_t address = slot->as ? hk_gen1_as_bound_va(slot->as) : 0;
          if (address) entries[(*count)++] = (struct libagx_gen1_as_address) {
             .address = address, .resource_id = hk_gen1_as_index_to_id(index),
          };
@@ -2156,7 +2177,7 @@ hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
       hk_as_native_va(dst), info->src.deviceAddress, metadata, uuid, dst->size - padding, id);
    simple_mtx_lock(&dev->gen1_as_lock);
    const uint32_t id_bound = hk_gen1_as_index_to_id(
-      util_dynarray_num_elements(&dev->gen1_ases, struct vk_acceleration_structure *));
+      util_dynarray_num_elements(&dev->gen1_ases, struct hk_gen1_as_slot));
    simple_mtx_unlock(&dev->gen1_as_lock);
    libagx_gen1_as_deserialize_references(cmd,
       agx_1d((dst->size - padding) / 128), AGX_BARRIER_ALL,
