@@ -277,6 +277,10 @@ int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
+   vk_object_base_init(NULL, &instance.base, VK_OBJECT_TYPE_INSTANCE);
+   instance.base.client_visible = true;
+   list_inithead(&instance.debug_utils.callbacks);
+   list_inithead(&instance.debug_report.callbacks);
    vk_object_base_init(&dev.vk, &dev.vk.base, VK_OBJECT_TYPE_DEVICE);
    vk_object_base_init(NULL, &pdev.vk.base, VK_OBJECT_TYPE_PHYSICAL_DEVICE);
    instance.app_info.api_version = VK_API_VERSION_1_4;
@@ -551,6 +555,7 @@ main(void)
    vk_pipeline_cache_destroy(populated, NULL);
    vk_object_base_finish(&dev.vk.base);
    vk_object_base_finish(&pdev.vk.base);
+   vk_object_base_finish(&instance.base);
    glsl_type_singleton_decref();
    puts(
       "PASS: all pipeline allocations, stage NIR, layout and shader references released");
