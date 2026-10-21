@@ -906,6 +906,12 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "Pipeline barrier");
 
+   if (!agx_native_graphics(&dev->dev)) {
+      hk_cmd_buffer_end_compute(cmd);
+      hk_cmd_buffer_end_graphics(cmd);
+      return;
+   }
+
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
    if (unlikely(cmd->state.pass_merge.valid))
