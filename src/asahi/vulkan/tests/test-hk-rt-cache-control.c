@@ -483,8 +483,8 @@ main(void)
       "PASS: mixed batches, success preservation, EARLY_RETURN and skipped null handles");
    /* CTS misc.shaders_from_lib creates stage-only libraries and supplies
     * groups when linking, with recursion depth 10 in all three creates. */
-   for (unsigned depth = 10; depth <= HK_MAX_RAY_RECURSION_DEPTH;
-        depth += HK_MAX_RAY_RECURSION_DEPTH - 10) {
+   for (unsigned depth = 10; depth <= HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH;
+        depth += HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH - 10) {
       VkPipeline libs[2];
       ci = info(LIB);
       ci.maxPipelineRayRecursionDepth = depth;
@@ -510,10 +510,18 @@ main(void)
       destroy(p);
    }
    ci = info(0);
-   ci.maxPipelineRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH + 1;
+   ci.maxPipelineRayRecursionDepth = HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH + 1;
    CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_ERROR_FEATURE_NOT_PRESENT);
    CHECK(p == VK_NULL_HANDLE);
-   puts("PASS: stage-only libraries, link-time groups, depth 10/31 and overflow");
+   puts("PASS: stage-only libraries, link-time groups, legacy-client depth 10/31 and overflow");
+   /* M1-M3 retain the legacy limit even for the same library request. */
+   dev.dev.chip = AGX_CHIP_G13G;
+   ci = info(LIB);
+   ci.maxPipelineRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH + 1;
+   t = translations;
+   CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_ERROR_FEATURE_NOT_PRESENT);
+   CHECK(p == VK_NULL_HANDLE && translations == t);
+   dev.dev.chip = AGX_CHIP_G17P;
 
    /* Exercise the real G17P loader and its SPECTPR spill frame. The nested
     * callable CTS has a 256-element local array and reserves 31 frames. */

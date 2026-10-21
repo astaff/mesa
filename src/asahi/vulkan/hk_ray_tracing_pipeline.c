@@ -2735,13 +2735,14 @@ hk_compile_ray_tracing_pipeline(
     * the complete callee tree at every level, even though the pre-inline DAG
     * is small. Reject that expansion before NIR allocates gigabytes and
     * drives the system into reclaim. This is a compiler resource limit, not
-    * a lower advertised recursion depth. Legacy generations are unchanged.
+    * a substitute for the advertised depth bound. Legacy generations are
+    * unchanged.
     */
    if (dev->dev.chip == AGX_CHIP_G17P &&
-       !hk_rt_inlining_fits(b->shader, 1u << 18)) {
+       !hk_rt_inlining_fits(b->shader, 1u << 20)) {
       ralloc_free(b->shader);
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
-                       "RT inlining exceeds 262144 instructions");
+                       "RT inlining exceeds 1048576 instructions");
    }
 
    NIR_PASS(_, b->shader, nir_inline_functions);
@@ -3137,6 +3138,17 @@ hk_create_ray_tracing_pipeline(
    const VkPipelineCreateFlags2KHR flags =
       vk_rt_pipeline_create_flags(create_info);
 
+   /* Keep the existing defensive ceiling before key construction or NIR
+    * cloning. G17P advertises three levels. Some older clients request 10
+    * even for non-recursive stage libraries; accepting these invalid requests
+    * is harmless when the actual call graph fits the compiler budget. */
+   const uint32_t max_depth = dev->dev.chip == AGX_CHIP_G17P ?
+      HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH;
+   if (create_info->maxPipelineRayRecursionDepth > max_depth)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "maxPipelineRayRecursionDepth %u exceeds %u",
+                       create_info->maxPipelineRayRecursionDepth, max_depth);
+
    struct hk_ray_tracing_pipeline *pipeline = vk_pipeline_zalloc(
       &dev->vk, &hk_ray_tracing_pipeline_ops,
       VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, flags, pAllocator,
@@ -3166,20 +3178,6 @@ hk_create_ray_tracing_pipeline(
    }
    if (dev->dev.chip == AGX_CHIP_G17P)
       hk_rt_pipeline_key(dev, create_info, pipeline->binary_key);
-
-   /* maxRayRecursionDepth is a property, and exceeding it is application
-    * error the validation layer catches -- but recursion here is unrolled at
-    * compile time, so a pipeline that asks for more would silently get a
-    * megakernel that traces one level and stops.  Refuse instead: a wrong
-    * image is worse than a failed create. */
-   if (create_info->maxPipelineRayRecursionDepth > HK_MAX_RAY_RECURSION_DEPTH) {
-      result = vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
-                       "maxPipelineRayRecursionDepth %u exceeds the %u this "
-                       "driver advertises",
-                       create_info->maxPipelineRayRecursionDepth,
-                       HK_MAX_RAY_RECURSION_DEPTH);
-      goto fail;
-   }
 
    pipeline->stage_count = create_info->stageCount;
    pipeline->group_count = create_info->groupCount;

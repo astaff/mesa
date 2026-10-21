@@ -1085,13 +1085,15 @@ hk_get_device_properties(const struct agx_device *dev,
        * address the shader adds a stride to.
        *
        * Trace recursion is unrolled into the megakernel at compile time.
-       * Advertise the required minimum of 31; stage functions are cloned at
-       * each reachable depth, so compilation may grow with recursion.
+       * G17P supports three levels until trace continuations can be shared.
+       * KHR requires at least one level; legacy generations retain their
+       * limit of three.
        *
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */
       .shaderGroupHandleSize = HK_RAY_TRACING_GROUP_HANDLE_SIZE,
-      .maxRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH,
+      .maxRayRecursionDepth = dev->chip == AGX_CHIP_G17P ?
+         HK_G17P_MAX_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH,
       .maxShaderGroupStride = 16384,
       .shaderGroupBaseAlignment = 64,
       .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
