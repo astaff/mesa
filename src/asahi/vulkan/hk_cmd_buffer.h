@@ -838,6 +838,9 @@ struct hk_cs {
    bool gen1_native_fragment_rq;
    bool gen1_native_vertex_rq;
 
+   /* At least one AS-build dispatch or compute transfer is in this stream. */
+   bool as_build;
+
    /* M5: a later render pass instance continues in this stream
     * (hk_m5_pass_merge_begin()); its draws may not share the stream's
     * committed sample locations (hk_flush_gfx_state()). */
@@ -1054,6 +1057,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->gen1_native_rq |= b->gen1_native_rq;
+   a->as_build |= b->as_build;
    a->scratch.cs.main |= b->scratch.cs.main;
    a->scratch.cs.preamble |= b->scratch.cs.preamble;
 
@@ -1180,6 +1184,9 @@ struct hk_cmd_buffer {
 
       /* Suppress consumption of pending resets while recording another reset. */
       bool query_reset_recording;
+
+      /* Scoped around direct/indirect AS builds, including their meta blits. */
+      bool as_build_recording;
 
       /* AGX3: the last render pass instance stored a whole depth-only image
        * that nothing recorded since may have read. A later instance that
@@ -1755,6 +1762,8 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (compute && unlikely((*ptr)->query_reset_pending) &&
        !cmd->state.query_reset_recording)
       hk_flush_query_resets(cmd, *ptr);
+   if (compute && cmd->state.as_build_recording)
+      (*ptr)->as_build = true;
    return *ptr;
 }
 

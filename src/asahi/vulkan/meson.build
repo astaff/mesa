@@ -91,6 +91,7 @@ hk_files = files(
   'hk_query_pool.h',
   'hk_drm_render_core.c',
   'hk_drm_render_core.h',
+  'hk_execution_allowance.h',
   'hk_queue.c',
   'hk_queue.h',
   'hk_sampler.c',
@@ -118,6 +119,20 @@ hk_drirc = custom_target(
 )
 
 if with_tests
+  test('hk_execution_allowance',
+    executable('hk_execution_allowance_test',
+      files('tests/test-hk-execution-allowance.c'),
+      include_directories : [
+        include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
+        inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_libagx,
+        idep_libagx_shaders_h, idep_agx_pack,
+        idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+      ]),
+    suite : ['asahi'])
+
   test(
     'hk_barrier',
     executable(

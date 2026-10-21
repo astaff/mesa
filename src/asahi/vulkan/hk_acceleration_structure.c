@@ -1882,6 +1882,9 @@ hk_cmd_build_acceleration_structures(
       }
    }
 
+   const bool was_as_build = cmd->state.as_build_recording;
+   cmd->state.as_build_recording = dev->dev.chip == AGX_CHIP_G17P;
+
    /* A build binds its own compute pipelines and push constants, so the
     * application's compute state has to survive it. */
    struct hk_meta_save save;
@@ -1923,6 +1926,7 @@ hk_cmd_build_acceleration_structures(
          &dev->accel_struct_args);
 
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+   cmd->state.as_build_recording = was_as_build;
    free(nonempty_infos);
    free(nonempty_ranges);
    free(nonempty_indirect);

@@ -24,6 +24,7 @@
 #include "hk_device.h"
 #include "hk_drm_render_core.h"
 #include "hk_drm_prior_core.h"
+#include "hk_execution_allowance.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
@@ -1249,6 +1250,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             asahi_append_compute_attachments(dev, &payload, cs);
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
             asahi_fill_cdm_command(dev, cs, &cmd.legacy);
+            cmd.legacy.flags |= hk_as_build_flags(dev->dev.chip,
+                                                  dev->dev.params.features,
+                                                  cs->as_build);
             /* Native ray queries exist only on kernels that accept the
              * extended command (hk_g17p_rt_enabled). */
             assert(!cs->gen1_native_rq || dev->gen1_native_rq);
