@@ -70,7 +70,19 @@ hk_wsi_allocate_memory(VkDevice device, const VkMemoryAllocateInfo *info,
             return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
    }
-   return hk_AllocateMemory(device, info, alloc, out);
+   /* Headless WSI's non-modifier path does not supply the private WSI
+    * allocation info. Tag it here as well, before BO allocation/binding, so
+    * failures at any point bypass the BO cache. Preserve an existing info's
+    * synchronization flags and every other allocation extension. */
+   struct wsi_memory_allocate_info wsi_info = {
+      .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
+      .pNext = info->pNext,
+   };
+   VkMemoryAllocateInfo tagged_info = *info;
+   if (dev->dev.chip == AGX_CHIP_G17P &&
+       !vk_find_struct_const(info->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
+      tagged_info.pNext = &wsi_info;
+   return hk_AllocateMemory(device, &tagged_info, alloc, out);
 }
 
 VkResult

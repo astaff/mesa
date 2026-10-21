@@ -349,11 +349,14 @@ main(void)
    /* The CTS tries callback limits 0..1024, including an extent requiring
     * four 1 GiB images. No attempt may enter the kernel above the hard limit,
     * and every completed image must be freed on the next image's failure. */
-   for (unsigned count = 0; count <= 1024; ++count) {
-      passing = count;
-      swapchain_attempt(dev, 1024 * MIB);
-      passing = count;
-      swapchain_attempt(dev, 256 * MIB);
+   for (unsigned modifiers = 0; modifiers < 2; ++modifiers) {
+      pdev->wsi_device.supports_modifiers = modifiers;
+      for (unsigned count = 0; count <= 1024; ++count) {
+         passing = count;
+         swapchain_attempt(dev, 1024 * MIB);
+         passing = count;
+         swapchain_attempt(dev, 256 * MIB);
+      }
    }
    assert(peak == 1024 * MIB);
    assert(trims && bo_calls && successes);
@@ -433,6 +436,6 @@ main(void)
    simple_mtx_destroy(&dev->dev.bo_map_lock);
    free(dev);
    free(pdev);
-   puts("PASS: 2050 swapchain allocation attempts, no kernel OOM entry or retained backing");
+   puts("PASS: 4100 swapchain allocation attempts (with/without modifiers), no kernel OOM entry or retained backing");
    return 0;
 }
