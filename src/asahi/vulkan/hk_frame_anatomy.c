@@ -18,6 +18,7 @@
  * userspace-visible split of an API render pass into several streams.
  */
 #include "hk_frame_anatomy.h"
+#include "nir.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -38,6 +39,7 @@
 #include "hk_device.h"
 #include "hk_queue.h"
 #include "util/format/u_format.h"
+#include "util/hash_table.h"
 #include "util/log.h"
 #include "util/macros.h"
 #include "util/os_misc.h"
@@ -46,7 +48,7 @@
 #include "util/u_debug.h"
 #include "util/u_dynarray.h"
 
-#define HK_FA_TEXT_MAX       640
+#define HK_FA_TEXT_MAX       1024
 #define HK_FA_STAMPS         4
 #define HK_FA_TS_BO_SIZE     (256 * 1024)
 #define HK_FA_RING_RECS      (HK_FA_TS_BO_SIZE / (HK_FA_STAMPS * sizeof(uint64_t)))
@@ -101,6 +103,12 @@ struct hk_frame_anatomy {
    /* Free-form notes written so far and dropped at the limit
     * (hk_frame_anatomy_note); the limit is HK_FRAME_ANATOMY_NOTES. */
    uint32_t notes, notes_dropped, note_limit;
+
+   /* HK_FRAME_ANATOMY_DUMP=<dir>: each sampled fragment program's binary is
+    * written once to <dir>/fs-<hash>.bin. */
+   const char *dump_dir;
+   uint32_t dumped[1024];
+   unsigned nr_dumped;
 };
 
 void
@@ -301,6 +309,10 @@ hk_frame_anatomy_init(struct hk_device *dev)
    int64_t notes = debug_get_num_option("HK_FRAME_ANATOMY_NOTES",
                                         HK_FA_NOTE_LIMIT);
    fa->note_limit = notes > 0 ? (uint32_t)MIN2(notes, INT32_MAX) : 0;
+
+   fa->dump_dir = os_get_option("HK_FRAME_ANATOMY_DUMP");
+   if (fa->dump_dir && !*fa->dump_dir)
+      fa->dump_dir = NULL;
 
    const char *ts = os_get_option("HK_FRAME_ANATOMY_TS");
    fa->ts_mode = HK_FA_TS_ALL;
@@ -520,6 +532,54 @@ hk_fa_hw_char(unsigned op)
 }
 
 void
+hk_frame_anatomy_dump_nir(struct hk_device *dev, const struct hk_shader *shader,
+                          struct nir_shader *nir, unsigned stage)
+{
+   struct hk_frame_anatomy *fa = dev->frame_anatomy;
+   if (!fa || !fa->dump_dir || !shader->code_size ||
+       (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE))
+      return;
+
+   char path[512];
+   snprintf(path, sizeof(path), "%s/%s-%08x.nir", fa->dump_dir,
+            stage == MESA_SHADER_FRAGMENT ? "fs" : "cs",
+            _mesa_hash_data(shader->code_ptr, shader->code_size));
+   if (access(path, F_OK) == 0)
+      return;
+   FILE *f = fopen(path, "w");
+   if (f) {
+      nir_print_shader(nir, f);
+      fclose(f);
+   }
+}
+
+static void
+hk_fa_dump_fs(struct hk_frame_anatomy *fa, uint32_t hash,
+              const struct hk_shader *fs)
+{
+   if (!fa->dump_dir || !fs->code_size)
+      return;
+
+   simple_mtx_lock(&fa->lock);
+   bool dump = fa->nr_dumped < ARRAY_SIZE(fa->dumped);
+   for (unsigned i = 0; dump && i < fa->nr_dumped; ++i)
+      dump = fa->dumped[i] != hash;
+   if (dump)
+      fa->dumped[fa->nr_dumped++] = hash;
+   simple_mtx_unlock(&fa->lock);
+   if (!dump)
+      return;
+
+   char path[512];
+   snprintf(path, sizeof(path), "%s/fs-%08x.bin", fa->dump_dir, hash);
+   FILE *f = fopen(path, "wb");
+   if (f) {
+      fwrite(fs->code_ptr, 1, fs->code_size, f);
+      fclose(f);
+   }
+}
+
+void
 hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
                         struct hk_device *dev, const struct hk_cs *cs,
                         struct drm_asahi_cmd_render *c, unsigned cmdbuf_index,
@@ -591,6 +651,38 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
                 c->fragment_helper.data ? 'f' : '-');
    if (cs->g17p_primitive_bound != UINT64_MAX)
       HK_FA_APPEND(" prims<=%" PRIu64, cs->g17p_primitive_bound);
+
+   /* Fragment programs: hash of the main binary, draws, then the compiler's
+    * instruction count, registers, threads, spills+fills, scratch bytes and
+    * sample-rate shading. */
+   for (unsigned i = 0; i < HK_FA_FS_MAX && cs->anatomy_fs[i].fs; ++i) {
+      const struct hk_shader *fs = cs->anatomy_fs[i].fs;
+      const struct agx2_stats *st = &fs->b.info.stats;
+      const uint32_t hash =
+         fs->code_size ? _mesa_hash_data(fs->code_ptr, fs->code_size) : 0;
+      hk_fa_dump_fs(fa, hash, fs);
+      HK_FA_APPEND(" fs=%08x:d%u:i%u:g%u:t%u:sp%u:sc%u:ss%u", hash,
+                   cs->anatomy_fs[i].draws, st->instrs, st->gprs, st->threads,
+                   st->spills + st->fills, st->scratch,
+                   fs->info.fs.uses_sample_shading);
+   }
+   if (cs->anatomy_fs_other)
+      HK_FA_APPEND(" fs_other=%u", cs->anatomy_fs_other);
+}
+
+void
+hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs)
+{
+   if (!fs)
+      return;
+   for (unsigned i = 0; i < HK_FA_FS_MAX; ++i) {
+      if (cs->anatomy_fs[i].fs == fs || !cs->anatomy_fs[i].fs) {
+         cs->anatomy_fs[i].fs = fs;
+         cs->anatomy_fs[i].draws++;
+         return;
+      }
+   }
+   cs->anatomy_fs_other++;
 }
 
 void

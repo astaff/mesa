@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_image.h"
+#include "hk_frame_anatomy.h"
 #include "hk_g17p_compression.h"
 #include "agx_bg_eot_key.h"
 #include "hk_native_descriptor.h"
@@ -1664,6 +1665,23 @@ hk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       hk_image_finish(dev, image, pAllocator);
       vk_free2(&dev->vk.alloc, pAllocator, image);
       return result;
+   }
+
+   /* Frame anatomy profiler: the compression decision for every image large
+    * enough to matter for bandwidth. */
+   if (unlikely(dev->frame_anatomy) && pCreateInfo->extent.width >= 128 &&
+       pCreateInfo->extent.height >= 128) {
+      hk_frame_anatomy_note(
+         dev,
+         "image %ux%ux%u fmt=%s samples=%u mips=%u layers=%u usage=0x%x "
+         "flags=0x%x tiling=%u pnext=%u compressed=%u",
+         pCreateInfo->extent.width, pCreateInfo->extent.height,
+         pCreateInfo->extent.depth,
+         util_format_short_name(hk_format_to_pipe_format(pCreateInfo->format)),
+         pCreateInfo->samples, pCreateInfo->mipLevels,
+         pCreateInfo->arrayLayers, pCreateInfo->usage, pCreateInfo->flags,
+         pCreateInfo->tiling, pCreateInfo->pNext != NULL,
+         image->planes[0].layout.compressed);
    }
 
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {

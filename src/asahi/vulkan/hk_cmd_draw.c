@@ -11878,6 +11878,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       hk_g17p_note_layer_zero_draw(cmd, cs);
       hk_note_pre_raster_images(cmd, cs);
       hk_m5_note_render_resources(cmd, cs);
+      if (unlikely(dev->frame_anatomy))
+         hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
       cs->stats.cmds++;
    }
 }

@@ -1029,6 +1029,10 @@ enum hk_cs_type {
    HK_CS_VDM,
 };
 
+/* Fragment programs a control stream records for the frame anatomy
+ * profiler (hk_frame_anatomy.h). */
+#define HK_FA_FS_MAX 4
+
 struct hk_cs {
    struct list_head node;
 
@@ -1182,6 +1186,15 @@ struct hk_cs {
       uint32_t robust_index_draws, robust_index_dispatches,
          robust_index_batches;
    } stats;
+
+   /* Frame anatomy profiler only: the first fragment programs this stream
+    * draws with and their draw counts; later programs are only counted.
+    * Zero unless HK_FRAME_ANATOMY is set. */
+   struct {
+      const struct hk_shader *fs;
+      uint32_t draws;
+   } anatomy_fs[HK_FA_FS_MAX];
+   uint32_t anatomy_fs_other;
 
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The

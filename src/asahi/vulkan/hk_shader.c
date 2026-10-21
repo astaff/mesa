@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "hk_frame_anatomy.h"
 #include "hk_nir_lower_gs.h"
 #include "hk_nir_root_size.h"
 #include "hk_nir_lower_tes_rq.h"
@@ -4878,6 +4879,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    shader->code_ptr = shader->b.binary;
    shader->code_size = shader->b.info.binary_size;
+
+   if (unlikely(dev->frame_anatomy))
+      hk_frame_anatomy_dump_nir(dev, shader, nir, sw_stage);
 
    if (sw_stage == MESA_SHADER_FRAGMENT)
       shader->info.fs.g17p_samples = MAX2(backend_key.fs.nr_samples, 1);

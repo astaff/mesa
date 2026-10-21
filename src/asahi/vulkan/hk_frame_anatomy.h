@@ -28,6 +28,7 @@
 struct hk_device;
 struct hk_queue;
 struct hk_cs;
+struct hk_shader;
 struct drm_asahi_cmd_render;
 struct drm_asahi_cmd_compute;
 struct hk_frame_anatomy_submit;
@@ -57,6 +58,17 @@ void hk_frame_anatomy_finish(struct hk_device *dev);
 #define HK_FA_NOTE_LIMIT 4096
 void hk_frame_anatomy_note(struct hk_device *dev, const char *fmt, ...)
    PRINTFLIKE(2, 3);
+
+/* Count one draw of a render stream with fragment program fs (NULL for no
+ * fragment shader). Called only while the profiler is enabled. */
+void hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs);
+
+/* HK_FRAME_ANATOMY_DUMP only: write the final NIR of a compiled fragment or
+ * compute program to <dir>/{fs,cs}-<binary hash>.nir. */
+struct nir_shader;
+void hk_frame_anatomy_dump_nir(struct hk_device *dev,
+                               const struct hk_shader *shader,
+                               struct nir_shader *nir, unsigned stage);
 
 /* Returns NULL unless this submit is sampled. */
 struct hk_frame_anatomy_submit *
