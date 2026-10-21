@@ -54,7 +54,7 @@ extern "C" {
  * decision, not a hardware limit.  A pipeline asking for more is refused
  * rather than silently given a shader that traces one level and stops.
  */
-#define HK_MAX_RAY_RECURSION_DEPTH 3
+#define HK_MAX_RAY_RECURSION_DEPTH 31
 
 #define HK_RT_WORKGROUP_SIZE_X      32
 #define HK_RT_WORKGROUP_SIZE_X_LOG2 5

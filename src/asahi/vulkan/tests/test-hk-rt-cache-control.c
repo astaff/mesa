@@ -8,6 +8,7 @@
  * replaced.  These checks do not execute shaders or establish conformance.
  */
 #include "spirv/spirv.h"
+#include "asahi/compiler/agx3_compute_program.h"
 #include "util/set.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
@@ -476,6 +477,70 @@ main(void)
    }
    puts(
       "PASS: mixed batches, success preservation, EARLY_RETURN and skipped null handles");
+   /* CTS misc.shaders_from_lib creates stage-only libraries and supplies
+    * groups when linking, with recursion depth 10 in all three creates. */
+   for (unsigned depth = 10; depth <= HK_MAX_RAY_RECURSION_DEPTH;
+        depth += HK_MAX_RAY_RECURSION_DEPTH - 10) {
+      VkPipeline libs[2];
+      ci = info(LIB);
+      ci.maxPipelineRayRecursionDepth = depth;
+      ci.groupCount = 0;
+      ci.pGroups = NULL;
+      CHECK(create(VK_NULL_HANDLE, &ci, &libs[0]) == VK_SUCCESS);
+      CHECK(create(VK_NULL_HANDLE, &ci, &libs[1]) == VK_SUCCESS);
+      VkPipelineLibraryCreateInfoKHR imports = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
+         .libraryCount = 2, .pLibraries = libs,
+      };
+      ci = info(0);
+      ci.maxPipelineRayRecursionDepth = depth;
+      ci.stageCount = 0;
+      ci.pStages = NULL;
+      ci.pLibraryInfo = &imports;
+      CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS);
+      struct hk_ray_tracing_pipeline *linked =
+         hk_ray_tracing_pipeline_from_handle(p);
+      CHECK(linked->stage_count == 2 && linked->group_count == 1);
+      destroy(libs[0]);
+      destroy(libs[1]);
+      destroy(p);
+   }
+   ci = info(0);
+   ci.maxPipelineRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH + 1;
+   CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_ERROR_FEATURE_NOT_PRESENT);
+   CHECK(p == VK_NULL_HANDLE);
+   puts("PASS: stage-only libraries, link-time groups, depth 10/31 and overflow");
+
+   /* Exercise the real G17P loader and its SPECTPR spill frame. The nested
+    * callable CTS has a 256-element local array and reserves 31 frames. */
+   struct agx3_g17p_compute_program_desc desc = {
+      .program_va = 0x100000, .shader_va = 0x200000,
+      .shader_binary_size = 64, .nr_gprs = 32,
+      .compiler_d_valid = true, .compiler_d = 64,
+      .ldshdr_f1 = AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
+   };
+   CHECK(agx3_cdm_direct_template_sources_compute(false, false, false,
+                                                  &desc.launch_sources));
+   const uint32_t frames[] = {0, 8192, 31 * 1088, UINT16_MAX * 4u};
+   for (unsigned i = 0; i < ARRAY_SIZE(frames); ++i) {
+      desc.scratch_size = frames[i];
+      struct agx3_g17p_compute_program program;
+      CHECK(agx3_g17p_compute_program_generate(AGX_CHIP_G17P, &desc, &program));
+      uint8_t spectpr[AGX_IOTO_SPECTPR_SIZE];
+      CHECK(agx_ioto_g17p_compiler_spectpr_pack(frames[i], desc.compiler_d,
+                                               spectpr, sizeof(spectpr)));
+      bool found = false;
+      for (unsigned j = 0; j + sizeof(spectpr) <= program.length; ++j)
+         found |= !memcmp(program.bytes + j, spectpr, sizeof(spectpr));
+      CHECK(found);
+   }
+   desc.scratch_size = UINT16_MAX * 4u + 4u;
+   struct agx3_g17p_compute_program program;
+   CHECK(!agx3_g17p_compute_program_generate(AGX_CHIP_G17P, &desc, &program));
+   desc.scratch_size = 8193;
+   CHECK(!agx3_g17p_compute_program_generate(AGX_CHIP_G17P, &desc, &program));
+   puts("PASS: G17P callable-size spill frames and encoding bounds");
+
    destroy(library);
    CHECK(live_nir == 0 && pipeline_allocs == pipeline_frees);
    CHECK(layout->ref_cnt == 1);
