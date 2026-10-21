@@ -70,7 +70,7 @@ hk_wsi_allocate_memory(VkDevice device, const VkMemoryAllocateInfo *info,
             return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
    }
-   /* Headless WSI's non-modifier path does not supply the private WSI
+   /* WSI's dma-buf sync-file capability probe does not supply the private
     * allocation info. Tag it here as well, before BO allocation/binding, so
     * failures at any point bypass the BO cache. Preserve an existing info's
     * synchronization flags and every other allocation extension. */

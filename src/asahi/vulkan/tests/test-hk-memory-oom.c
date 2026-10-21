@@ -349,14 +349,11 @@ main(void)
    /* The CTS tries callback limits 0..1024, including an extent requiring
     * four 1 GiB images. No attempt may enter the kernel above the hard limit,
     * and every completed image must be freed on the next image's failure. */
-   for (unsigned modifiers = 0; modifiers < 2; ++modifiers) {
-      pdev->wsi_device.supports_modifiers = modifiers;
-      for (unsigned count = 0; count <= 1024; ++count) {
-         passing = count;
-         swapchain_attempt(dev, 1024 * MIB);
-         passing = count;
-         swapchain_attempt(dev, 256 * MIB);
-      }
+   for (unsigned count = 0; count <= 1024; ++count) {
+      passing = count;
+      swapchain_attempt(dev, 1024 * MIB);
+      passing = count;
+      swapchain_attempt(dev, 256 * MIB);
    }
    assert(peak == 1024 * MIB);
    assert(trims && bo_calls && successes);
@@ -399,6 +396,7 @@ main(void)
    sibling_snapshot = 0;
    assert(!pinned && !host_live);
 
+
    passing = 4;
    assert(alloc(dev, 1024 * MIB, &memory) == VK_SUCCESS);
    VkMemoryGetFdInfoKHR get_fd = {
@@ -412,6 +410,28 @@ main(void)
    assert(fd == -1);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    assert(!pinned && !host_live);
+
+   /* The real headless path first probes dma-buf sync-file support with a
+    * small export allocation lacking WSI_MEMORY_ALLOCATE_INFO_MESA. Its
+    * failed export must release backing too, with no cache growth. */
+   const VkExportMemoryAllocateInfo export_info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   const VkMemoryAllocateInfo probe_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &export_info,
+      .allocationSize = 4096,
+   };
+   passing = 4;
+   assert(hk_wsi_allocate_memory(hk_device_to_handle(dev), &probe_info,
+                                &allocator, &memory) == VK_SUCCESS);
+   assert(hk_device_memory_from_handle(memory)->bo->flags & AGX_BO_SHAREABLE);
+   get_fd.memory = memory;
+   assert(hk_GetMemoryFdKHR(hk_device_to_handle(dev), &get_fd, &fd) ==
+          VK_ERROR_OUT_OF_HOST_MEMORY);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   assert(!pinned && !host_live && !dev->dev.bo_cache.size);
 
    /* Physical heap and alignment failures must also precede BO allocation. */
    pdev->mem_heaps[0].size = 512 * MIB;
@@ -436,6 +456,6 @@ main(void)
    simple_mtx_destroy(&dev->dev.bo_map_lock);
    free(dev);
    free(pdev);
-   puts("PASS: 4100 swapchain allocation attempts (with/without modifiers), no kernel OOM entry or retained backing");
+   puts("PASS: 2050 swapchain allocation attempts and sync-file probe, no kernel OOM entry or retained backing");
    return 0;
 }
