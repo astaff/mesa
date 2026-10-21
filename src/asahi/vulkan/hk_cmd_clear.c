@@ -144,7 +144,9 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
             libagx_fast_clear(cmd, grid, AGX_BARRIER_ALL, meta_addr, address,
                               grid.count[0], grid.count[1], tilesize.width_el,
                               tilesize.height_el, meta_layer_stride_tl,
-                              layer_stride_uint4, util_logbase2(blocksize_B),
+                              layer_stride_uint4,
+                              util_logbase2(ail_metadata_tile(layout).height_el),
+                              util_logbase2(blocksize_B),
                               util_logbase2(layout->sample_count_sa), c[0],
                               c[1], c[2], c[3], word);
          } else {
