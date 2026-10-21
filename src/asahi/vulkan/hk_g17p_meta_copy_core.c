@@ -578,8 +578,8 @@ hk_g17p_buffer_to_image_copy_supported(
        * PBE, which also updates compression metadata. Keep this fallback
        * bounded to the single-level 2D shape G17P depth compression admits
        * (hk_g17p_compression.h). A combined depth/stencil image is split
-       * into a depth plane and a stencil plane; only the depth plane is
-       * compressed, so only its aspect comes here. */
+       * into a depth plane and a stencil plane; the stencil aspect is the
+       * branch below. */
       const bool split = copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
                          copy->format == VK_FORMAT_D16_UNORM_S8_UINT;
       if (copy->plane_count != (split ? 2 : 1) ||
@@ -590,6 +590,15 @@ hk_g17p_buffer_to_image_copy_supported(
                       copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
                         ? VK_FORMAT_R32_UINT
                         : VK_FORMAT_R16_UINT;
+   } else if ((copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+               copy->format == VK_FORMAT_D16_UNORM_S8_UINT) &&
+              copy->aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
+      /* A compressed stencil plane takes the same graphics copy through its
+       * bit-compatible R8_UINT view, in the same single-level 2D shape. */
+      if (copy->plane_count != 2 || copy->image_type != VK_IMAGE_TYPE_2D ||
+          copy->mip_levels != 1 || copy->array_layers != 1)
+         return false;
+      plane_format = VK_FORMAT_R8_UINT;
    } else if (copy->plane_count != 1 ||
               copy->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
       return false;

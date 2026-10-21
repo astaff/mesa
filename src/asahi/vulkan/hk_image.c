@@ -382,6 +382,7 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 {
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(format);
+   const VkFormat api_format = format;
 
    if (ycbcr_info) {
       format = ycbcr_info->planes[plane].format;
@@ -437,8 +438,11 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
     * makes the host-copy performance query report a plain device layout;
     * Zink then retains HOST_TRANSFER and never compresses its depth images.
     */
+   /* Decided on the API format: the stencil plane of D32_SFLOAT_S8_UINT is
+    * S8_UINT here, and zink gives its depth/stencil images feedback-loop
+    * usage. */
    const bool depth_feedback = dev->chip == AGX_CHIP_G17P && allow_agx3 &&
-                               hk_g17p_compression_depth_format(format);
+                               hk_g17p_compression_depth_format(api_format);
    if ((usage & (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
                  VK_IMAGE_USAGE_STORAGE_BIT)) ||
        ((usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) &&

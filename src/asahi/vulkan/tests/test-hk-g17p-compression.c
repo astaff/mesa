@@ -97,8 +97,12 @@ check_shape(VkFormat format, bool is_depth)
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_g17p_compression_eligible((enum agx_chip)chip, 0, &base) ==
             (chip == AGX_CHIP_G17P));
-   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &base));
+   /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
+   CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &base) ==
+         (format == VK_FORMAT_D32_SFLOAT_S8_UINT));
+   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 2, &base));
    CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, NULL));
+   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, NULL));
 
    /* Usage: only texture/PBE/ZLS usages are admitted. */
    VkImageUsageFlags allowed =
@@ -257,8 +261,8 @@ check_zink(void)
 {
    /* Portal 2 under zink (t-1079): GL render targets declare
     * feedback-loop usage and keep the uncompressed layout. The GL Z24S8
-    * depth buffer is D32S8 on Honeykrisp; its depth plane compresses and
-    * its stencil plane stays plain. */
+    * depth buffer is D32S8 on Honeykrisp; both its depth and its stencil
+    * plane compress. */
    const VkImageUsageFlags rt = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
@@ -281,7 +285,7 @@ check_zink(void)
       image(VK_FORMAT_D32_SFLOAT_S8_UINT, 2408, 1506, 1, ds);
    depth.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
    CHECK(ELIGIBLE(depth));
-   CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &depth));
+   CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &depth));
    /* This is Portal's actual shape. A device-copy performance query must
     * find its compressed layout when host transfer is removed; otherwise
     * zink retains HOST_TRANSFER and never uses depth compression. */

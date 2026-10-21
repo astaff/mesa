@@ -25,12 +25,14 @@
  *    texels are excluded so that a single-sample tilebuffer never spills a
  *    compressed target (spilling needs libagx_decompress, which has no G17P
  *    binary): 8 targets x 8 B fit in the 120 B/sample G17P budget.
- *  - Depth: D16_UNORM, D32_SFLOAT and the D32_SFLOAT depth plane (plane 0)
- *    of D32_SFLOAT_S8_UINT, one level, one layer, one sample. Stencil
- *    planes stay plain. Zink stores GL Z24S8 as D32S8, so its depth plane
- *    is every GL depth buffer's ZLS traffic; buffer uploads into it take
- *    the graphics copy (R32_UINT PBE) and the stencil plane keeps the raw
- *    upload kernel.
+ *  - Depth: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT,
+ *    one level, one layer, one sample. The ZLS unit compresses the S8
+ *    stencil plane with the same metadata layout as depth (stencil
+ *    load/store compression bits 4/8), it is read through its R8_UINT
+ *    alias, and its clears are metadata fast clears. Zink stores GL Z24S8
+ *    as D32S8, so these planes carry every GL depth/stencil buffer's ZLS
+ *    traffic; buffer uploads into them take the graphics copy (R32_UINT
+ *    and R8_UINT PBEs).
  *
  * Images that may be shared with another process or device (external
  * memory, WSI, DRM modifiers) stay plain under this private policy. Colour
@@ -127,7 +129,9 @@ static inline bool
 hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
                              const VkImageCreateInfo *info)
 {
-   if (chip != AGX_CHIP_G17P || plane != 0 || !info)
+   if (chip != AGX_CHIP_G17P || !info ||
+       (plane != 0 && !(plane == 1 &&
+                        info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
 
    /* Shared images keep their plain layout contract. Read each header by
