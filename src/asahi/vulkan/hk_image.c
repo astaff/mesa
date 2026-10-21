@@ -519,26 +519,41 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 }
 
 /* M5 lossless storage compression of formats without image atomics: the
- * half-float formats, RG32F and RGBA32F have none, and R32F has them only
- * with the float32 image atomic features, so it is compressed only when the
- * device did not enable them (and its views cannot reinterpret it). The
+ * half-float formats, RG32F, RGBA32F and RGBA8 have none, and R32F has them
+ * only with the float32 image atomic features, so it is compressed only when
+ * the device did not enable them (and its views cannot reinterpret it). The
  * single-layer/level native read/write packets use the allocator's
  * recovered Gen10 metadata layout, the same layout colour attachments use,
  * so a storage image may also be a colour attachment and a transfer
  * destination: end-of-tile stores, shader image stores, clears and uploads
  * all write it through compressed PBE descriptors. Bits select RGBA16F,
- * RG16F, R16F, R32F, RG32F and RGBA32F, respectively; zero retains the
- * uncompressed diagnostic control. */
+ * RG16F, R16F, R32F, RG32F, RGBA32F and RGBA8, respectively; zero retains
+ * the uncompressed diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
-                         "ASAHI_M5_STORAGE_COMPRESSION", 63)
+                         "ASAHI_M5_STORAGE_COMPRESSION", 127)
 
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
                                  const VkImageCreateInfo *info,
                                  bool float_image_atomics)
 {
-   if (dev->chip != AGX_CHIP_G17S || plane || info->pNext ||
-       (info->flags & ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) ||
+   /* Typeless RGBA8 resources of D3D translation layers are mutable and
+    * list their view formats. Every RGBA8 view shares the image's channels
+    * and none has image atomics, so such an image compresses when
+    * hk_can_compress() finds only compatible formats in the list. */
+   const bool rgba8 = info->format == VK_FORMAT_R8G8B8A8_UNORM;
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+      (rgba8 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+   const VkBaseInStructure *ext = info->pNext;
+   const bool format_list_only =
+      rgba8 && (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && ext &&
+      ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
+      !ext->pNext;
+
+   if (dev->chip != AGX_CHIP_G17S || plane ||
+       (info->pNext && !format_list_only) ||
+       (info->flags & ~allowed_flags) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
        info->extent.width < 16 || info->extent.height < 16 ||
        info->mipLevels != 1 || info->arrayLayers != 1 ||
@@ -564,6 +579,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       break;
    case VK_FORMAT_R32G32_SFLOAT: bit = 16; break;
    case VK_FORMAT_R32G32B32A32_SFLOAT: bit = 32; break;
+   case VK_FORMAT_R8G8B8A8_UNORM: bit = 64; break;
    default: return false;
    }
    return debug_get_option_m5_storage_compression() & bit;
