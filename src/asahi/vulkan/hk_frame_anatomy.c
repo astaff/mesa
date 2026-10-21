@@ -109,6 +109,8 @@ struct hk_frame_anatomy {
    const char *dump_dir;
    uint32_t dumped[1024];
    unsigned nr_dumped;
+
+   bool merge_notes;
 };
 
 void
@@ -116,6 +118,12 @@ hk_frame_anatomy_note(struct hk_device *dev, const char *fmt, ...)
 {
    struct hk_frame_anatomy *fa = dev->frame_anatomy;
    if (likely(!fa))
+      return;
+
+   /* Render pass continuation notes arrive for nearly every pass; they are
+    * written only with HK_FRAME_ANATOMY_MERGE_NOTES so other notes fit. */
+   if (!fa->merge_notes && (!strncmp(fmt, "pass-merge", 10) ||
+                            !strncmp(fmt, "MSAA pass merge", 15)))
       return;
 
    simple_mtx_lock(&fa->lock);
@@ -310,6 +318,7 @@ hk_frame_anatomy_init(struct hk_device *dev)
                                         HK_FA_NOTE_LIMIT);
    fa->note_limit = notes > 0 ? (uint32_t)MIN2(notes, INT32_MAX) : 0;
 
+   fa->merge_notes = debug_get_bool_option("HK_FRAME_ANATOMY_MERGE_NOTES", false);
    fa->dump_dir = os_get_option("HK_FRAME_ANATOMY_DUMP");
    if (fa->dump_dir && !*fa->dump_dir)
       fa->dump_dir = NULL;
@@ -686,6 +695,30 @@ hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs)
 }
 
 void
+hk_frame_anatomy_note_precomp(struct hk_cs *cs, unsigned program,
+                              struct agx_grid grid)
+{
+   const uint64_t threads =
+      agx_is_indirect(grid)
+         ? UINT64_MAX
+         : (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
+   for (unsigned i = 0; i < HK_FA_FS_MAX; ++i) {
+      if (!cs->anatomy_precomp[i].dispatches ||
+          cs->anatomy_precomp[i].program == program) {
+         cs->anatomy_precomp[i].program = program;
+         cs->anatomy_precomp[i].dispatches++;
+         if (threads == UINT64_MAX ||
+             cs->anatomy_precomp[i].threads == UINT64_MAX)
+            cs->anatomy_precomp[i].threads = UINT64_MAX;
+         else
+            cs->anatomy_precomp[i].threads += threads;
+         return;
+      }
+   }
+   cs->anatomy_precomp_other++;
+}
+
+void
 hk_frame_anatomy_compute(struct hk_frame_anatomy_submit *s,
                          struct hk_device *dev, const struct hk_cs *cs,
                          struct drm_asahi_cmd_compute *c, unsigned cmdbuf_index,
@@ -725,6 +758,18 @@ hk_frame_anatomy_compute(struct hk_frame_anatomy_submit *s,
    }
    if (cs->anatomy_fs_other)
       HK_FA_APPEND(" cs_other=%u", cs->anatomy_fs_other);
+   for (unsigned i = 0; i < HK_FA_FS_MAX && cs->anatomy_precomp[i].dispatches;
+        ++i) {
+      if (cs->anatomy_precomp[i].threads == UINT64_MAX)
+         HK_FA_APPEND(" pre=%u:d%u:indirect", cs->anatomy_precomp[i].program,
+                      cs->anatomy_precomp[i].dispatches);
+      else
+         HK_FA_APPEND(" pre=%u:d%u:t%" PRIu64, cs->anatomy_precomp[i].program,
+                      cs->anatomy_precomp[i].dispatches,
+                      cs->anatomy_precomp[i].threads);
+   }
+   if (cs->anatomy_precomp_other)
+      HK_FA_APPEND(" pre_other=%u", cs->anatomy_precomp_other);
 }
 
 /* The command struct a record's header introduces, if the payload holds it. */

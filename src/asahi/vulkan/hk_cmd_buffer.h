@@ -1196,6 +1196,16 @@ struct hk_cs {
    } anatomy_fs[HK_FA_FS_MAX];
    uint32_t anatomy_fs_other;
 
+   /* Frame anatomy profiler only: driver-internal (precompiled) kernels this
+    * stream dispatches, with counts and total threads (UINT64_MAX once any
+    * dispatch is indirect). */
+   struct {
+      uint16_t program;
+      uint16_t dispatches;
+      uint64_t threads;
+   } anatomy_precomp[HK_FA_FS_MAX];
+   uint32_t anatomy_precomp_other;
+
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The
     * kernel writes both from the firmware's native pass record.
@@ -1971,7 +1981,8 @@ void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd,
 
 uint64_t hk_default_sample_positions(unsigned nr_samples);
 
-void hk_flush_deferred_clears(struct hk_cmd_buffer *cmd);
+void hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why);
+#define hk_flush_deferred_clears(cmd) hk_flush_deferred_clears_why(cmd, __func__)
 
 /* The depth image of the pending store is overwritten as a whole before
  * anything read it: the store is dead (see hk_take_pending_z_store()). */

@@ -1634,6 +1634,8 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    }
    hk_m5_compute_resources(cs, desc.scratch_size, 0, desc.threadgroup_memory_size_B,
                            local[0] * local[1] * local[2]);
+   if (unlikely(dev->frame_anatomy))
+      hk_frame_anatomy_note_precomp(cs, idx, grid);
    cs->stats.cmds++;
 }
 

@@ -9,6 +9,7 @@
 #include "util/u_math.h"
 #include "vulkan/vulkan_core.h"
 #include "hk_cmd_buffer.h"
+#include "hk_frame_anatomy.h"
 #include "layout.h"
 
 #include "hk_device.h"
@@ -200,6 +201,16 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
    if (hk_defer_clear(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, &value,
                       rangeCount, pRanges))
       return;
+
+   if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
+      hk_frame_anatomy_note(
+         hk_cmd_buffer_device(cmd),
+         "clear not deferred: %ux%u %s ranges=%u levels=%u layers=%u usage=0x%x compressed=%u",
+         image->vk.extent.width, image->vk.extent.height,
+         util_format_short_name(hk_format_to_pipe_format(image->vk.format)),
+         rangeCount, image->vk.mip_levels, image->vk.array_layers,
+         (unsigned)image->vk.usage, image->planes[0].layout.compressed);
+   }
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */

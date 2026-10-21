@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_cmd_buffer.h"
+#include "util/format/u_format.h"
+#include "hk_frame_anatomy.h"
 #include "hk_ppp_state.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
@@ -4246,7 +4248,7 @@ hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
 }
 
 void
-hk_flush_deferred_clears(struct hk_cmd_buffer *cmd)
+hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 {
    /* Whatever observes the deferred clears may also read a pending store. */
    cmd->state.pending_z_store.cs = NULL;
@@ -4258,6 +4260,14 @@ hk_flush_deferred_clears(struct hk_cmd_buffer *cmd)
    cmd->state.deferred_clear_flushing = true;
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       const struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
+      if (unlikely(dev->frame_anatomy)) {
+         hk_frame_anatomy_note(
+            dev, "deferred-clear fill by %s: %ux%u %s aspects=0x%x compressed=%u",
+            why, e->image->vk.extent.width, e->image->vk.extent.height,
+            util_format_short_name(
+               hk_format_to_pipe_format(e->image->vk.format)),
+            e->aspects, e->image->planes[0].layout.compressed);
+      }
       const VkImageSubresourceRange range = {
          .aspectMask = e->aspects,
          .levelCount = 1,
@@ -4384,6 +4394,12 @@ hk_deferred_clear_for(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       return NULL;
 
    *fill = use == HK_DEFERRED_CLEAR_LOAD_AND_FILL;
+   if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
+      hk_frame_anatomy_note(hk_cmd_buffer_device(cmd),
+                            "deferred-clear taken: %ux%u layout=%u fill=%u",
+                            image->vk.extent.width, image->vk.extent.height,
+                            att->imageLayout, *fill);
+   }
    return e;
 }
 

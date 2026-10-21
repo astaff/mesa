@@ -70,6 +70,11 @@ void hk_frame_anatomy_dump_nir(struct hk_device *dev,
                                const struct hk_shader *shader,
                                struct nir_shader *nir, unsigned stage);
 
+/* Count one dispatch of precompiled internal program `program`. */
+struct agx_grid;
+void hk_frame_anatomy_note_precomp(struct hk_cs *cs, unsigned program,
+                                   struct agx_grid grid);
+
 /* Returns NULL unless this submit is sampled. */
 struct hk_frame_anatomy_submit *
 hk_frame_anatomy_begin_submit(struct hk_device *dev, struct hk_queue *queue,
