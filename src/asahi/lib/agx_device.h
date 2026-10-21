@@ -250,6 +250,9 @@ struct agx_device {
       struct u_cnd_monotonic idle_cond;
       thrd_t idle_thread;
       bool idle_started, idle_stop, idle_pending;
+
+      /* First cached object whose purge advice still needs checking. */
+      uint32_t next_unadvised;
    } bo_cache;
 
    struct agxdecode_ctx *agxdecode;
