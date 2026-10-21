@@ -1204,6 +1204,21 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          struct drm_asahi_cmd_header header =
             agx_cmd_header(cs->type == HK_CS_CDM, cs->sync.barrier[HK_SYNC_VDM],
                            cs->sync.barrier[HK_SYNC_CDM]);
+         uint64_t command_prior[HK_SYNC_NUM_SQ] = {
+            cs->sync.prior[HK_SYNC_VDM], cs->sync.prior[HK_SYNC_CDM],
+         };
+         /* The same recording can occur twice in a merged submit (for
+          * example synchronization2.basic.event.none_set_reset). Assign
+          * classic prefixes here, per emitted occurrence. Storing them in
+          * hk_cs makes the later occurrence overwrite the earlier one and
+          * creates a self-wait that the kernel rejects with EINVAL. */
+         if (queue->sync.serialize &&
+             !hk_drm_serialize_prefix(&header, command_prior, nr_vdm, nr_cdm,
+                                       prior_base, queue->sync.exact_prior)) {
+            util_dynarray_fini(&payload);
+            return vk_device_set_lost(&dev->vk,
+                                      "Asahi serialization ordinal overflow");
+         }
          assert(header.vdm_barrier == DRM_ASAHI_BARRIER_NONE ||
                 header.vdm_barrier <= nr_vdm);
          assert(header.cdm_barrier == DRM_ASAHI_BARRIER_NONE ||
@@ -1248,8 +1263,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             }
             if (queue->sync.exact_prior) {
                header.size = sizeof(cmd);
-               cmd.prior_vdm = cs->sync.prior[HK_SYNC_VDM];
-               cmd.prior_cdm = cs->sync.prior[HK_SYNC_CDM];
+               cmd.prior_vdm = command_prior[HK_SYNC_VDM];
+               cmd.prior_cdm = command_prior[HK_SYNC_CDM];
             }
             util_dynarray_append(&payload, header);
             util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
@@ -1277,7 +1292,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
              * the fragment half after them, so this render's vertex work can
              * overlap their fragment work. Compute dependencies keep ordering
              * the vertex half either way. */
-            if ((dev->dev.params.features &
+            if (!queue->sync.serialize &&
+                (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
                 cs->sync.ta_split &&
                 cs->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
@@ -1288,8 +1304,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             header.size = hk_drm_render_command_size(
                agx_native_graphics(&dev->dev), queue->sync.exact_prior);
             if (queue->sync.exact_prior) {
-               cmd.prior_vdm = cs->sync.prior[HK_SYNC_VDM];
-               cmd.prior_cdm = cs->sync.prior[HK_SYNC_CDM];
+               cmd.prior_vdm = command_prior[HK_SYNC_VDM];
+               cmd.prior_cdm = command_prior[HK_SYNC_CDM];
             }
             if (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq) {
                struct drm_asahi_cmd_render_with_ray_query extended = {.legacy = cmd};

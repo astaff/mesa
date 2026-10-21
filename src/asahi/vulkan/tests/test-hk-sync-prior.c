@@ -475,10 +475,26 @@ test_rt_kernel_gate(void)
    T("rt off outside G17P", !hk_g17p_rt_enabled(dev));
 }
 
-/* Compare the compatibility resolver against upstream's command-prefix
- * contract over every four-command engine mix, command-buffer partition and
- * both prior encodings. No application barrier is supplied: these are the
- * implicit execution edges which the native graph intentionally omits. */
+/* Exercise the production payload helper against upstream's prefix contract.
+ * A packet is private to an occurrence, even when its hk_cs is shared. */
+static void
+check_classic_packet(struct hk_cs *cs, const unsigned prefix[2],
+                      const uint64_t base[2], bool exact)
+{
+   struct drm_asahi_cmd_header packet = agx_cmd_header(
+      cs->type == HK_CS_CDM, cs->sync.barrier[0], cs->sync.barrier[1]);
+   uint64_t prior[2] = {cs->sync.prior[0], cs->sync.prior[1]};
+   T("classic payload prefix", hk_drm_serialize_prefix(
+        &packet, prior, prefix[0], prefix[1], base, exact));
+   const unsigned barriers[2] = {packet.vdm_barrier, packet.cdm_barrier};
+   for (unsigned sq = 0; sq < 2; ++sq) {
+      bool historical = exact && prefix[sq] == 0;
+      T("classic upstream prefix", barriers[sq] ==
+         (historical ? DRM_ASAHI_BARRIER_NONE : prefix[sq]));
+      T("classic prior ordinal", prior[sq] == (historical ? base[sq] : 0));
+   }
+}
+
 static void
 test_classic_submission_order(void)
 {
@@ -487,8 +503,8 @@ test_classic_submission_order(void)
          for (unsigned mix = 0; mix < 16; ++mix) {
             struct hk_queue *q = new_queue(exact);
             q->sync.serialize = true;
-            q->sync.submitted[HK_SYNC_VDM] = 7;
-            q->sync.submitted[HK_SYNC_CDM] = 11;
+            q->sync.submitted[0] = 7;
+            q->sync.submitted[1] = 11;
             struct hk_cmd_buffer *cmds[4];
             struct hk_cs *streams[4];
             for (unsigned i = 0; i < groups; ++i)
@@ -500,44 +516,59 @@ test_classic_submission_order(void)
             unsigned prefix[2] = {0, 0};
             const uint64_t base[2] = {7, 11};
             for (unsigned i = 0; i < 4; ++i) {
-               struct hk_cs *cs = streams[i];
-               struct drm_asahi_cmd_header upstream = agx_cmd_header(
-                  cs->type == HK_CS_CDM, prefix[0], prefix[1]);
-               const unsigned barriers[2] = {upstream.vdm_barrier,
-                                             upstream.cdm_barrier};
-               for (unsigned sq = 0; sq < 2; ++sq) {
-                  bool prior = exact && barriers[sq] == 0;
-                  T("classic upstream prefix", cs->sync.barrier[sq] ==
-                     (prior ? DRM_ASAHI_BARRIER_NONE : barriers[sq]));
-                  T("classic prior ordinal", cs->sync.prior[sq] ==
-                     (prior ? base[sq] : 0));
-                  T("classic tiler ordered", cs->sync.barrier_ta[sq] ==
-                     cs->sync.barrier[sq] && cs->sync.prior_ta[sq] ==
-                     cs->sync.prior[sq]);
-               }
-               T("classic no tiler split", !cs->sync.ta_split);
-               prefix[hk_sync_sq(cs)]++;
+               check_classic_packet(streams[i], prefix, base, exact);
+               prefix[hk_sync_sq(streams[i])]++;
             }
             struct hk_cmd_buffer *next = new_cmd();
             struct hk_cs *read = add(next, true);
+            const uint64_t next_base[2] = {7 + prefix[0], 11 + prefix[1]};
+            const unsigned zero[2] = {0, 0};
             T("classic later read submission", submit(q, next));
-            for (unsigned sq = 0; sq < 2; ++sq) {
-               T("classic earlier submit ordered", exact
-                  ? read->sync.prior[sq] == base[sq] + prefix[sq] &&
-                    read->sync.barrier[sq] == DRM_ASAHI_BARRIER_NONE
-                  : read->sync.prior[sq] == 0 && read->sync.barrier[sq] == 0);
-            }
+            check_classic_packet(read, zero, next_base, exact);
          }
       }
+
+      /* NONE event set/reset reuses one simultaneous-use recording in two
+       * merged VkSubmitInfo2 entries. Include empty buffers and graphics too. */
+      struct hk_queue *q = new_queue(exact);
+      q->sync.serialize = true;
+      q->sync.submitted[0] = 7;
+      q->sync.submitted[1] = 11;
+      struct hk_cmd_buffer *empty = new_cmd(), *event = new_cmd();
+      struct hk_cmd_buffer *draw = new_cmd();
+      add(event, true);
+      add(draw, false);
+      struct hk_cmd_buffer *cmds[] = {empty, event, event, draw, event};
+      T("classic repeated recording", hk_sync_resolve_submit(
+           q, cmds, 5, false, false, 0));
+      unsigned prefix[2] = {0, 0};
+      const uint64_t base[2] = {7, 11};
+      for (unsigned i = 0; i < 5; ++i) {
+         list_for_each_entry(struct hk_cs, cs, &cmds[i]->control_streams, node) {
+            check_classic_packet(cs, prefix, base, exact);
+            prefix[hk_sync_sq(cs)]++;
+         }
+      }
+      T("classic repeated ordinals", !exact ||
+         (q->sync.submitted[0] == 8 && q->sync.submitted[1] == 14));
    }
-   /* The policy is opt-in; native independent streams keep their overlap. */
+
+   struct drm_asahi_cmd_header packet = agx_cmd_header(true, 0, 0);
+   struct drm_asahi_cmd_header saved = packet;
+   uint64_t prior[2] = {3, 5}, base[2] = {7, 11};
+   T("classic prefix overflow rejected", !hk_drm_serialize_prefix(
+        &packet, prior, DRM_ASAHI_BARRIER_NONE, 0, base, true));
+   T("classic prefix overflow no mutation", !memcmp(&packet, &saved,
+      sizeof(packet)) && prior[0] == 3 && prior[1] == 5);
+
+   /* Native independent streams keep their original graph policy. */
    struct hk_queue *q = new_queue(true);
    struct hk_cmd_buffer *cmd = new_cmd();
    add(cmd, false);
    struct hk_cs *compute = add(cmd, true);
    T("native independent submission", submit(q, cmd));
-   T("native remains unordered", compute->sync.barrier[HK_SYNC_VDM] ==
-      DRM_ASAHI_BARRIER_NONE && compute->sync.prior[HK_SYNC_VDM] == 0);
+   T("native remains unordered", compute->sync.barrier[0] ==
+      DRM_ASAHI_BARRIER_NONE && compute->sync.prior[0] == 0);
 }
 
 int
