@@ -90,7 +90,8 @@ hk_get_device_extensions(const struct agx_device *dev,
     * implementations have been qualified there. Native AGX3 keeps its
     * existing exposure.
     */
-   const bool native_agx3 = agx_native_graphics(dev);
+   const bool native_agx3 = agx_native_graphics(dev) &&
+                            dev->params.gpu_generation > 15;
 
    /*
     * VK_KHR_ray_query and everything it depends on.  Software traversal:
@@ -577,8 +578,8 @@ hk_get_device_features(
       .shaderFloatControls2 = true,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = agx_chip_exact_fma32(dev->chip),
-      .shaderFmaFloat32 = agx_chip_exact_fma32(dev->chip),
+      .shaderFmaFloat16 = (dev->chip == AGX_CHIP_G17P && agx_chip_exact_fma32(dev->chip)),
+      .shaderFmaFloat32 = (dev->chip == AGX_CHIP_G17P && agx_chip_exact_fma32(dev->chip)),
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */
@@ -1060,8 +1061,7 @@ hk_get_device_properties(const struct agx_device *dev,
        * sixteen-set root needs 68 halfwords and uses a separate loader.
        */
       .maxBoundDescriptorSets =
-         agx_chip_isa_encoding(dev->chip) == AGX_ISA_ENCODING_AGX2
-            ? 8 : HK_MAX_SETS,
+         dev->params.gpu_generation <= 15 ? 8 : HK_MAX_SETS,
       /* VK_KHR_acceleration_structure limits.  The counts are the
        * specification's own 24/29-bit encoding maxima, which is what bounds
        * us: the geometry, instance and primitive ids all live in packed
@@ -1295,7 +1295,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderDenormFlushToZeroFloat32 = true,
       .shaderDenormFlushToZeroFloat64 = false,
       .shaderRoundingModeRTEFloat16 = true,
-      .shaderRoundingModeRTEFloat32 = true,
+      .shaderRoundingModeRTEFloat32 = dev->params.gpu_generation > 15,
       .shaderRoundingModeRTEFloat64 = false,
       .shaderRoundingModeRTZFloat16 = false,
       .shaderRoundingModeRTZFloat32 = false,
@@ -1811,7 +1811,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
-   if (!agx_chip_exact_fma32(pdev->dev.chip))
+   if (pdev->dev.chip != AGX_CHIP_G17P ||
+       !agx_chip_exact_fma32(pdev->dev.chip))
       supported_extensions.KHR_shader_fma = false;
 
    if (pdev->dev.chip == AGX_CHIP_G17P) {

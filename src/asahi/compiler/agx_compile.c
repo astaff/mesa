@@ -11758,6 +11758,9 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
 
+   if (key->dev.chip == AGX_CHIP_G17P)
+      NIR_PASS(_, nir, agx_nir_lower_fma_rte);
+
    /* Late VBO lowering creates constant udiv instructions */
    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
 
