@@ -48,7 +48,7 @@ static void instances(unsigned count, bool pointers)
    struct hk_host_as_staging layout = {0};
    uint64_t bytes = 256;
    assert(hk_host_as_stage_layout(&g, &r, &layout, &bytes));
-   assert(bytes == 256 + (uint64_t)count * 64);
+   assert(bytes == ((256 + (uint64_t)count * 64 + 255) & ~UINT64_C(255)));
    uint8_t *map = calloc(1, bytes + 16);
    assert(map);
    memset(map + bytes, 0xa5, 16);
