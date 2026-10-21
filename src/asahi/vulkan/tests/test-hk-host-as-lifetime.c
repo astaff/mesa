@@ -74,6 +74,9 @@ free_cmd(VkDevice d, VkCommandPool pool, uint32_t count, const VkCommandBuffer *
 static VkResult VKAPI_CALL
 begin_cmd(VkCommandBuffer cmd, const VkCommandBufferBeginInfo *ci)
 {
+   /* Pool access includes recording, not just allocation/free. Check the
+    * invariant directly before the concurrent stress below. */
+   simple_mtx_assert_locked(&dev.host_as.lock);
    /* Make the shared-pool recording interval overlap reliably if only
     * Allocate/FreeCommandBuffers are serialized. */
    usleep(1000);
