@@ -66,6 +66,9 @@
 #include <string.h>
 
 DEBUG_GET_ONCE_BOOL_OPTION(m5_begin_cf_live, "ASAHI_M5_BEGIN_CF_LIVE", true)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_fs_3d_banks, "ASAHI_M5_FS_3D_BANKS", true)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_texture_result_tokens,
+                           "ASAHI_M5_TEXTURE_RESULT_TOKENS", true)
 
 struct agx3_branch_fixup {
    agx_block *block;
@@ -2479,9 +2482,13 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
     * test_linked_staging_witnesses. Additional operands retain the existing
     * mode-specific ABI; only the relocatable profile can choose a new base.
     */
+   const bool m5_fragment_3d = enc == AGX_ISA_ENCODING_AGX3C && three_d &&
+      !vertex_stage && !compute_stage && implicit_lod &&
+      debug_get_option_m5_fs_3d_banks();
    const bool m5_banked_3d = enc == AGX_ISA_ENCODING_AGX3C && three_d &&
-      (vertex_stage || compute_stage) && !shadow && !offset && !query_lod &&
-      !min_lod && (immediate_lod || gradient_lod);
+      !shadow && !offset && !query_lod && !min_lod &&
+      (((vertex_stage || compute_stage) && (immediate_lod || gradient_lod)) ||
+       m5_fragment_3d);
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
         native_staged_coords ||
@@ -9576,8 +9583,22 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          unsigned nd = 0, ns = 0;
          if (!I->agx3_tex_coord_stage) {
-            for (unsigned d = 0; d < I->nr_dests; ++d)
-               nd = agx3_expand_regs(I->dest[d], e->dst, nd);
+            for (unsigned d = 0; d < I->nr_dests; ++d) {
+               agx_index dest = I->dest[d];
+               /* Masked samples write a dense result, not SSA padding. */
+               if (enc == AGX_ISA_ENCODING_AGX3C &&
+                   I->op == AGX_OPCODE_TEXTURE_SAMPLE && !I->sparse &&
+                   I->gather == AGX_GATHER_NONE && !I->query_lod &&
+                   d == 0 && dest.size == AGX_SIZE_32 &&
+                   I->mask &&
+                   !(I->mask & ~0xfu) &&
+                   debug_get_option_m5_texture_result_tokens()) {
+                  const unsigned channels = util_bitcount(I->mask);
+                  if (channels < agx_channels(dest))
+                     dest.channels_m1 = channels - 1;
+               }
+               nd = agx3_expand_regs(dest, e->dst, nd);
+            }
          }
          for (unsigned s = 0; s < I->nr_srcs; ++s) {
              if (I->agx3_tex_coords_staged && s == 0)
@@ -10956,14 +10977,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             /* Relocation is an operand-ABI property. Other forms retain
              * their fixed operand locations and wait only for overlapping
              * live ranges before publishing into those locations. */
+            const bool m5_fragment_3d =
+               ctx->stage == MESA_SHADER_FRAGMENT &&
+               I->lod_mode == AGX_LOD_MODE_AUTO_LOD &&
+               debug_get_option_m5_fs_3d_banks();
             const bool m5_banked_3d =
                enc == AGX_ISA_ENCODING_AGX3C && I->dim == AGX_DIM_3D &&
-               (ctx->stage == MESA_SHADER_VERTEX ||
-                ctx->stage == MESA_SHADER_COMPUTE) &&
                !I->shadow && !I->offset && !I->query_lod &&
-               ((I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
-                 I->src[1].type == AGX_INDEX_IMMEDIATE) ||
-                I->lod_mode == AGX_LOD_MODE_LOD_GRAD);
+               (((ctx->stage == MESA_SHADER_VERTEX ||
+                  ctx->stage == MESA_SHADER_COMPUTE) &&
+                 ((I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+                   I->src[1].type == AGX_INDEX_IMMEDIATE) ||
+                  I->lod_mode == AGX_LOD_MODE_LOD_GRAD)) ||
+                m5_fragment_3d);
             const bool relocatable_coordinates =
                (enc == AGX_ISA_ENCODING_AGX3B ||
                 enc == AGX_ISA_ENCODING_AGX3C) && slot != 0 &&
