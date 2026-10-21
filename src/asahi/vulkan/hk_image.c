@@ -518,20 +518,24 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    return true;
 }
 
-/* M5 lossless storage compression. These half-float formats have no image
- * atomic operations. The single-layer/level native read/write packets use
- * the allocator's recovered Gen10 metadata layout, the same layout colour
- * attachments use, so a storage image may also be a colour attachment and a
- * transfer destination: end-of-tile stores, shader image stores, clears and
- * uploads all write it through compressed PBE descriptors. Bits select
- * RGBA16F, RG16F and R16F, respectively; zero retains the uncompressed
+/* M5 lossless storage compression of formats without image atomics: the
+ * half-float formats and RG32F have none, and R32F has them only with the
+ * float32 image atomic features, so it is compressed only when the device
+ * did not enable them (and its views cannot reinterpret it). The
+ * single-layer/level native read/write packets use the allocator's
+ * recovered Gen10 metadata layout, the same layout colour attachments use,
+ * so a storage image may also be a colour attachment and a transfer
+ * destination: end-of-tile stores, shader image stores, clears and uploads
+ * all write it through compressed PBE descriptors. Bits select RGBA16F,
+ * RG16F, R16F, R32F and RG32F, respectively; zero retains the uncompressed
  * diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
-                         "ASAHI_M5_STORAGE_COMPRESSION", 7)
+                         "ASAHI_M5_STORAGE_COMPRESSION", 31)
 
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
-                                 const VkImageCreateInfo *info)
+                                 const VkImageCreateInfo *info,
+                                 bool float_image_atomics)
 {
    if (dev->chip != AGX_CHIP_G17S || plane || info->pNext ||
        (info->flags & ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) ||
@@ -553,6 +557,12 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R16G16B16A16_SFLOAT: bit = 1; break;
    case VK_FORMAT_R16G16_SFLOAT: bit = 2; break;
    case VK_FORMAT_R16_SFLOAT: bit = 4; break;
+   case VK_FORMAT_R32_SFLOAT:
+      if (float_image_atomics)
+         return false;
+      bit = 8;
+      break;
+   case VK_FORMAT_R32G32_SFLOAT: bit = 16; break;
    default: return false;
    }
    return debug_get_option_m5_storage_compression() & bit;
@@ -560,7 +570,18 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
 
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
-                            const VkImageCreateInfo *info);
+                            const VkImageCreateInfo *info,
+                            bool float_image_atomics);
+
+/* Whether shaders of this device may use atomics on R32_SFLOAT images. */
+static bool
+hk_float_image_atomics(const struct hk_device *dev)
+{
+   const struct vk_features *f = &dev->vk.enabled_features;
+   return f->shaderImageFloat32Atomics || f->shaderImageFloat32AtomicAdd ||
+          f->shaderImageFloat32AtomicMinMax || f->sparseImageFloat32Atomics ||
+          f->sparseImageFloat32AtomicAdd || f->sparseImageFloat32AtomicMinMax;
+}
 
 /* Compressed data is only decodable through its own channel class. Every
  * G17P writer of a colour image is a PBE; the end-of-tile PBE may store a
@@ -1101,7 +1122,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL) {
             for (unsigned plane = 0; plane < plane_count; ++plane) {
                can_compress |= hk_can_compress_create_info(
-                  &pdev->dev, plane, &device_copy_info);
+                  &pdev->dev, plane, &device_copy_info, false);
             }
          }
 
@@ -1199,11 +1220,13 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
 
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
-                            const VkImageCreateInfo *info)
+                            const VkImageCreateInfo *info,
+                            bool float_image_atomics)
 {
    /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
     * AGX3 chips stay plain until their packets are recovered. */
-   const bool m5_storage = hk_m5_storage_compression_eligible(dev, plane, info);
+   const bool m5_storage =
+      hk_m5_storage_compression_eligible(dev, plane, info, float_image_atomics);
    bool allow_agx3 =
       hk_m5_msaa_color_compression_eligible(
          dev->chip, plane, info,
@@ -1259,7 +1282,8 @@ hk_map_compression(struct hk_device *dev, const VkImageCreateInfo *info,
       return false;
 
    case VK_IMAGE_TILING_OPTIMAL:
-      return hk_can_compress_create_info(&dev->dev, plane, info);
+      return hk_can_compress_create_info(&dev->dev, plane, info,
+                                         hk_float_image_atomics(dev));
 
    case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:
       return ail_is_drm_modifier_compressed(modifier);
@@ -1309,7 +1333,8 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
    bool can_compress = true;
 
    for (uint8_t plane = 0; plane < plane_count; plane++) {
-      if (!hk_can_compress_create_info(&dev->dev, plane, info))
+      if (!hk_can_compress_create_info(&dev->dev, plane, info,
+                                       hk_float_image_atomics(dev)))
          can_compress = false;
    }
 
