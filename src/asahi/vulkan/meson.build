@@ -61,6 +61,7 @@ hk_files = files(
   'hk_nir_forward_image_stores.h',
   'hk_nir_lower_descriptors.c',
   'hk_nir_lower_gs.c',
+  'hk_nir_lower_tes_rq.c',
   'hk_nir_lower_gs.h',
   'hk_nir_root_size.c',
   'hk_nir_lower_ray_queries.c',

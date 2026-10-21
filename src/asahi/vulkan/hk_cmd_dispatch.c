@@ -1332,7 +1332,21 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool internal_graphics = s->info.stage != MESA_SHADER_COMPUTE;
    if (s->b.info.uses_ray_traversal && dev->gen1_native_rq) {
       bool valid = !internal_graphics || dev->gen1_native_graphics_rq;
-      if (agx_is_indirect(grid)) {
+      struct hk_gen1_rt_indirect_contract tes_contract;
+      if (agx_is_indirect(grid) && internal_graphics &&
+          s->info.stage == MESA_SHADER_TESS_EVAL) {
+         /* Poly's TES-before-GS kernel (hk_launch_gs_prerast()) always has
+          * a driver-written indirect grid, since the tessellator decides its
+          * size. It is an ordinary 64x1x1 graphics kernel: its query context
+          * is the direct one and SCS slots are addressed by resident
+          * warp/lane, independent of the grid. Application indirect query
+          * dispatches keep the trace-rays contract below. */
+         valid = valid && dev->gen1_rq_instances && dev->gen1_rq_candidates &&
+            grid.mode == AGX_CDM_MODE_INDIRECT_LOCAL &&
+            local_size.x == 64 && local_size.y == 1 && local_size.z == 1 &&
+            hk_gen1_rt_indirect_contract_init(hk_gen1_ray_query_scs_layout(dev),
+                                              &tes_contract);
+      } else if (agx_is_indirect(grid)) {
          struct hk_gen1_rt_indirect_contract contract;
          struct agx_precompiled_shader *setup = NULL;
          /* The shared native indirect helper already publishes a private

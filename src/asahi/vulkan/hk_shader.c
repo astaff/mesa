@@ -9,6 +9,7 @@
 #include "hk_shader.h"
 #include "hk_nir_lower_gs.h"
 #include "hk_nir_root_size.h"
+#include "hk_nir_lower_tes_rq.h"
 #include "hk_nir_sampler_bias.h"
 #include "hk_gen1_rt_indirect_contract.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
@@ -2053,6 +2054,22 @@ hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
    };
 }
 
+/*
+ * A native ray query in the post-tessellation hardware vertex program does
+ * not execute on G17P: every query-bearing TES case reads back zero, even
+ * with a null acceleration structure, where no traversal is issued and only
+ * the result store remains. The same lowering, uniform layout and render
+ * state work for an API vertex shader drawn directly. Run such a TES in
+ * Poly's compute variant instead, whose query context is the one TCS, GS and
+ * compute queries use, and rasterize its outputs through a passthrough GS.
+ */
+bool
+hk_tes_ray_queries_in_compute(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17P &&
+          dev->gen1_native_rq && dev->gen1_native_graphics_rq;
+}
+
 static void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -2219,8 +2236,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * that split so the raster variant gets the graphics query ABI and Poly
     * cannot strip stores introduced by query lowering as API side effects.
     */
+   /* A TES likewise has a hardware vertex variant and a CDM variant, so its
+    * native queries are lowered per variant in hk_compile_nir().
+    */
    if (nir->info.ray_queries > 0 &&
-       !(dev->gen1_native_rq && nir->info.stage == MESA_SHADER_GEOMETRY)) {
+       !(dev->gen1_native_rq &&
+         (nir->info.stage == MESA_SHADER_GEOMETRY ||
+          nir->info.stage == MESA_SHADER_TESS_EVAL))) {
       if(dev->gen1_native_rq) {
          NIR_PASS(_, nir, nir_opt_ray_queries);
          NIR_PASS(_, nir, nir_opt_ray_query_ranges);
@@ -3419,7 +3441,19 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          shader->info.tess.tcs_output_stride = poly_tcs_output_stride(nir);
       } else {
          /* This destroys info so it needs to happen after the gather */
-         NIR_PASS(_, nir, poly_nir_lower_tes, hw);
+         struct agx_gen1_ray_query_layout rq_layout =
+            hk_gen1_ray_query_layout(dev, nir, 0);
+         if (!hk_nir_lower_tes_variant(nir, hw,
+                                       dev->gen1_native_rq ? &rq_layout
+                                                           : NULL)) {
+            ralloc_free(nir);
+            return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                             "Gen1 native TES ray query lowering failed");
+         }
+
+         /* The query-state flag above was gathered before this lowering. */
+         if (dev->gen1_native_graphics_rq)
+            shader->info.agx3_gen1_fragment_rq = hk_nir_has_ray_query(nir);
       }
    }
 
@@ -4527,6 +4561,14 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * shader for the purpose. Update the next_stage mask accordingly.
        */
       if (nir->xfb_info != NULL) {
+         next_stage |= VK_SHADER_STAGE_GEOMETRY_BIT;
+      }
+
+      /* Native TES ray queries execute in Poly's compute variant, which
+       * needs the software variant (see hk_tes_ray_queries_in_compute()).
+       */
+      if (sw_stage == MESA_SHADER_TESS_EVAL && nir->info.ray_queries > 0 &&
+          hk_tes_ray_queries_in_compute(dev)) {
          next_stage |= VK_SHADER_STAGE_GEOMETRY_BIT;
       }
 

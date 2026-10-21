@@ -688,3 +688,6 @@ struct spirv_to_nir_options
 hk_get_spirv_options(struct vk_physical_device *vk_pdev,
                      UNUSED mesa_shader_stage stage,
                      const struct vk_pipeline_robustness_state *rs);
+
+/* True when a native TES ray query runs in Poly's compute variant. */
+bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);

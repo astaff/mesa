@@ -711,6 +711,9 @@ struct hk_graphics_state {
    struct {
       uint64_t out_draws;
       uint64_t grids;
+      /* Direct thread count bounding the TES-before-GS kernel of this draw,
+       * or 0 to use the indirect grid (hk_tes_direct_query_threads()). */
+      uint32_t tes_direct_threads;
       struct hk_tess_info info;
       enum mesa_prim prim;
    } tess;

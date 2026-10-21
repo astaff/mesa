@@ -4141,6 +4141,13 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       grid_gs.count[0] = u_decomposed_prims_for_vertices(mode, draw.b.count[0]);
    }
 
+   /* A TES with native ray queries is launched with a direct grid bounding
+    * the tessellator's output; the kernel skips threads past the real count
+    * (hk_nir_lower_tes_variant()). See hk_tes_direct_query_threads(). */
+   if (gfx->shaders[MESA_SHADER_TESS_EVAL] && gfx->tess.tes_direct_threads &&
+       vs->b.info.uses_ray_traversal)
+      grid_vs = agx_1d(gfx->tess.tes_direct_threads);
+
    /* Launch the vertex shader first */
    if (agx_native_graphics(&dev->dev)) {
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs, wg);
@@ -4214,6 +4221,38 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          };
       }
    }
+}
+
+/*
+ * On G17P, TES ray queries read back zero both from the post-tessellation
+ * vertex program (an indexed indirect draw) and from Poly's TES-before-GS
+ * kernel (an indirect dispatch), even with a null acceleration structure.
+ * Queries issued from direct draws and dispatches (VS, TCS, GS, compute)
+ * work, and no other launch property distinguishes the TES. Give the TES
+ * kernel a direct grid: the tessellator decides the invocation count on the
+ * GPU, but every patch emits at most HK_TES_MAX_PATCH_INDICES of them, and
+ * the kernel skips invocations past the count it is given. Indirect API
+ * draws keep the indirect grid.
+ */
+#define HK_TES_MAX_PATCH_INDICES (4u * 64u * 64u * 3u)
+#define HK_TES_DIRECT_QUERY_MAX_THREADS (1u << 24)
+
+static uint32_t
+hk_tes_direct_query_threads(struct hk_cmd_buffer *cmd, struct agx_draw draw)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_shader *tes = hk_bound_sw_vs_before_gs(gfx);
+   const uint32_t patch_size =
+      cmd->vk.dynamic_graphics_state.ts.patch_control_points;
+
+   if (!tes || !tes->compiled || !tes->info.agx3_gen1_fragment_rq ||
+       !hk_tes_ray_queries_in_compute(hk_cmd_buffer_device(cmd)) ||
+       agx_is_indirect(draw.b) || !patch_size)
+      return 0;
+
+   const uint64_t threads = (uint64_t)(draw.b.count[0] / patch_size) *
+                            draw.b.count[1] * HK_TES_MAX_PATCH_INDICES;
+   return threads && threads <= HK_TES_DIRECT_QUERY_MAX_THREADS ? threads : 0;
 }
 
 static __attribute__((hot)) struct agx_draw
@@ -8538,17 +8577,29 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
 
-   if (!IS_SHADER_DIRTY(VERTEX) && !IS_SHADER_DIRTY(GEOMETRY))
+   /* The TES decides as well, and the primitive the passthrough consumes
+    * comes from the merged TCS/TES state. */
+   if (!IS_SHADER_DIRTY(VERTEX) && !IS_SHADER_DIRTY(GEOMETRY) &&
+       (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P ||
+        (!IS_SHADER_DIRTY(TESS_CTRL) && !IS_SHADER_DIRTY(TESS_EVAL))))
       return;
 
    /* If there's an application geometry shader, there's nothing to un/bind */
    if (gs && !gs->is_passthrough)
       return;
 
-   /* Determine if we need a geometry shader to emulate XFB or adjacency */
+   /* Determine if we need a geometry shader to emulate XFB, or to rasterize
+    * a TES whose native ray queries run in its compute variant (the queries
+    * and the application's stores then execute before rasterization, and
+    * the passthrough's raster program replays outputs only). */
    struct hk_shader *last_sw = hk_bound_sw_vs_before_gs(gfx);
    uint32_t xfb_outputs = last_sw->info.xfb_info.output_count;
-   bool needs_gs = xfb_outputs;
+   const bool tes_rq = gfx->shaders[MESA_SHADER_TESS_EVAL] &&
+                       last_sw->compiled &&
+                       last_sw->info.agx3_gen1_fragment_rq &&
+                       hk_tes_ray_queries_in_compute(
+                          hk_cmd_buffer_device(cmd));
+   bool needs_gs = xfb_outputs || tes_rq;
 
    /* If we don't need a GS but we do have a passthrough, unbind it */
    if (!needs_gs) {
@@ -9519,6 +9570,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       }
 
       if (tess) {
+         cmd->state.gfx.tess.tes_direct_threads =
+            hk_tes_direct_query_threads(cmd, draw);
          draw = hk_launch_tess(cmd, ccs, draw, geom ? 0 : stat_c_prims,
                                geom ? 0 : stat_c_inv);
       }
