@@ -6314,6 +6314,15 @@ agx_emit_tex(agx_builder *b, nir_tex_instr *instr)
          texture = index;
          break;
       case nir_tex_src_sampler_handle:
+         /* AGX2 preamble lowering replaces unpromoted bindless sampler
+          * tokens with their heap indices. Custom-border clamp-to-0 samples
+          * also carry plain indices, so the intrinsic is not evidence that
+          * the heap is unused. Keep the upstream AGX2 binding contract;
+          * native AGX3 samplers retain their separate resource path.
+          */
+         if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX2)
+            b->shader->out->uses_sampler_heap = true;
+
          nir_intrinsic_instr *intr = nir_src_as_intrinsic(instr->src[i].src);
          if (intr && intr->intrinsic == nir_intrinsic_bindless_sampler_agx) {
             b->shader->out->uses_sampler_heap = true;

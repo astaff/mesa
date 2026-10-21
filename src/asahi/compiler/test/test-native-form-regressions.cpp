@@ -3011,3 +3011,51 @@ TEST(NativeForms, SchedulerSsaBookkeepingStaysWithinEachBlock)
       }
    }
 }
+
+/* AGX2 preamble lowering replaces an unpromoted bindless sampler token with
+ * its heap index. The main shader must still request the sampler heap. */
+TEST(LegacySamplers, UnpromotedIndexNeedsHeap)
+{
+   for (bool dynamic : {false, true}) {
+      for (bool border : {false, true}) {
+         SCOPED_TRACE(::testing::Message() << "dynamic=" << dynamic
+                                         << " border=" << border);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "AGX2 sampler heap");
+         b.shader->info.workgroup_size[0] = 1;
+         b.shader->info.workgroup_size[1] = 1;
+         b.shader->info.workgroup_size[2] = 1;
+         nir_def *index = dynamic
+            ? nir_u2u16(&b, nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0))
+            : nir_imm_intN_t(&b, 28, 16);
+         nir_def *sampler = border ? index : nir_bindless_sampler_agx(
+            &b, nir_imm_int(&b, 24), index);
+         nir_def *texture = nir_bindless_image_agx(&b, nir_imm_int(&b, 0));
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 4);
+         tex->op = nir_texop_txl;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+         tex->coord_components = 2;
+         tex->dest_type = nir_type_float32;
+         tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1,
+            nir_vec2(&b, nir_imm_float(&b, 0.25), nir_imm_float(&b, 0.5)));
+         tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(&b, 0));
+         tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, texture);
+         tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, sampler);
+         nir_def_init(&tex->instr, &tex->def, 4, 32);
+         nir_builder_instr_insert(&b, &tex->instr);
+         nir_store_global(&b, &tex->def, nir_imm_int64(&b, 0x1000), .align_mul = 16);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+         key.dev.chip = AGX_CHIP_G13G;
+         key.promote_textures = false;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+         EXPECT_TRUE(ok);
+         if (ok)
+            EXPECT_TRUE(part.info.uses_sampler_heap);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+   }
+}
