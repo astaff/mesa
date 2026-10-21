@@ -2379,7 +2379,8 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 static inline bool
 hk_sync_image_class(const struct hk_cmd_buffer *cmd)
 {
-   return hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P;
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
 }
 
 /* AGX2 returns its shader-base-relative USC offset.  G17P returns the absolute

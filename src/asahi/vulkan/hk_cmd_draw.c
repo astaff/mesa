@@ -11467,10 +11467,10 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 }
 
-/* G17P: a draw whose pre-rasterization shaders may read images orders its
- * render's vertex half after the image barriers before it (HK_SYNC_GFX_IMG).
- * Software tessellation, geometry, task and mesh stages are assumed to
- * read.
+/* G17P and M5: a draw whose pre-rasterization shaders may read images
+ * orders its render's vertex half after the image barriers before it
+ * (HK_SYNC_GFX_IMG). Software tessellation, geometry, task and mesh stages
+ * are assumed to read.
  *
  * An image barrier's memory dependency covers only its image, but its
  * execution dependency covers all work in its stages, so vertex work that

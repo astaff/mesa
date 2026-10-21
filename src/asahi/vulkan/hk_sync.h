@@ -73,10 +73,10 @@ enum hk_sync_kind {
    /* Destination scopes only: pre-rasterization shaders that read images.
     * An image barrier can only order the image's own accesses, and a
     * pre-rasterization stage accesses an image only through a shader that
-    * reads one. On G17P, image barriers therefore name this class (and the
-    * fragment class) where other dependencies name HK_SYNC_GFX: a render's
-    * fragment half always waits on it, its vertex half only once it draws
-    * with a pre-rasterization shader that reads images
+    * reads one. On G17P and M5, image barriers therefore name this class
+    * (and the fragment class) where other dependencies name HK_SYNC_GFX: a
+    * render's fragment half always waits on it, its vertex half only once it
+    * draws with a pre-rasterization shader that reads images
     * (hk_sync_vertex_images). Other chips never record it. */
    HK_SYNC_GFX_IMG = 1 << 4,
 };
