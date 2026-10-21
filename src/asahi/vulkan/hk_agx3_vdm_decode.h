@@ -12,6 +12,7 @@
 #include <stddef.h>
 
 #include "asahi/lib/agx_vdm_decode_core.h"
+#include "asahi/lib/agx_chip.h"
 
 struct blob;
 struct blob_reader;
@@ -24,6 +25,14 @@ extern "C" {
  * binaries carry this version outside the driver-private blob, so stale
  * layouts are rejected before any fields are consumed. */
 #define HK_AGX3_SHADER_BINARY_VERSION 35u
+#define HK_CLASSIC_SHADER_BINARY_VERSION 34u
+
+static inline uint32_t
+hk_shader_binary_version(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P ? HK_AGX3_SHADER_BINARY_VERSION
+                                : HK_CLASSIC_SHADER_BINARY_VERSION;
+}
 
 /* API outputs include position. Unlinked shaders additionally reserve a
  * default Layer varying and PointSize, up to eight fixed clip-distance copies,

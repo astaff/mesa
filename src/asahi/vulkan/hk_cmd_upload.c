@@ -29,8 +29,8 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    if (dev->dev.chip == AGX_CHIP_G17P &&
        bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
       const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
-      if (s && s->info.root_descriptor_size)
-         root_size = MIN2(root_size, s->info.root_descriptor_size);
+      if (s && s->root_descriptor_size)
+         root_size = MIN2(root_size, s->root_descriptor_size);
    }
 
    root->printf_buffer_address = dev->dev.printf_buffer_address;

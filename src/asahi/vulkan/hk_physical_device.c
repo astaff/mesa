@@ -1453,7 +1453,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .variableSampleLocations = false,
 
       /* VK_EXT_shader_object */
-      .shaderBinaryVersion = HK_AGX3_SHADER_BINARY_VERSION,
+      .shaderBinaryVersion = hk_shader_binary_version(dev->chip),
 
       /* VK_EXT_transform_feedback */
       .maxTransformFeedbackStreams = 4,

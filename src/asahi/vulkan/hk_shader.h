@@ -143,8 +143,6 @@ struct hk_shader_info {
     */
    bool agx3_combined_sampler_valid;
    bool agx3_uses_root;
-   /* Proven root prefix, including direct uniform set loads; binary v35. */
-   uint32_t root_descriptor_size;
    bool agx3_gen1_fragment_rq;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
@@ -190,6 +188,9 @@ struct hk_shader {
    struct agx_shader_part b;
 
    struct hk_shader_info info;
+   /* G17P-only root prefix; serialized separately in its version-35 payload.
+    * Keep hk_shader_info and version-34 payloads unchanged on other chips. */
+   uint32_t root_descriptor_size;
    struct agx_fragment_face_2_packed frag_face;
    struct agx_counts_packed counts;
 

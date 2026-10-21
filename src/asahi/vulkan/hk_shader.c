@@ -3532,13 +3532,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    /* Measure while root markers are still explicit. Uniform lowering loads
     * the root pointer and set bases separately, so retain that prefix too.
     * Round up for native uniform/global load granularity. */
-   shader->info.root_descriptor_size = sizeof(struct hk_root_descriptor_table);
+   if (dev->dev.chip == AGX_CHIP_G17P)
+      shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
    if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_COMPUTE) {
       unsigned bytes = hk_nir_root_size(
          nir, sizeof(struct hk_root_descriptor_table));
       bytes = MAX2(bytes, hk_root_descriptor_offset(sets) +
                             set_count * sizeof(uint64_t));
-      shader->info.root_descriptor_size = MIN2(
+      shader->root_descriptor_size = MIN2(
          ALIGN_POT(bytes, 16), sizeof(struct hk_root_descriptor_table));
    }
 
@@ -5146,6 +5147,8 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
+   const uint32_t root_descriptor_size = dev->dev.chip == AGX_CHIP_G17P
+      ? blob_read_uint32(blob) : 0;
 
    struct agx_shader_info b_info;
    blob_copy_bytes(blob, &b_info, sizeof(b_info));
@@ -5179,6 +5182,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       shader->b.info = b_info;
       shader->info = info;
+      shader->root_descriptor_size = root_descriptor_size;
       shader->agx3_vdm_state_update = agx3_vdm_state_update;
       shader->b.info.binary_size = 0;
       return VK_SUCCESS;
@@ -5198,6 +5202,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 
    shader->b.info = b_info;
    shader->info = info;
+   shader->root_descriptor_size = root_descriptor_size;
    shader->agx3_vdm_state_update = agx3_vdm_state_update;
    shader->code_size = code_size;
    shader->data_size = data_size;
@@ -5301,7 +5306,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
 
-   if (!hk_agx3_shader_binary_version_supported(binary_version))
+   if (binary_version != hk_shader_binary_version(dev->dev.chip))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    mesa_shader_stage stage = blob_read_uint8(blob);
@@ -5662,7 +5667,10 @@ static void
 hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
                     struct blob *blob)
 {
+   struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
+   if (dev->dev.chip == AGX_CHIP_G17P)
+      blob_write_uint32(blob, shader->root_descriptor_size);
    blob_write_bytes(blob, &shader->b.info, sizeof(shader->b.info));
    if (!hk_agx3_vdm_program_cache_serialize(
           blob, &shader->agx3_vdm_state_update))

@@ -191,17 +191,17 @@ reuse_correctness(struct fixture *f)
    cmd->state.cs.shader = cs;
    struct hk_descriptor_state *cd = &cmd->state.cs.descriptors;
    const size_t small_B = 64;
-   cs->variants[0].info.root_descriptor_size = small_B;
+   cs->variants[0].root_descriptor_size = small_B;
    cd->root.push[0] = 0x12345678;
    uint64_t small = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
    CHECK(small != compute && cd->uploaded_root_size == small_B);
    CHECK(memcmp(cd->uploaded_root.cpu, &cd->root, small_B) == 0);
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) == small);
-   cs->variants[0].info.root_descriptor_size = sizeof(cd->root);
+   cs->variants[0].root_descriptor_size = sizeof(cd->root);
    uint64_t full = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
    CHECK(full != small && cd->uploaded_root_size == sizeof(cd->root));
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) == full);
-   cs->variants[0].info.root_descriptor_size = small_B;
+   cs->variants[0].root_descriptor_size = small_B;
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) != full);
    CHECK(cd->uploaded_root_size == small_B);
    /* A retained or adversarial short-prefix value must have no effect on
