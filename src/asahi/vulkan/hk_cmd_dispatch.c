@@ -14,6 +14,7 @@
 #include "hk_buffer.h"
 #include "hk_acceleration_structure.h"
 #include "hk_cmd_buffer.h"
+#include "hk_frame_anatomy.h"
 #include "hk_g17p_patch.h"
 #include "hk_descriptor_set.h"
 #include "hk_device.h"
@@ -2647,6 +2648,8 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
    }
 
    hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);
+   if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy))
+      hk_frame_anatomy_note_fs(cs, s);
    cs->stats.calls++;
 }
 

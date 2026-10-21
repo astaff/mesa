@@ -555,7 +555,7 @@ hk_frame_anatomy_dump_nir(struct hk_device *dev, const struct hk_shader *shader,
 
 static void
 hk_fa_dump_fs(struct hk_frame_anatomy *fa, uint32_t hash,
-              const struct hk_shader *fs)
+              const struct hk_shader *fs, const char *prefix)
 {
    if (!fa->dump_dir || !fs->code_size)
       return;
@@ -571,7 +571,7 @@ hk_fa_dump_fs(struct hk_frame_anatomy *fa, uint32_t hash,
       return;
 
    char path[512];
-   snprintf(path, sizeof(path), "%s/fs-%08x.bin", fa->dump_dir, hash);
+   snprintf(path, sizeof(path), "%s/%s-%08x.bin", fa->dump_dir, prefix, hash);
    FILE *f = fopen(path, "wb");
    if (f) {
       fwrite(fs->code_ptr, 1, fs->code_size, f);
@@ -660,7 +660,7 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
       const struct agx2_stats *st = &fs->b.info.stats;
       const uint32_t hash =
          fs->code_size ? _mesa_hash_data(fs->code_ptr, fs->code_size) : 0;
-      hk_fa_dump_fs(fa, hash, fs);
+      hk_fa_dump_fs(fa, hash, fs, "fs");
       HK_FA_APPEND(" fs=%08x:d%u:i%u:g%u:t%u:sp%u:sc%u:ss%u", hash,
                    cs->anatomy_fs[i].draws, st->instrs, st->gprs, st->threads,
                    st->spills + st->fills, st->scratch,
@@ -712,6 +712,19 @@ hk_frame_anatomy_compute(struct hk_frame_anatomy_submit *s,
                                                      struct libagx_imm_write),
                 cs->m5_native_rq || cs->gen1_native_rq ? 1 : 0,
                 cs->m5_matrix_ops ? 1 : 0, c->helper.data ? 'c' : '-');
+   /* Compute programs, as for fragment programs in render records. */
+   for (unsigned i = 0; i < HK_FA_FS_MAX && cs->anatomy_fs[i].fs; ++i) {
+      const struct hk_shader *prog = cs->anatomy_fs[i].fs;
+      const struct agx2_stats *st = &prog->b.info.stats;
+      const uint32_t hash = prog->code_size
+         ? _mesa_hash_data(prog->code_ptr, prog->code_size) : 0;
+      hk_fa_dump_fs(fa, hash, prog, "cs");
+      HK_FA_APPEND(" cs=%08x:d%u:i%u:g%u:t%u:sp%u:sc%u", hash,
+                   cs->anatomy_fs[i].draws, st->instrs, st->gprs, st->threads,
+                   st->spills + st->fills, st->scratch);
+   }
+   if (cs->anatomy_fs_other)
+      HK_FA_APPEND(" cs_other=%u", cs->anatomy_fs_other);
 }
 
 /* The command struct a record's header introduces, if the payload holds it. */
