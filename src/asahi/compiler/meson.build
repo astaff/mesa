@@ -274,6 +274,15 @@ if with_tests
       link_with : [libasahi_compiler]),
     suite : ['asahi'],
   )
+  test(
+    'agx3_gen1_null_as',
+    executable('agx3_gen1_null_as_test', files('test/test-gen1-null-as.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler]),
+    suite : ['asahi'],
+  )
 
   test(
     'agx3_gen1_terminate',
@@ -321,6 +330,16 @@ if with_tests
       dependencies : [idep_nir, idep_mesautil],
       link_with : [libasahi_compiler],
     ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_gen1_position_fetch',
+    executable('agx3_gen1_position_fetch_test', files('test/test-gen1-position-fetch.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler]),
     suite : ['asahi'],
   )
 
