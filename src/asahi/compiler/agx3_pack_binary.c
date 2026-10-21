@@ -67,6 +67,8 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(m5_begin_cf_live, "ASAHI_M5_BEGIN_CF_LIVE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_scalar_3d_coords, "ASAHI_M5_SCALAR_3D_COORDS", true)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
+                           "ASAHI_M5_WIDE_SCALAR_SOURCES", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_fs_3d_banks, "ASAHI_M5_FS_3D_BANKS", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_texture_result_tokens,
                            "ASAHI_M5_TEXTURE_RESULT_TOKENS", true)
@@ -10358,12 +10360,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                      next_src.value + (!scalar && later == 1 ? 2 : 0);
                   last &= next_reg != reg;
                }
-               if (!agx3_tex_stage_copy_hints(enc, base + 2 * c, reg, slot, 0,
-                                             m5_scalar ? !(src.discard && last)
-                                                       : src.cache,
-                                             src.discard && last,
-                                             bytes, &len) ||
-                   !agx3_append(emission, bytes, len))
+               const bool wide_scalar = m5_scalar &&
+                  debug_get_option_m5_wide_scalar_sources();
+               const bool copied = wide_scalar
+                  ? agx3_tex_stage_copy_scalar_m5(
+                       base + 2 * c, reg, slot, 0, !(src.discard && last),
+                       src.discard && last, bytes, &len)
+                  : agx3_tex_stage_copy_hints(
+                       enc, base + 2 * c, reg, slot, 0,
+                       m5_scalar ? !(src.discard && last) : src.cache,
+                       src.discard && last, bytes, &len);
+               if (!copied || !agx3_append(emission, bytes, len))
                   AGX3_REFUSE(I);
             }
             if (!agx3_staging_hold(&staging_banks, base, span, slot))

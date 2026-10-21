@@ -909,8 +909,9 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
    return true;
 }
 
-bool
-agx3_tex_stage_copy_hints(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
+static bool
+agx3_tex_stage_copy_hints_impl(enum agx_isa_encoding enc, bool wide_source,
+                    uint16_t dest, uint16_t src,
                     uint8_t slot, uint16_t wait_mask,
                           bool src_cache, bool src_discard,
                     uint8_t out[AGX3_TEX_COPY_MAX_LENGTH], uint8_t *len)
@@ -926,11 +927,12 @@ agx3_tex_stage_copy_hints(enum agx_isa_encoding enc, uint16_t dest, uint16_t src
    if (enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C)
       return false;
 
-   /* One even 32-bit register each way, as in every witness. The source field
-    * is seven bits wide. Unlike PACK_SMPIR, COPY has no separately recovered
-    * bit 7, so accepting a high-bank source would alias it into the low bank.
+   /* High source registers require the extended M5 encoding. Keep the
+    * original helper's range unchanged for other publication paths.
     */
-   if ((dest & 1) || (src & 1) || dest >= 256 || src >= 128)
+   if ((wide_source && enc != AGX_ISA_ENCODING_AGX3C) ||
+       (dest & 1) || (src & 1) || dest >= 256 ||
+       src >= (wide_source ? 256 : 128))
       return false;
 
    const unsigned slots = enc == AGX_ISA_ENCODING_AGX3C ? 8 : 6;
@@ -964,13 +966,34 @@ agx3_tex_stage_copy_hints(enum agx_isa_encoding enc, uint16_t dest, uint16_t src
    /* The compact form first; Apple escalates the encoding point when a slot
     * or wait bit does not fit, and the composer's first-success order
     * reproduces that choice on every witness. */
-   for (int ep = 0; ep <= 1; ++ep) {
+   for (int ep = wide_source && src >= 128 ? 1 : 0; ep <= 1; ++ep) {
       if (agx3_bind_compose(enc, "copy", ep, base, nb, ov, n, out, len))
          return true;
    }
    memset(out, 0, AGX3_TEX_COPY_MAX_LENGTH);
    *len = 0;
    return false;
+}
+
+bool
+agx3_tex_stage_copy_hints(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
+                          uint8_t slot, uint16_t wait_mask,
+                          bool src_cache, bool src_discard,
+                          uint8_t out[AGX3_TEX_COPY_MAX_LENGTH], uint8_t *len)
+{
+   return agx3_tex_stage_copy_hints_impl(enc, false, dest, src, slot, wait_mask,
+                                         src_cache, src_discard, out, len);
+}
+
+bool
+agx3_tex_stage_copy_scalar_m5(uint16_t dest, uint16_t src, uint8_t slot,
+                              uint16_t wait_mask, bool src_cache,
+                              bool src_discard,
+                              uint8_t out[AGX3_TEX_COPY_MAX_LENGTH], uint8_t *len)
+{
+   return agx3_tex_stage_copy_hints_impl(AGX_ISA_ENCODING_AGX3C, true, dest, src,
+                                         slot, wait_mask, src_cache,
+                                         src_discard, out, len);
 }
 
 bool

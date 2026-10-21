@@ -13,6 +13,10 @@
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/u_qsort.h"
+#include "util/u_debug.h"
+
+DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
+                           "ASAHI_M5_WIDE_SCALAR_SOURCES", true)
 #include "agx3_copy_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
@@ -3135,22 +3139,32 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
             BITSET_SET(low_gpr, split_source[I->src[0].value] - 1);
       }
 
-      /* Explicit scalar publications are the coordinate GPR consumers now.
-       * Their native COPY source still has the same seven-bit domain, even
-       * though the following sample no longer exposes a GPR operand to RA.
+      /* Explicit publications own the coordinate GPR constraints even when
+       * the following sample no longer exposes those operands to RA.
        */
       if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
           agx_is_texture_publication(I)) {
-         agx_foreach_ssa_src(I, s)
-            BITSET_SET(texture_gpr, I->src[s].value);
+         /* Scalar 3D publication can use the full M5 source register field.
+          * Keep every other publication within the original low-bank range.
+          */
+         bool wide_scalar = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+            ctx->stage == MESA_SHADER_FRAGMENT &&
+            I->op == AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3 &&
+            I->nr_srcs == 3 && !agx_is_null(I->src[2]) &&
+            debug_get_option_m5_wide_scalar_sources();
+         for (unsigned s = 0; s < I->nr_srcs && wide_scalar; ++s)
+            wide_scalar &= !agx_is_null(I->src[s]) &&
+                           I->src[s].size == AGX_SIZE_32;
+         if (!wide_scalar) {
+            agx_foreach_ssa_src(I, s)
+               BITSET_SET(texture_gpr, I->src[s].value);
+         }
       }
 
-      /* AGX3 publishes sampled coordinates through COPY, whose source field
-       * has seven bits and no high-bit extension. CEM has the same source
-       * domain. Keep every SSA vector that reaches either path below half
-       * 128; the packer independently rejects precoloured high-bank inputs.
-       * Gradient scalars and shadow references use the same COPY producer. */
+      /* Other sampled coordinates and CEM retain their low-bank source
+       * constraints. Gradient scalars and shadow references also remain
+       * within the existing qualified range. */
       if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
           (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
