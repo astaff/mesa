@@ -15,6 +15,8 @@ struct hk_host_as_staging {
 bool hk_host_as_stage_layout(const VkAccelerationStructureGeometryKHR *g,
    const VkAccelerationStructureBuildRangeInfoKHR *r,
    struct hk_host_as_staging *layout, uint64_t *offset);
-void hk_host_as_stage_geometry(VkAccelerationStructureGeometryKHR *g,
-   VkAccelerationStructureBuildRangeInfoKHR *r,
-   const struct hk_host_as_staging *layout, uint8_t *map, uint64_t va);
+void hk_host_as_stage_geometries(uint32_t count,
+   VkAccelerationStructureGeometryKHR *geometries,
+   VkAccelerationStructureBuildRangeInfoKHR *ranges,
+   const struct hk_host_as_staging *layouts,
+   uint8_t *map, uint64_t va, uint64_t size);

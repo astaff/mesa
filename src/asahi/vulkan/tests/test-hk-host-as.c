@@ -8,6 +8,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* A non-coherent fixture: device-visible bytes change only on publication. */
+static uint8_t *device_map;
+static uint64_t published_size;
+void __wrap_util_flush_range(void *map, size_t size);
+void __wrap_util_flush_range(void *map, size_t size)
+{
+   published_size = size;
+   if (device_map)
+      memcpy(device_map, map, size);
+}
+
 static const uint64_t va = UINT64_C(0x1800000000);
 
 static void normalized(const VkAccelerationStructureBuildRangeInfoKHR *r)
@@ -52,7 +63,14 @@ static void instances(unsigned count, bool pointers)
    uint8_t *map = calloc(1, bytes + 16);
    assert(map);
    memset(map + bytes, 0xa5, 16);
-   hk_host_as_stage_geometry(&g, &r, &layout, map, va);
+   device_map = calloc(1, bytes);
+   assert(device_map);
+   published_size = 0;
+   hk_host_as_stage_geometries(1, &g, &r, &layout, map, va, bytes);
+   assert(published_size == bytes);
+   assert(!memcmp(map, device_map, bytes));
+   free(device_map);
+   device_map = NULL;
    normalized(&r);
    assert(!g.geometry.instances.arrayOfPointers);
    assert(g.geometry.instances.data.deviceAddress == va + layout.data);
@@ -91,7 +109,7 @@ static void geometry_offsets(void)
       struct hk_host_as_staging l = {0}; uint64_t bytes = 0;
       assert(hk_host_as_stage_layout(&g, &r, &l, &bytes));
       memset(map, 0, sizeof(map));
-      hk_host_as_stage_geometry(&g, &r, &l, map, va);
+      hk_host_as_stage_geometries(1, &g, &r, &l, map, va, bytes);
       normalized(&r);
       assert(!memcmp(map + l.vertices, (uint8_t *)input + 32 + (indexed ? 0 : 16),
                      (l.vertex_count - 1) * 16 + 12));
@@ -108,7 +126,7 @@ static void geometry_offsets(void)
    VkAccelerationStructureBuildRangeInfoKHR r = {.primitiveCount = 4, .primitiveOffset = 64};
    struct hk_host_as_staging l = {0}; uint64_t bytes = 256;
    assert(hk_host_as_stage_layout(&g, &r, &l, &bytes));
-   hk_host_as_stage_geometry(&g, &r, &l, map, va);
+   hk_host_as_stage_geometries(1, &g, &r, &l, map, va, bytes);
    normalized(&r);
    assert(!memcmp(map + l.data, (uint8_t *)input + 64, 3 * 32 + 24));
 }
@@ -119,6 +137,6 @@ int main(void)
    const unsigned counts[] = {65535, 65536, 65537};
    for (unsigned i = 0; i < 3; ++i)
       for (unsigned p = 0; p < 2; ++p) instances(counts[i], p);
-   puts("PASS: host geometry offsets and 65,535/65,536/65,537 packed/pointer instances");
+   puts("PASS: published host geometry offsets and 65,535/65,536/65,537 packed/pointer instances");
    return 0;
 }

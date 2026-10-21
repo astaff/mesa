@@ -2171,6 +2171,7 @@ struct hk_host_as_run {
    VkCommandBuffer cmd;
    VkFence fence;
    struct util_dynarray bos;
+   bool locked;
 };
 
 static VkResult
@@ -2215,15 +2216,17 @@ hk_host_as_finish(struct hk_host_as_run *run)
    VkDevice device = hk_device_to_handle(dev);
    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
    if (run->cmd) {
-      simple_mtx_lock(&dev->host_as.lock);
       disp->FreeCommandBuffers(device, dev->host_as.pool, 1, &run->cmd);
-      simple_mtx_unlock(&dev->host_as.lock);
    }
    if (run->fence)
       disp->DestroyFence(device, run->fence, NULL);
    util_dynarray_foreach(&run->bos, struct agx_bo *, bo)
       agx_bo_unreference(&dev->dev, *bo);
    util_dynarray_fini(&run->bos);
+   if (run->locked) {
+      run->locked = false;
+      simple_mtx_unlock(&dev->host_as.lock);
+   }
 }
 
 static VkResult
@@ -2236,12 +2239,20 @@ hk_host_as_begin(struct hk_device *dev, struct hk_host_as_run *run)
    if (!dev->g17p_native_as || !dev->host_as.queue || !dev->host_as.pool)
       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
 
+   /* Recording command buffers also accesses the shared pool's free BO and
+    * AS chunk lists. Serialize the whole synchronous operation, including
+    * recording and retirement, rather than just allocation and submission. */
+   simple_mtx_lock(&dev->host_as.lock);
+   run->locked = true;
+
    const VkFenceCreateInfo fence_info = {
       .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
    };
    VkResult result = disp->CreateFence(device, &fence_info, NULL, &run->fence);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      hk_host_as_finish(run);
       return result;
+   }
 
    const VkCommandBufferAllocateInfo alloc_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -2249,9 +2260,7 @@ hk_host_as_begin(struct hk_device *dev, struct hk_host_as_run *run)
       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
       .commandBufferCount = 1,
    };
-   simple_mtx_lock(&dev->host_as.lock);
    result = disp->AllocateCommandBuffers(device, &alloc_info, &run->cmd);
-   simple_mtx_unlock(&dev->host_as.lock);
    if (result != VK_SUCCESS) {
       run->cmd = VK_NULL_HANDLE;
       hk_host_as_finish(run);
@@ -2272,7 +2281,8 @@ static struct agx_bo *
 hk_host_as_bo(struct hk_host_as_run *run, uint64_t size, const char *name)
 {
    struct agx_bo *bo = agx_bo_create(&run->dev->dev, MAX2(size, 16), 0,
-                                     AGX_BO_WRITEBACK, name);
+                                     util_has_cache_ops() ? AGX_BO_WRITEBACK : 0,
+                                     name);
    if (bo)
       util_dynarray_append(&run->bos, bo);
    return bo;
@@ -2296,10 +2306,8 @@ hk_host_as_execute(struct hk_host_as_run *run)
       .commandBufferInfoCount = 1,
       .pCommandBufferInfos = &cmd_info,
    };
-   simple_mtx_lock(&dev->host_as.lock);
    result = disp->QueueSubmit2(vk_queue_to_handle(&dev->host_as.queue->vk), 1,
                                &submit, run->fence);
-   simple_mtx_unlock(&dev->host_as.lock);
    if (result != VK_SUCCESS)
       return result;
    return disp->WaitForFences(device, 1, &run->fence, VK_TRUE, UINT64_MAX);
@@ -2383,11 +2391,10 @@ hk_BuildAccelerationStructuresKHR(
          result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
          goto out;
       }
-      for (uint32_t g = 0; g < info->geometryCount; ++g) {
-         const uint32_t j = k - info->geometryCount + g;
-         hk_host_as_stage_geometry(&geometries[j], &ranges[j], &layouts[j],
-                                   map, staging->va->addr);
-      }
+      const uint32_t first = k - info->geometryCount;
+      hk_host_as_stage_geometries(info->geometryCount, geometries + first,
+                                  ranges + first, layouts + first, map,
+                                  staging->va->addr, bytes);
       infos[i].scratchData.deviceAddress = scratch->va->addr;
    }
 

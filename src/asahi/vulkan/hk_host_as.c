@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_host_as.h"
+#include "util/cache_ops.h"
 #include "vk_acceleration_structure.h"
 #include "vk_format.h"
 #include "asahi/libagx/gen1_as.h"
@@ -79,7 +80,7 @@ hk_host_as_read_index(const uint8_t *indices, VkIndexType type, uint64_t i)
    }
 }
 
-void
+static void
 hk_host_as_stage_geometry(VkAccelerationStructureGeometryKHR *g,
                           VkAccelerationStructureBuildRangeInfoKHR *r,
                           const struct hk_host_as_staging *layout,
@@ -168,4 +169,21 @@ hk_host_as_stage_geometry(VkAccelerationStructureGeometryKHR *g,
    default:
       break;
    }
+}
+
+void
+hk_host_as_stage_geometries(uint32_t count,
+                            VkAccelerationStructureGeometryKHR *geometries,
+                            VkAccelerationStructureBuildRangeInfoKHR *ranges,
+                            const struct hk_host_as_staging *layouts,
+                            uint8_t *map, uint64_t va, uint64_t size)
+{
+   for (uint32_t i = 0; i < count; ++i)
+      hk_host_as_stage_geometry(&geometries[i], &ranges[i], &layouts[i], map, va);
+
+   /* The CPU wrote a write-back BO, which is outside the command buffer's
+    * upload pools. Publish all staged vertices, AABBs and instance records
+    * before the internal queue can launch the device builder. */
+   if (size && util_has_cache_ops())
+      util_flush_range(map, size);
 }
