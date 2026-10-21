@@ -1048,7 +1048,13 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxSamplerAllocationCount = 4000,
       .bufferImageGranularity = 0x400,
       .sparseAddressSpaceSize = HK_SPARSE_ADDR_SPACE_SIZE,
-      .maxBoundDescriptorSets = HK_MAX_SETS,
+      /* The classic AGX2 root upload has one USC uniform record, limited
+       * to 64 halfwords. Keep upstream's eight-set limit: the native
+       * sixteen-set root needs 68 halfwords and uses a separate loader.
+       */
+      .maxBoundDescriptorSets =
+         agx_chip_isa_encoding(dev->chip) == AGX_ISA_ENCODING_AGX2
+            ? 8 : HK_MAX_SETS,
       /* VK_KHR_acceleration_structure limits.  The counts are the
        * specification's own 24/29-bit encoding maxima, which is what bounds
        * us: the geometry, instance and primitive ids all live in packed
