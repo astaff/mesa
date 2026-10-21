@@ -44,6 +44,16 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
       struct ail_layout *layout = &image->planes[plane].layout;
       perf_debug(cmd, "Image clear (%scompressed)",
                  layout->compressed ? "" : "un");
+      if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
+         hk_frame_anatomy_note(
+            hk_cmd_buffer_device(cmd),
+            "image clear %ux%ux%u %s samples=%u levels=%u plane=%u "
+            "compressed=%u usage=0x%x empty_pass=%u",
+            image->vk.extent.width, image->vk.extent.height,
+            image->vk.array_layers, util_format_short_name(layout->format),
+            layout->sample_count_sa, level_count, plane, layout->compressed,
+            (unsigned)image->vk.usage, cmd->sync.kind_override != 0);
+      }
 
       for (uint32_t l = 0; l < level_count; l++) {
          const uint32_t level = range->baseMipLevel + l;

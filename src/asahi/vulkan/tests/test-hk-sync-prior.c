@@ -7,6 +7,7 @@
 #include <string.h>
 #include "util/ralloc.h"
 #include "hk_cmd_buffer.h"
+#include "hk_device.h"
 #include "hk_drm_prior_core.h"
 #include "hk_queue.h"
 _Static_assert(sizeof(struct drm_asahi_cmd_render) == 320, "legacy render");
@@ -75,6 +76,9 @@ static struct hk_cmd_buffer *
 new_cmd(void)
 {
    struct hk_cmd_buffer *c = test_alloc(sizeof(*c));
+   /* Stream creation reads device-wide options (the frame anatomy flag):
+    * give each fixture a zeroed device. */
+   c->vk.base.device = test_alloc(sizeof(struct hk_device));
    list_inithead(&c->control_streams);
    util_dynarray_init(&c->sync_pass_records, NULL);
    return c;

@@ -677,6 +677,9 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
    }
    if (cs->anatomy_fs_other)
       HK_FA_APPEND(" fs_other=%u", cs->anatomy_fs_other);
+   if (cs->anatomy_api_barriers)
+      HK_FA_APPEND(" apibar=%u:%" PRIx64 ":%" PRIx64, cs->anatomy_api_barriers,
+                   cs->anatomy_api_src, cs->anatomy_api_dst);
 }
 
 void
@@ -758,6 +761,9 @@ hk_frame_anatomy_compute(struct hk_frame_anatomy_submit *s,
    }
    if (cs->anatomy_fs_other)
       HK_FA_APPEND(" cs_other=%u", cs->anatomy_fs_other);
+   if (cs->anatomy_api_barriers)
+      HK_FA_APPEND(" apibar=%u:%" PRIx64 ":%" PRIx64, cs->anatomy_api_barriers,
+                   cs->anatomy_api_src, cs->anatomy_api_dst);
    for (unsigned i = 0; i < HK_FA_FS_MAX && cs->anatomy_precomp[i].dispatches;
         ++i) {
       if (cs->anatomy_precomp[i].threads == UINT64_MAX)

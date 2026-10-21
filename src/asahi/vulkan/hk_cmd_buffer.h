@@ -1206,6 +1206,12 @@ struct hk_cs {
    } anatomy_precomp[HK_FA_FS_MAX];
    uint32_t anatomy_precomp_other;
 
+   /* Frame anatomy profiler only: the API pipeline barriers recorded between
+    * the previous stream's creation and this one's (count, and the union of
+    * their source and destination stage masks). */
+   uint32_t anatomy_api_barriers;
+   uint64_t anatomy_api_src, anatomy_api_dst;
+
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The
     * kernel writes both from the firmware's native pass record.
@@ -1455,6 +1461,13 @@ struct hk_gen1_as_table_chunk {
 
 struct hk_cmd_buffer {
    struct vk_command_buffer vk;
+
+   /* Frame anatomy profiler only: API pipeline barriers recorded since the
+    * last stream was created (see hk_cs::anatomy_api_barriers). */
+   struct {
+      uint32_t count;
+      uint64_t src, dst;
+   } anatomy_bar;
 
    /* frg-codegen v4: the per-recording BG/EOT cache (13.5 KiB) lives outside
     * `state` so the full-state memset of every reset no longer clears it;

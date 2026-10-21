@@ -1007,6 +1007,23 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "Pipeline barrier");
 
+   if (unlikely(dev->frame_anatomy)) {
+      const VkDependencyInfo *dep = pDependencyInfo;
+      for (uint32_t i = 0; i < dep->memoryBarrierCount; ++i) {
+         cmd->anatomy_bar.src |= dep->pMemoryBarriers[i].srcStageMask;
+         cmd->anatomy_bar.dst |= dep->pMemoryBarriers[i].dstStageMask;
+      }
+      for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; ++i) {
+         cmd->anatomy_bar.src |= dep->pBufferMemoryBarriers[i].srcStageMask;
+         cmd->anatomy_bar.dst |= dep->pBufferMemoryBarriers[i].dstStageMask;
+      }
+      for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; ++i) {
+         cmd->anatomy_bar.src |= dep->pImageMemoryBarriers[i].srcStageMask;
+         cmd->anatomy_bar.dst |= dep->pImageMemoryBarriers[i].dstStageMask;
+      }
+      cmd->anatomy_bar.count++;
+   }
+
    /* M5 records its barriers with the native dependency tracker. */
    if (!agx_native_graphics(&dev->dev) && !agx_chip_g17_m5(dev->dev.chip)) {
       hk_cmd_buffer_end_compute(cmd);

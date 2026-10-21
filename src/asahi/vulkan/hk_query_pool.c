@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_query_pool.h"
+#include "hk_frame_anatomy.h"
 
 #include "agx_compile.h"
 #include "agx_pack.h"
@@ -669,6 +670,12 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (unlikely(dev->frame_anatomy)) {
+      hk_frame_anatomy_note(dev, "timestamp stage=0x%llx query=%u in_pass=%u",
+                            (unsigned long long)stage, query,
+                            cmd->state.gfx.render.tilebuffer.nr_samples != 0 &&
+                               cmd->current_cs.gfx != NULL);
+   }
 
    const struct agx_timestamp_req req = {
       .addr = hk_query_report_addr(dev, pool, query),
