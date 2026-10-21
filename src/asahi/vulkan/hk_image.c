@@ -520,10 +520,12 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 
 /* M5 lossless storage compression. These half-float formats have no image
  * atomic operations. The single-layer/level native read/write packets use
- * the allocator's recovered Gen10 metadata layout.
- * Transfer destinations and attachments stay plain until all of their write
- * paths have a Gen10 compressed-layout witness. Bits select RGBA16F, RG16F
- * and R16F, respectively; zero retains the uncompressed diagnostic control. */
+ * the allocator's recovered Gen10 metadata layout, the same layout colour
+ * attachments use, so a storage image may also be a colour attachment and a
+ * transfer destination: end-of-tile stores, shader image stores, clears and
+ * uploads all write it through compressed PBE descriptors. Bits select
+ * RGBA16F, RG16F and R16F, respectively; zero retains the uncompressed
+ * diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
                          "ASAHI_M5_STORAGE_COMPRESSION", 7)
 
@@ -531,7 +533,8 @@ static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
                                  const VkImageCreateInfo *info)
 {
-   if (dev->chip != AGX_CHIP_G17S || plane || info->pNext || info->flags ||
+   if (dev->chip != AGX_CHIP_G17S || plane || info->pNext ||
+       (info->flags & ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
        info->extent.width < 16 || info->extent.height < 16 ||
        info->mipLevels != 1 || info->arrayLayers != 1 ||
@@ -540,7 +543,9 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
        !(info->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
        (info->usage & ~(VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_SAMPLED_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT)))
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))
       return false;
 
    unsigned bit;
