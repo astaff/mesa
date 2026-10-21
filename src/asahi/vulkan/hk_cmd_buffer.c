@@ -909,6 +909,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    if (!agx_native_graphics(&dev->dev)) {
       hk_cmd_buffer_end_compute(cmd);
       hk_cmd_buffer_end_graphics(cmd);
+      /* Preserve the same conservative ordering in the shared submit graph,
+       * including kernels that advertise exact prior barriers on AGX2. */
+      hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
       return;
    }
 
