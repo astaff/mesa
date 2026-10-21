@@ -685,7 +685,10 @@ hk_populate_fs_key(struct hk_fs_key *key,
    /* A fragment library without output-interface state may acquire color
     * attachments later. Alpha-to-coverage also consumes color even without
     * an attachment, so require it to be statically disabled. */
-   if (chip == AGX_CHIP_G17P && state->rp &&
+   if ((chip == AGX_CHIP_G17P ||
+        (agx_chip_g17_m5(chip) &&
+         debug_get_bool_option("ASAHI_M5_PRUNE_DEPTH_COLOR", true))) &&
+       state->rp &&
        (state->cal || BITSET_TEST(state->dynamic,
                                    MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP)) &&
        vk_render_pass_state_has_attachment_info(state->rp) &&
