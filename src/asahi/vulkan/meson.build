@@ -4,6 +4,7 @@ hk_files = files(
   'hk_barrier.c',
   'hk_barrier.h',
   'hk_acceleration_structure.c',
+  'hk_host_as.c',
   'hk_acceleration_structure.h',
   'hk_buffer.c',
   'hk_buffer.h',
@@ -441,6 +442,12 @@ _dev_icd = custom_target(
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 
 if with_tests and ld_args_gc_sections.length() > 0
+  test(
+    'hk_host_as', executable('hk_host_as_test',
+      files('tests/test-hk-host-as.c', 'hk_host_as.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src],
+      dependencies : [hk_deps],
+      link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test(
     'hk_rt_cache_control',
     executable(
