@@ -1012,14 +1012,20 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       for (uint32_t i = 0; i < dep->memoryBarrierCount; ++i) {
          cmd->anatomy_bar.src |= dep->pMemoryBarriers[i].srcStageMask;
          cmd->anatomy_bar.dst |= dep->pMemoryBarriers[i].dstStageMask;
+         cmd->anatomy_bar.src_access |= dep->pMemoryBarriers[i].srcAccessMask;
+         cmd->anatomy_bar.dst_access |= dep->pMemoryBarriers[i].dstAccessMask;
       }
       for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount; ++i) {
          cmd->anatomy_bar.src |= dep->pBufferMemoryBarriers[i].srcStageMask;
          cmd->anatomy_bar.dst |= dep->pBufferMemoryBarriers[i].dstStageMask;
+         cmd->anatomy_bar.src_access |= dep->pBufferMemoryBarriers[i].srcAccessMask;
+         cmd->anatomy_bar.dst_access |= dep->pBufferMemoryBarriers[i].dstAccessMask;
       }
       for (uint32_t i = 0; i < dep->imageMemoryBarrierCount; ++i) {
          cmd->anatomy_bar.src |= dep->pImageMemoryBarriers[i].srcStageMask;
          cmd->anatomy_bar.dst |= dep->pImageMemoryBarriers[i].dstStageMask;
+         cmd->anatomy_bar.src_access |= dep->pImageMemoryBarriers[i].srcAccessMask;
+         cmd->anatomy_bar.dst_access |= dep->pImageMemoryBarriers[i].dstAccessMask;
       }
       cmd->anatomy_bar.count++;
    }

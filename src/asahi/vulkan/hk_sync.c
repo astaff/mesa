@@ -576,6 +576,8 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->anatomy_api_barriers = cmd->anatomy_bar.count;
       cs->anatomy_api_src = cmd->anatomy_bar.src;
       cs->anatomy_api_dst = cmd->anatomy_bar.dst;
+      cs->anatomy_api_src_access = cmd->anatomy_bar.src_access;
+      cs->anatomy_api_dst_access = cmd->anatomy_bar.dst_access;
       memset(&cmd->anatomy_bar, 0, sizeof(cmd->anatomy_bar));
    }
    const bool post_gfx = compute && slot == &cmd->current_cs.post_gfx;

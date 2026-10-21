@@ -1211,6 +1211,7 @@ struct hk_cs {
     * their source and destination stage masks). */
    uint32_t anatomy_api_barriers;
    uint64_t anatomy_api_src, anatomy_api_dst;
+   uint64_t anatomy_api_src_access, anatomy_api_dst_access;
 
    /* Timestamp writes: the start of the command (compute start, render
     * vertex start) and its end (compute end, render fragment end). The
@@ -1466,7 +1467,7 @@ struct hk_cmd_buffer {
     * last stream was created (see hk_cs::anatomy_api_barriers). */
    struct {
       uint32_t count;
-      uint64_t src, dst;
+      uint64_t src, dst, src_access, dst_access;
    } anatomy_bar;
 
    /* frg-codegen v4: the per-recording BG/EOT cache (13.5 KiB) lives outside
