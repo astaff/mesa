@@ -2730,6 +2730,19 @@ hk_compile_ray_tracing_pipeline(
     * and the calls are flattened here.  lavapipe leaves them standing because
     * its backend executes calls directly; ours cannot, and a call that reaches
     * agx_compile_shader_nir() faults rather than refusing. */
+   /* Depth alone does not bound code size: two traces per stage duplicate
+    * the complete callee tree at every level, even though the pre-inline DAG
+    * is small. Reject that expansion before NIR allocates gigabytes and
+    * drives the system into reclaim. This is a compiler resource limit, not
+    * a lower advertised recursion depth. Legacy generations are unchanged.
+    */
+   if (dev->dev.chip == AGX_CHIP_G17P &&
+       !hk_rt_inlining_fits(b->shader, 1u << 18)) {
+      ralloc_free(b->shader);
+      return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
+                       "RT inlining exceeds 262144 instructions");
+   }
+
    NIR_PASS(_, b->shader, nir_inline_functions);
    nir_remove_non_entrypoints(b->shader);
 

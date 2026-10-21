@@ -72,6 +72,7 @@ hk_files = files(
   'hk_nir_lower_robust_image.h',
   'hk_nir_ray_tracing.c',
   'hk_ray_tracing_core.c',
+  'hk_rt_inlining.c',
   'hk_ray_tracing_core.h',
   'hk_ray_tracing_pipeline.c',
   'hk_ray_tracing_pipeline.h',
@@ -381,14 +382,20 @@ libhk = static_library(
 )
 
 if with_tests
+  test('hk_rt_inlining', executable('hk_rt_inlining_test',
+    files('tests/test-hk-rt-inlining.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_memory_oom', executable('hk_memory_oom_test',
     files('tests/test-hk-memory-oom.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections,
-      '-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
       '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=agx_bo_cache_evict_all',
+      '-Wl,--wrap=agx_bo_export',
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf']),
     suite : ['asahi'])
   test('hk_tes_query', executable('hk_tes_query_test', files('tests/test-hk-tes-query.c'),

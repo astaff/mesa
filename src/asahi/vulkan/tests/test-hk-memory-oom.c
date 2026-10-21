@@ -7,6 +7,7 @@
 #include "hk_entrypoints.h"
 #include "hk_physical_device.h"
 #include "hk_memory_budget.h"
+#include "hk_wsi.h"
 #include "vk_alloc.h"
 #include "wsi_common_private.h"
 #include "wsi_common_entrypoints.h"
@@ -22,25 +23,27 @@
 
 #define MIB (UINT64_C(1024) * 1024)
 static const uint64_t limit = 2048 * MIB, host = 384 * MIB;
-static uint64_t pinned, cached, peak;
-static unsigned bo_calls, kernel_oom_attempts, trims;
+static uint64_t pinned, cached, peak, sibling_snapshot;
+static unsigned bo_calls, kernel_oom_attempts, trims, budget_queries;
 static unsigned passing, host_live;
 static bool bind_fails, bo_fails, image_bind_fails, export_fails, limited = true;
 static unsigned images_live, successes, exported_count;
 static int exported_fds[4];
+static struct agx_bo *live_bos[16];
+static uint64_t bo_sizes[16];
 
-__typeof__(agx_bo_create) __wrap_agx_bo_create;
-__typeof__(agx_bo_unreference) __wrap_agx_bo_unreference;
 __typeof__(agx_bo_bind) __wrap_agx_bo_bind;
 __typeof__(agx_bo_cache_evict_all) __wrap_agx_bo_cache_evict_all;
+__typeof__(agx_bo_cache_evict_all) __real_agx_bo_cache_evict_all;
+__typeof__(agx_bo_export) __wrap_agx_bo_export;
 __typeof__(hk_get_cgroup_memory_available) __wrap_hk_get_cgroup_memory_available;
 __typeof__(__vk_errorf) __wrap___vk_errorf;
 
-/* These replace only the kernel-facing allocation operations. The test calls
- * the production Vulkan allocation and free entrypoints and object allocator. */
-struct agx_bo *
-__wrap_agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
-                     enum agx_bo_flags flags, const char *label)
+/* Mock only backend allocation/close and VM_BIND. BO cache insertion, fetch,
+ * reference counting, VA release and WSI object cleanup use production code. */
+static struct agx_bo *
+mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
+              enum agx_bo_flags flags)
 {
    ++bo_calls;
    if (limited && size > limit - host - pinned - cached) {
@@ -51,26 +54,34 @@ __wrap_agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
       return NULL;
    struct agx_bo *bo = calloc(1, sizeof(*bo));
    assert(bo);
+   unsigned handle;
+   for (handle = 1; handle < ARRAY_SIZE(live_bos); ++handle)
+      if (!live_bos[handle]) break;
+   assert(handle < ARRAY_SIZE(live_bos));
+   live_bos[handle] = bo;
+   bo_sizes[handle] = size;
+   bo->dev = dev;
+   bo->handle = bo->uapi_handle = handle;
+   bo->prime_fd = -1;
    bo->size = size;
+   bo->align = align;
    bo->flags = flags;
-   bo->va = calloc(1, sizeof(*bo->va));
+   bo->va = agx_va_alloc(dev, size, align, 0, 0);
    assert(bo->va);
-   bo->va->addr = UINT64_C(0x1000000000) + pinned;
    pinned += size;
    if (pinned > peak)
       peak = pinned;
    return bo;
 }
 
-void
-__wrap_agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
+static void
+mock_bo_free(struct agx_device *dev, uint32_t handle)
 {
-   if (!bo)
-      return;
-   assert(pinned >= bo->size);
-   pinned -= bo->size;
-   free(bo->va);
-   free(bo);
+   assert(handle && handle < ARRAY_SIZE(live_bos) && live_bos[handle]);
+   assert(pinned >= bo_sizes[handle]);
+   pinned -= bo_sizes[handle];
+   free(live_bos[handle]);
+   live_bos[handle] = NULL;
 }
 
 int
@@ -85,13 +96,22 @@ __wrap_agx_bo_cache_evict_all(struct agx_device *dev)
 {
    ++trims;
    cached = 0;
+   __real_agx_bo_cache_evict_all(dev);
+}
+
+int
+__wrap_agx_bo_export(struct agx_device *dev, struct agx_bo *bo)
+{
+   return -1;
 }
 
 bool
 __wrap_hk_get_cgroup_memory_available(const char *cgroup, const char *mountinfo,
                                      uint64_t *available)
 {
-   *available = limit - host - pinned - cached;
+   ++budget_queries;
+   uint64_t used = host + pinned + cached + sibling_snapshot;
+   *available = used < limit ? limit - used : 0;
    return limited;
 }
 
@@ -238,7 +258,7 @@ init_wsi(struct hk_device *dev)
       .override_present_mode = VK_PRESENT_MODE_MAX_ENUM_KHR,
       .CreateImage = create_image, .DestroyImage = destroy_image,
       .GetImageMemoryRequirements = image_requirements,
-      .AllocateMemory = hk_AllocateMemory, .FreeMemory = hk_FreeMemory,
+      .AllocateMemory = hk_wsi_allocate_memory, .FreeMemory = hk_FreeMemory,
       .BindImageMemory = bind_image, .GetMemoryFdKHR = memory_fd,
       .GetPhysicalDeviceFormatProperties2 = format_properties,
       .GetPhysicalDeviceImageFormatProperties2 = image_format_properties,
@@ -292,6 +312,7 @@ swapchain_attempt(struct hk_device *dev, uint64_t image_size)
       wsi_DestroySwapchainKHR(hk_device_to_handle(dev), swapchain, &allocator);
    }
    assert(!pinned && !host_live && !images_live);
+   assert(!dev->dev.bo_cache.size);
    for (unsigned i = 0; i < exported_count; ++i)
       assert(fcntl(exported_fds[i], F_GETFD) == -1 && errno == EBADF);
    assert(!hk_device_physical(dev)->mem_heaps[0].used);
@@ -311,9 +332,18 @@ main(void)
    dev->vk.physical = &pdev->vk;
    vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
    vk_object_base_init(NULL, &pdev->vk.base, VK_OBJECT_TYPE_PHYSICAL_DEVICE);
+   dev->dev.chip = AGX_CHIP_G17P;
    pdev->mem_types[0].heapIndex = 0;
    pdev->mem_heaps[0].size = 8 * 1024 * MIB;
    simple_mtx_init(&dev->dev.bo_map_lock, mtx_plain);
+   simple_mtx_init(&dev->dev.bo_cache.lock, mtx_plain);
+   simple_mtx_init(&dev->dev.vma_lock, mtx_plain);
+   list_inithead(&dev->dev.bo_cache.lru);
+   for (unsigned i = 0; i < ARRAY_SIZE(dev->dev.bo_cache.buckets); ++i)
+      list_inithead(&dev->dev.bo_cache.buckets[i]);
+   util_vma_heap_init(&dev->dev.main_heap, UINT64_C(0x1000000000), UINT64_C(1) << 40);
+   dev->dev.ops.bo_alloc = mock_bo_alloc;
+   dev->dev.ops.bo_free = mock_bo_free;
    init_wsi(dev);
 
    /* The CTS tries callback limits 0..1024, including an extent requiring
@@ -339,7 +369,7 @@ main(void)
    passing = 1024;
    before = bo_calls;
    swapchain_attempt(dev, 256 * MIB);
-   assert(bo_calls == before + 1);
+   assert(bo_calls == before + 2);
    bo_fails = false;
    passing = 1024;
    image_bind_fails = true;
@@ -352,13 +382,31 @@ main(void)
    assert(exported_count == 1);
    export_fails = false;
 
-   /* Cached objects are reclaimed and admission retried before returning OOM. */
-   cached = 1024 * MIB;
+   /* Application allocations are admitted by the allocator/kernel, even when
+    * a WSI budget snapshot would refuse them. No cgroup query or trim occurs. */
+   sibling_snapshot = 1536 * MIB;
+   limited = true;
    passing = 4;
    VkDeviceMemory memory = 0;
-   before = trims;
+   before = budget_queries;
+   unsigned old_trims = trims;
    assert(alloc(dev, 1024 * MIB, &memory) == VK_SUCCESS);
-   assert(trims == before + 1 && !cached);
+   assert(budget_queries == before && trims == old_trims);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   sibling_snapshot = 0;
+   assert(!pinned && !host_live);
+
+   passing = 4;
+   assert(alloc(dev, 1024 * MIB, &memory) == VK_SUCCESS);
+   VkMemoryGetFdInfoKHR get_fd = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+      .memory = memory,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   int fd = 88;
+   assert(hk_GetMemoryFdKHR(hk_device_to_handle(dev), &get_fd, &fd) ==
+          VK_ERROR_OUT_OF_HOST_MEMORY);
+   assert(fd == -1);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    assert(!pinned && !host_live);
 
@@ -379,6 +427,9 @@ main(void)
    wsi_headless_finish_wsi(&pdev->wsi_device, vk_default_allocator());
    vk_object_base_finish(&dev->vk.base);
    vk_object_base_finish(&pdev->vk.base);
+   util_vma_heap_finish(&dev->dev.main_heap);
+   simple_mtx_destroy(&dev->dev.vma_lock);
+   simple_mtx_destroy(&dev->dev.bo_cache.lock);
    simple_mtx_destroy(&dev->dev.bo_map_lock);
    free(dev);
    free(pdev);

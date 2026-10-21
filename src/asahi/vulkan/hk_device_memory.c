@@ -9,7 +9,6 @@
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
-#include "hk_memory_budget.h"
 #include "hk_physical_device.h"
 
 #include "asahi/lib/agx_bo.h"
@@ -198,29 +197,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (used > heap->size || aligned_size > heap->size - used)
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-   /* Native VM_BIND pins UMA backing. GEM_CREATE/VM_BIND may invoke the
-    * cgroup OOM killer before returning an allocation error, even when the
-    * physical heap has ample space. In particular, a max-extent headless
-    * swapchain needs four 1 GiB BOs. Reject an allocation that cannot fit
-    * before entering the kernel, leaving room for page tables and host
-    * allocations. Imports already own their backing in another allocation.
-    */
-   if (!dev->dev.is_virtio && !(fd_info && fd_info->handleType)) {
-      uint64_t available;
-      if (hk_get_cgroup_memory_available("/proc/self/cgroup",
-                                         "/proc/self/mountinfo", &available) &&
-          aligned_size > available - available / 16) {
-         /* Cached BOs may be the reason this allocation does not fit. */
-         simple_mtx_lock(&dev->dev.bo_map_lock);
-         agx_bo_cache_evict_all(&dev->dev);
-         simple_mtx_unlock(&dev->dev.bo_map_lock);
-         if (hk_get_cgroup_memory_available("/proc/self/cgroup",
-                                            "/proc/self/mountinfo", &available) &&
-             aligned_size > available - available / 16)
-            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-      }
-   }
-
    mem = vk_device_memory_create(&dev->vk, pAllocateInfo, pAllocator,
                                  sizeof(*mem));
    if (!mem)
@@ -242,6 +218,11 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       enum agx_bo_flags flags = 0;
       if (handle_types)
          flags |= AGX_BO_SHAREABLE;
+      /* A failed WSI export must not leave pinned backing in the BO cache.
+       * Successful exports already acquire AGX_BO_SHARED. */
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+          vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
+         flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
 
@@ -503,6 +484,8 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
       *pFD = agx_bo_export(&dev->dev, memory->bo);
+      if (*pFD < 0 && dev->dev.chip == AGX_CHIP_G17P)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       return VK_SUCCESS;
    default:
       assert(!"unsupported handle type");
