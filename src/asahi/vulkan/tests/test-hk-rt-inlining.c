@@ -11,7 +11,8 @@
 static nir_shader *
 graph(unsigned depth, unsigned calls)
 {
-   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "RT DAG");
+   static const nir_shader_compiler_options options = {0};
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, &options, "RT DAG");
    nir_function *callee = b.impl->function;
    nir_function *levels[32];
    for (unsigned i = 0; i < depth; ++i) {
