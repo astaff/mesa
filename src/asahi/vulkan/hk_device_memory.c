@@ -9,6 +9,7 @@
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
+#include "hk_memory_budget.h"
 #include "hk_physical_device.h"
 
 #include "asahi/lib/agx_bo.h"
@@ -188,11 +189,37 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    uint32_t alignment = 16384; /* Apple page size */
 
    struct hk_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
-   if (p_atomic_read(&heap->used) > heap->size)
+   if (pAllocateInfo->allocationSize > UINT64_MAX - (alignment - 1))
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
+   uint64_t used = p_atomic_read(&heap->used);
+   if (used > heap->size || aligned_size > heap->size - used)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   /* Native VM_BIND pins UMA backing. GEM_CREATE/VM_BIND may invoke the
+    * cgroup OOM killer before returning an allocation error, even when the
+    * physical heap has ample space. In particular, a max-extent headless
+    * swapchain needs four 1 GiB BOs. Reject an allocation that cannot fit
+    * before entering the kernel, leaving room for page tables and host
+    * allocations. Imports already own their backing in another allocation.
+    */
+   if (!dev->dev.is_virtio && !(fd_info && fd_info->handleType)) {
+      uint64_t available;
+      if (hk_get_cgroup_memory_available("/proc/self/cgroup",
+                                         "/proc/self/mountinfo", &available) &&
+          aligned_size > available - available / 16) {
+         /* Cached BOs may be the reason this allocation does not fit. */
+         simple_mtx_lock(&dev->dev.bo_map_lock);
+         agx_bo_cache_evict_all(&dev->dev);
+         simple_mtx_unlock(&dev->dev.bo_map_lock);
+         if (hk_get_cgroup_memory_available("/proc/self/cgroup",
+                                            "/proc/self/mountinfo", &available) &&
+             aligned_size > available - available / 16)
+            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+   }
 
    mem = vk_device_memory_create(&dev->vk, pAllocateInfo, pAllocator,
                                  sizeof(*mem));

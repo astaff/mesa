@@ -38,6 +38,8 @@ hk_files = files(
   'hk_device.h',
   'hk_device_memory.c',
   'hk_device_memory.h',
+  'hk_memory_budget.c',
+  'hk_memory_budget.h',
   'hk_event.c',
   'hk_event.h',
   'hk_format.c',
@@ -134,6 +136,10 @@ if with_tests
       ]),
     suite : ['asahi'])
 
+  test('hk_memory_budget', executable('hk_memory_budget_test',
+    files('tests/test-hk-memory-budget.c', 'hk_memory_budget.c'),
+    include_directories : include_directories('.')),
+    suite : ['asahi'])
   test(
     'hk_barrier',
     executable(
@@ -375,6 +381,16 @@ libhk = static_library(
 )
 
 if with_tests
+  test('hk_memory_oom', executable('hk_memory_oom_test',
+    files('tests/test-hk-memory-oom.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections,
+      '-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
+      '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=agx_bo_cache_evict_all',
+      '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf']),
+    suite : ['asahi'])
   test('hk_tes_query', executable('hk_tes_query_test', files('tests/test-hk-tes-query.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
