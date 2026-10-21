@@ -3475,6 +3475,15 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    hk_sync_end_rendering(cmd);
 
+   /* Classic upstream submits each render after its predecessor. In
+    * particular, coherent advanced blending in a later render pass must
+    * load the earlier pass's stored colour without an application barrier.
+    * The native dependency tracker otherwise permits full-tile passes to
+    * overlap. Retain upstream ordering on AGX2, including across command
+    * buffers/submissions through the tracker's prior requirements. */
+   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev))
+      hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+
    if (continuable && !need_resolve && cs->end == end_before &&
        !vk_command_buffer_has_error(&cmd->vk)) {
       merge->cs = cs;
@@ -7351,8 +7360,12 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    *key = (struct hk_fast_link_key_fs){
       .prolog.statistics = in->statistics,
       .prolog.cull_distance_size = in->cull_distance_size,
+      /* AGX2 must apply the API mask before an explicit-early main part
+       * counts samples, just as upstream does. Only the native path folds
+       * that mask into its forced-early coverage word. */
       .prolog.api_sample_mask =
-         has_sample_mask && !nontrivial_force_early && !defer_api_sample_mask
+         has_sample_mask && !defer_api_sample_mask &&
+               (!agx_native_graphics(&dev->dev) || !nontrivial_force_early)
             ? api_sample_mask
             : 0xff,
       .prolog.nr_samples = agx_native_graphics(&dev->dev) ? samples : 0,
