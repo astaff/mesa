@@ -51,6 +51,8 @@
 #include "vk_drm_syncobj.h"
 #include "vk_sync.h"
 
+DEBUG_GET_ONCE_BOOL_OPTION(m5_chunk_timelines, "ASAHI_M5_CHUNK_TIMELINES", true)
+
 /* Signal scope includes all earlier commands on this Vulkan queue. A DRM
  * timeline point retains its predecessor fence chain; an individual submit's
  * aggregate fence covers only that submit. Transferring the queue point orders
@@ -480,15 +482,24 @@ static VkResult
 queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
                     struct drm_asahi_submit *submit, unsigned command_count,
                     unsigned ring_idx, const uint64_t prior_base[2],
+                    bool chunk_timelines, uint64_t first_chunk_point,
                     struct hk_frame_anatomy_submit *anatomy)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
    unsigned submitted_vdm = 0, submitted_cdm = 0;
    unsigned commands_remaining = command_count;
+   unsigned chunk_index = 0;
+   uint64_t last_attempted_point = first_chunk_point - 1;
 
    uint64_t out_syncs =
       submit->syncs + sizeof(struct drm_asahi_sync) * submit->in_sync_count;
+
+   struct drm_asahi_sync *chunk_signal = (void *)(uintptr_t)out_syncs;
+   if (chunk_timelines)
+      assert(submit->out_sync_count == 1 &&
+             chunk_signal->sync_type == DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ &&
+             chunk_signal->handle == queue->drm.syncobj);
 
    while (commands_remaining) {
       bool first = commands_remaining == command_count;
@@ -504,6 +515,8 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
       struct hk_drm_command_span span;
       if (!hk_drm_next_command_span(cmdbuf, submit->cmdbuf_size, base_offs,
                                     count, &span)) {
+         if (chunk_timelines)
+            queue->drm.timeline_value = last_attempted_point;
          return vk_device_set_lost(
             &dev->vk, "Invalid internal Asahi command stream framing");
       }
@@ -511,6 +524,8 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
       unsigned cdm_count = span.compute_count;
       unsigned vdm_count = span.render_count;
       if (last && offs != submit->cmdbuf_size) {
+         if (chunk_timelines)
+            queue->drm.timeline_value = last_attempted_point;
          return vk_device_set_lost(
             &dev->vk, "Trailing synthetic Asahi commands without hardware");
       }
@@ -526,17 +541,17 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
 
          if (!hk_drm_rebase_prior(cmd, cmd + 1, submitted_vdm,
                                   submitted_cdm, prior_base,
-                                  queue->sync.exact_prior))
+                                  queue->sync.exact_prior)) {
+            if (chunk_timelines)
+               queue->drm.timeline_value = last_attempted_point;
             return vk_device_set_lost(&dev->vk,
                                       "Invalid historical Asahi prefix");
+         }
       }
 
-      /* We can't signal the out-syncobjs until all prior work finishes. Since
-       * only the last ioctl will signal, make sure it waits on prior ioctls.
-       *
-       * TODO: there might be a more performant way to do this.
-      */
-      if (last && !first) {
+      /* Without per-chunk completion points, only the final ioctl contributes
+       * to the output fence. It must cover the preceding chunks explicitly. */
+      if (last && !first && !chunk_timelines) {
          assert(span.first_hardware_offset != SIZE_MAX);
          struct drm_asahi_cmd_header *cmd =
             (void *)(cmdbuf + span.first_hardware_offset);
@@ -553,7 +568,11 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
        * retain the first-command chain and receive the waits only once. */
       bool has_in_syncs = first ||
          (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS);
-      bool has_out_syncs = last;
+      /* Distinct timeline points join completion without making this
+       * chunk execute after every command in its predecessor. */
+      bool has_out_syncs = last || chunk_timelines;
+      if (chunk_timelines)
+         chunk_signal->timeline_value = first_chunk_point + chunk_index;
 
       /* Profiler: barriers of this chunk exactly as rebased above. */
       if (unlikely(anatomy))
@@ -570,9 +589,15 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
          .out_sync_count = has_out_syncs ? submit->out_sync_count : 0,
       };
 
+      if (chunk_timelines)
+         last_attempted_point = chunk_signal->timeline_value;
       VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         if (chunk_timelines)
+            queue->drm.timeline_value = last_attempted_point;
          return result;
+      }
+      chunk_index++;
 
       submitted_cdm += cdm_count;
       submitted_vdm += vdm_count;
@@ -1143,6 +1168,17 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
        (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
    const unsigned kernel_signal_count =
       cumulative_signals ? 0 : submit->signal_count;
+   const bool chunk_timelines = cumulative_signals &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
+      agx_chip_g17_m5(dev->dev.chip) &&
+      debug_get_option_m5_chunk_timelines() &&
+      command_count > max_commands_per_submit(dev);
+   const uint64_t point_count = chunk_timelines
+      ? 1 + (command_count - 1) / max_commands_per_submit(dev) : 1;
+   if (queue->drm.timeline_value > UINT64_MAX - point_count)
+      return vk_device_set_lost(&dev->vk, "Asahi queue timeline overflow");
+   const uint64_t first_chunk_point = queue->drm.timeline_value + 1;
+   queue->drm.timeline_value += point_count;
    unsigned wait_count = 0;
    struct drm_asahi_sync *syncs =
       alloca((submit->wait_count + kernel_signal_count + 1) *
@@ -1185,7 +1221,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    syncs[wait_count + kernel_signal_count] = (struct drm_asahi_sync){
       .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
       .handle = queue->drm.syncobj,
-      .timeline_value = ++queue->drm.timeline_value,
+      .timeline_value = queue->drm.timeline_value,
    };
 
    /* Opt-in frame anatomy profiler (HK_FRAME_ANATOMY): NULL unless enabled
@@ -1510,7 +1546,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    } else {
       result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
                                    queue->drm.virt_ring_idx, prior_base,
-                                   anatomy);
+                                   chunk_timelines, first_chunk_point, anatomy);
    }
    if (cumulative_signals) {
       /* The kernel can publish an error fence even when submission fails.
