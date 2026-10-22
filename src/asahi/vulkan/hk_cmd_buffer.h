@@ -565,6 +565,11 @@ struct hk_rendering_state {
     */
    VkImageAspectFlags g17p_zls_written;
 
+   /* M5: an attachment of the pass can alias another resource (aliased,
+    * sparse or linear image), so its stores count as memory writes for
+    * dependency tracking (HK_SYNC_GFX_MEM). */
+   bool m5_attachments_reach_memory;
+
    /* AGX3 dead depth store: the "only" ZLS word with the depth store
     * dropped, and whether the pass processes empty tiles without that store,
     * for a later pass that makes the store dead (hk_take_pending_z_store()).

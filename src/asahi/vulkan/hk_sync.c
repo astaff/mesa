@@ -405,6 +405,26 @@ barrier_source_dependencies(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
       dep_max(&dep[sq], &pending[sq]);
 }
 
+static void note_last(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
+/* The latest HK_SYNC_GFX_MEM stream at or before a cut: a prefix wait on it
+ * covers every such stream the cut covers. */
+static struct hk_cs *
+memory_cut(struct hk_cs *cut)
+{
+   return !cut || (cut->sync.kind & HK_SYNC_GFX_MEM) ? cut
+                                                     : cut->sync.prev_mem;
+}
+
+void
+hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   if (cs->sync.kind & HK_SYNC_GFX_MEM)
+      return;
+   cs->sync.kind |= HK_SYNC_GFX_MEM;
+   note_last(cmd, cs);
+}
+
 void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
@@ -415,6 +435,26 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    barrier_source_dependencies(cmd, src_kinds, dep);
+
+   /* M5: of the renders this dependency orders pre-rasterization work after,
+    * only those that wrote memory other than their attachments
+    * (HK_SYNC_GFX_MEM) can hand that work anything it reads without an
+    * image. Order the vertex half (HK_SYNC_GFX) after the latest of them;
+    * the fragment half and image-reading vertex work keep the whole
+    * dependency. The compute subqueue's requirement is unchanged: the kernel
+    * orders both halves after compute work either way. */
+   if ((src_kinds & HK_SYNC_GFX) && (dst_kinds & HK_SYNC_GFX) &&
+       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
+      struct hk_sync_dep vtx = dep[HK_SYNC_VDM];
+      vtx.cut = memory_cut(vtx.cut);
+      if (vtx.prior & HK_SYNC_GFX)
+         vtx.prior = (vtx.prior & ~HK_SYNC_GFX) | HK_SYNC_GFX_MEM;
+      const unsigned gfx = util_logbase2(HK_SYNC_GFX);
+      dep_max(&cmd->sync.req[gfx][HK_SYNC_VDM], &vtx);
+      dep_max(&cmd->sync.req[gfx][HK_SYNC_CDM], &dep[HK_SYNC_CDM]);
+      dst_kinds = (dst_kinds & ~HK_SYNC_GFX) | HK_SYNC_GFX_FRAG |
+                  HK_SYNC_GFX_IMG;
+   }
 
    u_foreach_bit(d, dst_kinds) {
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
@@ -598,6 +638,11 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    cs->sync.kind = stream_kind(cmd, slot, compute);
+   if (cs->sync.kind != HK_SYNC_GFX || slot == &cmd->current_cs.pre_gfx ||
+       slot == &cmd->current_cs.post_gfx)
+      cs->sync.kind |= HK_SYNC_GFX_MEM;
+   cs->sync.prev_mem =
+      st->last[util_logbase2(HK_SYNC_GFX_MEM)][hk_sync_sq(cs)];
 
    /* The recorded requirement for this kind of work. A render's vertex half
     * needs only the part whose destination is not fragment-only. */
@@ -755,6 +800,8 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
    req_for_kinds(cmd, kinds, dep);
    hk_sync_stream_wait(cs, dep);
    cs->sync.kind |= kinds;
+   if (cs->sync.kind != HK_SYNC_GFX)
+      cs->sync.kind |= HK_SYNC_GFX_MEM;
    note_last(cmd, cs);
 
    if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
@@ -879,6 +926,7 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
       replace_pointer(&it->sync.dep[sq].cut, cs, prev);
       replace_pointer(&it->sync.dep_ta[sq].cut, cs, prev);
+      replace_pointer(&it->sync.prev_mem, cs, cs->sync.prev_mem);
    }
 
    /* A pre-graphics or continuation stream that was waiting on nothing but
@@ -948,6 +996,7 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       if (it != into && it != from) {
          replace_pointer(&it->sync.dep[sq].cut, from, into);
          replace_pointer(&it->sync.dep_ta[sq].cut, from, into);
+         replace_pointer(&it->sync.prev_mem, from, into);
       }
    }
 }

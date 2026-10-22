@@ -1787,6 +1787,9 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       hk_m5_accumulate_shader_writes(&cs->m5_shader_writes_memory,
                                      object->info.writes_external_memory);
    }
+   if (cs->m5_shader_writes_memory || gfx->xfb_enabled ||
+       gfx->render.m5_attachments_reach_memory)
+      hk_sync_note_memory_write(cmd, cs);
    const bool v2 = dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2;
    struct drm_asahi_render_program_v2 programs[3] = {{0}, {
       .legacy = {.stage = 1,
@@ -4525,6 +4528,24 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    render->zls_precise = agx3 && z_layout != NULL;
    render->g17p_zls_touched = 0;
    render->g17p_zls_written = 0;
+   render->m5_attachments_reach_memory = false;
+   {
+      const struct hk_image_view *views[2 * HK_MAX_RTS + 4] = {
+         render->depth_att.iview, render->stencil_att.iview,
+         render->depth_att.resolve_iview, render->stencil_att.resolve_iview};
+      for (uint32_t i = 0; i < render->color_att_count; ++i) {
+         views[4 + 2 * i] = render->color_att[i].iview;
+         views[5 + 2 * i] = render->color_att[i].resolve_iview;
+      }
+      for (unsigned i = 0; i < 4 + 2 * render->color_att_count; ++i) {
+         const struct vk_image *image = views[i] ? views[i]->vk.image : NULL;
+         if (image && ((image->create_flags &
+                        (VK_IMAGE_CREATE_ALIAS_BIT |
+                         VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) ||
+                       image->tiling == VK_IMAGE_TILING_LINEAR))
+            render->m5_attachments_reach_memory = true;
+      }
+   }
    render->g17p_zls_elide_mask = 0;
    if (agx3 && !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
                                  VK_RENDERING_RESUMING_BIT))) {
