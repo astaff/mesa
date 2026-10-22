@@ -574,6 +574,9 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                         gfx != cs;
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
       cs->anatomy_api_barriers = cmd->anatomy_bar.count;
+      cs->anatomy_api_mem = cmd->anatomy_bar.mem;
+      cs->anatomy_api_buf = cmd->anatomy_bar.buf;
+      cs->anatomy_api_img = cmd->anatomy_bar.img;
       cs->anatomy_api_src = cmd->anatomy_bar.src;
       cs->anatomy_api_dst = cmd->anatomy_bar.dst;
       cs->anatomy_api_src_access = cmd->anatomy_bar.src_access;

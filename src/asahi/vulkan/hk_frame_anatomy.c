@@ -682,6 +682,9 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
                    cs->anatomy_api_barriers, cs->anatomy_api_src,
                    cs->anatomy_api_dst, cs->anatomy_api_src_access,
                    cs->anatomy_api_dst_access);
+   if (cs->anatomy_api_barriers)
+      HK_FA_APPEND(" apibar_n=m%u:b%u:i%u", cs->anatomy_api_mem,
+                   cs->anatomy_api_buf, cs->anatomy_api_img);
 }
 
 void
@@ -768,6 +771,9 @@ hk_frame_anatomy_compute(struct hk_frame_anatomy_submit *s,
                    cs->anatomy_api_barriers, cs->anatomy_api_src,
                    cs->anatomy_api_dst, cs->anatomy_api_src_access,
                    cs->anatomy_api_dst_access);
+   if (cs->anatomy_api_barriers)
+      HK_FA_APPEND(" apibar_n=m%u:b%u:i%u", cs->anatomy_api_mem,
+                   cs->anatomy_api_buf, cs->anatomy_api_img);
    for (unsigned i = 0; i < HK_FA_FS_MAX && cs->anatomy_precomp[i].dispatches;
         ++i) {
       if (cs->anatomy_precomp[i].threads == UINT64_MAX)

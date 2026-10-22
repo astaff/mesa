@@ -1027,6 +1027,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          cmd->anatomy_bar.src_access |= dep->pImageMemoryBarriers[i].srcAccessMask;
          cmd->anatomy_bar.dst_access |= dep->pImageMemoryBarriers[i].dstAccessMask;
       }
+      cmd->anatomy_bar.mem += dep->memoryBarrierCount;
+      cmd->anatomy_bar.buf += dep->bufferMemoryBarrierCount;
+      cmd->anatomy_bar.img += dep->imageMemoryBarrierCount;
       cmd->anatomy_bar.count++;
    }
 
