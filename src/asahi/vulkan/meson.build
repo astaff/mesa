@@ -486,6 +486,15 @@ if with_tests and ld_args_gc_sections.length() > 0
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections, '-Wl,--wrap=hk_meta_begin',
       '-Wl,--wrap=hk_meta_end']), suite : ['asahi'])
+  test('hk_rt_on_demand', executable('hk_rt_on_demand_test',
+    files('tests/test-hk-rt-on-demand.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections,
+      '-Wl,--wrap=agx_va_alloc', '-Wl,--wrap=agx_va_free',
+      '-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
+      '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=__vk_errorf']), suite : ['asahi'])
   test(
     'hk_rt_cache_control',
     executable(

@@ -13,6 +13,7 @@
 #include "util/u_debug.h"
 #include "asahi/lib/agx_chip.h"
 #include "asahi/lib/agx_device.h"
+#include "vk_physical_device_features.h"
 #include "vk_util.h"
 
 #define HK_MAX_SETS                      16
@@ -74,4 +75,32 @@ hk_g17p_rt_enabled(const struct agx_device *dev)
           (dev->params.features & HK_G17P_RT_KERNEL_FEATURES) ==
              HK_G17P_RT_KERNEL_FEATURES &&
           !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
+}
+
+/* Whether a logical device enables any ray-tracing feature. Only such a
+ * device sets up the native G17P ray-tracing state: the ray query program
+ * image and its fixed code binds, the acceleration-structure tables, and the
+ * render SCS reservation in the kernel context of each of its queues
+ * (hk_device_init_accel_struct_state()). Without one of these features no
+ * acceleration structure, ray query or ray-tracing pipeline can exist on the
+ * device. Every feature here is advertised only with the ray-tracing
+ * extensions, so on any device without hk_g17p_rt_enabled() this is false.
+ *
+ * Shaders compiled for the two kinds of device differ, so this is part of
+ * every shader cache key (HK_FEAT_RAY_TRACING). */
+static inline bool
+hk_rt_features_enabled(const struct vk_features *f)
+{
+   return f->accelerationStructure || f->accelerationStructureCaptureReplay ||
+          f->accelerationStructureIndirectBuild ||
+          f->accelerationStructureHostCommands ||
+          f->descriptorBindingAccelerationStructureUpdateAfterBind ||
+          f->rayQuery || f->rayTraversalPrimitiveCulling ||
+          f->rayTracingPipeline ||
+          f->rayTracingPipelineShaderGroupHandleCaptureReplay ||
+          f->rayTracingPipelineShaderGroupHandleCaptureReplayMixed ||
+          f->rayTracingPipelineTraceRaysIndirect ||
+          f->pipelineLibraryGroupHandles || f->rayTracingMaintenance1 ||
+          f->rayTracingPipelineTraceRaysIndirect2 ||
+          f->rayTracingPositionFetch || f->rayTracingInvocationReorder;
 }
