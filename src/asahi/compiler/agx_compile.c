@@ -4327,7 +4327,7 @@ agx_agx3_bitop_immediate_ok(const agx_context *ctx, const agx_instr *I)
           !reg.neg && agx_channels(reg) == 1 && reg.size == I->dest[0].size;
 }
 
-static void
+void
 agx_materialize_agx3_alu_constants(agx_context *ctx)
 {
    agx_foreach_instr_global_safe(ctx, I) {
@@ -5338,9 +5338,9 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
       }
 
-      /* The general half compare/select takes four registers. When a half
-       * comparison selects a register or a minifloat, materialize the latter;
-       * terrain uses this for threshold ? value : 0.0h. Keep f32 comparisons
+      /* The general half compare/select takes four registers. Selected
+       * immediates are integer bit patterns, including discard's 0/1 masks.
+       * Tied min/max constants were materialized above. Keep f32 comparisons
        * selecting byte constants on their separate grounded form. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4 &&
@@ -5358,6 +5358,11 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          for (unsigned s = 2; s < 4; ++s) {
             if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                continue;
+
+            if (ctx->key->dev.chip == AGX_CHIP_G17P) {
+               I->src[s] = agx_mov_imm(&b, 16, I->src[s].value);
+               continue;
+            }
 
             float value = agx_minifloat_decode(I->src[s].value);
             if (I->src[s].abs)

@@ -11219,9 +11219,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 (src.cache && src.discard))
                AGX3_REFUSE(I);
             uint8_t bytes[AGX3_ALU_MAX_LENGTH],len;
+            /* The half-input leaf requires a retained source. Cache hints
+             * are advisory, so retain even a last-use half after legalization
+             * has widened its other reads for the following multiply. */
+            const enum agx3_alu_hint half_hint =
+               ctx->key->dev.chip == AGX_CHIP_G17P
+                  ? AGX3_ALU_HINT_CACHE : agx3_post_ra_hint(src);
             const bool ok =
                half ? agx3_alu_sqrt_step_half(enc, dest.value, src.value,
-                                              agx3_post_ra_hint(src),
+                                              half_hint,
                                               true, wait, bytes, &len)
                     : (src.size == AGX_SIZE_32 && !(src.value & 1) &&
                        src.value < 256 &&
