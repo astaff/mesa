@@ -332,6 +332,17 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
       if (denom.x > 1) {
          assert(view->vk.level_count == 1);
          assert(view->vk.layer_count == 1);
+         /* The level is described as a standalone image, so the hardware
+          * derives that image's layer stride, not the allocation's: only the
+          * first layer or slice is addressed correctly. Applications cannot
+          * create such views (blockTexelViewCompatibleMultipleLayers is
+          * false) and native meta copies view one layer
+          * (copied_layers_src_view).
+          */
+         if (unlikely(layers > 1) && agx_native_graphics(&dev->dev))
+            mesa_loge_once("hk: uncompressed view of %u layers of a "
+                           "block-compressed image addresses only the first",
+                           layers);
 
          cfg.address = base_addr + ail_get_layer_level_B(layout, layer, level);
          cfg.width = DIV_ROUND_UP(u_minify(layout->width_px, level), denom.x);

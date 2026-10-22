@@ -1872,6 +1872,14 @@ hk_meta_copy_get_image_properties(struct hk_image *img, bool g17p)
                ? hk_meta_bitwise_copy_format(img->vk.format)
                : img->vk.format;
       }
+
+      /* That uncompressed view addresses one level of a block-compressed
+       * image as a standalone image (hk_image_view.c), so it reaches one
+       * layer only: the layer stride the hardware derives for it is not the
+       * image's. G17P copies one layer or slice per region, so view just
+       * that one. */
+      props.copied_layers_src_view =
+         g17p && vk_format_is_compressed(img->vk.format);
    } else {
       switch (img->vk.format) {
       case VK_FORMAT_S8_UINT:

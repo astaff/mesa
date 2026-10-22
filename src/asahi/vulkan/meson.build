@@ -561,6 +561,16 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  # Also a no-op shim test, registered with the shim in ../meson.build.
+  g17p_vulkan_compressed_layer_copy = executable(
+    'g17p-vulkan-compressed-layer-copy',
+    files('tests/g17p_vulkan_compressed_layer_copy.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
 endif
 
 if with_tests
