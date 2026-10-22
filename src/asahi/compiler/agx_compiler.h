@@ -494,9 +494,9 @@ typedef struct {
 
    /* M5 texel fetch or 2D sample with independent scalar coordinates:
     * src[0] is x, src[6] is y and src[7] is the sample index of a
-    * multisampled read (null otherwise). The staging COPYs read each
-    * component where it lives, so no contiguous coordinate vector has to be
-    * collected for the read. */
+    * multisampled read or the layer of an array read (null otherwise). The
+    * staging COPYs read each component where it lives, so no contiguous
+    * coordinate vector has to be collected for the read. */
    bool agx3_split_coords : 1;
 
 } agx_instr;

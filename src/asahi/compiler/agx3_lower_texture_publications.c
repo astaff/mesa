@@ -275,8 +275,8 @@ agx3_lower_scalar_cube_coordinates(agx_context *ctx)
 }
 
 /* An M5 texel fetch stages its coordinates with one COPY per component, and a
- * multisampled read publishes its sample index with PACK_SMPIR, so the read
- * never needs its coordinates as a contiguous vector.
+ * multisampled or array read publishes its sample index or layer with
+ * PACK_SMPIR, so the read never needs its coordinates as a contiguous vector.
  * A filtered 2D sample stages x and y with one COPY each as well; its level,
  * bias, gradient, offset and comparison operands stage on their own. A
  * collected vector per read costs a GPR move for every component that already
@@ -298,8 +298,9 @@ split_coords_candidate(const agx_instr *I)
 
    return I->op == AGX_OPCODE_TEXTURE_LOAD && !I->offset && !I->shadow &&
           I->gather == AGX_GATHER_NONE &&
-          (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS) &&
-          agx_channels(I->src[0]) == (I->dim == AGX_DIM_2D_MS ? 3 : 2) &&
+          (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS ||
+           I->dim == AGX_DIM_2D_ARRAY) &&
+          agx_channels(I->src[0]) == (I->dim == AGX_DIM_2D ? 2 : 3) &&
           agx_is_null(I->src[5]);
 }
 

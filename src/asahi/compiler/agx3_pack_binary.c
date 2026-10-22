@@ -1535,7 +1535,8 @@ agx3_fetch_coordinates_match(const agx_instr *a, const agx_instr *b)
 }
 
 /* Split coordinate word c: x and y use the wide scalar COPY, which reads the
- * whole register file; the sample index keeps PACK_SMPIR's seven-bit source. */
+ * whole register file; a sample index or layer keeps PACK_SMPIR's seven-bit
+ * source. */
 static bool
 agx3_split_coord_ok(agx_index coord, unsigned c)
 {
@@ -1551,7 +1552,8 @@ agx3_fetch_coords_ok(const agx_instr *I, bool m5, bool staged, unsigned count)
 {
    if (I->agx3_split_coords) {
       if (!m5 || !staged ||
-          (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_MS) ||
+          (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_MS &&
+           I->dim != AGX_DIM_2D_ARRAY) ||
           (count == 2) != agx_is_null(I->src[7]))
          return false;
       for (unsigned c = 0; c < count; ++c) {
@@ -1782,11 +1784,17 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       }
       if (combined_array_lod) {
          uint8_t packed[AGX3_TEX_MAX_LENGTH], packed_len = 0;
+         /* The layer is read before the x/y COPYs: it may only discard a
+          * register neither of them still reads. */
+         const agx_index layer = agx3_tex_coord(I, 2);
+         const bool layer_discard = layer.discard &&
+            agx3_tex_coord(I, 0).value != layer.value &&
+            agx3_tex_coord(I, 1).value != layer.value;
          if (!agx3_tex_stage_array_integer_lod_at(
-                enc, staging_base, I->src[0].value + 4, I->src[1].value,
+                enc, staging_base, layer.value, I->src[1].value,
                 staging_slot, staging_wait,
-                m5 ? !I->src[0].discard : I->src[0].cache,
-                I->src[0].discard,
+                m5 ? !layer_discard : layer.cache,
+                layer_discard,
                 m5 ? !I->src[1].discard : I->src[1].cache,
                 I->src[1].discard,
                 packed, &packed_len) ||
@@ -1861,9 +1869,10 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
        * lowered layer is the low16 bits of the third coordinate word. */
       if (array && !combined_array_lod) {
          uint8_t packed[AGX3_TEX_MAX_LENGTH], packed_len = 0;
+         const agx_index layer = agx3_tex_coord(I, 2);
          if (!agx3_tex_stage_array_layer_at(
-                enc, staging_base, I->src[0].value + 4, staging_slot, 0,
-                I->src[0].cache, I->src[0].discard,
+                enc, staging_base, layer.value, staging_slot, 0,
+                layer.cache, layer.discard,
                 packed, &packed_len) ||
              !agx3_append(emission, packed, packed_len))
             return false;

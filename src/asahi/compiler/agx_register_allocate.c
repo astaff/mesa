@@ -3184,7 +3184,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
            I->op == AGX_OPCODE_IMAGE_LOAD)) {
          /* Split M5 fetch and sample coordinates stage x and y through the
           * wide scalar COPY, which reads the whole register file; the sample
-          * index keeps PACK_SMPIR's seven-bit source. */
+          * index or layer keeps PACK_SMPIR's seven-bit source. */
          if (I->src[0].type == AGX_INDEX_NORMAL && !I->agx3_split_coords)
             BITSET_SET(texture_gpr, I->src[0].value);
          if (I->agx3_cube_scalar_coords) {

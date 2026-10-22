@@ -220,11 +220,13 @@ TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
 }
 
 static agx_instr *
-split_test_fetch(agx_builder *b, agx_index dest, agx_index coords, bool ms)
+split_test_fetch(agx_builder *b, agx_index dest, agx_index coords,
+                 enum agx_dim dim, agx_index lod = agx_immediate(0))
 {
+   const bool ms = dim == AGX_DIM_2D_MS;
    return agx_texture_load_to(
-      b, dest, coords, agx_immediate(0), agx_immediate(0), agx_immediate(0),
-      agx_immediate(0), agx_null(), ms ? AGX_DIM_2D_MS : AGX_DIM_2D,
+      b, dest, coords, lod, agx_immediate(0), agx_immediate(0),
+      agx_immediate(0), agx_null(), dim,
       ms ? AGX_LOD_MODE_AUTO_LOD : AGX_LOD_MODE_LOD_MIN, 15, false, false);
 }
 
@@ -241,8 +243,8 @@ split_test_registers(agx_builder *b, agx_instr *I, unsigned x, unsigned y,
    memcpy(fetch->src, I->src, 6 * sizeof(agx_index));
    fetch->src[0] = agx_register(x, AGX_SIZE_32);
    fetch->src[6] = agx_register(y, AGX_SIZE_32);
-   fetch->src[7] = I->dim == AGX_DIM_2D_MS ? agx_register(sample, AGX_SIZE_32)
-                                           : agx_null();
+   fetch->src[7] = I->dim != AGX_DIM_2D ? agx_register(sample, AGX_SIZE_32)
+                                        : agx_null();
    fetch->agx3_split_coords = true;
    agx_cursor cursor = agx_before_instr(I);
    agx_builder_insert(&cursor, fetch);
@@ -251,7 +253,8 @@ split_test_registers(agx_builder *b, agx_instr *I, unsigned x, unsigned y,
 }
 
 static std::vector<uint8_t>
-split_test_pack(bool ms, int split_x, unsigned y, unsigned sample)
+split_test_pack(enum agx_dim dim, int split_x, unsigned y, unsigned sample,
+                bool register_lod = false)
 {
    void *mem = ralloc_context(NULL);
    agx_shader_key key = {};
@@ -262,10 +265,12 @@ split_test_pack(bool ms, int split_x, unsigned y, unsigned sample)
    b->shader->stage = MESA_SHADER_COMPUTE;
    b->shader->max_reg = 95;
    agx_index coords = agx_register(20, AGX_SIZE_32);
-   coords.channels_m1 = ms ? 2 : 1;
+   coords.channels_m1 = dim == AGX_DIM_2D ? 1 : 2;
    agx_index dest = agx_register(0, AGX_SIZE_32);
    dest.channels_m1 = 3;
-   agx_instr *I = split_test_fetch(b, dest, coords, ms);
+   agx_instr *I = split_test_fetch(
+      b, dest, coords, dim,
+      register_lod ? agx_register(100, AGX_SIZE_32) : agx_immediate(0));
    if (split_x >= 0)
       split_test_registers(b, I, split_x, y, sample);
    agx_stop(b);
@@ -285,22 +290,32 @@ split_test_pack(bool ms, int split_x, unsigned y, unsigned sample)
  * exactly like the vector, and scattered ones still encode. */
 TEST(AGX3FetchBanks, SplitCoordinatesStageLikeVector)
 {
-   for (bool ms : {false, true}) {
-      SCOPED_TRACE(ms);
-      const std::vector<uint8_t> vector = split_test_pack(ms, -1, 0, 0);
+   for (enum agx_dim dim : {AGX_DIM_2D, AGX_DIM_2D_MS, AGX_DIM_2D_ARRAY}) {
+      SCOPED_TRACE(dim);
+      const std::vector<uint8_t> vector = split_test_pack(dim, -1, 0, 0);
       ASSERT_FALSE(vector.empty());
-      EXPECT_EQ(split_test_pack(ms, 20, 22, 24), vector);
-      const std::vector<uint8_t> scattered = split_test_pack(ms, 40, 20, 60);
+      EXPECT_EQ(split_test_pack(dim, 20, 22, 24), vector);
+      const std::vector<uint8_t> scattered = split_test_pack(dim, 40, 20, 60);
       ASSERT_FALSE(scattered.empty());
       EXPECT_EQ(scattered.size(), vector.size());
       EXPECT_NE(scattered, vector);
       /* The same register for two components still encodes. */
-      EXPECT_FALSE(split_test_pack(ms, 40, 40, 40).empty());
+      EXPECT_FALSE(split_test_pack(dim, 40, 40, 40).empty());
       /* x and y may live above the seven-bit COPY range; the sample index
-       * may not. */
-      EXPECT_FALSE(split_test_pack(ms, 200, 150, 60).empty());
-      if (ms)
-         EXPECT_TRUE(split_test_pack(ms, 20, 22, 200).empty());
+       * or layer may not. */
+      EXPECT_FALSE(split_test_pack(dim, 200, 150, 60).empty());
+      if (dim != AGX_DIM_2D)
+         EXPECT_TRUE(split_test_pack(dim, 20, 22, 200).empty());
+   }
+   /* A register level stages beside the layer (2D array) or after the
+    * coordinates (2D). */
+   for (enum agx_dim dim : {AGX_DIM_2D, AGX_DIM_2D_ARRAY}) {
+      SCOPED_TRACE(dim);
+      const std::vector<uint8_t> vector = split_test_pack(dim, -1, 0, 0, true);
+      ASSERT_FALSE(vector.empty());
+      EXPECT_EQ(split_test_pack(dim, 20, 22, 24, true), vector);
+      EXPECT_FALSE(split_test_pack(dim, 40, 20, 60, true).empty());
+      EXPECT_FALSE(split_test_pack(dim, 60, 20, 60, true).empty());
    }
 }
 
@@ -321,7 +336,8 @@ TEST(AGX3FetchBanks, SplitCoordinatesReplaceCollects)
       collect->src[0] = x;
       collect->src[1] = y;
       collect->src[2] = samples[i];
-      split_test_fetch(b, agx_vec_temp(b->shader, AGX_SIZE_32, 4), coords, true);
+      split_test_fetch(b, agx_vec_temp(b->shader, AGX_SIZE_32, 4), coords,
+                       AGX_DIM_2D_MS);
    }
    /* A uniform component cannot be staged in place: keep the vector. */
    agx_index uniform_coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
@@ -329,7 +345,7 @@ TEST(AGX3FetchBanks, SplitCoordinatesReplaceCollects)
    collect->src[0] = x;
    collect->src[1] = agx_uniform(8, AGX_SIZE_32);
    split_test_fetch(b, agx_vec_temp(b->shader, AGX_SIZE_32, 4), uniform_coords,
-                    false);
+                    AGX_DIM_2D);
 
    EXPECT_TRUE(agx3_split_texture_coordinates(b->shader));
    unsigned split = 0, vector = 0;

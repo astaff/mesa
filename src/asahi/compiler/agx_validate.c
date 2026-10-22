@@ -313,7 +313,8 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
       assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
              I->nr_srcs == 8 &&
              ((I->op == AGX_OPCODE_TEXTURE_LOAD &&
-               (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS)) ||
+               (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS ||
+                I->dim == AGX_DIM_2D_ARRAY)) ||
               (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
                I->dim == AGX_DIM_2D)));
       return 2;
