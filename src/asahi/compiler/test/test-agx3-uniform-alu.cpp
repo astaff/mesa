@@ -228,7 +228,7 @@ split_test_fetch(agx_builder *b, agx_index dest, agx_index coords, bool ms)
       ms ? AGX_LOD_MODE_AUTO_LOD : AGX_LOD_MODE_LOD_MIN, 15, false, false);
 }
 
-/* Rebuild a fetch with split coordinates, as agx3_split_fetch_coordinates()
+/* Rebuild a fetch with split coordinates, as agx3_split_texture_coordinates()
  * does, from physical registers. */
 static void
 split_test_registers(agx_builder *b, agx_instr *I, unsigned x, unsigned y,
@@ -331,7 +331,7 @@ TEST(AGX3FetchBanks, SplitCoordinatesReplaceCollects)
    split_test_fetch(b, agx_vec_temp(b->shader, AGX_SIZE_32, 4), uniform_coords,
                     false);
 
-   EXPECT_TRUE(agx3_split_fetch_coordinates(b->shader));
+   EXPECT_TRUE(agx3_split_texture_coordinates(b->shader));
    unsigned split = 0, vector = 0;
    agx_foreach_instr_global(b->shader, I) {
       if (I->op != AGX_OPCODE_TEXTURE_LOAD)
@@ -354,7 +354,154 @@ TEST(AGX3FetchBanks, SplitCoordinatesReplaceCollects)
 
    /* Other encodings keep their coordinate vectors. */
    key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-   EXPECT_FALSE(agx3_split_fetch_coordinates(b->shader));
+   EXPECT_FALSE(agx3_split_texture_coordinates(b->shader));
+   ralloc_free(mem);
+}
+
+static agx_instr *
+split_test_sample(agx_builder *b, agx_index dest, agx_index coords,
+                  agx_index reference)
+{
+   const bool shadow = !agx_is_null(reference);
+   return agx_texture_sample_to(
+      b, dest, coords, agx_immediate(0), agx_immediate(0), agx_immediate(0),
+      agx_immediate(0), reference, AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN,
+      shadow ? 1 : 15, false, shadow, false, AGX_GATHER_NONE, false);
+}
+
+/* A compute 2D sample at level zero, with vector coordinates in r10..r11 or
+ * split ones in r<x>/r<y> (word numbers), and a comparison reference in
+ * r<reference> when that is not negative. */
+static std::vector<uint8_t>
+split_test_pack_sample(int split_x, unsigned y, int reference,
+                       bool discard = false)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 127;
+   agx_index coords = agx_register(20, AGX_SIZE_32);
+   coords.channels_m1 = 1;
+   agx_index dest = agx_register(0, AGX_SIZE_32);
+   dest.channels_m1 = 3;
+   agx_instr *I = split_test_sample(
+      b, dest, coords,
+      reference >= 0 ? agx_register(2 * reference, AGX_SIZE_32) : agx_null());
+   if (split_x >= 0) {
+      split_test_registers(b, I, 2 * split_x, 2 * y, 0);
+      agx_foreach_instr_global(b->shader, split) {
+         if (split->agx3_split_coords)
+            split->src[0].discard = split->src[6].discard = discard;
+      }
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   std::vector<uint8_t> out;
+   if (agx3_pack_binary(b->shader, &binary)) {
+      const uint8_t *data = static_cast<const uint8_t *>(binary.data);
+      out.assign(data, data + binary.size);
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+   return out;
+}
+
+/* Split 2D sample coordinates stage byte for byte like the vector in the same
+ * registers, with or without a comparison reference; scattered and high
+ * coordinates still encode. */
+TEST(AGX3FetchBanks, SplitSampleCoordinatesStageLikeVector)
+{
+   for (int reference : {-1, 30}) {
+      SCOPED_TRACE(reference);
+      const std::vector<uint8_t> vector =
+         split_test_pack_sample(-1, 0, reference);
+      ASSERT_FALSE(vector.empty());
+      EXPECT_EQ(split_test_pack_sample(10, 11, reference), vector);
+      const std::vector<uint8_t> scattered =
+         split_test_pack_sample(21, 9, reference);
+      ASSERT_FALSE(scattered.empty());
+      EXPECT_EQ(scattered.size(), vector.size());
+      EXPECT_NE(scattered, vector);
+      EXPECT_FALSE(split_test_pack_sample(21, 21, reference).empty());
+      /* x and y may live above the seven-bit COPY range. */
+      EXPECT_FALSE(split_test_pack_sample(100, 75, reference).empty());
+   }
+   /* A coordinate in the reference's register is refused, not staged after
+    * the reference may have discarded it. */
+   EXPECT_TRUE(split_test_pack_sample(30, 11, 30).empty());
+}
+
+/* x and y in one register: only the second COPY may discard it. */
+TEST(AGX3FetchBanks, SplitSampleSharedRegisterDiscardsOnce)
+{
+   const std::vector<uint8_t> binary = split_test_pack_sample(21, 21, -1, true);
+   ASSERT_FALSE(binary.empty());
+   bool found = false;
+   for (unsigned slot = 1; slot <= 8 && !found; ++slot) {
+      for (unsigned bank = 0; bank < 64 && !found; bank += 4) {
+         uint8_t x[AGX3_TEX_COPY_MAX_LENGTH], y[AGX3_TEX_COPY_MAX_LENGTH];
+         uint8_t x_len = 0, y_len = 0;
+         ASSERT_TRUE(agx3_tex_stage_copy_scalar_m5(bank, 42, slot, 0, true,
+                                                   false, x, &x_len));
+         ASSERT_TRUE(agx3_tex_stage_copy_scalar_m5(bank + 2, 42, slot, 0,
+                                                   false, true, y, &y_len));
+         for (unsigned i = 0; i + x_len + y_len <= binary.size(); ++i) {
+            found |= std::memcmp(binary.data() + i, x, x_len) == 0 &&
+                     std::memcmp(binary.data() + i + x_len, y, y_len) == 0;
+         }
+      }
+   }
+   EXPECT_TRUE(found);
+}
+
+TEST(AGX3FetchBanks, SplitSampleCoordinatesReplaceCollects)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   agx_index x = agx_mov_imm(b, 32, 5), y = agx_mov_imm(b, 32, 7);
+   agx_index reference = agx_mov_imm(b, 32, 9);
+   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_instr *collect = agx_collect_to(b, coords, 2);
+   collect->src[0] = x;
+   collect->src[1] = y;
+   /* One coordinate pair, three filtered taps: a plain, a comparison and a
+    * comparison whose reference is also its x coordinate. */
+   split_test_sample(b, agx_vec_temp(b->shader, AGX_SIZE_32, 4), coords,
+                     agx_null());
+   split_test_sample(b, agx_vec_temp(b->shader, AGX_SIZE_32, 4), coords,
+                     reference);
+   split_test_sample(b, agx_vec_temp(b->shader, AGX_SIZE_32, 4), coords, x);
+
+   EXPECT_TRUE(agx3_split_texture_coordinates(b->shader));
+   unsigned split = 0, vector = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE)
+         continue;
+      if (!I->agx3_split_coords) {
+         EXPECT_EQ(I->nr_srcs, 6);
+         EXPECT_EQ(I->src[0].value, coords.value);
+         EXPECT_EQ(I->src[5].value, x.value);
+         ++vector;
+         continue;
+      }
+      ASSERT_EQ(I->nr_srcs, 8);
+      EXPECT_EQ(I->src[0].value, x.value);
+      EXPECT_EQ(I->src[6].value, y.value);
+      EXPECT_TRUE(agx_is_null(I->src[7]));
+      ++split;
+   }
+   EXPECT_EQ(split, 2u);
+   EXPECT_EQ(vector, 1u);
    ralloc_free(mem);
 }
 

@@ -311,8 +311,11 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
 
    if (I->agx3_split_coords && (s == 0 || s == 6 || s == 7)) {
       assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-             I->op == AGX_OPCODE_TEXTURE_LOAD && I->nr_srcs == 8 &&
-             (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS));
+             I->nr_srcs == 8 &&
+             ((I->op == AGX_OPCODE_TEXTURE_LOAD &&
+               (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS)) ||
+              (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
+               I->dim == AGX_DIM_2D)));
       return 2;
    }
 

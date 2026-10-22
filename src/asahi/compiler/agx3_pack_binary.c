@@ -1463,10 +1463,10 @@ struct agx3_fetch_group {
    uint16_t coord;
 };
 
-/* Coordinate word c of a texel fetch: that word of its coordinate vector, or
- * its own scalar source when the fetch takes split coordinates. */
+/* Coordinate word c of a texel fetch or sample: that word of its coordinate
+ * vector, or its own scalar source when it takes split coordinates. */
 static agx_index
-agx3_fetch_coord(const agx_instr *I, unsigned c)
+agx3_tex_coord(const agx_instr *I, unsigned c)
 {
    if (I->agx3_split_coords)
       return c ? I->src[c + 5] : I->src[0];
@@ -1477,16 +1477,17 @@ agx3_fetch_coord(const agx_instr *I, unsigned c)
 }
 
 /* Whether staging coordinate word c is the last read of its register by this
- * fetch. Split components may name one register twice; only the final read
- * may discard it. Words are read in order, x, y, then the third word. */
+ * fetch or sample. Split components may name one register twice; only the
+ * final read may discard it. Words are read in order, x, y, then the third
+ * word. */
 static bool
-agx3_fetch_coord_discard(const agx_instr *I, unsigned c, unsigned count)
+agx3_tex_coord_discard(const agx_instr *I, unsigned c, unsigned count)
 {
-   const agx_index coord = agx3_fetch_coord(I, c);
+   const agx_index coord = agx3_tex_coord(I, c);
    if (!coord.discard)
       return false;
    for (unsigned later = c + 1; later < count; ++later) {
-      if (agx3_fetch_coord(I, later).value == coord.value)
+      if (agx3_tex_coord(I, later).value == coord.value)
          return false;
    }
    return true;
@@ -1521,7 +1522,7 @@ agx3_fetch_coordinates_match(const agx_instr *a, const agx_instr *b)
     * first fetch replaces any part of the second fetch's coordinate input. */
    const unsigned dst = a->dest[0].value;
    for (unsigned c = 0; c < 2; ++c) {
-      const agx_index x = agx3_fetch_coord(a, c), y = agx3_fetch_coord(b, c);
+      const agx_index x = agx3_tex_coord(a, c), y = agx3_tex_coord(b, c);
       if (!agx3_tex_plain_reg(x) || !agx3_tex_plain_reg(y) ||
           x.size != AGX_SIZE_32 || y.size != AGX_SIZE_32 ||
           x.value != y.value)
@@ -1531,6 +1532,16 @@ agx3_fetch_coordinates_match(const agx_instr *a, const agx_instr *b)
          return false;
    }
    return true;
+}
+
+/* Split coordinate word c: x and y use the wide scalar COPY, which reads the
+ * whole register file; the sample index keeps PACK_SMPIR's seven-bit source. */
+static bool
+agx3_split_coord_ok(agx_index coord, unsigned c)
+{
+   return agx3_tex_plain_reg(coord) && coord.size == AGX_SIZE_32 &&
+          agx_channels(coord) == 1 && !(coord.value & 1) &&
+          coord.value + 2 <= (c == 2 ? 128 : 256);
 }
 
 /* The coordinate operands of a texel fetch: a vector of `count` words, or,
@@ -1544,12 +1555,7 @@ agx3_fetch_coords_ok(const agx_instr *I, bool m5, bool staged, unsigned count)
           (count == 2) != agx_is_null(I->src[7]))
          return false;
       for (unsigned c = 0; c < count; ++c) {
-         const agx_index coord = agx3_fetch_coord(I, c);
-         /* x and y use the wide scalar COPY; the sample index keeps
-          * PACK_SMPIR's seven-bit source. */
-         if (!agx3_tex_plain_reg(coord) || coord.size != AGX_SIZE_32 ||
-             agx_channels(coord) != 1 || (coord.value & 1) ||
-             coord.value + 2 > (c == 2 ? 128 : 256))
+         if (!agx3_split_coord_ok(agx3_tex_coord(I, c), c))
             return false;
       }
       return true;
@@ -1816,9 +1822,9 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
             pending_wait &= (uint16_t)~wait_bit;
          }
          uint8_t copy[AGX3_TEX_MAX_LENGTH], copy_len = 0;
-         const agx_index coord = agx3_fetch_coord(I, i);
+         const agx_index coord = agx3_tex_coord(I, i);
          const bool last =
-            agx3_fetch_coord_discard(I, i, coord_count) && rep + 1 == reps;
+            agx3_tex_coord_discard(I, i, coord_count) && rep + 1 == reps;
          /* Split coordinates may live anywhere in the register file: stage
           * them with the wide scalar COPY, as scalar publications do. */
          const bool copied = I->agx3_split_coords
@@ -1867,7 +1873,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
        * Publish it through native's dedicated integer PACK_SMPIR operand. */
       if (ms_2d) {
          uint8_t packed[AGX3_TEX_MAX_LENGTH], packed_len = 0;
-         const agx_index sample = agx3_fetch_coord(I, 2);
+         const agx_index sample = agx3_tex_coord(I, 2);
          if (!agx3_tex_stage_ms_sample_at(
                 enc, staging_coord, sample.value, staging_slot, 0,
                 sample.cache, sample.discard,
@@ -2238,7 +2244,8 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
 {
    const bool published = agx_texture_resource(I) != 0;
    const bool scalar_cube = I->agx3_cube_scalar_coords;
-   const unsigned source_count = scalar_cube ? 8 : 6;
+   const bool split = I->agx3_split_coords;
+   const unsigned source_count = scalar_cube || split ? 8 : 6;
    const bool explicit_lod = I->lod_mode == AGX_LOD_MODE_LOD_MIN;
    const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
    const bool gradient_min = I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN;
@@ -2422,7 +2429,30 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
             return agx3_tex_decline(I, __LINE__);
       }
    }
-   const bool coordinates_valid = published ? published_shape : scalar_cube ||
+   if (split) {
+      /* Split x and y stage through the wide scalar COPY. No other operand
+       * names their registers (agx3_split_texture_coordinates() keeps such a
+       * component in the vector): a level, bias or offset staged before them
+       * could otherwise discard one first. */
+      if (enc != AGX_ISA_ENCODING_AGX3C || I->nr_srcs != 8 ||
+          I->dim != AGX_DIM_2D || published || query_lod ||
+          native_coord_slot || !agx_is_null(I->src[7]))
+         return agx3_tex_decline(I, __LINE__);
+      for (unsigned c = 0; c < 2; ++c) {
+         const agx_index coord = agx3_tex_coord(I, c);
+         if (!agx3_split_coord_ok(coord, c))
+            return agx3_tex_decline(I, __LINE__);
+         for (unsigned s = 1; s < 6; ++s) {
+            const agx_index other = I->src[s];
+            if (agx3_tex_plain_reg(other) &&
+                other.value < coord.value + 2 &&
+                coord.value < other.value + agx_index_size_16(other))
+               return agx3_tex_decline(I, __LINE__);
+         }
+      }
+   }
+   const bool coordinates_valid = published ? published_shape :
+      scalar_cube || split ||
       (agx3_tex_plain_reg(I->src[0]) && I->src[0].size == AGX_SIZE_32 &&
        agx_channels(I->src[0]) == (query_lod ? (three_d || cube ? 3 : 2) :
                                   cube_array ? 4 :
@@ -2794,6 +2824,20 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
          if (!agx3_tex_cube_cem_finalize_to(
                 enc, component, scratch[0], scratch[component + 1],
                 stage_slot, bytes, &len) ||
+             !agx3_append(emission, bytes, len))
+            return agx3_tex_decline(I, __LINE__);
+      }
+   } else if (split) {
+      /* Split coordinates may live anywhere in the register file: stage
+       * them with the wide scalar COPY, as split texel fetches do. Nothing
+       * after them reads their registers, so the later read of a shared
+       * register discards it. */
+      for (unsigned c = 0; c < 2; ++c) {
+         const bool last = agx3_tex_coord_discard(I, c, 2);
+         if (!agx3_tex_stage_copy_scalar_m5(coord + 2 * c,
+                                            agx3_tex_coord(I, c).value,
+                                            stage_slot, c ? 0 : wait_mask,
+                                            !last, last, bytes, &len) ||
              !agx3_append(emission, bytes, len))
             return agx3_tex_decline(I, __LINE__);
       }

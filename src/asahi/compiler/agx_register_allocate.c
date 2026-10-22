@@ -3054,8 +3054,11 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       util_dynarray_num_elements(&ctx->collect_split_hints, agx_instr *);
    if (ssa_renumbered || ctx->scratch_size_B) {
       agx_foreach_instr_global(ctx, I) {
+         /* Split sample coordinates take no pair hint (see
+          * agx3_split_texture_coordinates()). */
          if ((!I->agx3_cube_scalar_coords && !I->agx3_split_coords) ||
-             I->nr_srcs != 8)
+             I->nr_srcs != 8 ||
+             (I->agx3_split_coords && I->op != AGX_OPCODE_TEXTURE_LOAD))
             continue;
          if (!ctx->collect_split_hints.data)
             util_dynarray_init(&ctx->collect_split_hints, ctx);
@@ -3179,9 +3182,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
           (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
            I->op == AGX_OPCODE_TEXTURE_LOAD ||
            I->op == AGX_OPCODE_IMAGE_LOAD)) {
-         /* Split M5 fetch coordinates stage x and y through the wide scalar
-          * COPY, which reads the whole register file; the sample index keeps
-          * PACK_SMPIR's seven-bit source. */
+         /* Split M5 fetch and sample coordinates stage x and y through the
+          * wide scalar COPY, which reads the whole register file; the sample
+          * index keeps PACK_SMPIR's seven-bit source. */
          if (I->src[0].type == AGX_INDEX_NORMAL && !I->agx3_split_coords)
             BITSET_SET(texture_gpr, I->src[0].value);
          if (I->agx3_cube_scalar_coords) {
