@@ -8,6 +8,7 @@
 #include "hk_device.h"
 #include "hk_entrypoints.h"
 #include "hk_queue.h"
+#undef NDEBUG
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
