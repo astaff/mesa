@@ -1196,6 +1196,13 @@ struct hk_cs {
    } anatomy_fs[HK_FA_FS_MAX];
    uint32_t anatomy_fs_other;
 
+   /* Likewise for the hardware vertex programs. */
+   struct {
+      const struct hk_shader *vs;
+      uint32_t draws;
+   } anatomy_vs[HK_FA_FS_MAX];
+   uint32_t anatomy_vs_other;
+
    /* Frame anatomy profiler only: driver-internal (precompiled) kernels this
     * stream dispatches, with counts and total threads (UINT64_MAX once any
     * dispatch is indirect). */

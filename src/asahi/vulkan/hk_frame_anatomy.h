@@ -62,6 +62,7 @@ void hk_frame_anatomy_note(struct hk_device *dev, const char *fmt, ...)
 /* Count one draw of a render stream with fragment program fs (NULL for no
  * fragment shader). Called only while the profiler is enabled. */
 void hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs);
+void hk_frame_anatomy_note_vs(struct hk_cs *cs, const struct hk_shader *vs);
 
 /* HK_FRAME_ANATOMY_DUMP only: write the final NIR of a compiled fragment or
  * compute program to <dir>/{fs,cs}-<binary hash>.nir. */

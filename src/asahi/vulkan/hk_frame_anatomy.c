@@ -677,6 +677,19 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
    }
    if (cs->anatomy_fs_other)
       HK_FA_APPEND(" fs_other=%u", cs->anatomy_fs_other);
+   /* Vertex programs: hash, draws, instructions, registers, threads,
+    * spills+fills. */
+   for (unsigned i = 0; i < HK_FA_FS_MAX && cs->anatomy_vs[i].vs; ++i) {
+      const struct hk_shader *vs = cs->anatomy_vs[i].vs;
+      const struct agx2_stats *st = &vs->b.info.stats;
+      const uint32_t hash =
+         vs->code_size ? _mesa_hash_data(vs->code_ptr, vs->code_size) : 0;
+      HK_FA_APPEND(" vs=%08x:d%u:i%u:g%u:t%u:sp%u", hash,
+                   cs->anatomy_vs[i].draws, st->instrs, st->gprs, st->threads,
+                   st->spills + st->fills);
+   }
+   if (cs->anatomy_vs_other)
+      HK_FA_APPEND(" vs_other=%u", cs->anatomy_vs_other);
    if (cs->anatomy_api_barriers)
       HK_FA_APPEND(" apibar=%u:%" PRIx64 ":%" PRIx64 ":%" PRIx64 ":%" PRIx64,
                    cs->anatomy_api_barriers, cs->anatomy_api_src,
@@ -700,6 +713,21 @@ hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs)
       }
    }
    cs->anatomy_fs_other++;
+}
+
+void
+hk_frame_anatomy_note_vs(struct hk_cs *cs, const struct hk_shader *vs)
+{
+   if (!vs)
+      return;
+   for (unsigned i = 0; i < HK_FA_FS_MAX; ++i) {
+      if (cs->anatomy_vs[i].vs == vs || !cs->anatomy_vs[i].vs) {
+         cs->anatomy_vs[i].vs = vs;
+         cs->anatomy_vs[i].draws++;
+         return;
+      }
+   }
+   cs->anatomy_vs_other++;
 }
 
 void
