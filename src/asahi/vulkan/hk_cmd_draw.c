@@ -778,7 +778,6 @@ struct hk_g17p_bg_eot_dev_key {
    struct hk_native_pbe_descriptor eot, layered_eot;
    struct hk_native_texture_descriptor background, layered_background;
    uint32_t pbe_valid;
-   uint32_t pad;
 };
 
 struct hk_g17p_bg_eot_dev_entry {
@@ -3448,7 +3447,8 @@ hk_pack_zls_control_final(struct agx_zls_control_packed *packed,
 static struct agx_tilebuffer_layout
 hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
                      size_t stride, unsigned count, unsigned samples,
-                     bool layered, bool g17p_wide_ms_to_memory)
+                     bool layered, bool g17p_wide_ms_to_memory,
+                     uint8_t resident_mask)
 {
    enum pipe_format formats[HK_MAX_RTS] = {0};
    for (unsigned i = 0; i < count; ++i) {
@@ -3473,11 +3473,39 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
       !imageblock              ? 0
       : g17p_wide_ms_to_memory ? AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE
                                : AGX_G17P_MAX_BYTES_PER_SAMPLE;
-   return (m5 ? agx_build_tilebuffer_layout_for_imageblock
-              : agx_build_tilebuffer_layout_with_limits)(
+   if (m5) {
+      return agx_build_tilebuffer_layout_resident(
+         formats, count, samples, layered, max_sample_size_B, 65536, 2048,
+         resident_mask);
+   }
+   return agx_build_tilebuffer_layout_with_limits(
       formats, count, samples, layered, max_sample_size_B,
-      m5 ? 65536 : imageblock ? 32768 : 0,
-      (agx_native_graphics(&dev->dev) || m5) ? 2048 : 0);
+      imageblock ? 32768 : 0, agx_native_graphics(&dev->dev) ? 2048 : 0);
+}
+
+/* M5 compressed multisample colour attachments stay in the tilebuffer: a
+ * spilled attachment is read back during the pass through its texture view,
+ * and compressed reads do not observe the pass's own memory stores.
+ * Compressed multisample targets are at most eight bytes, so all eight fit
+ * the 4x sample budget (64 bytes) and do not spill when allocated first. */
+static uint8_t
+hk_m5_resident_attachments(const struct hk_device *dev,
+                           const struct hk_rendering_state *render)
+{
+   if (!agx_chip_g17_m5(dev->dev.chip) || render->tilebuffer.nr_samples <= 1)
+      return 0;
+
+   uint8_t mask = 0;
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      const struct hk_image_view *view = render->color_att[i].iview;
+      if (!view)
+         continue;
+      const struct hk_image *image =
+         container_of(view->vk.image, struct hk_image, vk);
+      if (image->planes[view->planes[0].image_plane].layout.compressed)
+         mask |= BITFIELD_BIT(i);
+   }
+   return mask;
 }
 
 /*
@@ -4282,7 +4310,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       render->color_att_count, render->tilebuffer.nr_samples,
       (!agx_native_graphics(&dev->dev) && !agx_chip_g17_m5(dev->dev.chip)) ||
          !hk_agx3_g17p_single_layer_rendering(render->view_mask, layer_count),
-      g17p_wide_ms_to_memory);
+      g17p_wide_ms_to_memory, hk_m5_resident_attachments(dev, render));
 
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))
       render->g17p_rt0_layout_supported =
@@ -6857,12 +6885,17 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    BITSET_DECLARE(g17p_tile_partitions, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       const struct agx_tilebuffer_layout tib =
-         (key->epilog.native_imageblock
-             ? agx_build_tilebuffer_layout_for_imageblock
-             : agx_build_tilebuffer_layout_with_limits)(
-            key->epilog.rt_formats, ARRAY_SIZE(key->epilog.rt_formats),
-            key->epilog.nr_samples, true, key->epilog.max_sample_size_B,
-            key->epilog.max_bytes_per_tile, key->epilog.max_samples_per_tile);
+         key->epilog.native_imageblock
+            ? agx_build_tilebuffer_layout_resident(
+                 key->epilog.rt_formats, ARRAY_SIZE(key->epilog.rt_formats),
+                 key->epilog.nr_samples, true, key->epilog.max_sample_size_B,
+                 key->epilog.max_bytes_per_tile,
+                 key->epilog.max_samples_per_tile, key->epilog.resident_mask)
+            : agx_build_tilebuffer_layout_with_limits(
+                 key->epilog.rt_formats, ARRAY_SIZE(key->epilog.rt_formats),
+                 key->epilog.nr_samples, true, key->epilog.max_sample_size_B,
+                 key->epilog.max_bytes_per_tile,
+                 key->epilog.max_samples_per_tile);
       for (unsigned rt = 0; rt < ARRAY_SIZE(tib.logical_format); ++rt) {
          if (tib.logical_format[rt] != PIPE_FORMAT_NONE && !tib.spilled[rt])
             BITSET_SET(g17p_tile_partitions, tib._offset_B[rt]);
@@ -9473,6 +9506,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    key->epilog.link.already_ran_zs |= nontrivial_force_early;
    key->epilog.native_imageblock = in->tib->native_imageblock;
    key->epilog.max_sample_size_B = in->tib->max_sample_size_B;
+   key->epilog.resident_mask = in->tib->resident_mask;
    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;
 
@@ -9625,7 +9659,7 @@ hk_prelink_pipeline_fragment(struct hk_device *dev,
    struct agx_tilebuffer_layout tib = hk_tilebuffer_layout(
       dev, state->rp->color_attachment_formats, sizeof(VkFormat),
       state->rp->color_attachment_count, samples, view_mask != 0,
-      samples > 1 && view_mask != 0);
+      samples > 1 && view_mask != 0, 0);
    if (!hk_agx3_g17p_rt0_tile_layout_supported(&tib))
       return;
 

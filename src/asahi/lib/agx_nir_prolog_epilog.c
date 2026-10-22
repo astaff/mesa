@@ -663,10 +663,15 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
    b->shader->info.name = "FS epilog";
 
    struct agx_tilebuffer_layout tib =
-      (key->native_imageblock ? agx_build_tilebuffer_layout_for_imageblock
-                             : agx_build_tilebuffer_layout_with_limits)(
-      key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples, true,
-      key->max_sample_size_B, key->max_bytes_per_tile, key->max_samples_per_tile);
+      key->native_imageblock
+         ? agx_build_tilebuffer_layout_resident(
+              key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples,
+              true, key->max_sample_size_B, key->max_bytes_per_tile,
+              key->max_samples_per_tile, key->resident_mask)
+         : agx_build_tilebuffer_layout_with_limits(
+              key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples,
+              true, key->max_sample_size_B, key->max_bytes_per_tile,
+              key->max_samples_per_tile);
 
    unsigned rt_order[AGX_MAX_RENDER_TARGETS];
    for (unsigned rt = 0; rt < ARRAY_SIZE(rt_order); ++rt)

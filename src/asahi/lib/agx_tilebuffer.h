@@ -70,6 +70,15 @@ struct agx_tilebuffer_layout {
    /* Selected tile size in pixels. Either 32*32, 32*16, or 16*16. */
    uint16_t tile_size;
 
+   /* Render targets allocated ahead of the others because the descending
+    * alignment order would spill one of them; zero for that order. See
+    * agx_build_tilebuffer_layout_resident(). */
+   uint8_t resident_mask;
+
+   /* Named so that layouts hashed or compared byte-wise have no
+    * indeterminate padding. Always zero. */
+   uint8_t reserved[3];
+
    /* USC word corresponding to this configuration of the tilebuffer */
    struct agx_usc_shared_packed usc;
 };
@@ -130,6 +139,17 @@ agx_build_tilebuffer_layout_for_imageblock(
    const enum pipe_format *formats, uint8_t nr_cbufs, uint8_t nr_samples,
    bool layered, uint8_t max_sample_size_B, uint32_t max_bytes_per_tile,
    uint16_t max_samples_per_tile);
+
+/* As agx_build_tilebuffer_layout_for_imageblock(), but when that layout
+ * spills one of the render targets in resident_mask, those are allocated
+ * first so that they stay in the tilebuffer and the others spill instead.
+ * The applied mask is recorded in the layout; building again with it
+ * reproduces the layout. */
+struct agx_tilebuffer_layout
+agx_build_tilebuffer_layout_resident(
+   const enum pipe_format *formats, uint8_t nr_cbufs, uint8_t nr_samples,
+   bool layered, uint8_t max_sample_size_B, uint32_t max_bytes_per_tile,
+   uint16_t max_samples_per_tile, uint8_t resident_mask);
 
 /* Compact attachment slots for internal programs without moving tile data.
  * map[dense slot] identifies the original logical attachment. */
