@@ -16,6 +16,7 @@
 #include "agx_pack.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "hk_frame_anatomy.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
 
@@ -905,6 +906,21 @@ hk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    if (result != VK_SUCCESS) {
       hk_DestroyImageView(_device, hk_image_view_to_handle(view), pAllocator);
       return result;
+   }
+
+   /* Frame anatomy profiler: the formats that reinterpret a mutable image,
+    * which its compression decision could not see without a format list. */
+   const struct vk_image *vk_image = view->vk.image;
+   if (unlikely(dev->frame_anatomy) &&
+       (vk_image->create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+       view->vk.view_format != vk_image->format) {
+      hk_frame_anatomy_note(
+         dev, "view %ux%u fmt=%s samples=%u -> %s usage=0x%x",
+         vk_image->extent.width, vk_image->extent.height,
+         util_format_short_name(hk_format_to_pipe_format(vk_image->format)),
+         vk_image->samples,
+         util_format_short_name(hk_format_to_pipe_format(view->vk.view_format)),
+         (unsigned)view->vk.usage);
    }
 
    *pView = hk_image_view_to_handle(view);
