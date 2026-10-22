@@ -516,6 +516,52 @@ m5_native_float_uniform(const agx_context *ctx, const agx_instr *I)
       0, src, I->saturate, false, 0, out, &length);
 }
 
+/*
+ * Every native M5 float form with a uniform operand also has a GPR operand,
+ * so an operation on uniforms and immediates alone has to copy a uniform. One
+ * copy suffices whenever the rest is then a native form: u0 - u1 is R + -U
+ * after copying u0, whereas copying u1 would leave U - R, which has none.
+ * Mark the uniforms that can stay when one is copied.
+ */
+static bool
+m5_float_uniforms_to_keep(const agx_context *ctx, const agx_instr *I,
+                          bool keep[3])
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->is_preamble || I->nr_srcs > 3 ||
+       (I->op != AGX_OPCODE_FADD && I->op != AGX_OPCODE_FMUL &&
+        I->op != AGX_OPCODE_FFMA))
+      return false;
+
+   unsigned uniforms = 0;
+   agx_foreach_src(I, s)
+      uniforms += I->src[s].type == AGX_INDEX_UNIFORM;
+   if (uniforms < 2)
+      return false;
+
+   agx_foreach_src(I, s) {
+      if (I->src[s].type != AGX_INDEX_UNIFORM)
+         continue;
+
+      /* The copy is a register of the uniform's size. The encoder query
+       * looks at a register's size and modifiers, not at its index. */
+      agx_instr candidate = *I;
+      agx_index sources[3];
+      memcpy(sources, I->src, I->nr_srcs * sizeof(*sources));
+      candidate.src = sources;
+      sources[s] =
+         agx_replace_index(sources[s], agx_get_index(0, I->src[s].size));
+
+      if (m5_native_float_uniform(ctx, &candidate)) {
+         agx_foreach_src(I, t)
+            keep[t] = t != s && I->src[t].type == AGX_INDEX_UNIFORM;
+         return true;
+      }
+   }
+
+   return false;
+}
+
 bool
 agx3_m5_float_accepts_uniform(const agx_context *ctx, const agx_instr *I,
                               unsigned s, unsigned uniform,
@@ -641,6 +687,9 @@ agx_lower_uniform_sources(agx_context *ctx)
       if (!m5_native_float_uniform(ctx, I))
          agx3_m5_negate_uniform_difference(ctx, I);
       const bool native_m5_float = m5_native_float_uniform(ctx, I);
+      bool keep_m5_float_uniform[3] = {false};
+      if (!native_m5_float)
+         m5_float_uniforms_to_keep(ctx, I, keep_m5_float_uniform);
       bool copy_float_uniforms = false;
       unsigned first_uniform = UINT_MAX;
       const bool half_float = I->op == AGX_OPCODE_HADD ||
@@ -922,6 +971,7 @@ agx_lower_uniform_sources(agx_context *ctx)
               copy_minmax || copy_float_uniforms || copy_float_modifier ||
               copy_compare_uniform || copy_tex ||
               !(native_integer || native_m5_float || uniform_imm_compare ||
+                (s < 3 && keep_m5_float_uniform[s]) ||
                 (s < 4 && keep_isel_uniform[s]) ||
                 (m5_tex_uniform_pair && (s == 3 || s == 4)) ||
                 (m5_fsel_uniform && s == 0) ||

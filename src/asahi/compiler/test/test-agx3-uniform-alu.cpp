@@ -117,6 +117,38 @@ uniform_difference_zero_bits(bool relax)
    return bits;
 }
 
+/* u0 - u1 on M5: copying u0 leaves the native R + -U addition, so u1 stays a
+ * uniform operand instead of being copied as well. */
+TEST(AGX3UniformALU, M5UniformDifferenceCopiesOneUniform)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   agx_instr *sub = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                agx_uniform(12, AGX_SIZE_32),
+                                agx_neg(agx_uniform(14, AGX_SIZE_32)));
+   agx_unit_test(b, sub->dest[0]);
+   agx_lower_uniform_sources(b->shader);
+
+   unsigned copies = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_MOV && I->src[0].type == AGX_INDEX_UNIFORM) {
+         EXPECT_EQ(I->src[0].value, 12u);
+         ++copies;
+      }
+   }
+   EXPECT_EQ(copies, 1u);
+   EXPECT_EQ(sub->src[0].type, AGX_INDEX_NORMAL);
+   EXPECT_FALSE(sub->src[0].neg);
+   EXPECT_EQ(sub->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(sub->src[1].value, 14u);
+   EXPECT_TRUE(sub->src[1].neg);
+   ralloc_free(mem);
+}
+
 TEST(AGX3UniformALU, UniformDifferencePreservesPositiveZero)
 {
    EXPECT_EQ(uniform_difference_zero_bits(false), 0u);
