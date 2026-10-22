@@ -892,6 +892,51 @@ TEST(NativeForms, M5Matrix8MetalCompilerWitnesses)
    EXPECT_EQ(memcmp(bytes, accumulator, sizeof(accumulator)), 0);
 }
 
+static unsigned
+m5_absolute_comparison_instrs(bool repeat_absolute)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 absolute comparisons");
+   nir_def *input = agx_test_load_preamble(&b, 4, 32, 4);
+   nir_def *x = nir_channel(&b, input, 0);
+   nir_def *abs_x = nir_fabs(&b, x);
+   nir_def *first = nir_bcsel(&b, nir_flt(&b, abs_x, nir_channel(&b, input, 1)),
+                              nir_channel(&b, input, 2),
+                              nir_channel(&b, input, 3));
+   nir_def *second =
+      nir_bcsel(&b,
+                nir_flt(&b, repeat_absolute ? abs_x : x,
+                        nir_channel(&b, input, 2)),
+                nir_channel(&b, input, 1), nir_channel(&b, input, 3));
+   agx_test_store_local_pixel_agx(
+      &b, nir_vec4(&b, first, second, first, second),
+      nir_imm_intN_t(&b, 0xff, 16), nir_undef(&b, 2, 16), 0, 0xf,
+      (enum pipe_format)AIL_ISA_FORMAT_I32);
+   b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   key.no_preamble = true;
+   key.reserved_preamble = 16;
+   key.fs.nr_samples = 1;
+   agx_preprocess_nir(b.shader);
+   agx_shader_part part = {};
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+   unsigned instrs = part.info.stats.instrs;
+   free(part.binary);
+   ralloc_free(b.shader);
+   return instrs;
+}
+
+/* M5 compares |x| through a plain copy. Comparing the same |x| twice in a
+ * block costs no more than comparing |x| and x. */
+TEST(NativeForms, M5RepeatedAbsoluteComparandSharesItsCopy)
+{
+   unsigned once = m5_absolute_comparison_instrs(false);
+   EXPECT_GT(once, 0u);
+   EXPECT_EQ(m5_absolute_comparison_instrs(true), once);
+}
+
 TEST(NativeForms, M5SignedByteToHalfReachesPacker)
 {
    void *mem = ralloc_context(NULL);

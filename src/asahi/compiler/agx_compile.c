@@ -4178,6 +4178,23 @@ agx_lower_agx3_half_converts(agx_context *ctx)
    }
 }
 
+/* A modified comparand and the plain value materializing it */
+struct agx_m5_comparand {
+   agx_index source, plain;
+};
+
+static agx_index
+agx_m5_find_comparand(const struct util_dynarray *comparands, agx_index src)
+{
+   util_dynarray_foreach(comparands, struct agx_m5_comparand, c) {
+      if (agx_is_equiv(c->source, src) && c->source.size == src.size &&
+          c->source.abs == src.abs && c->source.neg == src.neg)
+         return c->plain;
+   }
+
+   return agx_null();
+}
+
 /* A fragment shader that reads a varying array at a run-time index computes
  * its coefficient index as dest16 = imm + (index << 2), because the ITERPROJ
  * coefficient operand is sixteen bits wide. AGX3B's shifted add writes a
@@ -4189,6 +4206,14 @@ agx_lower_m5_alu_operands(agx_context *ctx)
 {
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
       return;
+
+   /* Comparands materialized in the current block. Shaders often compare one
+    * |x| against several bounds, and no CSE runs after this pass for M5
+    * fragment shaders, so reuse the first move rather than repeat it.
+    */
+   struct util_dynarray comparands = UTIL_DYNARRAY_INIT;
+   agx_block *comparand_block = NULL;
+
    agx_foreach_instr_global_safe(ctx, I) {
       /* M5 has no grounded compare-select whose compared operands carry |x|
        * or -x: the AGX3C packer refuses every such FCMPSEL form, and FCMP and
@@ -4197,13 +4222,24 @@ agx_lower_m5_alu_operands(agx_context *ctx)
        * the optimizer has folded what it can, as the agx3c series did. */
       if (I->op == AGX_OPCODE_FCMP || I->op == AGX_OPCODE_FCMPSEL ||
           I->op == AGX_OPCODE_BREAK_IF_FCMP) {
+         if (comparand_block != v_block) {
+            util_dynarray_clear(&comparands);
+            comparand_block = v_block;
+         }
+
          for (unsigned s = 0; s < 2 && s < I->nr_srcs; ++s) {
             const agx_index src = I->src[s];
             if (src.type == AGX_INDEX_IMMEDIATE || !(src.abs || src.neg))
                continue;
-            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-            agx_index plain = agx_temp(ctx, src.size);
-            agx_fmov_to(&b, plain, src);
+            agx_index plain = agx_m5_find_comparand(&comparands, src);
+            if (agx_is_null(plain)) {
+               agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+               plain = agx_temp(ctx, src.size);
+               agx_fmov_to(&b, plain, src);
+               util_dynarray_append(
+                  &comparands,
+                  ((struct agx_m5_comparand){.source = src, .plain = plain}));
+            }
             I->src[s] = plain;
          }
       }
@@ -4298,6 +4334,8 @@ agx_lower_m5_alu_operands(agx_context *ctx)
       agx_iadd_to(&b, I->dest[0], I->src[2], product, m.value == 6 ? 1 : 0);
       agx_remove_instruction(I);
    }
+
+   util_dynarray_fini(&comparands);
 }
 
 static void
