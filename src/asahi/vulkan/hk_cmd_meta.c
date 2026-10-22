@@ -954,6 +954,13 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
    image->data.binding = BINDING_OUTPUT;
    image->data.access = ACCESS_NON_READABLE;
 
+   /* Multisampled stores use a linear PBE view. AGX2's address lowering
+    * needs the texel size to convert the byte layer stride to samples.
+    * Leaving the format unspecified makes that division use a zero texel
+    * size, corrupting copies spanning multiple array layers. */
+   if (msaa)
+      image->data.image.format = key->dst_format;
+
    texture->data.descriptor_set = 0;
    texture->data.binding = BINDING_INPUT;
 

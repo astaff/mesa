@@ -12,6 +12,8 @@
 #include "hk_device.h"
 #include "hk_image.h"
 #include "hk_image_view.h"
+#include "compiler/nir/nir.h"
+#include "vulkan/util/vk_internal_exts.h"
 
 #define CHECK(call)                                                            \
    do {                                                                        \
@@ -23,8 +25,47 @@
    } while (0)
 
 static PFN_vkCreateImageView create_view;
+static PFN_vkCreateComputePipelines create_compute;
 static unsigned views, depth_views, stencil_views, packed_views;
+static unsigned msaa_stores;
 static bool require_fixed;
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+observe_compute(VkDevice device, VkPipelineCache cache, uint32_t count,
+                const VkComputePipelineCreateInfo *infos,
+                const VkAllocationCallbacks *alloc, VkPipeline *out)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      const VkPipelineShaderStageNirCreateInfoMESA *ni =
+         vk_find_struct_const(infos[i].stage.pNext,
+                              PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA);
+      if (!ni)
+         continue;
+      nir_foreach_function_impl(impl, ni->nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_image_deref_store ||
+                   nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_MS)
+                  continue;
+               msaa_stores++;
+               /* Deref stores inherit their format from the image variable
+                * when the driver lowers descriptors. */
+               enum pipe_format format = nir_intrinsic_format(intr);
+               if (format == PIPE_FORMAT_NONE)
+                  format = nir_intrinsic_get_var(intr, 0)->data.image.format;
+               printf("MSAA store format=%u array=%u\n",
+                      format, nir_intrinsic_image_array(intr));
+               if (require_fixed)
+                  assert(format != PIPE_FORMAT_NONE);
+            }
+         }
+      }
+   }
+   return create_compute(device, cache, count, infos, alloc, out);
+}
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 observe_view(VkDevice device, const VkImageViewCreateInfo *info,
@@ -136,6 +177,8 @@ main(void)
    struct hk_device *dev = (void *)vk_device_from_handle(device);
    create_view = dev->vk.dispatch_table.CreateImageView;
    dev->vk.dispatch_table.CreateImageView = observe_view;
+   create_compute = dev->vk.dispatch_table.CreateComputePipelines;
+   dev->vk.dispatch_table.CreateComputePipelines = observe_compute;
    VkCommandPoolCreateInfo pci = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
       .queueFamilyIndex = 0,
@@ -169,6 +212,53 @@ main(void)
                                VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,
                                VK_FORMAT_R32_UINT, VK_FORMAT_R8G8B8A8_UNORM};
    unsigned cases = 0;
+   /* The whole-image CTS form uses one two-layer region, while _regions_
+    * uses a separate one-layer view for each layer. Exercise both, plus a
+    * single region starting at layer 1, at each supported MSAA count. */
+   for (unsigned f = 0; f < ARRAY_SIZE(formats); ++f) {
+      for (unsigned samples = 2; samples <= 4; samples *= 2) {
+         struct bound_image a = make_image(device, formats[f], VK_IMAGE_TYPE_2D,
+                                           VK_IMAGE_TILING_OPTIMAL, samples);
+         struct bound_image b = make_image(device, formats[f], VK_IMAGE_TYPE_2D,
+                                           VK_IMAGE_TILING_OPTIMAL, samples);
+         for (unsigned shape = 0; shape < 3; ++shape) {
+            VkImageCopy2 regions[2] = {{
+               .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+               .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, shape == 2,
+                                  shape == 0 ? 2 : 1},
+               .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, shape == 2,
+                                  shape == 0 ? 2 : 1},
+               .extent = {64, 64, 1},
+            }};
+            regions[1] = regions[0];
+            regions[1].srcSubresource.baseArrayLayer = 1;
+            regions[1].dstSubresource.baseArrayLayer = 1;
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            VkCommandBufferBeginInfo begin = {
+               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            VkCopyImageInfo2 copy = {
+               .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,
+               .srcImage = a.image,
+               .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+               .dstImage = b.image,
+               .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+               .regionCount = shape == 1 ? 2 : 1,
+               .pRegions = regions,
+            };
+            vkCmdCopyImage2(cmd, &copy);
+            CHECK(vkEndCommandBuffer(cmd));
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            cases++;
+         }
+         vkDestroyImage(device, a.image, NULL);
+         vkFreeMemory(device, a.memory, NULL);
+         vkDestroyImage(device, b.image, NULL);
+         vkFreeMemory(device, b.memory, NULL);
+      }
+   }
+   if (getenv("ONLY_MSAA"))
+      goto done;
    for (unsigned src = 0; src < 4; ++src) {
       for (unsigned dst = 0; dst < 4; ++dst) {
          for (unsigned shape = 0; shape < 5; ++shape) {
@@ -283,9 +373,14 @@ main(void)
       vkFreeMemory(device, b.memory, NULL);
       cases++;
    }
-   if (require_fixed)
-      assert(depth_views && stencil_views && packed_views);
+done:
+   if (require_fixed) {
+      assert(packed_views && msaa_stores);
+      if (!getenv("ONLY_MSAA"))
+         assert(depth_views && stencil_views);
+   }
    dev->vk.dispatch_table.CreateImageView = create_view;
+   dev->vk.dispatch_table.CreateComputePipelines = create_compute;
    vkDestroyBuffer(device, buffer, NULL);
    vkFreeMemory(device, memory, NULL);
    vkDestroyCommandPool(device, pool, NULL);
