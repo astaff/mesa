@@ -434,6 +434,12 @@ struct hk_rendering_state {
    bool no_z_store_ok;
    bool process_empty_tiles_without_z;
    struct agx_zls_control_packed zls_control_only_no_z_store;
+
+   /* G17P: colour attachments a draw or clear of the pass may write, and
+    * whether a fragment shader reads the tilebuffer. See
+    * hk_g17p_elide_untouched_color(). */
+   uint8_t color_written;
+   bool color_read;
 };
 
 struct hk_index_buffer_state {
@@ -681,6 +687,10 @@ struct hk_graphics_state {
       struct hk_shader *shader;
       struct hk_fast_link_key_fs key;
       bool valid;
+      /* Colour attachments the linked fragment program writes, and whether
+       * it reads the tilebuffer. */
+      uint8_t color_written;
+      bool reads_tib;
    } fast_link_fs;
 
    /* Exact last VS/FS loader identities. These are recording-only selectors;

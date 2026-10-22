@@ -4424,6 +4424,9 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
       if (pAttachments[i].aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT |
                                         VK_IMAGE_ASPECT_STENCIL_BIT))
          hk_g17p_note_depth_clear(cmd, pAttachments[i].aspectMask);
+      if (pAttachments[i].aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)
+         cmd->state.gfx.render.color_written |=
+            BITFIELD_BIT(pAttachments[i].colorAttachment);
    }
 
    struct hk_meta_save save;

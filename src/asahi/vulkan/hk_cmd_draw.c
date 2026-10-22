@@ -2216,6 +2216,88 @@ hk_g17p_zls_elide_store(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
    }
 }
 
+/* G17P: a colour attachment that a single-stream, single-sample pass loads
+ * and stores, but that no draw or clear wrote and no fragment shader read,
+ * keeps its memory contents as they are. Its end-of-tile stores, partial-
+ * render ones included, are dropped, and the main background program clears
+ * its tile instead of loading it: the end-of-tile program then carries no
+ * operation for it, as for storeOp DONT_CARE, and the background program a
+ * load-op clear, as for loadOp CLEAR. The partial-render background program
+ * still reloads it, from the memory no store touched. The rebuild is exact
+ * only for attachments without clear, resolve or flags, so other passes keep
+ * their programs. A continuation of the pass restores the full programs
+ * (hk_m5_pass_merge_begin()). */
+static void
+hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   if (dev->dev.chip != AGX_CHIP_G17P || cs != render->zls_first_cs ||
+       cmd->in_meta || render->color_read || render->view_mask ||
+       render->layer_count > 1 || render->tilebuffer.nr_samples > 1 ||
+       agx_tilebuffer_spills(&render->tilebuffer) ||
+       render->g17p_direct_color_resolve ||
+       (render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                         VK_RENDERING_RESUMING_BIT |
+                         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)))
+      return;
+
+   VkRenderingAttachmentInfo atts[HK_MAX_RTS], bg_atts[HK_MAX_RTS];
+   uint8_t elide = 0;
+   for (uint32_t i = 0; i < render->color_att_count; ++i) {
+      const struct hk_attachment *att = &render->color_att[i];
+      if (att->load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+          att->resolve_mode != VK_RESOLVE_MODE_NONE || att->flags)
+         return;
+
+      atts[i] = (VkRenderingAttachmentInfo){
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .imageView = hk_image_view_to_handle(att->iview),
+         .imageLayout = att->layout,
+         .loadOp = att->load_op,
+         .storeOp = att->store_op,
+      };
+      bg_atts[i] = atts[i];
+      if (att->iview && att->load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
+          att->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
+          !(render->color_written & BITFIELD_BIT(i))) {
+         atts[i].imageView = VK_NULL_HANDLE;
+         bg_atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+         elide |= BITFIELD_BIT(i);
+      }
+   }
+   if (!elide)
+      return;
+
+   const bool incomplete_render_area =
+      render->area.offset.x > 0 || render->area.offset.y > 0 ||
+      render->area.extent.width < render->cr.width ||
+      render->area.extent.height < render->cr.height;
+   const VkRenderingInfo info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = render->area,
+      .layerCount = render->layer_count,
+      .viewMask = render->view_mask,
+      .colorAttachmentCount = render->color_att_count,
+      .pColorAttachments = atts,
+   };
+   VkRenderingInfo bg_info = info;
+   bg_info.pColorAttachments = bg_atts;
+   const struct hk_bg_eot bg_main = hk_build_bg_eot(
+      cmd, &bg_info, false, false, incomplete_render_area, NULL);
+   const struct hk_bg_eot eot_main =
+      hk_build_bg_eot(cmd, &info, true, false, incomplete_render_area, NULL);
+   const struct hk_bg_eot eot_partial =
+      hk_build_bg_eot(cmd, &info, true, true, incomplete_render_area, NULL);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   cs->cr.bg.main = bg_main;
+   cs->cr.eot.main = eot_main;
+   cs->cr.eot.partial = eot_partial;
+   perf_debug(cmd, "Dropped untouched colour attachments 0x%x", elide);
+}
+
 static void
 hk_pack_zls_control_final(struct agx_zls_control_packed *packed,
                           struct ail_layout *z_layout,
@@ -2820,6 +2902,10 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
     * stream has when it is created (hk_cs_init_graphics()). */
    cs->current = m->resume_current;
    cs->cr.eot.main = prev->cr.eot.partial;
+   /* EndRendering may also have dropped untouched colour attachments from
+    * the tile programs (hk_g17p_elide_untouched_color()). */
+   cs->cr.bg = prev->cr.bg;
+   cs->cr.eot.partial = prev->cr.eot.partial;
    /* EndRendering may have elided untouched depth/stencil planes or replaced
     * the forced intermediate stores with the final store operations. A later
     * draw in this continued stream can use those planes, and a split can need
@@ -3507,6 +3593,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    if (cs) {
       cs->cr.eot.main = render->cr.eot.main;
       cs->g17p_pass_ends = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
+      hk_g17p_elide_untouched_color(cmd, cs);
 
       /* Precise depth store: see hk_pack_zls_control_final(). A
        * suspended pass continues in a later command buffer, which reloads
@@ -7700,6 +7787,27 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    return true;
 }
 
+/* Colour attachments a draw with this fragment link key writes: the
+ * attachment is mapped to a location the shader writes (location 0 for
+ * every attachment with gl_FragColor broadcast) and its write mask is not
+ * empty. */
+static uint8_t
+hk_fs_color_written(const struct hk_fast_link_key_fs *key)
+{
+   const struct agx_fs_epilog_link_info *link = &key->epilog.link;
+   uint8_t mask = 0;
+   for (unsigned rt = 0; rt < ARRAY_SIZE(key->epilog.remap); ++rt) {
+      const int loc = key->epilog.remap[rt];
+      if (loc < 0)
+         continue;
+      const unsigned src = link->broadcast_rt0 ? 0 : loc;
+      if ((link->loc_written & BITFIELD_BIT(src)) &&
+          key->epilog.blend.rt[rt].colormask)
+         mask |= BITFIELD_BIT(rt);
+   }
+   return mask;
+}
+
 static bool
 hk_fill_fast_link_key_fs(struct hk_cmd_buffer *cmd, struct hk_shader *fs,
                          struct hk_shader *hw_vs,
@@ -8219,7 +8327,11 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          cs->current = out;
          return;
       }
+      gfx->fast_link_fs.color_written = hk_fs_color_written(&key);
+      gfx->fast_link_fs.reads_tib = fs->b.info.reads_tib;
    }
+   gfx->render.color_written |= gfx->fast_link_fs.color_written;
+   gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
 
    /* Direct draws use an immutable parameter block, reused while the values
     * match. Indirect draws always retain the execution-time GPU pointer. */
