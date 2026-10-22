@@ -8337,7 +8337,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
     * should work on unlowered fmin/fmax.
     */
-   NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p);
+   NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p || m5);
 
    /* AGX_G17P_DISCARD_WORD: reduce one-sample coverage-update sources to bit
     * 0 after the algebraic loops and right before preamble formation, so the
@@ -8435,7 +8435,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * GLES.
     */
    NIR_PASS(_, nir, nir_opt_algebraic_late);
-   NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p);
+   NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p || m5);
 
    /* The AGX3 byte-address backend cannot encode 64-bit shifted adds.
     * Lower remaining multiplies before fusion turns x * 3 into one; the
