@@ -3,6 +3,19 @@ Asahi
 
 The Asahi driver aims to provide an OpenGL implementation for the Apple M1.
 
+Borealis
+--------
+
+Borealis is Aurora Silicon's Vulkan driver for Apple GPUs. It is derived from
+Honeykrisp, the Vulkan driver written by Asahi Linux, and keeps its code and
+credits. It reports ``Borealis`` as its driver name on every GPU it supports,
+from M1 to M5 and the A18 Pro. The driver ID is still
+``VK_DRIVER_ID_MESA_HONEYKRISP`` until Borealis has its own registered ID.
+
+The sources stay in ``src/asahi/vulkan`` with the ``hk_`` prefix, and the
+library is still ``libvulkan_asahi.so``, so packaging and upstream syncs keep
+working as before.
+
 .. toctree::
    :maxdepth: 1
 

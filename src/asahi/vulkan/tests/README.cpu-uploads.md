@@ -1,4 +1,4 @@
-# Honeykrisp CPU upload benchmark
+# Borealis CPU upload benchmark
 
 Build Mesa with `-Dvulkan-drivers=asahi -Dbuild-tests=true`. The `asahi` test
 suite includes `hk_cpu_upload`, a host-only correctness test that also runs a
