@@ -96,6 +96,17 @@ hk_device_finish_meta(struct hk_device *dev)
    vk_meta_device_finish(&dev->vk, &dev->meta);
 }
 
+/* A push descriptor set without the bytes its layout does not use */
+static void
+hk_copy_push_descriptor_set(struct hk_push_descriptor_set *dst,
+                            const struct hk_push_descriptor_set *src)
+{
+   memcpy(dst->layout_hash, src->layout_hash, sizeof(dst->layout_hash));
+   dst->layout_flags = src->layout_flags;
+   dst->size = src->size;
+   memcpy(dst->data, src->data, src->size);
+}
+
 void
 hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
               VkPipelineBindPoint bind_point)
@@ -129,7 +140,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    save->has_push_desc0 = desc->push[0];
    save->push_active0 = !!(desc->push_active & BITFIELD_BIT(0));
    if (save->has_push_desc0)
-      save->push_desc0 = *desc->push[0];
+      hk_copy_push_descriptor_set(&save->push_desc0, desc->push[0]);
 
    static_assert(sizeof(save->push) == sizeof(desc->root.push));
    memcpy(save->push, desc->root.push, sizeof(save->push));
@@ -172,7 +183,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       desc->push_dirty &= ~BITFIELD_BIT(0);
       desc->push_active &= ~BITFIELD_BIT(0);
    } else if (save->has_push_desc0) {
-      *desc->push[0] = save->push_desc0;
+      hk_copy_push_descriptor_set(desc->push[0], &save->push_desc0);
       desc->push_dirty |= BITFIELD_BIT(0);
       if (save->push_active0)
          desc->push_active |= BITFIELD_BIT(0);
