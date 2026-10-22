@@ -10359,25 +10359,33 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
     * register allocation, retaining the legalized operand types. The existing
     * DMA path also needs this for descriptor words used by several operations.
     * Do not run copy propagation here: it could undo source legalization.
-    * AGX3B main programs additionally use the pressure-aware CSE. */
-   if (((agx_isa_is_agx3(key->dev.encoding) &&
-         ctx->stage == MESA_SHADER_VERTEX) ||
-        (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble) ||
-        (key->g17p_uniform_dma && out->agx3_uniform_dma_count)) &&
+    * AGX3B main programs additionally use the pressure-aware CSE, and M5
+    * main programs the bounded one described below. */
+   const bool agx3_cse =
+      (agx_isa_is_agx3(key->dev.encoding) &&
+       ctx->stage == MESA_SHADER_VERTEX) ||
+      (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble) ||
+      (key->g17p_uniform_dma && out->agx3_uniform_dma_count);
+   const bool m5_bounded_cse =
+      !agx3_cse && key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      !ctx->is_preamble;
+   if ((agx3_cse || m5_bounded_cse) &&
        !(agx_compiler_debug & AGX_DBG_NOOPT)) {
       /* AGX3B main programs use the pressure-aware CSE, which merges only
        * while the earlier result is still live. Uniform source lowering
        * copies a uniform into a GPR for each operation that cannot read it in
        * place, so a value used by a run of selects is copied once per select,
-       * and each copy is read right after it is made. On G17P, also merge
-       * such copies where that keeps the register pressure within the
-       * shader's existing peak. */
+       * and each copy is read right after it is made. On G17P and in M5
+       * main programs, also merge such copies where that keeps the register
+       * pressure within the shader's existing peak. */
       if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
           ctx->stage != MESA_SHADER_VERTEX) {
          if (key->dev.chip == AGX_CHIP_G17P)
             AGX_PASS(ctx, agx_opt_cse_bounded);
          else
             AGX_PASS(ctx, agx_opt_cse_pressure);
+      } else if (m5_bounded_cse) {
+         AGX_PASS(ctx, agx_opt_cse_bounded);
       } else {
          AGX_PASS(ctx, agx_opt_cse);
       }
