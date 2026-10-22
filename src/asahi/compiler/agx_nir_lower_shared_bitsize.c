@@ -6,6 +6,10 @@
 #include "compiler/nir/nir_builder.h"
 #include "agx_compiler.h"
 #include "agx_nir.h"
+#include <stdlib.h>
+
+static nir_def *divide_exact(nir_builder *b, nir_scalar s, unsigned shift,
+                             unsigned depth);
 
 /* Local memory instructions require 16-bit offsets, so we add conversions. */
 static bool
@@ -30,7 +34,11 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
             ? intr->def.bit_size
             : nir_src_bit_size(intr->src[0]);
       const unsigned shift = util_logbase2(bit_size / 8);
-      address = nir_ushr_imm(b, address, shift);
+      /* Divide the byte arithmetic itself where that is exact, so a scaled
+       * thread index becomes an element index without a shift per access. */
+      nir_def *elements =
+         shift ? divide_exact(b, nir_get_scalar(address, 0), shift, 4) : NULL;
+      address = elements ? elements : nir_ushr_imm(b, address, shift);
    }
 
    if (address->bit_size != 16)
@@ -88,6 +96,7 @@ divide_exact(nir_builder *b, nir_scalar s, unsigned shift, unsigned depth)
       return k == shift ? kept : nir_ishl_imm(b, kept, k - shift);
    }
 
+   case nir_op_amul:
    case nir_op_imul: {
       for (unsigned i = 0; i < 2; ++i) {
          const nir_scalar factor = nir_scalar_chase_alu_src(s, i);
@@ -101,6 +110,41 @@ divide_exact(nir_builder *b, nir_scalar s, unsigned shift, unsigned depth)
                              f >> shift);
       }
       return NULL;
+   }
+
+   case nir_op_imadshl_agx:
+   case nir_op_imsubshl_agx: {
+      /* (src0 * src1) +/- (src2 << src3): the shifted term divides when it
+       * shifts at least as far, the product when either factor is a constant
+       * multiple of the divisor (or zero). */
+      const nir_scalar amount = nir_scalar_chase_alu_src(s, 3);
+      if (!nir_scalar_is_const(amount))
+         return NULL;
+      const uint64_t k = nir_scalar_as_uint(amount);
+      if (k < shift)
+         return NULL;
+      nir_scalar factor[2] = {nir_scalar_chase_alu_src(s, 0),
+                              nir_scalar_chase_alu_src(s, 1)};
+      nir_def *f[2] = {nir_channel(b, factor[0].def, factor[0].comp),
+                       nir_channel(b, factor[1].def, factor[1].comp)};
+      bool divided = false;
+      for (unsigned i = 0; i < 2 && !divided; ++i) {
+         if (!nir_scalar_is_const(factor[i]))
+            continue;
+         const uint64_t c = nir_scalar_as_uint(factor[i]);
+         if (c & mask)
+            continue;
+         f[i] = nir_imm_intN_t(b, c >> shift, s.def->bit_size);
+         divided = true;
+      }
+      if (!divided)
+         return NULL;
+      const nir_scalar value = nir_scalar_chase_alu_src(s, 2);
+      nir_def *v = nir_channel(b, value.def, value.comp);
+      nir_def *k_s = nir_imm_int(b, k - shift);
+      return nir_scalar_alu_op(s) == nir_op_imadshl_agx
+                ? nir_imadshl_agx(b, f[0], f[1], v, k_s)
+                : nir_imsubshl_agx(b, f[0], f[1], v, k_s);
    }
 
    case nir_op_iadd: {
@@ -189,6 +233,62 @@ agx_nir_lower_shared_element_index(nir_shader *shader)
                                      nir_metadata_control_flow, NULL);
 }
 
+/* Flatten a 32-bit iadd tree into at most four non-constant terms and the sum
+ * of its constants. */
+static bool
+gather_sum(nir_scalar s, unsigned depth, nir_scalar *terms, unsigned *count,
+           uint64_t *constant)
+{
+   if (nir_scalar_is_const(s)) {
+      *constant += nir_scalar_as_uint(s);
+      return *constant <= UINT16_MAX;
+   }
+   if (depth && nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd) {
+      return gather_sum(nir_scalar_chase_alu_src(s, 0), depth - 1, terms, count,
+                        constant) &&
+             gather_sum(nir_scalar_chase_alu_src(s, 1), depth - 1, terms, count,
+                        constant);
+   }
+   if (*count == 4)
+      return false;
+   terms[(*count)++] = s;
+   return true;
+}
+
+/* nir_unsigned_upper_bound() with the AGX address multiply-add understood:
+ * (src0 * src1) + (src2 << src3), bounded termwise. */
+static uint64_t
+term_upper_bound(nir_shader *shader, struct hash_table *ranges, nir_scalar s,
+                 unsigned depth)
+{
+   if (depth && nir_scalar_is_alu(s) &&
+       nir_scalar_alu_op(s) == nir_op_imadshl_agx) {
+      const nir_scalar amount = nir_scalar_chase_alu_src(s, 3);
+      if (!nir_scalar_is_const(amount) || nir_scalar_as_uint(amount) > 31)
+         return UINT32_MAX;
+      const uint64_t x =
+         term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 0), depth - 1);
+      const uint64_t y =
+         term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 1), depth - 1);
+      const uint64_t z =
+         term_upper_bound(shader, ranges, nir_scalar_chase_alu_src(s, 2), depth - 1);
+      const unsigned k = nir_scalar_as_uint(amount);
+      if ((x && y > UINT32_MAX / x) || z > (UINT32_MAX >> k))
+         return UINT32_MAX;
+      return MIN2(x * y + (z << k), UINT32_MAX);
+   }
+   return nir_unsigned_upper_bound(shader, ranges, s);
+}
+
+static int
+compare_scalars(const void *a, const void *b)
+{
+   const nir_scalar *x = a, *y = b;
+   if (x->def->index != y->def->index)
+      return x->def->index < y->def->index ? -1 : 1;
+   return (int)x->comp - (int)y->comp;
+}
+
 /* Element-index lowering leaves byte additions beneath the shift/narrowing:
  * u2u16((byte_address + constant) >> log2(element_size)).  Extract a small,
  * aligned constant into LDTG/STTG's byte offset.  Both the source addition and
@@ -213,6 +313,40 @@ fold_byte_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        nir_scalar_alu_op(s) != nir_op_u2u16)
       return false;
    s = nir_scalar_chase_alu_src(s, 0);
+   const unsigned base = nir_intrinsic_base(intr);
+   if (base > 255)
+      return false;
+
+   /* An element index the lowering divided exactly keeps its constant
+    * addends inside a sum: u2u16(a + (b + constant)). Gather the sum's terms,
+    * and move the constant to the byte offset when neither the remaining sum
+    * nor the narrowing can wrap. Summing the variable terms in a fixed order
+    * lets accesses that differ only in the constant share one index. */
+   if (s.def->bit_size == 32 && nir_scalar_is_alu(s) &&
+       nir_scalar_alu_op(s) == nir_op_iadd) {
+      nir_scalar terms[4];
+      unsigned count = 0;
+      uint64_t elements = 0;
+      if (!gather_sum(s, 3, terms, &count, &elements) || !elements || !count ||
+          elements > (255 - base) >> shift)
+         return false;
+
+      uint64_t bound = 0;
+      for (unsigned t = 0; t < count; ++t)
+         bound += term_upper_bound(b->shader, data, terms[t], 2);
+      if (bound > UINT16_MAX - elements)
+         return false;
+
+      qsort(terms, count, sizeof(terms[0]), compare_scalars);
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *variable = nir_mov_scalar(b, terms[0]);
+      for (unsigned t = 1; t < count; ++t)
+         variable = nir_iadd(b, variable, nir_mov_scalar(b, terms[t]));
+      nir_src_rewrite(offset, nir_u2u16(b, variable));
+      nir_intrinsic_set_base(intr, base + (elements << shift));
+      return true;
+   }
+
    if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_ushr)
       return false;
    nir_scalar amount = nir_scalar_chase_alu_src(s, 1);
@@ -223,9 +357,6 @@ fold_byte_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        nir_scalar_alu_op(s) != nir_op_iadd)
       return false;
 
-   const unsigned base = nir_intrinsic_base(intr);
-   if (base > 255)
-      return false;
    for (unsigned c = 0; c < 2; ++c) {
       nir_scalar constant = nir_scalar_chase_alu_src(s, c);
       if (!nir_scalar_is_const(constant))
