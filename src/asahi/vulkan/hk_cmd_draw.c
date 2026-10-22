@@ -4835,6 +4835,19 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
          .layerCount = render->view_mask ? 1 : render->layer_count,
       };
 
+      /* The clear draw covers the whole render area, so every tile it has
+       * to clear is non-empty. A tile outside the area takes no draw and has
+       * nothing to clear: processing it only loads and stores it back
+       * unchanged (and an incomplete render area always loads). On M5 that
+       * was a whole-framebuffer load/store round trip, ~50 us for a 1x
+       * RGBA8 3024x1964 target, for a clear of a small HUD rectangle. Only
+       * a resolve of loaded samples still writes its destination from empty
+       * tiles. */
+      if (agx_chip_g17_m5(dev->dev.chip)) {
+         render->process_empty_tiles_without_z = loaded_resolve;
+         cs->cr.process_empty_tiles = loaded_resolve;
+      }
+
       hk_CmdClearAttachments(hk_cmd_buffer_to_handle(cmd), clear_count,
                              clear_att, 1, &clear_rect);
    } else {
