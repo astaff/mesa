@@ -716,6 +716,21 @@ hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs)
 }
 
 void
+hk_frame_anatomy_note_grid(struct hk_cs *cs, const struct hk_shader *shader,
+                           uint64_t threads, uint64_t groups, bool indirect)
+{
+   for (unsigned i = 0; i < HK_FA_FS_MAX; ++i) {
+      if (cs->anatomy_fs[i].fs == shader) {
+         if (indirect)
+            cs->anatomy_fs[i].indirect++;
+         cs->anatomy_fs[i].threads += threads;
+         cs->anatomy_fs[i].groups += groups;
+         return;
+      }
+   }
+}
+
+void
 hk_frame_anatomy_note_vs(struct hk_cs *cs, const struct hk_shader *vs)
 {
    if (!vs)
@@ -788,9 +803,12 @@ hk_frame_anatomy_compute(struct hk_frame_anatomy_submit *s,
       const uint32_t hash = prog->code_size
          ? _mesa_hash_data(prog->code_ptr, prog->code_size) : 0;
       hk_fa_dump_fs(fa, hash, prog, "cs");
-      HK_FA_APPEND(" cs=%08x:d%u:i%u:g%u:t%u:sp%u:sc%u", hash,
+      HK_FA_APPEND(" cs=%08x:d%u:i%u:g%u:t%u:sp%u:sc%u:n%" PRIu64 ":w%" PRIu64
+                   ":x%u", hash,
                    cs->anatomy_fs[i].draws, st->instrs, st->gprs, st->threads,
-                   st->spills + st->fills, st->scratch);
+                   st->spills + st->fills, st->scratch,
+                   cs->anatomy_fs[i].threads, cs->anatomy_fs[i].groups,
+                   cs->anatomy_fs[i].indirect);
    }
    if (cs->anatomy_fs_other)
       HK_FA_APPEND(" cs_other=%u", cs->anatomy_fs_other);

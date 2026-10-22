@@ -1198,6 +1198,10 @@ struct hk_cs {
    struct {
       const struct hk_shader *fs;
       uint32_t draws;
+      /* Compute streams: total threads and workgroups of the direct
+       * dispatches, and how many were indirect. */
+      uint64_t threads, groups;
+      uint32_t indirect;
    } anatomy_fs[HK_FA_FS_MAX];
    uint32_t anatomy_fs_other;
 
