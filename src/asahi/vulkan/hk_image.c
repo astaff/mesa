@@ -1746,17 +1746,28 @@ hk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
     * enough to matter for bandwidth. */
    if (unlikely(dev->frame_anatomy) && pCreateInfo->extent.width >= 128 &&
        pCreateInfo->extent.height >= 128) {
+      /* The view formats a mutable image lists, which the compression
+       * decision depends on. */
+      char views[256] = "";
+      const VkImageFormatListCreateInfo *list =
+         vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+      for (unsigned i = 0; list && i < list->viewFormatCount; ++i) {
+         const size_t len = strlen(views);
+         snprintf(views + len, sizeof(views) - len, "%s%s", i ? "," : " views=",
+                  util_format_short_name(
+                     hk_format_to_pipe_format(list->pViewFormats[i])));
+      }
       hk_frame_anatomy_note(
          dev,
          "image %ux%ux%u fmt=%s samples=%u mips=%u layers=%u usage=0x%x "
-         "flags=0x%x tiling=%u pnext=%u compressed=%u",
+         "flags=0x%x tiling=%u pnext=%u compressed=%u%s",
          pCreateInfo->extent.width, pCreateInfo->extent.height,
          pCreateInfo->extent.depth,
          util_format_short_name(hk_format_to_pipe_format(pCreateInfo->format)),
          pCreateInfo->samples, pCreateInfo->mipLevels,
          pCreateInfo->arrayLayers, pCreateInfo->usage, pCreateInfo->flags,
          pCreateInfo->tiling, pCreateInfo->pNext != NULL,
-         image->planes[0].layout.compressed);
+         image->planes[0].layout.compressed, views);
    }
 
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
