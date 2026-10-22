@@ -30,6 +30,7 @@
 #include "asahi/lib/agx_va_runtime_hole.h"
 
 #include "hk_private.h"
+#include "hk_barrier.h"
 #include "hk_conditional_render_core.h"
 #include "hk_shader.h"
 #include "hk_sync.h"
@@ -257,10 +258,31 @@ static_assert(sizeof(((struct hk_root_descriptor_table *)0)->cs) <=
 #define hk_root_descriptor_offset(member)                                      \
    offsetof(struct hk_root_descriptor_table, member)
 
+/* Counts only these CPU upload paths, enabled by ASAHI_MESA_DEBUG=perf. */
+struct hk_upload_stats {
+   uint64_t draws, descriptor_binds, descriptor_noops;
+   uint64_t root_uploads, root_bytes, root_reuses;
+   uint64_t draw_param_uploads, draw_param_bytes, draw_param_reuses;
+   uint64_t draw_id_uploads, draw_id_bytes, draw_id_reuses;
+   uint64_t constant_uploads, constant_bytes, constant_reuses;
+};
+
+#define hk_upload_stat(cmd, field, value)                                      \
+   do {                                                                       \
+      if (unlikely(hk_cmd_buffer_device(cmd)->dev.debug & AGX_DBG_PERF))         \
+         (cmd)->state.upload_stats.field += (value);                            \
+   } while (0)
+
 struct hk_descriptor_state {
    bool root_dirty;
    uint64_t generation;
    struct hk_root_descriptor_table root;
+   /* Immutable command-buffer storage; reset with descriptor state. Only the
+    * uploaded head and tail are compared, excluding unused dynamic slots. */
+   struct agx_ptr uploaded_root;
+   uint32_t uploaded_root_size;
+   uint64_t uploaded_root_generation;
+   uint8_t uploaded_dynamic_buffer_end;
 
    /* One past the highest root.dynamic_buffers entry any bind wrote. Later
     * entries are unread by every bound layout and stay out of uploads. */
@@ -357,6 +379,10 @@ struct hk_render_registers {
 
 struct hk_rendering_state {
    VkRenderingFlagBits flags;
+
+   /* May have written storage memory/XFB anywhere in this API pass, including
+    * before a physical render split. Used only for conservative barriers. */
+   bool barrier_shader_writes;
 
    VkRect2D area;
    uint32_t layer_count;
@@ -685,6 +711,9 @@ struct hk_graphics_state {
    struct {
       uint64_t out_draws;
       uint64_t grids;
+      /* Direct thread count bounding the TES-before-GS kernel of this draw,
+       * or 0 to use the indirect grid (hk_tes_direct_query_threads()). */
+      uint32_t tes_direct_threads;
       struct hk_tess_info info;
       enum mesa_prim prim;
    } tess;
@@ -809,6 +838,9 @@ struct hk_cs {
    bool gen1_native_fragment_rq;
    bool gen1_native_vertex_rq;
 
+   /* At least one AS-build dispatch or compute transfer is in this stream. */
+   bool as_build;
+
    /* M5: a later render pass instance continues in this stream
     * (hk_m5_pass_merge_begin()); its draws may not share the stream's
     * committed sample locations (hk_flush_gfx_state()). */
@@ -859,9 +891,17 @@ struct hk_cs {
     * pass, not a part split off or continued. */
    bool g17p_pass_begins, g17p_pass_ends;
 
+   /* Consecutive GPU query resets share one strong flush, at the first
+    * consumer or the end of the stream. G13 never sets this. */
+   bool query_reset_pending;
+
    /* Statistics */
    struct {
       uint32_t calls, cmds, flushes, merged;
+      uint64_t query_copy_dispatches, query_copy_queries, query_copy_counters;
+      uint64_t query_reset_dispatches, query_reset_queries, query_reset_flushes;
+      uint32_t robust_index_draws, robust_index_dispatches,
+         robust_index_batches;
    } stats;
 
    /* Timestamp writes: the start of the command (compute start, render
@@ -1017,6 +1057,7 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
 
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->gen1_native_rq |= b->gen1_native_rq;
+   a->as_build |= b->as_build;
    a->scratch.cs.main |= b->scratch.cs.main;
    a->scratch.cs.preamble |= b->scratch.cs.preamble;
 
@@ -1042,7 +1083,17 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    a->stats.calls += b->stats.calls;
    a->stats.cmds += b->stats.cmds;
    a->stats.flushes += b->stats.flushes;
+   a->stats.robust_index_draws += b->stats.robust_index_draws;
+   a->stats.robust_index_dispatches += b->stats.robust_index_dispatches;
+   a->stats.robust_index_batches += b->stats.robust_index_batches;
    a->stats.merged++;
+   a->stats.query_copy_dispatches += b->stats.query_copy_dispatches;
+   a->stats.query_copy_queries += b->stats.query_copy_queries;
+   a->stats.query_copy_counters += b->stats.query_copy_counters;
+   a->stats.query_reset_dispatches += b->stats.query_reset_dispatches;
+   a->stats.query_reset_queries += b->stats.query_reset_queries;
+   a->stats.query_reset_flushes += b->stats.query_reset_flushes;
+   assert(!a->query_reset_pending && !b->query_reset_pending);
 }
 
 static inline uint64_t
@@ -1110,6 +1161,10 @@ struct hk_cmd_buffer {
    bool g17p_pristine;
 
    struct {
+      struct hk_upload_stats upload_stats;
+      struct {
+         uint64_t id, addr;
+      } constant_data[MESA_SHADER_STAGES];
       struct hk_graphics_state gfx;
       struct hk_compute_state cs;
       struct hk_ray_tracing_state rt;
@@ -1126,6 +1181,12 @@ struct hk_cmd_buffer {
       bool deferred_clear_flushing;
       /* Recording a buffer-only command that does not touch their memory. */
       bool deferred_clear_hold;
+
+      /* Suppress consumption of pending resets while recording another reset. */
+      bool query_reset_recording;
+
+      /* Scoped around direct/indirect AS builds, including their meta blits. */
+      bool as_build_recording;
 
       /* AGX3: the last render pass instance stored a whole depth-only image
        * that nothing recorded since may have read. A later instance that
@@ -1167,6 +1228,13 @@ struct hk_cmd_buffer {
        * m5_ordered) and a command recorded since may read the instance's
        * attachments through memory; the next draw ends the stream first. */
       bool m5_ordered_split;
+
+      /* Per recording; reported at submission so reused command buffers are
+       * counted each time. Reasons overlap, total counts physical splits. */
+      struct {
+         uint64_t kept, splits;
+         uint64_t reason[HK_BARRIER_SPLIT_COUNT];
+      } barrier_stats;
    } state;
 
    struct {
@@ -1608,6 +1676,8 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
                         VkRenderingAttachmentInfo *depth,
                         VkRenderingAttachmentInfo *stencil);
 
+void hk_flush_query_resets(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
 static inline struct hk_cs *
 hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
@@ -1689,6 +1759,11 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    }
 
    assert(*ptr != NULL);
+   if (compute && unlikely((*ptr)->query_reset_pending) &&
+       !cmd->state.query_reset_recording)
+      hk_flush_query_resets(cmd, *ptr);
+   if (compute && cmd->state.as_build_recording)
+      (*ptr)->as_build = true;
    return *ptr;
 }
 
@@ -1752,6 +1827,8 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
 {
    if (*ptr) {
       struct hk_cs *cs = *ptr;
+      if (unlikely(cs->query_reset_pending))
+         hk_flush_query_resets(cmd, cs);
 
       /* This control stream may write immediates as it ends. Queue the writes
        * now that we're done emitting everything else.
@@ -1785,7 +1862,8 @@ hk_cmd_buffer_end_compute(struct hk_cmd_buffer *cmd)
  * graphics finalization (for example, a native background clear). */
 bool hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd);
 
-static void
+/* Return whether a physical render was finalized (empty renders can vanish). */
+static bool
 hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.gfx;
@@ -1830,6 +1908,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
     * to queue a free for it again.
     */
    cmd->uses_heap = false;
+   return cs != NULL;
 }
 
 static inline uint64_t
@@ -1928,6 +2007,14 @@ void hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
 
 void hk_meta_resolve_rendering(struct hk_cmd_buffer *cmd,
                                const VkRenderingInfo *pRenderingInfo);
+
+void hk_cmd_upload_draw_params(struct hk_cmd_buffer *cmd, uint32_t first,
+                               uint32_t first_instance);
+void hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id);
+uint64_t hk_cmd_upload_constants(struct hk_cmd_buffer *cmd,
+                                 const struct hk_shader *shader,
+                                 mesa_shader_stage stage);
+void hk_cmd_print_upload_stats(struct hk_cmd_buffer *cmd);
 
 uint64_t hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
                                    VkPipelineBindPoint bind_point);
@@ -2099,9 +2186,6 @@ void hk_g17p_meta_fill_addr(struct hk_cmd_buffer *cmd, struct hk_cs **target,
  * stream until it reaches value. */
 void hk_g17p_meta_wait_addr(struct hk_cmd_buffer *cmd, uint64_t address,
                             uint32_t value);
-void hk_native_meta_copy_query(struct hk_cmd_buffer *cmd, uint64_t destination,
-                               uint64_t source, uint64_t availability,
-                               VkQueryResultFlags flags);
 
 void agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
                          uint64_t attribs_read, struct agx_velem_key *keys);

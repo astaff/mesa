@@ -468,17 +468,6 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
 }
 
-static struct agx_ptr
-hk_pool_root_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
-                   uint32_t alignment)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_native_graphics(&dev->dev))
-      return hk_pool_alloc(cmd, size, alignment);
-
-   return hk_pool_alloc_from(cmd, &cmd->uploader.root, size, alignment,
-                             HK_CMD_BO_ROOT);
-}
 
 struct agx_ptr
 hk_pool_vdm_primary_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
@@ -829,6 +818,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_cmd_buffer_publish_cached_uploads(cmd);
    hk_cmd_buffer_publish_root_uploads(cmd);
 
+   hk_cmd_print_upload_stats(cmd);
    return vk_command_buffer_end(&cmd->vk);
 }
 
@@ -855,28 +845,53 @@ hk_dependency_has_host_read(const VkDependencyInfo *info)
    return false;
 }
 
-/* Whether any barrier in the dependency makes writes visible to later reads.
- * An execution-only dependency (both access masks zero) inside a render pass
- * instance needs no tile store. */
-static bool
-hk_dependency_has_memory_scope(const VkDependencyInfo *info)
+/* Images are compared as whole resources. Subresource-disjoint barriers may
+ * still split, and aliasable/sparse attachments disable the unwritten-image
+ * proof. Never infer disjointness from different Vulkan handles alone.
+ */
+static uint32_t
+hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info)
 {
-   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
-      if (info->pMemoryBarriers[i].dstAccessMask)
-         return true;
-   }
+   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   VkImage images[HK_MAX_RTS + 2];
+   struct hk_barrier_state state = {
+      .shader_writes = render->barrier_shader_writes,
+      .pre_graphics = cmd->current_cs.pre_gfx != NULL,
+      .post_graphics = cmd->current_cs.post_gfx != NULL,
+      .tilebuffer_spilled = agx_tilebuffer_spills(&render->tilebuffer),
+      .attachments = images,
+   };
+   const struct hk_attachment *attachments[HK_MAX_RTS + 2];
+   unsigned count = 0;
+   for (unsigned i = 0; i < render->color_att_count; ++i)
+      attachments[count++] = &render->color_att[i];
+   attachments[count++] = &render->depth_att;
+   attachments[count++] = &render->stencil_att;
 
-   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
-      if (info->pBufferMemoryBarriers[i].dstAccessMask)
-         return true;
+   bool aliases = false;
+   for (unsigned i = 0; i < count; ++i) {
+      if (!attachments[i]->iview)
+         continue;
+      struct vk_image *image = attachments[i]->iview->vk.image;
+      aliases |= hk_barrier_image_may_alias(
+         image->create_flags, image->tiling, image->external_handle_types);
+      const VkImageAspectFlags aspect =
+         i < render->color_att_count ? VK_IMAGE_ASPECT_COLOR_BIT :
+         i == render->color_att_count ? VK_IMAGE_ASPECT_DEPTH_BIT :
+                                       VK_IMAGE_ASPECT_STENCIL_BIT;
+      if (!hk_barrier_attachment_may_write(
+             attachments[i]->layout, aspect,
+             attachments[i]->clear ? VK_ATTACHMENT_LOAD_OP_CLEAR :
+                                      attachments[i]->load_op,
+             attachments[i]->resolve_mode))
+         continue;
+      /* Do not mark a shared image client_visible while recording in parallel. */
+      images[state.attachment_count++] =
+         (VkImage)(uintptr_t)vk_object_to_u64_handle(&image->base);
    }
+   state.attachments_alias = state.attachment_count && aliases;
 
-   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
-      if (info->pImageMemoryBarriers[i].dstAccessMask)
-         return true;
-   }
-
-   return false;
+   return hk_barrier_classify(info, &state);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -891,6 +906,15 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "Pipeline barrier");
 
+   if (!agx_native_graphics(&dev->dev)) {
+      hk_cmd_buffer_end_compute(cmd);
+      hk_cmd_buffer_end_graphics(cmd);
+      /* Preserve the same conservative ordering in the shared submit graph,
+       * including kernels that advertise exact prior barriers on AGX2. */
+      hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+      return;
+   }
+
    /* M5: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
    if (unlikely(cmd->state.pass_merge.valid))
@@ -901,28 +925,24 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
        hk_dependency_has_host_read(pDependencyInfo))
       hk_flush_deferred_clears(cmd);
 
-   /* Inside a render pass instance both scopes are limited to that instance
-    * (Vulkan 1.3, 7.6.1: "If vkCmdPipelineBarrier2 is called inside a render
-    * pass instance, the first synchronization scope includes only commands
-    * that occur earlier in submission order within the same subpass" and
-    * likewise for the second). Nothing after the pass learns anything from
-    * it, but software graphics stages on CDM must observe it within the pass.
-    * Input attachments are
-    * lowered to texture loads (nir_lower_input_attachments in hk_shader.c),
-    * so a dependency with a memory scope needs the tile buffer stored and
-    * reloaded, which is a render split. The continuation stream then waits
-    * on the stream it continues, see hk_sync_stream_created. */
+   /* In-pass dependencies stay scoped to the API pass, even when its
+    * physical render must end. Keep local attachment operations in tile
+    * memory; descriptor/input-attachment reads still require a store because
+    * the compiler lowers them to texture fetches. Software vertex work needs
+    * a boundary only when the destination scope can name it.
+    */
    if (cmd->sync.in_pass) {
       uint8_t src_kinds, dst_kinds;
       hk_sync_dependency_kinds(pDependencyInfo, &src_kinds, &dst_kinds);
-      /* Software stages cannot cross an in-pass execution dependency by
-       * extending a stream positioned before its source render. End that
-       * stream too, even if the barrier has no memory access masks. */
-      const bool software_stages = src_kinds && dst_kinds &&
-         (cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx);
-      if ((hk_dependency_has_memory_scope(pDependencyInfo) || software_stages) &&
-          cmd->current_cs.gfx) {
-         hk_cmd_buffer_end_graphics(cmd);
+      const uint32_t reasons = hk_classify_pass_barrier(cmd, pDependencyInfo);
+      if (reasons) {
+         if (hk_cmd_buffer_end_graphics(cmd)) {
+            cmd->state.barrier_stats.splits++;
+            u_foreach_bit(r, reasons)
+               cmd->state.barrier_stats.reason[r]++;
+         }
+      } else if (cmd->current_cs.gfx) {
+         cmd->state.barrier_stats.kept++;
       }
       /* Ending an empty render can replace its clear with a CDM job. Capture
        * the first scope only after that replacement has its physical stream. */
@@ -1043,6 +1063,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
       pipeline_layout->dynamic_descriptor_offset[info->firstSet];
 
    bool root_changed = false;
+   bool binding_changed = false;
    uint32_t next_dyn_offset = 0;
    for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
       unsigned s = i + info->firstSet;
@@ -1050,6 +1071,7 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
 
       if (desc->sets[s] != set ||
           (desc->push_active & BITFIELD_BIT(s))) {
+         binding_changed = true;
          if (set != NULL) {
             root_changed |= desc->root.sets[s] != hk_descriptor_set_addr(set);
             desc->root.sets[s] = hk_descriptor_set_addr(set);
@@ -1098,13 +1120,19 @@ hk_bind_descriptor_sets(struct hk_cmd_buffer *cmd,
    }
    assert(dyn_buffer_start <= HK_MAX_DYNAMIC_BUFFERS);
    assert(next_dyn_offset <= info->dynamicOffsetCount);
+   root_changed |= desc->dynamic_buffer_end < dyn_buffer_start;
    desc->dynamic_buffer_end = MAX2(desc->dynamic_buffer_end, dyn_buffer_start);
 
-   /* Preserve all descriptor bookkeeping even if the root's immutable bytes
-    * can be reused.  Other paths keep the prior unconditional invalidation.
-    */
-   desc->root_dirty |= root_changed ||
-      !hk_g17p_can_retain_descriptor_root(cmd, desc);
+   hk_upload_stat(cmd, descriptor_binds, 1);
+   const bool retain_root = hk_g17p_can_retain_descriptor_root(cmd, desc);
+   if (!root_changed && !binding_changed && retain_root) {
+      hk_upload_stat(cmd, descriptor_noops, 1);
+      return;
+   }
+
+   /* CPU-decoded descriptor programs retain their conservative invalidation:
+    * their inputs can change in set memory without changing its address. */
+   desc->root_dirty |= root_changed || !retain_root;
    desc->generation++;
 }
 
@@ -1340,51 +1368,6 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       pPushDescriptorSetWithTemplateInfo->pData);
 }
 
-__attribute__((hot)) uint64_t
-hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
-                          VkPipelineBindPoint bind_point)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
-   struct hk_root_descriptor_table *root = &desc->root;
-
-   struct agx_ptr root_ptr = hk_pool_root_alloc(cmd, sizeof(*root), 8);
-
-   /* A HAL200 tail built for the old root names it and must be rebuilt
-    * before publication. */
-   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
-       cmd->state.gfx.root && root_ptr.gpu != cmd->state.gfx.root)
-      cmd->state.gfx.g17p_bind_tail.valid = false;
-   if (!root_ptr.gpu)
-      return 0;
-
-   root->root_desc_addr = root_ptr.gpu;
-   root->printf_buffer_address = dev->dev.printf_buffer_address;
-   root->sampler_heap_address =
-      dev->samplers.table.bo && dev->samplers.table.bo->va
-         ? dev->samplers.table.bo->va->addr
-         : 0;
-
-   /* Dynamic buffers past the highest one ever bound are read by no bound
-    * layout: copy the table around them. */
-   const size_t head_B = hk_root_descriptor_offset(dynamic_buffers) +
-                         desc->dynamic_buffer_end * sizeof(root->dynamic_buffers[0]);
-   const size_t tail_B = hk_root_descriptor_offset(set_dynamic_buffer_start);
-   memcpy(root_ptr.cpu, root, head_B);
-   memcpy((uint8_t *)root_ptr.cpu + tail_B, (const uint8_t *)root + tail_B,
-          sizeof(*root) - tail_B);
-
-   /* Cached G17P roots need explicit CPU-to-GPU publication. Clean just this
-    * table now; vkEndCommandBuffer completes all recorded root cleans with a
-    * single fence before submission can consume them. */
-   if (agx_native_graphics(&dev->dev) && util_has_cache_ops()) {
-      util_flush_range_no_fence(root_ptr.cpu, head_B);
-      util_flush_range_no_fence((uint8_t *)root_ptr.cpu + tail_B,
-                                sizeof(*root) - tail_B);
-   }
-
-   return root_ptr.gpu;
-}
 
 static uint64_t
 hk_upload_native_spilled_rt_descs(struct hk_cmd_buffer *cmd)

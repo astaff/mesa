@@ -3,6 +3,11 @@ Asahi
 
 The Asahi driver aims to provide an OpenGL implementation for the Apple M1.
 
+.. toctree::
+   :maxdepth: 1
+
+   asahi-barriers
+
 Wrap (macOS only)
 -----------------
 
@@ -352,6 +357,53 @@ Within a layer, the table works purely at an address level. It maps pages to
 pages, rather than tiles to tiles. It is not a spatial data structure in itself.
 Rather, it inherits the tiling of the image by virtue of the addresses mapped.
 This presumably simplifies the hardware implementation.
+
+Gallium performance counters
+----------------------------
+
+``ASAHI_MESA_DEBUG=perf`` prints a per-context line at each Gallium
+``PIPE_FLUSH_END_OF_FRAME`` boundary, for example::
+
+   [Queue 1 Frame 0] draws=120 vs_emits=8 query_waits=0
+
+``draws`` counts encoded raster draws, including internal draws. ``vs_emits``
+counts VDM vertex state updates and their vertex-program uploads, including
+uniform-only updates. ``query_waits`` counts batch synchronizations needed by
+CPU query operations after a nonblocking readiness check; this includes query
+reads, reuse and occlusion-query destruction. It counts attempted blocking
+synchronizations, rather than measuring time spent sleeping. All three counters
+reset at the frame boundary; ordinary flushes keep accumulating. Applications
+that do not issue an end-of-frame flush do not produce frame lines. Counters
+are disabled unless ``perf`` is set.
+
+On G17P, the VDM retains vertex state independently of the native bind tail and
+draw selector. An unchanged VS therefore survives fragment fixed-function
+updates and state-clean indirect draws. Shader, vertex-resource, varying and
+rasterizer changes still update VS state. Draw parameters consumed by the VS
+and changes to root ranges consumed by the VS also require a new vertex program.
+Fragment-only root changes can retain the VS's previous immutable uniform
+snapshot; a consumed root-table pointer moving still requires an update.
+Geometry copy and tessellation evaluation programs use this same hardware
+vertex path.
+
+CPU query reads with ``wait=false`` use zero-timeout polls for submitted writers.
+An unsubmitted writer is submitted once for progress, returning not-ready without
+waiting on the CPU or changing the result. Pending submitted writers do not
+flush again. This necessary submission preserves the `GL requirement that
+repeated availability polling eventually succeeds
+<https://registry.khronos.org/OpenGL/specs/gl/glspec46.core.pdf>`_ (section 4.2.3).
+Completed writers retire their CPU timestamp bookkeeping before reading the
+result. Blocking reads synchronize only writers that remain busy. Conditional
+rendering with ``NO_WAIT`` only polls and renders conservatively if unavailable,
+without submitting an active writer. CPU query-buffer fallbacks also honor
+``PIPE_QUERY_WAIT`` and leave an unavailable nonwaiting result untouched.
+
+For offline regression coverage, configure with ``-Dbuild-tests=true`` and
+``-Dtools=drm-shim``, then run the ``asahi`` Meson test suite. The
+``asahi-<chip>-gallium-vs`` and ``asahi-<chip>-gallium-query`` tests exercise
+G13G, G15C, G15S and G17P using controlled fence completion. These tests verify
+command construction and CPU synchronization behavior; the shim does not
+execute shaders or establish hardware performance.
 
 drm-shim (Linux only)
 ---------------------

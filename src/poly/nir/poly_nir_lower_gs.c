@@ -1231,8 +1231,10 @@ optimize_static_topology(struct poly_gs_info *info, nir_shader *gs)
 }
 
 bool
-poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
-                  nir_shader **pre_gs, struct poly_gs_info *info)
+poly_nir_lower_gs_with_options(nir_shader *gs, nir_shader **gs_count,
+                               nir_shader **gs_copy, nir_shader **pre_gs,
+                               struct poly_gs_info *info,
+                               bool eliminate_local_ray_queries)
 {
    /* Lower I/O as assumed by the rest of GS lowering */
    if (gs->xfb_info != NULL) {
@@ -1283,7 +1285,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
       NIR_PASS(progress, gs, nir_opt_constant_folding);
       NIR_PASS(progress, gs, nir_opt_algebraic);
       NIR_PASS(progress, gs, nir_opt_cse);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
+      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
+               eliminate_local_ray_queries);
       NIR_PASS(progress, gs, nir_opt_dce);
 
       /* Unrolling lets us statically determine counts more often, which
@@ -1363,7 +1366,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
                (void *)true);
 
       NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
+      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
+               eliminate_local_ray_queries);
    } while (progress);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_instr,
@@ -1381,7 +1385,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
       NIR_PASS(progress, gs, nir_opt_constant_folding);
       NIR_PASS(progress, gs, nir_opt_algebraic);
       NIR_PASS(progress, gs, nir_opt_cse);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
+      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
+               eliminate_local_ray_queries);
       NIR_PASS(progress, gs, nir_opt_dce);
       NIR_PASS(progress, gs, nir_opt_loop_unroll);
 
@@ -1395,7 +1400,8 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
                (void *)false);
 
       NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
+      NIR_PASS(progress, gs, nir_opt_dead_cf_with_options,
+               eliminate_local_ray_queries);
    } while (progress);
 
    /* All those variables we created should've gone away by now */
@@ -1508,4 +1514,13 @@ poly_nir_lower_vs_before_gs(struct nir_shader *vs)
    /* Lower vertex stores to memory stores */
    return nir_shader_intrinsics_pass(vs, lower_vs_before_gs,
                                      nir_metadata_control_flow, NULL);
+}
+
+/* Existing backends retain the original query side-effect rules. */
+bool
+poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
+                  nir_shader **pre_gs, struct poly_gs_info *info)
+{
+   return poly_nir_lower_gs_with_options(gs, gs_count, gs_copy, pre_gs, info,
+                                        false);
 }

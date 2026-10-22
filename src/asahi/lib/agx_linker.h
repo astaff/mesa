@@ -388,6 +388,7 @@ bool agx_fs_epilog_may_discard(const struct agx_fs_epilog_link_info *link,
 void agx_nir_vs_prolog(struct nir_builder *b, const void *key_);
 void agx_nir_vs_prolog_raw(struct nir_builder *b, const void *key_);
 void agx_nir_fs_epilog(struct nir_builder *b, const void *key_);
+void agx_nir_fs_epilog_agx2(struct nir_builder *b, const void *key_);
 void agx_nir_fs_epilog_g17p(struct nir_builder *b, const void *key);
 bool agx_nir_lower_g17p_sample_shading(
    nir_shader *nir, struct agx_fs_epilog_link_info *link, unsigned samples);

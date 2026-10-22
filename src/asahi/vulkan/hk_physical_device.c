@@ -74,17 +74,25 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
       agx_chip_descriptor_generation(dev->chip),
       agx_chip_sampler_generation(dev->chip),
       agx_chip_sampler_heap_element_size(dev->chip),
-      hk_g17p_rt_enabled(dev->chip),
-      hk_g17p_rt_enabled(dev->chip),
+      hk_g17p_rt_enabled(dev),
+      hk_g17p_rt_enabled(dev),
    };
 
    _mesa_blake3_update(ctx, values, sizeof(values));
 }
 
 static void
-hk_get_device_extensions(const struct hk_instance *instance,
+hk_get_device_extensions(const struct agx_device *dev,
+                         const struct hk_instance *instance,
                          struct vk_device_extension_table *ext)
 {
+   /* Keep the upstream AGX2 extension profile until the newly added common
+    * implementations have been qualified there. Native AGX3 keeps its
+    * existing exposure.
+    */
+   const bool native_agx3 = agx_native_graphics(dev) &&
+                            dev->params.gpu_generation > 15;
+
    /*
     * VK_KHR_ray_query and everything it depends on.  Software traversal:
     * grounded end to end in shader ALU and global loads, with no dependence
@@ -195,7 +203,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_swapchain_mutable_format = true,
 #endif
       .KHR_synchronization2 = true,
-      .KHR_unified_image_layouts = true,
+      .KHR_unified_image_layouts = native_agx3,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
       .KHR_vertex_attribute_divisor = true,
@@ -208,7 +216,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
       .EXT_calibrated_timestamps = true,
-      .EXT_conditional_rendering = true,
+      .EXT_conditional_rendering = native_agx3,
       .EXT_color_write_enable = true,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
@@ -240,7 +248,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
-      .EXT_memory_budget = true,
+      .EXT_memory_budget = native_agx3,
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_non_seamless_cube_map = true,
@@ -570,8 +578,8 @@ hk_get_device_features(
       .shaderFloatControls2 = true,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = agx_chip_exact_fma32(dev->chip),
-      .shaderFmaFloat32 = agx_chip_exact_fma32(dev->chip),
+      .shaderFmaFloat16 = (dev->chip == AGX_CHIP_G17P && agx_chip_exact_fma32(dev->chip)),
+      .shaderFmaFloat32 = (dev->chip == AGX_CHIP_G17P && agx_chip_exact_fma32(dev->chip)),
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */
@@ -595,7 +603,7 @@ hk_get_device_features(
        *
        * Video is not supported, so the video half stays false.
        */
-      .unifiedImageLayouts = true,
+      .unifiedImageLayouts = supported_extensions->KHR_unified_image_layouts,
       .unifiedImageLayoutsVideo = false,
 
       /* VK_KHR_vertex_attribute_divisor */
@@ -1048,7 +1056,12 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxSamplerAllocationCount = 4000,
       .bufferImageGranularity = 0x400,
       .sparseAddressSpaceSize = HK_SPARSE_ADDR_SPACE_SIZE,
-      .maxBoundDescriptorSets = HK_MAX_SETS,
+      /* The classic AGX2 root upload has one USC uniform record, limited
+       * to 64 halfwords. Keep upstream's eight-set limit: the native
+       * sixteen-set root needs 68 halfwords and uses a separate loader.
+       */
+      .maxBoundDescriptorSets =
+         dev->params.gpu_generation <= 15 ? 8 : HK_MAX_SETS,
       /* VK_KHR_acceleration_structure limits.  The counts are the
        * specification's own 24/29-bit encoding maxima, which is what bounds
        * us: the geometry, instance and primitive ids all live in packed
@@ -1071,15 +1084,16 @@ hk_get_device_properties(const struct agx_device *dev,
        * requires more, because every record address arrives as a device
        * address the shader adds a stride to.
        *
-       * maxRayRecursionDepth is 1, and that is a real limit rather than a
-       * policy: recursion is unrolled into the megakernel at compile time, so
-       * every extra level multiplies the compiled code.  Raising it is a
-       * decision about code size, not a hardware question.
+       * Trace recursion is unrolled into the megakernel at compile time.
+       * G17P supports three levels until trace continuations can be shared.
+       * KHR requires at least one level; legacy generations retain their
+       * limit of three.
        *
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */
       .shaderGroupHandleSize = HK_RAY_TRACING_GROUP_HANDLE_SIZE,
-      .maxRayRecursionDepth = HK_MAX_RAY_RECURSION_DEPTH,
+      .maxRayRecursionDepth = dev->chip == AGX_CHIP_G17P ?
+         HK_G17P_MAX_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH,
       .maxShaderGroupStride = 16384,
       .shaderGroupBaseAlignment = 64,
       .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
@@ -1282,7 +1296,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderDenormFlushToZeroFloat32 = true,
       .shaderDenormFlushToZeroFloat64 = false,
       .shaderRoundingModeRTEFloat16 = true,
-      .shaderRoundingModeRTEFloat32 = true,
+      .shaderRoundingModeRTEFloat32 = dev->params.gpu_generation > 15,
       .shaderRoundingModeRTEFloat64 = false,
       .shaderRoundingModeRTZFloat16 = false,
       .shaderRoundingModeRTZFloat32 = false,
@@ -1440,7 +1454,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .variableSampleLocations = false,
 
       /* VK_EXT_shader_object */
-      .shaderBinaryVersion = HK_AGX3_SHADER_BINARY_VERSION,
+      .shaderBinaryVersion = hk_shader_binary_version(dev->chip),
 
       /* VK_EXT_transform_feedback */
       .maxTransformFeedbackStreams = 4,
@@ -1777,8 +1791,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       &dispatch_table, &wsi_physical_device_entrypoints, false);
 
    struct vk_device_extension_table supported_extensions;
-   hk_get_device_extensions(instance, &supported_extensions);
-   if (hk_g17p_rt_enabled(pdev->dev.chip)) {
+   hk_get_device_extensions(&pdev->dev, instance, &supported_extensions);
+   if (hk_g17p_rt_enabled(&pdev->dev)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
       supported_extensions.KHR_ray_query =
@@ -1798,7 +1812,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
-   if (!agx_chip_exact_fma32(pdev->dev.chip))
+   if (pdev->dev.chip != AGX_CHIP_G17P ||
+       !agx_chip_exact_fma32(pdev->dev.chip))
       supported_extensions.KHR_shader_fma = false;
 
    if (pdev->dev.chip == AGX_CHIP_G17P) {

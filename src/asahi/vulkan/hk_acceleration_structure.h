@@ -12,6 +12,7 @@
 
 struct hk_device;
 struct hk_cmd_buffer;
+struct agx_scs_layout_gen2;
 struct vk_buffer;
 void hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
                                          const struct vk_buffer *buffer);
@@ -37,5 +38,7 @@ VkResult hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                                  VkDeviceAddress envelope_status);
 
 uint64_t hk_gen1_ray_query_scs_layout(const struct hk_device *dev);
+uint64_t hk_gen1_query_state(struct hk_cmd_buffer *cmd,
+                            const struct agx_scs_layout_gen2 *scs);
 
 #endif /* HK_ACCELERATION_STRUCTURE_H */

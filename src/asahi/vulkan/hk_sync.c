@@ -522,7 +522,19 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* The recorded requirement for this kind of work. A render's vertex half
     * needs only the part whose destination is not fragment-only. */
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   req_for_kinds(cmd, cs->sync.kind, dep);
+   /* Software vertex work is outside an in-pass fragment-only destination.
+    * Waiting on the current render here would create a cycle after a kept
+    * local barrier. Preserve global requirements, though: internal producers
+    * such as attachment decompression must still follow external writes. */
+   if (compute && slot == &cmd->current_cs.pre_gfx) {
+      req_for_kinds_ta(cmd, cs->sync.kind, dep);
+      u_foreach_bit(k, full_kinds(cs->sync.kind)) {
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+            dep_max(&dep[sq], &st->req[k][sq]);
+      }
+   } else {
+      req_for_kinds(cmd, cs->sync.kind, dep);
+   }
    if (!compute) {
       struct hk_sync_dep ta[HK_SYNC_NUM_SQ];
       req_for_kinds_ta(cmd, cs->sync.kind, ta);
@@ -1425,14 +1437,17 @@ hk_sync_resolve_submit(struct hk_queue *queue,
     * command that does not already follow the first one transitively gets
     * an explicit wait on it. Waits are prefixes, so following any command
     * that follows the first is enough. */
-   if (chain_first || first_cdm_is_flush) {
-      const unsigned first_sq = first_cdm_is_flush ? HK_SYNC_CDM
-                                : count && !list_is_empty(
-                                              &cmdbufs[0]->control_streams)
-                                   ? hk_sync_sq(list_first_entry(
-                                        &cmdbufs[0]->control_streams,
-                                        struct hk_cs, node))
-                                   : HK_SYNC_VDM;
+   /* The first command is the first stream of the first command buffer that
+    * emits any: command buffers without streams (barrier-only or empty) send
+    * nothing to the kernel. Without any command there is nothing to chain. */
+   int first_sq = first_cdm_is_flush ? HK_SYNC_CDM : -1;
+   for (unsigned i = 0; first_sq < 0 && i < count; ++i) {
+      if (!list_is_empty(&cmdbufs[i]->control_streams))
+         first_sq = hk_sync_sq(list_first_entry(&cmdbufs[i]->control_streams,
+                                                struct hk_cs, node));
+   }
+
+   if ((chain_first || first_cdm_is_flush) && first_sq >= 0) {
       /* covered[sq]: the lowest index on sq of a command that follows the
        * first command, 0 if none yet. A wait on prefix b of subqueue d
        * follows the first command when covered[d] is within that prefix. */

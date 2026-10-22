@@ -12,6 +12,7 @@
 #include "vk_log.h"
 #include "util/u_debug.h"
 #include "asahi/lib/agx_chip.h"
+#include "asahi/lib/agx_device.h"
 #include "vk_util.h"
 
 #define HK_MAX_SETS                      16
@@ -59,8 +60,18 @@ struct hk_addr_range {
          mesa_log(MESA_LOG_WARN, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__);        \
    } while (0)
 
+/* Native ray queries submit the extended compute command (prior fields and
+ * intersection state after the legacy payload). A kernel that does not
+ * advertise both features parses those bytes differently and rejects the
+ * submission, so ray tracing stays off there instead of failing at submit. */
+#define HK_G17P_RT_KERNEL_FEATURES                                             \
+   (DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS | DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
+
 static inline bool
-hk_g17p_rt_enabled(enum agx_chip chip)
+hk_g17p_rt_enabled(const struct agx_device *dev)
 {
-   return chip == AGX_CHIP_G17P && !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
+   return dev->chip == AGX_CHIP_G17P &&
+          (dev->params.features & HK_G17P_RT_KERNEL_FEATURES) ==
+             HK_G17P_RT_KERNEL_FEATURES &&
+          !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
 }

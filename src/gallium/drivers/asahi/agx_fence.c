@@ -126,6 +126,10 @@ agx_fence_create(struct agx_context *ctx)
    struct agx_device *dev = agx_device(ctx->base.screen);
    int fd = -1, ret;
 
+   /* A failed submission must not export an earlier rendering success. */
+   if (ctx->any_faults)
+      return NULL;
+
    /* Snapshot the last rendering out fence. We'd rather have another
     * syncobj instead of a sync file, but this is all we get.
     * (HandleToFD/FDToHandle just gives you another syncobj ID for the

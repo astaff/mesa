@@ -1534,6 +1534,17 @@ agx_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
 
    agx_flush_all(ctx, "Gallium flush");
 
+   if ((flags & PIPE_FLUSH_END_OF_FRAME) &&
+       unlikely(screen->dev.debug & AGX_DBG_PERF)) {
+      perf_debug_ctx(ctx, "[Queue %u Frame %" PRIu64 "] draws=%" PRIu64
+                          " vs_emits=%" PRIu64 " query_waits=%" PRIu64,
+                     ctx->queue_id, ctx->perf.frame++, ctx->perf.draws,
+                     ctx->perf.vs_emits, ctx->perf.query_waits);
+      ctx->perf.draws = 0;
+      ctx->perf.vs_emits = 0;
+      ctx->perf.query_waits = 0;
+   }
+
    if (!(flags & (PIPE_FLUSH_DEFERRED | PIPE_FLUSH_ASYNC)) &&
        ctx->flush_last_seqid) {
       /* Ensure other contexts in this screen serialize against the last
@@ -1591,6 +1602,15 @@ agx_flush(struct pipe_context *pctx, struct pipe_fence_handle **fence,
       struct pipe_fence_handle *f = agx_fence_create(ctx);
       pctx->screen->fence_reference(pctx->screen, fence, NULL);
       *fence = f;
+   }
+
+   if (unlikely(screen->dev.debug & AGX_DBG_PERF)) {
+      perf_debug_ctx(ctx, "Gallium flush: batches=%" PRIu64
+                     " mixed=%" PRIu64 " submits=%" PRIu64
+                     " submit_failures=%" PRIu64 "\n",
+                     ctx->submit_perf.batches, ctx->submit_perf.mixed_batches,
+                     ctx->submit_perf.submits, ctx->submit_perf.failures);
+      memset(&ctx->submit_perf, 0, sizeof(ctx->submit_perf));
    }
 }
 
@@ -1749,6 +1769,8 @@ agx_destroy_context(struct pipe_context *pctx)
     * ensure everything is cleaned up properly.
     */
    agx_sync_all(ctx, "destroy context");
+   if (ctx->submit_quarantined)
+      return;
 
    if (pctx->stream_uploader)
       u_upload_destroy(pctx->stream_uploader);
@@ -2492,6 +2514,12 @@ static void
 agx_destroy_screen(struct pipe_screen *pscreen)
 {
    struct agx_screen *screen = agx_screen(pscreen);
+
+   /* Unknown completion cannot be repaired by tearing down userspace owners.
+    * Quarantined contexts retain this screen and its device until exit.
+    */
+   if (p_atomic_read(&screen->submit_quarantined))
+      return;
 
    drmSyncobjDestroy(screen->dev.fd, screen->flush_syncobj);
 

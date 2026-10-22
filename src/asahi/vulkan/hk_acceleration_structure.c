@@ -15,6 +15,7 @@
  */
 
 #include "hk_acceleration_structure.h"
+#include "hk_host_as.h"
 #include "asahi/compiler/agx3_rt_gen1_default.h"
 #include "asahi/compiler/agx3_rt_gen1_triangle.h"
 #include "asahi/compiler/agx3_rt_gen1_aabb.h"
@@ -93,7 +94,8 @@ static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_bu
 static void hk_agx3_refit_phase(VkCommandBuffer,
    const struct vk_acceleration_structure_build_state *, unsigned);
 
-#define HK_GEN1_AS_ID_LIMIT (1u << 20)
+/* Allow a million distinct BLASes plus a TLAS and the reserved query IDs. */
+#define HK_GEN1_AS_ID_LIMIT (1u << 21)
 #define HK_GEN1_SPARSE_PAGE_BYTES 0x4000u
 
 static uint32_t
@@ -101,6 +103,26 @@ hk_gen1_as_index_to_id(uint32_t index)
 {
    const uint32_t id = index + 1;
    return id < HK_GEN1_AS_TABLE_AS_SLOTS ? id : id + HK_GEN1_RQ_PHYSICAL_SLOTS;
+}
+
+static uint32_t
+hk_gen1_as_id_to_index(uint32_t id)
+{
+   assert(id && (id < HK_GEN1_AS_TABLE_AS_SLOTS ||
+                 id >= HK_GEN1_AS_TABLE_ENTRIES));
+   return id - 1 - (id >= HK_GEN1_AS_TABLE_ENTRIES ?
+                      HK_GEN1_RQ_PHYSICAL_SLOTS : 0);
+}
+
+/* Caller holds gen1_as_lock. No allocation, search or failure on teardown. */
+static void
+hk_gen1_as_free_slot(struct hk_device *dev, uint32_t index)
+{
+   struct hk_gen1_as_slot *slot =
+      util_dynarray_element(&dev->gen1_ases, struct hk_gen1_as_slot, index);
+   slot->as = NULL;
+   slot->next_free = dev->gen1_as_free_head;
+   dev->gen1_as_free_head = index;
 }
 
 static bool
@@ -245,10 +267,10 @@ hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
       return;
    simple_mtx_lock(&dev->gen1_as_lock);
    uint32_t index = 0;
-   util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-      if (*p && (*p)->buffer == buffer)
+   util_dynarray_foreach(&dev->gen1_ases, struct hk_gen1_as_slot, slot) {
+      if (slot->as && slot->as->buffer == buffer)
          hk_gen1_as_publish_address(dev, hk_gen1_as_index_to_id(index),
-                                    hk_gen1_as_bound_va(*p));
+                                    hk_gen1_as_bound_va(slot->as));
       ++index;
    }
    simple_mtx_unlock(&dev->gen1_as_lock);
@@ -277,32 +299,30 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
       return vk_error(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS);
    }
    bool inserted = false;
-   uint32_t index = 0;
    simple_mtx_lock(&dev->gen1_as_lock);
-   if (dev->gen1_rq_live_as_table) {
-      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-         if (!*p) { *p = as; inserted = true; break; }
-         ++index;
-      }
-   }
-   if (!inserted)
-      index = util_dynarray_num_elements(&dev->gen1_ases,
-                                        struct vk_acceleration_structure *);
+   const bool reuse = dev->gen1_as_free_head != UINT32_MAX;
+   const uint32_t index = reuse ? dev->gen1_as_free_head :
+      util_dynarray_num_elements(&dev->gen1_ases, struct hk_gen1_as_slot);
    const uint32_t id = hk_gen1_as_index_to_id(index);
    const bool live_limit = dev->gen1_rq_live_as_table &&
                            id >= HK_GEN1_AS_TABLE_AS_SLOTS;
-   if (!inserted && !live_limit && id < HK_GEN1_AS_ID_LIMIT &&
+   if (!live_limit && id < HK_GEN1_AS_ID_LIMIT &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, id) &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages, id) &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, id)) {
-      struct vk_acceleration_structure **p =
-         util_dynarray_grow(&dev->gen1_ases, struct vk_acceleration_structure *, 1);
-      if (p) { *p = as; inserted = true; }
+      struct hk_gen1_as_slot *slot = reuse ?
+         util_dynarray_element(&dev->gen1_ases, struct hk_gen1_as_slot, index) :
+         util_dynarray_grow(&dev->gen1_ases, struct hk_gen1_as_slot, 1);
+      if (slot) {
+         if (reuse)
+            dev->gen1_as_free_head = slot->next_free;
+         *slot = (struct hk_gen1_as_slot){.as = as};
+         inserted = true;
+      }
    }
    if (inserted && dev->gen1_as_ids &&
        !_mesa_hash_table_insert(dev->gen1_as_ids, as, (void *)(uintptr_t)id)) {
-      *util_dynarray_element(&dev->gen1_ases, struct vk_acceleration_structure *,
-                             index) = NULL;
+      hk_gen1_as_free_slot(dev, index);
       inserted = false;
    }
    if (inserted)
@@ -335,9 +355,10 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
          ? _mesa_hash_table_search(dev->gen1_as_ids, as) : NULL;
       if (entry) {
          const uint32_t id = (uint32_t)(uintptr_t)entry->data;
-         util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, p) {
-            if (*p == as) { *p = NULL; break; }
-         }
+         const uint32_t index = hk_gen1_as_id_to_index(id);
+         assert(util_dynarray_element(&dev->gen1_ases,
+                     struct hk_gen1_as_slot, index)->as == as);
+         hk_gen1_as_free_slot(dev, index);
          hk_gen1_as_publish_address(dev, id, 0);
          _mesa_hash_table_remove(dev->gen1_as_ids, entry);
       }
@@ -645,7 +666,11 @@ hk_vertex_table_wanted(const struct hk_device *dev,
    return dev->g17p_native_as && dev->gen1_vertex_directory &&
           dev->vk.enabled_features.rayTracingPositionFetch &&
           vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
-          (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR) &&
+          /* Hit-object position fetch is part of invocation reorder and does
+           * not require the position-fetch AS build flag. Retain the same
+           * native vertex table for that feature as for explicit data access. */
+          ((state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_KHR) ||
+           dev->vk.enabled_features.rayTracingInvocationReorder) &&
           state->build_info->geometryCount > 0;
 }
 
@@ -1198,6 +1223,8 @@ hk_gen1_rq_finish(struct hk_device *dev)
    if(dev->gen1_rq_code_alias)agx_va_free(&dev->dev,dev->gen1_rq_code_alias,false);
    agx_bo_unreference(&dev->dev,dev->gen1_rq_code);
    agx_bo_unreference(&dev->dev,dev->gen1_rq_ift);
+   agx_bo_unreference(&dev->dev, dev->gen1_rq_state);
+   dev->gen1_rq_state = NULL;
    free(dev->gen1_rq_maps);free(dev->gen1_rq_user_image);
    dev->gen1_rq_maps=NULL;dev->gen1_rq_user_image=NULL;
    dev->gen1_rq_code=NULL;dev->gen1_rq_ift=NULL;
@@ -1569,7 +1596,7 @@ fail:
 VkResult
 hk_device_init_accel_struct_state(struct hk_device *dev)
 {
-   dev->g17p_native_as = hk_g17p_rt_enabled(dev->dev.chip);
+   dev->g17p_native_as = hk_g17p_rt_enabled(&dev->dev);
    const char *capture=getenv("ASAHI_G17P_RQ_CAPTURE_DIR");
    if(capture && dev->g17p_native_as && !hk_gen1_rq_init(dev,capture))
       return vk_error(dev,VK_ERROR_INITIALIZATION_FAILED);
@@ -1582,9 +1609,45 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
    dev->gen1_native_fragment_rq = dev->gen1_rq_candidates &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RAY_QUERY);
    dev->gen1_native_graphics_rq = dev->gen1_native_fragment_rq;
+   if (dev->gen1_native_rq && !capture &&
+       !getenv("ASAHI_G17P_RQ_BODIES_PATH")) {
+      /* Finalize after selecting the candidate profile: the initial image
+       * was generated before gen1_rq_instances/candidates were enabled.
+       * Neither the generated intersectors nor the query lowering stores to
+       * this image. SCS stacks are allocated separately by the kernel, and
+       * hk_gen1_upload_as_table() owns the writable AS query bank.
+       * Preserve the full legacy extent (including zero padding) here.
+       */
+      struct agx_scs_layout_gen2 scs;
+      ASSERTED bool valid = agx_scs_layout_gen1_init(
+         hk_gen1_ray_query_scs_layout(dev), &scs);
+      assert(valid);
+      const uint64_t size = MAX2(UINT64_C(0x60000),
+                                ALIGN_POT((uint64_t)scs.end[12], 0x4000));
+      const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
+      dev->gen1_rq_state = agx_bo_create(&dev->dev, size, 0x4000,
+         AGX_BO_READONLY | (cached ? AGX_BO_WRITEBACK : 0),
+         "Gen1 ray query user image");
+      if (!dev->gen1_rq_state) {
+         hk_gen1_rq_finish(dev);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      uint8_t *state = agx_bo_map(dev->gen1_rq_state);
+      if (!state) {
+         hk_gen1_rq_finish(dev);
+         return vk_error(dev, VK_ERROR_MEMORY_MAP_FAILED);
+      }
+      memcpy(state, dev->gen1_rq_user_image, 0x60000);
+      if (size > 0x60000)
+         memset(state + 0x60000, 0, size - 0x60000);
+      agx_scs_layout_gen1_parameters(&scs, state + 0x4000);
+      if (cached)
+         util_flush_range(state, size);
+   }
    if (dev->g17p_native_as) {
       simple_mtx_init(&dev->gen1_as_lock, mtx_plain);
       util_dynarray_init(&dev->gen1_ases, NULL);
+      dev->gen1_as_free_head = UINT32_MAX;
       dev->gen1_as_lock_ready=true;
       dev->gen1_vertex_tables = _mesa_pointer_hash_table_create(NULL);
       dev->gen1_as_ids = _mesa_pointer_hash_table_create(NULL);
@@ -1845,6 +1908,9 @@ hk_cmd_build_acceleration_structures(
       }
    }
 
+   const bool was_as_build = cmd->state.as_build_recording;
+   cmd->state.as_build_recording = dev->dev.chip == AGX_CHIP_G17P;
+
    /* A build binds its own compute pipelines and push constants, so the
     * application's compute state has to survive it. */
    struct hk_meta_save save;
@@ -1886,6 +1952,7 @@ hk_cmd_build_acceleration_structures(
          &dev->accel_struct_args);
 
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+   cmd->state.as_build_recording = was_as_build;
    free(nonempty_infos);
    free(nonempty_ranges);
    free(nonempty_indirect);
@@ -2038,15 +2105,15 @@ hk_gen1_as_address_map(struct hk_cmd_buffer *cmd, uint32_t *count)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    simple_mtx_lock(&dev->gen1_as_lock);
    uint32_t bound = util_dynarray_num_elements(&dev->gen1_ases,
-                                              struct vk_acceleration_structure *);
+                                              struct hk_gen1_as_slot);
    struct agx_ptr map = hk_pool_alloc(cmd,
       MAX2(bound, 1) * sizeof(struct libagx_gen1_as_address), 16);
    *count = 0;
    if (map.cpu) {
       struct libagx_gen1_as_address *entries = map.cpu;
       uint32_t index = 0;
-      util_dynarray_foreach(&dev->gen1_ases, struct vk_acceleration_structure *, as) {
-         uint64_t address = *as ? hk_gen1_as_bound_va(*as) : 0;
+      util_dynarray_foreach(&dev->gen1_ases, struct hk_gen1_as_slot, slot) {
+         uint64_t address = slot->as ? hk_gen1_as_bound_va(slot->as) : 0;
          if (address) entries[(*count)++] = (struct libagx_gen1_as_address) {
             .address = address, .resource_id = hk_gen1_as_index_to_id(index),
          };
@@ -2110,7 +2177,7 @@ hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
       hk_as_native_va(dst), info->src.deviceAddress, metadata, uuid, dst->size - padding, id);
    simple_mtx_lock(&dev->gen1_as_lock);
    const uint32_t id_bound = hk_gen1_as_index_to_id(
-      util_dynarray_num_elements(&dev->gen1_ases, struct vk_acceleration_structure *));
+      util_dynarray_num_elements(&dev->gen1_ases, struct hk_gen1_as_slot));
    simple_mtx_unlock(&dev->gen1_as_lock);
    libagx_gen1_as_deserialize_references(cmd,
       agx_1d((dst->size - padding) / 128), AGX_BARRIER_ALL,
@@ -2125,6 +2192,7 @@ struct hk_host_as_run {
    VkCommandBuffer cmd;
    VkFence fence;
    struct util_dynarray bos;
+   bool locked;
 };
 
 static VkResult
@@ -2169,15 +2237,17 @@ hk_host_as_finish(struct hk_host_as_run *run)
    VkDevice device = hk_device_to_handle(dev);
    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
    if (run->cmd) {
-      simple_mtx_lock(&dev->host_as.lock);
       disp->FreeCommandBuffers(device, dev->host_as.pool, 1, &run->cmd);
-      simple_mtx_unlock(&dev->host_as.lock);
    }
    if (run->fence)
       disp->DestroyFence(device, run->fence, NULL);
    util_dynarray_foreach(&run->bos, struct agx_bo *, bo)
       agx_bo_unreference(&dev->dev, *bo);
    util_dynarray_fini(&run->bos);
+   if (run->locked) {
+      run->locked = false;
+      simple_mtx_unlock(&dev->host_as.lock);
+   }
 }
 
 static VkResult
@@ -2190,12 +2260,20 @@ hk_host_as_begin(struct hk_device *dev, struct hk_host_as_run *run)
    if (!dev->g17p_native_as || !dev->host_as.queue || !dev->host_as.pool)
       return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
 
+   /* Recording command buffers also accesses the shared pool's free BO and
+    * AS chunk lists. Serialize the whole synchronous operation, including
+    * recording and retirement, rather than just allocation and submission. */
+   simple_mtx_lock(&dev->host_as.lock);
+   run->locked = true;
+
    const VkFenceCreateInfo fence_info = {
       .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
    };
    VkResult result = disp->CreateFence(device, &fence_info, NULL, &run->fence);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      hk_host_as_finish(run);
       return result;
+   }
 
    const VkCommandBufferAllocateInfo alloc_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -2203,9 +2281,7 @@ hk_host_as_begin(struct hk_device *dev, struct hk_host_as_run *run)
       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
       .commandBufferCount = 1,
    };
-   simple_mtx_lock(&dev->host_as.lock);
    result = disp->AllocateCommandBuffers(device, &alloc_info, &run->cmd);
-   simple_mtx_unlock(&dev->host_as.lock);
    if (result != VK_SUCCESS) {
       run->cmd = VK_NULL_HANDLE;
       hk_host_as_finish(run);
@@ -2226,7 +2302,8 @@ static struct agx_bo *
 hk_host_as_bo(struct hk_host_as_run *run, uint64_t size, const char *name)
 {
    struct agx_bo *bo = agx_bo_create(&run->dev->dev, MAX2(size, 16), 0,
-                                     AGX_BO_WRITEBACK, name);
+                                     util_has_cache_ops() ? AGX_BO_WRITEBACK : 0,
+                                     name);
    if (bo)
       util_dynarray_append(&run->bos, bo);
    return bo;
@@ -2250,10 +2327,8 @@ hk_host_as_execute(struct hk_host_as_run *run)
       .commandBufferInfoCount = 1,
       .pCommandBufferInfos = &cmd_info,
    };
-   simple_mtx_lock(&dev->host_as.lock);
    result = disp->QueueSubmit2(vk_queue_to_handle(&dev->host_as.queue->vk), 1,
                                &submit, run->fence);
-   simple_mtx_unlock(&dev->host_as.lock);
    if (result != VK_SUCCESS)
       return result;
    return disp->WaitForFences(device, 1, &run->fence, VK_TRUE, UINT64_MAX);
@@ -2267,173 +2342,6 @@ hk_host_as_result(VkDeferredOperationKHR deferred, VkResult result)
    return deferred != VK_NULL_HANDLE ? VK_OPERATION_NOT_DEFERRED_KHR : VK_SUCCESS;
 }
 
-struct hk_host_as_staging {
-   uint64_t vertices, indices, transform, data;
-   uint32_t vertex_count;
-};
-
-static bool
-hk_host_as_stage_layout(const VkAccelerationStructureGeometryKHR *g,
-                        const VkAccelerationStructureBuildRangeInfoKHR *r,
-                        struct hk_host_as_staging *layout, uint64_t *offset)
-{
-   const uint64_t count = r->primitiveCount;
-   if (!count)
-      return true;
-   switch (g->geometryType) {
-   case VK_GEOMETRY_TYPE_TRIANGLES_KHR: {
-      const VkAccelerationStructureGeometryTrianglesDataKHR *t = &g->geometry.triangles;
-      const uint32_t fmt = vk_format_get_blocksize(t->vertexFormat);
-      if (!fmt || !t->vertexStride)
-         return false;
-      const bool indexed = t->indexType != VK_INDEX_TYPE_NONE_KHR;
-      uint64_t vertex_count;
-      if (indexed) {
-         vertex_count = r->firstVertex <= t->maxVertex ?
-            (uint64_t)t->maxVertex + 1 - r->firstVertex : 0;
-      } else {
-         vertex_count = count * 3;
-      }
-      if (vertex_count > UINT32_MAX)
-         return false;
-      layout->vertex_count = vertex_count;
-      layout->vertices = *offset;
-      *offset = ALIGN_POT(*offset + (vertex_count ?
-         (vertex_count - 1) * t->vertexStride + fmt : 0), UINT64_C(256));
-      layout->indices = *offset;
-      if (indexed)
-         *offset = ALIGN_POT(*offset + count * 12, UINT64_C(256));
-      layout->transform = *offset;
-      if (t->transformData.hostAddress)
-         *offset = ALIGN_POT(*offset + 48, UINT64_C(256));
-      return true;
-   }
-   case VK_GEOMETRY_TYPE_AABBS_KHR:
-      if (g->geometry.aabbs.stride < 24)
-         return false;
-      layout->data = *offset;
-      *offset = ALIGN_POT(*offset + (count ?
-         (count - 1) * g->geometry.aabbs.stride + 24 : 0), UINT64_C(256));
-      return true;
-   case VK_GEOMETRY_TYPE_INSTANCES_KHR:
-      layout->data = *offset;
-      *offset = ALIGN_POT(*offset + count * sizeof(VkAccelerationStructureInstanceKHR),
-                          UINT64_C(256));
-      return true;
-   default:
-      return false;
-   }
-}
-
-static uint32_t
-hk_host_as_read_index(const uint8_t *indices, VkIndexType type, uint64_t i)
-{
-   switch (type) {
-   case VK_INDEX_TYPE_UINT8_EXT:
-      return indices[i];
-   case VK_INDEX_TYPE_UINT16: {
-      uint16_t v;
-      memcpy(&v, indices + 2 * i, 2);
-      return v;
-   }
-   default: {
-      uint32_t v;
-      memcpy(&v, indices + 4 * i, 4);
-      return v;
-   }
-   }
-}
-
-static void
-hk_host_as_stage_geometry(struct hk_device *dev,
-                          VkAccelerationStructureGeometryKHR *g,
-                          VkAccelerationStructureBuildRangeInfoKHR *r,
-                          const struct hk_host_as_staging *layout,
-                          uint8_t *map, uint64_t va)
-{
-   const uint64_t count = r->primitiveCount;
-   r->primitiveOffset = 0;
-   r->firstVertex = 0;
-   r->transformOffset = 0;
-   if (!count) {
-      switch (g->geometryType) {
-      case VK_GEOMETRY_TYPE_TRIANGLES_KHR:
-         g->geometry.triangles.vertexData.deviceAddress = va;
-         g->geometry.triangles.indexData.deviceAddress = va;
-         g->geometry.triangles.transformData.deviceAddress = 0;
-         break;
-      case VK_GEOMETRY_TYPE_AABBS_KHR:
-         g->geometry.aabbs.data.deviceAddress = va;
-         break;
-      case VK_GEOMETRY_TYPE_INSTANCES_KHR:
-         g->geometry.instances.arrayOfPointers = VK_FALSE;
-         g->geometry.instances.data.deviceAddress = va;
-         break;
-      default:
-         break;
-      }
-      return;
-   }
-   switch (g->geometryType) {
-   case VK_GEOMETRY_TYPE_TRIANGLES_KHR: {
-      VkAccelerationStructureGeometryTrianglesDataKHR *t = &g->geometry.triangles;
-      const uint32_t fmt = vk_format_get_blocksize(t->vertexFormat);
-      const bool indexed = t->indexType != VK_INDEX_TYPE_NONE_KHR;
-      const uint8_t *src = (const uint8_t *)t->vertexData.hostAddress +
-                           (uint64_t)r->firstVertex * t->vertexStride +
-                           (indexed ? 0 : r->primitiveOffset);
-      if (layout->vertex_count)
-         memcpy(map + layout->vertices, src,
-                (layout->vertex_count - 1) * t->vertexStride + fmt);
-      if (indexed) {
-         const uint8_t *index_src = (const uint8_t *)t->indexData.hostAddress +
-                                    r->primitiveOffset;
-         uint32_t *dst = (uint32_t *)(map + layout->indices);
-         const uint32_t last = layout->vertex_count ? layout->vertex_count - 1 : 0;
-         for (uint64_t i = 0; i < count * 3; ++i)
-            dst[i] = MIN2(hk_host_as_read_index(index_src, t->indexType, i), last);
-         t->indexType = VK_INDEX_TYPE_UINT32;
-         t->indexData.deviceAddress = va + layout->indices;
-      } else {
-         t->indexData.deviceAddress = 0;
-      }
-      if (t->transformData.hostAddress) {
-         memcpy(map + layout->transform,
-                (const uint8_t *)t->transformData.hostAddress + r->transformOffset, 48);
-         t->transformData.deviceAddress = va + layout->transform;
-      }
-      t->vertexData.deviceAddress = va + layout->vertices;
-      t->maxVertex = layout->vertex_count ? layout->vertex_count - 1 : 0;
-      break;
-   }
-   case VK_GEOMETRY_TYPE_AABBS_KHR:
-      if (count)
-         memcpy(map + layout->data,
-                (const uint8_t *)g->geometry.aabbs.data.hostAddress + r->primitiveOffset,
-                (count - 1) * g->geometry.aabbs.stride + 24);
-      g->geometry.aabbs.data.deviceAddress = va + layout->data;
-      break;
-   case VK_GEOMETRY_TYPE_INSTANCES_KHR: {
-      const uint8_t *src = (const uint8_t *)g->geometry.instances.data.hostAddress +
-                           r->primitiveOffset;
-      VkAccelerationStructureInstanceKHR *dst =
-         (VkAccelerationStructureInstanceKHR *)(map + layout->data);
-      for (uint64_t i = 0; i < count; ++i) {
-         const void *instance = g->geometry.instances.arrayOfPointers ?
-            ((const void *const *)src)[i] : src + i * sizeof(*dst);
-         memcpy(&dst[i], instance, sizeof(*dst));
-         VK_FROM_HANDLE(vk_acceleration_structure, blas,
-                        (VkAccelerationStructureKHR)dst[i].accelerationStructureReference);
-         dst[i].accelerationStructureReference = blas ? hk_as_native_va(blas) : 0;
-      }
-      g->geometry.instances.arrayOfPointers = VK_FALSE;
-      g->geometry.instances.data.deviceAddress = va + layout->data;
-      break;
-   }
-   default:
-      break;
-   }
-}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_BuildAccelerationStructuresKHR(
@@ -2500,11 +2408,14 @@ hk_BuildAccelerationStructuresKHR(
          goto out;
       }
       uint8_t *map = agx_bo_map(staging);
-      for (uint32_t g = 0; g < info->geometryCount; ++g) {
-         const uint32_t j = k - info->geometryCount + g;
-         hk_host_as_stage_geometry(dev, &geometries[j], &ranges[j], &layouts[j],
-                                   map, staging->va->addr);
+      if (!map) {
+         result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         goto out;
       }
+      const uint32_t first = k - info->geometryCount;
+      hk_host_as_stage_geometries(info->geometryCount, geometries + first,
+                                  ranges + first, layouts + first, map,
+                                  staging->va->addr, bytes);
       infos[i].scratchData.deviceAddress = scratch->va->addr;
    }
 

@@ -188,11 +188,14 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    uint32_t alignment = 16384; /* Apple page size */
 
    struct hk_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
-   if (p_atomic_read(&heap->used) > heap->size)
+   if (pAllocateInfo->allocationSize > UINT64_MAX - (alignment - 1))
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
+   uint64_t used = p_atomic_read(&heap->used);
+   if (used > heap->size || aligned_size > heap->size - used)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    mem = vk_device_memory_create(&dev->vk, pAllocateInfo, pAllocator,
                                  sizeof(*mem));
@@ -215,6 +218,11 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       enum agx_bo_flags flags = 0;
       if (handle_types)
          flags |= AGX_BO_SHAREABLE;
+      /* A failed WSI export must not leave pinned backing in the BO cache.
+       * Successful exports already acquire AGX_BO_SHARED. */
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+          vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
+         flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
 
@@ -476,6 +484,8 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
       *pFD = agx_bo_export(&dev->dev, memory->bo);
+      if (*pFD < 0 && dev->dev.chip == AGX_CHIP_G17P)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       return VK_SUCCESS;
    default:
       assert(!"unsupported handle type");

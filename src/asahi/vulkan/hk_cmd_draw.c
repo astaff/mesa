@@ -29,6 +29,7 @@
 #include "agx_vdm_hal200_direct_draw_core.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
+#include "hk_native_vertex_template.h"
 #include "asahi/lib/agx_vdm_mesh_core.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -2732,6 +2733,9 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       cmd, pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT);
 
    render->flags = pRenderingInfo->flags;
+   /* The preceding suspended instance may have written storage memory. */
+   render->barrier_shader_writes =
+      (pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT) != 0;
    render->area = pRenderingInfo->renderArea;
    render->view_mask = pRenderingInfo->viewMask;
    render->layer_count = pRenderingInfo->layerCount;
@@ -3471,6 +3475,15 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    hk_sync_end_rendering(cmd);
 
+   /* Classic upstream submits each render after its predecessor. In
+    * particular, coherent advanced blending in a later render pass must
+    * load the earlier pass's stored colour without an application barrier.
+    * The native dependency tracker otherwise permits full-tile passes to
+    * overlap. Retain upstream ordering on AGX2, including across command
+    * buffers/submissions through the tracker's prior requirements. */
+   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev))
+      hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+
    if (continuable && !need_resolve && cs->end == end_before &&
        !vk_command_buffer_has_error(&cmd->vk)) {
       merge->cs = cs;
@@ -4128,6 +4141,13 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       grid_gs.count[0] = u_decomposed_prims_for_vertices(mode, draw.b.count[0]);
    }
 
+   /* A TES with native ray queries is launched with a direct grid bounding
+    * the tessellator's output; the kernel skips threads past the real count
+    * (hk_nir_lower_tes_variant()). See hk_tes_direct_query_threads(). */
+   if (gfx->shaders[MESA_SHADER_TESS_EVAL] && gfx->tess.tes_direct_threads &&
+       vs->b.info.uses_ray_traversal)
+      grid_vs = agx_1d(gfx->tess.tes_direct_threads);
+
    /* Launch the vertex shader first */
    if (agx_native_graphics(&dev->dev)) {
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs, wg);
@@ -4201,6 +4221,38 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          };
       }
    }
+}
+
+/*
+ * On G17P, TES ray queries read back zero both from the post-tessellation
+ * vertex program (an indexed indirect draw) and from Poly's TES-before-GS
+ * kernel (an indirect dispatch), even with a null acceleration structure.
+ * Queries issued from direct draws and dispatches (VS, TCS, GS, compute)
+ * work, and no other launch property distinguishes the TES. Give the TES
+ * kernel a direct grid: the tessellator decides the invocation count on the
+ * GPU, but every patch emits at most HK_TES_MAX_PATCH_INDICES of them, and
+ * the kernel skips invocations past the count it is given. Indirect API
+ * draws keep the indirect grid.
+ */
+#define HK_TES_MAX_PATCH_INDICES (4u * 64u * 64u * 3u)
+#define HK_TES_DIRECT_QUERY_MAX_THREADS (1u << 24)
+
+static uint32_t
+hk_tes_direct_query_threads(struct hk_cmd_buffer *cmd, struct agx_draw draw)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_shader *tes = hk_bound_sw_vs_before_gs(gfx);
+   const uint32_t patch_size =
+      cmd->vk.dynamic_graphics_state.ts.patch_control_points;
+
+   if (!tes || !tes->compiled || !tes->info.agx3_gen1_fragment_rq ||
+       !hk_tes_ray_queries_in_compute(hk_cmd_buffer_device(cmd)) ||
+       agx_is_indirect(draw.b) || !patch_size)
+      return 0;
+
+   const uint64_t threads = (uint64_t)(draw.b.count[0] / patch_size) *
+                            draw.b.count[1] * HK_TES_MAX_PATCH_INDICES;
+   return threads && threads <= HK_TES_DIRECT_QUERY_MAX_THREADS ? threads : 0;
 }
 
 static __attribute__((hot)) struct agx_draw
@@ -4363,20 +4415,6 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
       BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
 }
 
-static uint64_t
-hk_upload_constant_data(struct hk_cmd_buffer *cmd, struct hk_shader *s)
-{
-   if (!s || s->data_size == 0)
-      return 0;
-
-   uint64_t addr =
-      hk_pool_upload(cmd, s->data_ptr, s->data_size, HK_MIN_UBO_ALIGNMENT);
-   if (!addr)
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-
-   return addr;
-}
-
 static void
 hk_flush_shaders(struct hk_cmd_buffer *cmd)
 {
@@ -4448,10 +4486,10 @@ hk_flush_shaders(struct hk_cmd_buffer *cmd)
     * immutable data address actually changes.  In particular, equivalent
     * shader objects must not clone the root and invalidate both native IOTO
     * programs merely because their API handles differ. */
-   const uint64_t vs_constant_data_addr = hk_upload_constant_data(
-      cmd, hk_any_variant(gfx->shaders[MESA_SHADER_VERTEX]));
+   const uint64_t vs_constant_data_addr = hk_cmd_upload_constants(
+      cmd, hk_any_variant(gfx->shaders[MESA_SHADER_VERTEX]), MESA_SHADER_VERTEX);
    const uint64_t fs_constant_data_addr =
-      hk_upload_constant_data(cmd, fs);
+      hk_cmd_upload_constants(cmd, fs, MESA_SHADER_FRAGMENT);
    if (desc->root.draw.vs_constant_data_addr != vs_constant_data_addr) {
       desc->root.draw.vs_constant_data_addr = vs_constant_data_addr;
       desc->root_dirty = true;
@@ -7361,8 +7399,12 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    *key = (struct hk_fast_link_key_fs){
       .prolog.statistics = in->statistics,
       .prolog.cull_distance_size = in->cull_distance_size,
+      /* AGX2 must apply the API mask before an explicit-early main part
+       * counts samples, just as upstream does. Only the native path folds
+       * that mask into its forced-early coverage word. */
       .prolog.api_sample_mask =
-         has_sample_mask && !nontrivial_force_early && !defer_api_sample_mask
+         has_sample_mask && !defer_api_sample_mask &&
+               (!agx_native_graphics(&dev->dev) || !nontrivial_force_early)
             ? api_sample_mask
             : 0xff,
       .prolog.nr_samples = agx_native_graphics(&dev->dev) ? samples : 0,
@@ -7630,14 +7672,13 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                          : AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_NONINDEXED)
          : (draw.indexed ? AGX_VDM_STATE_UPDATE_DRAW_DIRECT_INDEXED
                          : AGX_VDM_STATE_UPDATE_DRAW_DIRECT_NONINDEXED);
-   /* RenderPipeline+0x2f0 is populated from isRasterizationEnabled; the
-    * selected template carries 0x30 when this is false on pre-HAL300.
-    * Software XFB stores live in the raster variant's vertex program, so it
-    * must use the live vertex template even when Vulkan discards
-    * rasterization.  The independently packed HAL200 PPP discard bits still
-    * suppress fragments. */
-   const bool rasterization_enabled =
-      !hk_rast_discard(cmd) || hk_g17p_xfb_vertex_side_effects(cmd, hw_vs);
+   /* RenderPipeline+0x2f0 selects the native vertex template. TES and GS
+    * raster variants can write external memory just like API vertex shaders
+    * and software XFB. Keep that program live when rasterization is discarded;
+    * the independently packed PPP discard bits still suppress fragments. */
+   const bool rasterization_enabled = hk_native_vertex_template_enabled(
+      hk_rast_discard(cmd), hw_vs->info.writes_external_memory,
+      hk_g17p_xfb_vertex_side_effects(cmd, hw_vs));
 
    /* Every encoder input except the pipeline address, which occupies only
     * the two-word pipeline pair at bytes 8..15 (agx_vdm_state_update_pack())
@@ -8016,12 +8057,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   /* If the vertex shader uses draw parameters, vertex uniforms are dirty every
-    * draw. Fragment uniforms are unaffected.
-    *
-    * For a direct draw, we upload the draw parameters as-if indirect to
-    * avoid keying to indirectness.
-    */
+   /* Direct draws use an immutable parameter block, reused while the values
+    * match. Indirect draws always retain the execution-time GPU pointer. */
    if (gfx->linked[MESA_SHADER_VERTEX]->b.uses_base_param) {
       if (agx_is_indirect(draw.b)) {
          gfx->draw_params = draw.b.ptr;
@@ -8034,13 +8071,9 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             gfx->draw_params += offsetof(VkDrawIndirectCommand, firstVertex);
          }
       } else {
-         uint32_t params[] = {
-            draw.indexed ? draw.index_bias : draw.start,
-            draw.start_instance,
-         };
-         memcpy(gfx->g17p_draw_params_value, params, sizeof(params));
-         gfx->g17p_draw_params_host_valid = true;
-         gfx->draw_params = hk_pool_upload(cmd, params, sizeof(params), 4);
+         hk_cmd_upload_draw_params(cmd,
+                                   draw.indexed ? draw.index_bias : draw.start,
+                                   draw.start_instance);
       }
    } else {
       gfx->draw_params = 0;
@@ -8048,13 +8081,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    if (sw_vs->b.info.uses_draw_id) {
-      gfx->g17p_draw_id_value = draw_id;
-      gfx->g17p_draw_id_host_valid = true;
-      /* Uploaded as a whole dword: the native G17P uniform range that
-       * publishes it is loaded in 32-bit units, so a two-byte allocation
-       * would leave the upper half of the loaded dword reading whatever
-       * followed it in the pool. The shader only consumes the low half. */
-      gfx->draw_id_ptr = hk_pool_upload(cmd, &draw_id, 4, 4);
+      hk_cmd_upload_draw_id(cmd, draw_id);
    } else {
       gfx->draw_id_ptr = 0;
       gfx->g17p_draw_id_host_valid = false;
@@ -8550,17 +8577,29 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
 
-   if (!IS_SHADER_DIRTY(VERTEX) && !IS_SHADER_DIRTY(GEOMETRY))
+   /* The TES decides as well, and the primitive the passthrough consumes
+    * comes from the merged TCS/TES state. */
+   if (!IS_SHADER_DIRTY(VERTEX) && !IS_SHADER_DIRTY(GEOMETRY) &&
+       (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P ||
+        (!IS_SHADER_DIRTY(TESS_CTRL) && !IS_SHADER_DIRTY(TESS_EVAL))))
       return;
 
    /* If there's an application geometry shader, there's nothing to un/bind */
    if (gs && !gs->is_passthrough)
       return;
 
-   /* Determine if we need a geometry shader to emulate XFB or adjacency */
+   /* Determine if we need a geometry shader to emulate XFB, or to rasterize
+    * a TES whose native ray queries run in its compute variant (the queries
+    * and the application's stores then execute before rasterization, and
+    * the passthrough's raster program replays outputs only). */
    struct hk_shader *last_sw = hk_bound_sw_vs_before_gs(gfx);
    uint32_t xfb_outputs = last_sw->info.xfb_info.output_count;
-   bool needs_gs = xfb_outputs;
+   const bool tes_rq = gfx->shaders[MESA_SHADER_TESS_EVAL] &&
+                       last_sw->compiled &&
+                       last_sw->info.agx3_gen1_fragment_rq &&
+                       hk_tes_ray_queries_in_compute(
+                          hk_cmd_buffer_device(cmd));
+   bool needs_gs = xfb_outputs || tes_rq;
 
    /* If we don't need a GS but we do have a passthrough, unbind it */
    if (!needs_gs) {
@@ -8874,6 +8913,8 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    hk_flush_dynamic_state(cmd, cs, draw_id, *draw,
                           ordinary_draw_path || g17p_transformed_path,
                           g17p_native_bind_tail_emitted);
+   cmd->state.gfx.render.barrier_shader_writes |=
+      gfx->shaders_write_memory || gfx->xfb_enabled;
    return cs;
 }
 
@@ -9250,9 +9291,99 @@ hk_draw_primitive_bound(const struct hk_cmd_buffer *cmd,
    return primitives * draw->b.count[1];
 }
 
+/* Scoped to one API multi-draw. There is no pending repair across API
+ * commands, barriers, or render stream changes. */
+struct hk_robust_index_batch {
+   struct agx_ptr jobs;
+   uint32_t count;
+   struct hk_cs *cs;
+   struct agx_draw draw;
+};
+
+static void
+hk_flush_robust_index_batch(struct hk_cmd_buffer *cmd,
+                            struct hk_robust_index_batch *batch)
+{
+   if (!batch->count || vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct agx_draw *draw = &batch->draw;
+   libagx_draw_robust_index_batch(cmd, agx_1d(32 * batch->count),
+                                  AGX_BARRIER_ALL | AGX_PREGFX, batch->jobs.gpu,
+                                  hk_heap(cmd),
+                                  dev->dev.printf_buffer_address,
+                                  draw->index_buffer,
+                                  draw->index_buffer_range_B, draw->restart,
+                                  agx_chip_record_family(dev->dev.chip),
+                                  cmd->state.gfx.topology, draw->index_size);
+   batch->cs->stats.robust_index_dispatches++;
+   batch->cs->stats.robust_index_batches++;
+   batch->count = 0;
+}
+
+static void
+hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     struct agx_draw draw, enum agx_primitive topology,
+                     bool tail_emitted, struct hk_robust_index_batch *batch)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   uint32_t draw_state_offset = 0;
+   if (agx_native_graphics(&dev->dev) && tail_emitted) {
+      struct agx_ptr draw_state = hk_pool_vdm_alloc(cmd, 8, 4);
+      if (!draw_state.cpu ||
+          !hk_g17p_upload_draw_indices(
+             draw_state.cpu, 8, draw_state.gpu, cs->scissor.size,
+             cs->depth_bias.size,
+             MAX2(cmd->vk.dynamic_graphics_state.vp.viewport_count, 1),
+             &draw_state_offset)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+   }
+
+   size_t size_B = libagx_draw_robust_index_vdm_size(
+      agx_chip_record_family(dev->dev.chip), tail_emitted);
+   uint64_t target = hk_cs_alloc_for_indirect(cs, size_B);
+
+   uint64_t empty_draw_jump = 0;
+   if (agx_native_graphics(&dev->dev)) {
+      const uint64_t compact = hk_g17p_vdm_compact(cmd, target + size_B);
+      if (!compact || compact >= (UINT64_C(1) << 40)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      empty_draw_jump = compact;
+   }
+
+   const struct libagx_robust_index_draw job = {
+      .vdm = target,
+      .command = draw.b.ptr,
+      .empty_draw_jump = empty_draw_jump,
+      .draw_state_offset = draw_state_offset,
+      .render_state_emitted = tail_emitted,
+   };
+   cs->stats.robust_index_draws++;
+   if (batch) {
+      assert(batch->count == 0 || batch->cs == cs);
+      ((struct libagx_robust_index_draw *)batch->jobs.cpu)[batch->count++] =
+         job;
+      batch->cs = cs;
+      batch->draw = draw;
+   } else {
+      libagx_draw_robust_index(
+         cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX, target, hk_heap(cmd),
+         dev->dev.printf_buffer_address, draw.b.ptr, draw.index_buffer,
+         draw.index_buffer_range_B, draw.restart,
+         agx_chip_record_family(dev->dev.chip), topology, draw_state_offset,
+         tail_emitted, empty_draw_jump, draw.index_size);
+      cs->stats.robust_index_dispatches++;
+   }
+}
+
 static __attribute__((hot)) void
-hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
-             struct agx_draw draw_)
+hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
+             struct hk_robust_index_batch *batch)
 {
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
@@ -9424,6 +9555,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          continue;
 
       cs->stats.calls++;
+      hk_upload_stat(cmd, draws, 1);
 
       if (geom || tess) {
          ccs =
@@ -9438,6 +9570,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       }
 
       if (tess) {
+         cmd->state.gfx.tess.tes_direct_threads =
+            hk_tes_direct_query_threads(cmd, draw);
          draw = hk_launch_tess(cmd, ccs, draw, geom ? 0 : stat_c_prims,
                                geom ? 0 : stat_c_inv);
       }
@@ -9577,49 +9711,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
             return;
          }
 
-         uint32_t draw_state_offset = 0;
-         if (agx_native_graphics(&dev->dev) &&
-             g17p_native_bind_tail_emitted) {
-            struct agx_ptr draw_state = hk_pool_vdm_alloc(cmd, 8, 4);
-            if (!draw_state.cpu ||
-                !hk_g17p_upload_draw_indices(
-                   draw_state.cpu, 8, draw_state.gpu, cs->scissor.size,
-                   cs->depth_bias.size,
-                   MAX2(cmd->vk.dynamic_graphics_state.vp.viewport_count, 1),
-                   &draw_state_offset)) {
-               vk_command_buffer_set_error(&cmd->vk,
-                                           VK_ERROR_FEATURE_NOT_PRESENT);
-               return;
-            }
-         }
-
-         size_t size_B = libagx_draw_robust_index_vdm_size(
-            agx_chip_record_family(dev->dev.chip),
-            g17p_native_bind_tail_emitted);
-         uint64_t target = hk_cs_alloc_for_indirect(cs, size_B);
-
-         uint64_t empty_draw_jump = 0;
-         if (agx_native_graphics(&dev->dev)) {
-            const uint64_t compact =
-               hk_g17p_vdm_compact(cmd, target + size_B);
-            if (!compact || compact >= (UINT64_C(1) << 40)) {
-               vk_command_buffer_set_error(&cmd->vk,
-                                           VK_ERROR_OUT_OF_DEVICE_MEMORY);
-               return;
-            }
-            empty_draw_jump = compact;
-         }
-
-         libagx_draw_robust_index(cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX,
-                                  target, hk_heap(cmd), draw.b.ptr,
-                                  draw.index_buffer, draw.index_buffer_range_B,
-                                  draw.restart,
-                                  agx_chip_record_family(dev->dev.chip),
-                                  topology,
-                                  draw_state_offset,
-                                  g17p_native_bind_tail_emitted,
-                                  empty_draw_jump,
-                                  draw.index_size);
+         hk_emit_robust_index(cmd, cs, draw, topology,
+                              g17p_native_bind_tail_emitted, batch);
       } else {
          if (agx_native_graphics(&dev->dev)) {
             if (!hk_g17p_emit_draw(cmd, cs, out, draw, topology,
@@ -9639,7 +9732,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id,
 static __attribute__((hot)) void
 hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw)
 {
-   hk_draw_impl(cmd, draw_id, draw);
+   hk_draw_impl(cmd, draw_id, draw, NULL);
 }
 
 static void
@@ -9709,6 +9802,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
    cs->current += AGX_VDM_MESH_DISPATCH_LENGTH;
 
    cs->stats.calls++;
+   hk_upload_stat(cmd, draws, 1);
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
@@ -9873,14 +9967,17 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
  * to do in hk_draw_impl() / hk_flush_gfx_state() /
  * hk_flush_dynamic_state_slow() except their own publication: no dirty
  * dynamic, shader, link, root, descriptor or vertex-buffer state, and none of
- * the transformed, robust, conditional, statistics, multiview, split or trace
- * paths.  That is every record after the first of an indexed-indirect
- * multi-draw.  In that state the general path reduces to exactly the sequence
+ * the transformed, conditional, statistics, multiview, split or trace paths.
+ * Ordinary emission also excludes robustness. In that state the general path
+ * reduces to exactly the sequence
  * in hk_g17p_emit_indirect_record() -- stream space, the record's draw
  * parameters, the vertex-program publication (hk_agx3_publish_vertex_state())
  * when the vertex shader reads draw parameters, then the draw record
- * (hk_g17p_emit_draw()) -- so records are emitted directly, byte for byte
- * what the general path emits.
+ * (hk_g17p_emit_draw()) -- so ordinary records are emitted directly, byte for
+ * byte what the general path emits. With allow_robust, the first record has
+ * already queued a repair job for this API multi-draw. The same proof admits
+ * later records' state publication followed by a reserved repair slot instead
+ * (hk_emit_robust_index); no other compute work or stream split intervenes.
  *
  * The check reads no per-record value except the indirect address, and
  * emitting a record changes none of what it reads, so a multi-draw checks it
@@ -9888,7 +9985,8 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
  */
 static bool
 hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
-                                  const struct agx_draw *draw)
+                                  const struct agx_draw *draw,
+                                  bool allow_robust)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -9935,7 +10033,7 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
            draw->index_size != AGX_INDEX_SIZE_U16 &&
            draw->index_size != AGX_INDEX_SIZE_U32) ||
           !draw->index_buffer ||
-          hk_needs_index_robustness(cmd, &robust_draw, NULL))
+          (!allow_robust && hk_needs_index_robustness(cmd, &robust_draw, NULL)))
          return false;
    }
 
@@ -9946,7 +10044,8 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
 static void
 hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
                              struct agx_draw draw, bool republishes,
-                             bool continuing)
+                             bool continuing,
+                             struct hk_robust_index_batch *batch)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -9986,11 +10085,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       gfx->g17p_draw_params_host_valid = false;
 
       if (sw_vs->b.info.uses_draw_id) {
-         /* The general path uploads the whole 32-bit draw index. */
-         const uint32_t draw_id_word = draw_id;
-         gfx->g17p_draw_id_value = draw_id_word;
-         gfx->g17p_draw_id_host_valid = true;
-         gfx->draw_id_ptr = hk_pool_upload(cmd, &draw_id_word, 4, 4);
+         hk_cmd_upload_draw_id(cmd, draw_id);
       } else {
          gfx->draw_id_ptr = 0;
          gfx->g17p_draw_id_host_valid = false;
@@ -10034,9 +10129,13 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       return;
 
    cs->stats.calls++;
-   if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
-                          tail_emitted))
+   hk_upload_stat(cmd, draws, 1);
+   if (batch) {
+      hk_emit_robust_index(cmd, cs, draw, gfx->topology, tail_emitted, batch);
+   } else if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
+                                 tail_emitted)) {
       return;
+   }
    hk_g17p_note_layer_zero_draw(cmd, cs);
    cs->stats.cmds++;
 }
@@ -10054,15 +10153,15 @@ hk_draw_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
        * nothing recorded since. */
       const bool continuing = *eligible > 0;
       if (*eligible < 0) {
-         *eligible = hk_g17p_indirect_records_eligible(cmd, &normalized)
-                        ? 1 : -1;
+         *eligible =
+            hk_g17p_indirect_records_eligible(cmd, &normalized, false) ? 1 : -1;
       }
       /* A zero indirect address is refused by the general path. */
       if (*eligible > 0 && normalized.b.ptr &&
           !vk_command_buffer_has_error(&cmd->vk)) {
-         hk_g17p_emit_indirect_record(
-            cmd, draw_id, normalized, hk_gfx_republishes_render_state(cmd),
-            continuing);
+         hk_g17p_emit_indirect_record(cmd, draw_id, normalized,
+                                      hk_gfx_republishes_render_state(cmd),
+                                      continuing, NULL);
          return;
       }
    }
@@ -10109,6 +10208,74 @@ hk_CmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
                           drawCount, stride);
 }
 
+/* The first record derives/flushes state through the general path. Once it
+ * has reached robustness, no helper follows it. Later records can join only
+ * when the existing indirect-record proof rules out all other compute work
+ * and stream splits. Otherwise publish the first repair before falling back.
+ * This also covers DrawIndexedIndirectCount after its count predication. */
+static bool
+hk_g17p_draw_robust_multi(struct hk_cmd_buffer *cmd, uint64_t buffer,
+                          uint32_t draw_count, uint32_t stride)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!agx_native_graphics(&dev->dev) || draw_count <= 1)
+      return false;
+
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct hk_addr_range buf = gfx->index.buffer;
+   struct agx_draw first =
+      agx_draw_indexed_indirect(buffer, buf.addr, buf.range, 0, 0);
+   hk_g17p_normalize_indirect_draw(cmd, &first);
+
+   if (gfx->render.view_mask || dyn->rs.depth_bias.enable ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       mesa_prim_has_adjacency(
+          vk_topology_to_mesa(dyn->ia.primitive_topology)) ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       gfx->descriptors.root.draw.pipeline_stats_flags ||
+       !hk_needs_index_robustness(cmd, &first, NULL))
+      return false;
+
+   /* maxDrawIndirectCount is UINT16_MAX; the grid has exactly one 32-lane
+    * workgroup per record and neither the byte allocation nor grid wraps. */
+   assert(draw_count <= UINT16_MAX);
+   struct hk_robust_index_batch batch = {
+      .jobs = hk_pool_alloc(
+         cmd, (size_t)draw_count * sizeof(struct libagx_robust_index_draw), 8),
+   };
+   if (!batch.jobs.cpu)
+      return true;
+
+   hk_draw_impl(cmd, 0, first, &batch);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return true;
+
+   const bool eligible =
+      batch.count == 1 && hk_g17p_indirect_records_eligible(cmd, &first, true);
+   if (!eligible)
+      hk_flush_robust_index_batch(cmd, &batch);
+
+   for (uint32_t i = 1; i < draw_count; ++i) {
+      struct agx_draw draw = first;
+      draw.b.ptr = buffer + (uint64_t)stride * i;
+      if (eligible) {
+         hk_g17p_emit_indirect_record(
+            cmd, i, draw, hk_gfx_republishes_render_state(cmd), i > 1, &batch);
+      } else {
+         hk_draw(cmd, i, draw);
+      }
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return true;
+   }
+
+   hk_flush_robust_index_batch(cmd, &batch);
+   return true;
+}
+
 static void
 hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
                                uint32_t drawCount, uint32_t stride)
@@ -10131,6 +10298,9 @@ hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
       assert(stride % 4 == 0);
       assert(stride >= sizeof(VkDrawIndexedIndirectCommand));
    }
+
+   if (hk_g17p_draw_robust_multi(cmd, buffer, drawCount, stride))
+      return;
 
    int eligible = agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ? -1 : 0;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {

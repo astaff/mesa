@@ -188,6 +188,9 @@ struct hk_shader {
    struct agx_shader_part b;
 
    struct hk_shader_info info;
+   /* G17P-only root prefix; serialized separately in its version-35 payload.
+    * Keep hk_shader_info and version-34 payloads unchanged on other chips. */
+   uint32_t root_descriptor_size;
    struct agx_fragment_face_2_packed frag_face;
    struct agx_counts_packed counts;
 
@@ -201,6 +204,8 @@ struct hk_shader {
 
    const void *data_ptr;
    uint32_t data_size;
+   /* Process-unique identity of the immutable payload, shared by cache clones. */
+   uint64_t constant_data_id;
 
    /* BO for any uploaded shader part */
    /* Code heap chunk holding the binary, at bo_offset. */
@@ -684,3 +689,6 @@ struct spirv_to_nir_options
 hk_get_spirv_options(struct vk_physical_device *vk_pdev,
                      UNUSED mesa_shader_stage stage,
                      const struct vk_pipeline_robustness_state *rs);
+
+/* True when a native TES ray query runs in Poly's compute variant. */
+bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);

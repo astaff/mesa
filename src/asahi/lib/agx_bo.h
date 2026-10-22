@@ -42,6 +42,10 @@ enum agx_bo_flags {
     * the userspace cache, clear it before returning it to the caller. */
    AGX_BO_ZERO_ON_REUSE = 1 << 6,
 
+   /* Short-lived backing whose release must immediately close the GEM handle,
+    * including objects which fail before their first successful export. */
+   AGX_BO_NO_CACHE = 1 << 7,
+
 };
 
 enum agx_va_flags {

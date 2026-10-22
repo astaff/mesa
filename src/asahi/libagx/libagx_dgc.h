@@ -251,7 +251,7 @@ agx_primitive_restart_index(enum agx_index_size index_size)
 static bool
 agx_direct_draw_overreads_indices(struct agx_draw d)
 {
-   uint32_t range_B = agx_indices_to_B(d.start + d.b.count[0], d.index_size);
+   uint64_t range_B = ((uint64_t)d.start + d.b.count[0]) << d.index_size;
    return range_B > d.index_buffer_range_B;
 }
 
@@ -813,8 +813,32 @@ agx_usc_words_precomp(GLOBAL uint32_t *out, CONST struct agx_shader *s,
 }
 
 static inline uint32_t
-agx_robust_index_clamped_count(uint32_t requested, uint32_t available)
+agx_robust_index_available(uint32_t first, uint32_t range_B,
+                           enum agx_index_size index_size)
 {
+   const uint64_t start_B = (uint64_t)first << index_size;
+   return start_B < range_B ? (range_B - start_B) >> index_size : 0;
+}
+
+/* Also used by host tests: copy exactly the accessible bytes, including a
+ * short or unaligned source, and zero every byte of the extension. A uint32
+ * index can require 128 bytes of padding, more than one byte per lane. */
+static inline void
+agx_robust_index_copy(GLOBAL uint8_t *dst, CONST uint8_t *src,
+                      uint32_t available_B, uint32_t output_B, uint32_t lane)
+{
+   for (uint64_t i = lane; i < output_B; i += 32)
+      dst[i] = i < available_B ? src[i] : 0;
+}
+
+static inline uint32_t
+agx_robust_index_clamped_count(uint32_t requested, uint32_t available,
+                                enum agx_primitive topology)
+{
+   /* Repeated zero indices are visible points, not degenerate primitives. */
+   if (topology == AGX_PRIMITIVE_POINTS)
+      return requested;
+
    const uint32_t limit =
       available > 0xffffffffu - 32
          ? 0xffffffffu
@@ -934,6 +958,18 @@ libagx_draw_robust_index_vdm_size(enum agx_chip chip,
 
    return size_B;
 }
+
+/* A batch shares its index binding, topology and heap. Every record keeps its
+ * own source arguments, VDM destination and native state/empty-draw link. */
+struct libagx_robust_index_draw {
+   uint64_t vdm;
+   uint64_t command;
+   uint64_t empty_draw_jump;
+   uint32_t draw_state_offset;
+   uint32_t render_state_emitted;
+};
+static_assert(sizeof(struct libagx_robust_index_draw) == 32,
+              "robust index batch host/device ABI");
 
 static inline unsigned
 libagx_remap_adj_count(unsigned count, enum mesa_prim prim)

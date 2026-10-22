@@ -259,6 +259,8 @@ struct hk_sync_state {
 struct hk_sync_queue {
    uint8_t ever[HK_SYNC_NUM_SQ];
    bool exact_prior;
+   /* G13/G14 retain upstream's order after both preceding engine prefixes. */
+   bool serialize;
    uint64_t submitted[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];

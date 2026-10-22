@@ -7,6 +7,9 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "hk_nir_lower_gs.h"
+#include "hk_nir_root_size.h"
+#include "hk_nir_lower_tes_rq.h"
 #include "hk_nir_sampler_bias.h"
 #include "hk_gen1_rt_indirect_contract.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
@@ -14,6 +17,7 @@
 #include "asahi/compiler/agx_nir_gen1_ray_query.h"
 #include "hk_nir_border_index.h"
 #include "util/u_debug.h"
+#include "util/u_atomic.h"
 
 #include "hk_nir_ray_tracing.h"
 #include "hk_nir_forward_image_stores.h"
@@ -2018,6 +2022,54 @@ hk_lower_multiview_stage(mesa_shader_stage stage,
    }
 }
 
+/* Select the query ABI from the stage that will execute the query. */
+static struct agx_gen1_ray_query_layout
+hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
+                         VkShaderStageFlags next_stage_mask)
+{
+   return (struct agx_gen1_ray_query_layout){
+      .payload_uniform = dev->gen1_rq_candidates ? 118 : 124,
+      .bvh_uniform = 96,
+      .status_uniform = dev->gen1_rq_candidates ? 128 :
+                        dev->gen1_rq_instances ? 130 : 128,
+      .instance_traversal = dev->gen1_rq_instances,
+      .candidates = dev->gen1_rq_candidates,
+      .as_table_first = dev->gen1_rq_instances ? HK_GEN1_AS_TABLE_AS_SLOTS : 1,
+      .launch_header = dev->gen1_rq_candidates ? 0x210000 : 0x110000,
+      .context_uniform = 160,
+      .as_table_uniform = 164,
+      .fragment_shader = dev->gen1_native_fragment_rq,
+      .graphics_stage = dev->gen1_native_graphics_rq &&
+         ((nir->info.stage == MESA_SHADER_VERTEX &&
+           !(next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                VK_SHADER_STAGE_GEOMETRY_BIT))) ||
+          (nir->info.stage == MESA_SHADER_TESS_EVAL &&
+           !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT))),
+      .compute_kernel = dev->gen1_native_graphics_rq,
+      .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch &&
+                        dev->gen1_vertex_directory != NULL,
+      .diagnostic_features = dev->vk.enabled_features.rayTracingPositionFetch,
+      .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
+         ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
+   };
+}
+
+/*
+ * A native ray query in the post-tessellation hardware vertex program does
+ * not execute on G17P: every query-bearing TES case reads back zero, even
+ * with a null acceleration structure, where no traversal is issued and only
+ * the result store remains. The same lowering, uniform layout and render
+ * state work for an API vertex shader drawn directly. Run such a TES in
+ * Poly's compute variant instead, whose query context is the one TCS, GS and
+ * compute queries use, and rasterize its outputs through a passthrough GS.
+ */
+bool
+hk_tes_ray_queries_in_compute(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17P &&
+          dev->gen1_native_rq && dev->gen1_native_graphics_rq;
+}
+
 static void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -2180,31 +2232,22 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * by the time the traversal reads a node through it, and before shared
     * memory is laid out, because the pass introduces shader temporaries that
     * nir_lower_vars_to_ssa still has to promote. */
-   if (nir->info.ray_queries > 0) {
+   /* Poly replays a GS in a hardware vertex shader. Keep native queries until
+    * that split so the raster variant gets the graphics query ABI and Poly
+    * cannot strip stores introduced by query lowering as API side effects.
+    */
+   /* A TES likewise has a hardware vertex variant and a CDM variant, so its
+    * native queries are lowered per variant in hk_compile_nir().
+    */
+   if (nir->info.ray_queries > 0 &&
+       !(dev->gen1_native_rq &&
+         (nir->info.stage == MESA_SHADER_GEOMETRY ||
+          nir->info.stage == MESA_SHADER_TESS_EVAL))) {
       if(dev->gen1_native_rq) {
          NIR_PASS(_, nir, nir_opt_ray_queries);
          NIR_PASS(_, nir, nir_opt_ray_query_ranges);
-         const struct agx_gen1_ray_query_layout layout={
-            .payload_uniform=dev->gen1_rq_candidates ? 118 : 124,.bvh_uniform=96,
-            .status_uniform=dev->gen1_rq_candidates ? 128 : dev->gen1_rq_instances ? 130 : 128,
-            .instance_traversal=dev->gen1_rq_instances,.candidates=dev->gen1_rq_candidates,
-            .as_table_first=dev->gen1_rq_instances ? HK_GEN1_AS_TABLE_AS_SLOTS : 1,
-            .launch_header = dev->gen1_rq_candidates ? 0x210000 : 0x110000,
-            .context_uniform=160,.as_table_uniform=164,
-            .fragment_shader=dev->gen1_native_fragment_rq,
-            .graphics_stage = dev->gen1_native_graphics_rq &&
-               ((nir->info.stage == MESA_SHADER_VERTEX &&
-                 !(next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
-                                      VK_SHADER_STAGE_GEOMETRY_BIT))) ||
-                (nir->info.stage == MESA_SHADER_TESS_EVAL &&
-                 !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT))),
-            .compute_kernel = dev->gen1_native_graphics_rq,
-            .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch &&
-                              dev->gen1_vertex_directory != NULL,
-            .diagnostic_features = dev->vk.enabled_features.rayTracingPositionFetch,
-            .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
-               ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
-         };
+         const struct agx_gen1_ray_query_layout layout =
+            hk_gen1_ray_query_layout(dev, nir, next_stage_mask);
          if(!agx_nir_lower_gen1_ray_query(nir,&layout)) {
             mesa_loge("Gen1 native ray query: unsupported shape or operation");
             return;
@@ -2364,6 +2407,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
 static VkResult
 hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 {
+   /* Allocator addresses can be recycled after a shader is destroyed while
+    * earlier commands still own an upload of its constants. Do not key those
+    * uploads by a shader or malloc pointer. This is not serialized. */
+   static uint64_t next_constant_data_id;
+   if (shader->data_size && !shader->constant_data_id)
+      shader->constant_data_id = p_atomic_inc_return(&next_constant_data_id);
+
    if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
       /* TODO: Do we wnat to compact? Revisit when we rework prolog/epilogs. */
       size_t size = shader->b.info.binary_size;
@@ -3352,7 +3402,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
          nir_export_agx(&b, mask, .base = AGX_ABI_FOUT_SAMPLE_MASK);
 
-         NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
+         NIR_PASS(_, nir, agx_nir_lower_to_per_sample_agx2);
       }
 
       /* Explicit interpolateAtSample() is not sample shading. Fold its
@@ -3391,7 +3441,19 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          shader->info.tess.tcs_output_stride = poly_tcs_output_stride(nir);
       } else {
          /* This destroys info so it needs to happen after the gather */
-         NIR_PASS(_, nir, poly_nir_lower_tes, hw);
+         struct agx_gen1_ray_query_layout rq_layout =
+            hk_gen1_ray_query_layout(dev, nir, 0);
+         if (!hk_nir_lower_tes_variant(nir, hw,
+                                       dev->gen1_native_rq ? &rq_layout
+                                                           : NULL)) {
+            ralloc_free(nir);
+            return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                             "Gen1 native TES ray query lowering failed");
+         }
+
+         /* The query-state flag above was gathered before this lowering. */
+         if (dev->gen1_native_graphics_rq)
+            shader->info.agx3_gen1_fragment_rq = hk_nir_has_ray_query(nir);
       }
    }
 
@@ -3466,6 +3528,20 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * lower_uniforms removes the load_root_agx markers. */
    if (agx_native_graphics(&dev->dev))
       shader->info.agx3_uses_root = hk_nir_uses_root(nir);
+
+   /* Measure while root markers are still explicit. Uniform lowering loads
+    * the root pointer and set bases separately, so retain that prefix too.
+    * Round up for native uniform/global load granularity. */
+   if (dev->dev.chip == AGX_CHIP_G17P)
+      shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
+   if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_COMPUTE) {
+      unsigned bytes = hk_nir_root_size(
+         nir, sizeof(struct hk_root_descriptor_table));
+      bytes = MAX2(bytes, hk_root_descriptor_offset(sets) +
+                            set_count * sizeof(uint64_t));
+      shader->root_descriptor_size = MIN2(
+         ALIGN_POT(bytes, 16), sizeof(struct hk_root_descriptor_table));
+   }
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
             nir_metadata_control_flow, &root);
@@ -4223,7 +4299,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    } else if (sw_stage == MESA_SHADER_VERTEX) {
       key = &key_tmp;
    } else if (sw_stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS(_, nir, poly_nir_lower_tcs, false);
+      NIR_PASS(_, nir, poly_nir_lower_tcs_with_options, false,
+               dev->dev.chip == AGX_CHIP_G17P);
    }
 
    
@@ -4415,8 +4492,21 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
 
-      NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
-               &count_variant->info.gs);
+      struct agx_gen1_ray_query_layout rq_layout =
+         hk_gen1_ray_query_layout(dev, nir, 0);
+      /* The raster replay is always a hardware vertex shader. */
+      rq_layout.graphics_stage = dev->gen1_native_graphics_rq;
+      if (!hk_nir_lower_gs(nir, &count, &rast, &pre_gs,
+                           &count_variant->info.gs,
+                           dev->gen1_native_rq ? &rq_layout : NULL)) {
+         ralloc_free(nir);
+         ralloc_free(count);
+         ralloc_free(rast);
+         ralloc_free(pre_gs);
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_errorf(dev, VK_ERROR_UNKNOWN,
+                          "Gen1 native GS ray query lowering failed");
+      }
 
       agx_preprocess_nir(count);
       agx_preprocess_nir(rast);
@@ -4473,6 +4563,14 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * shader for the purpose. Update the next_stage mask accordingly.
        */
       if (nir->xfb_info != NULL) {
+         next_stage |= VK_SHADER_STAGE_GEOMETRY_BIT;
+      }
+
+      /* Native TES ray queries execute in Poly's compute variant, which
+       * needs the software variant (see hk_tes_ray_queries_in_compute()).
+       */
+      if (sw_stage == MESA_SHADER_TESS_EVAL && nir->info.ray_queries > 0 &&
+          hk_tes_ray_queries_in_compute(dev)) {
          next_stage |= VK_SHADER_STAGE_GEOMETRY_BIT;
       }
 
@@ -5049,6 +5147,8 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
+   const uint32_t root_descriptor_size = dev->dev.chip == AGX_CHIP_G17P
+      ? blob_read_uint32(blob) : 0;
 
    struct agx_shader_info b_info;
    blob_copy_bytes(blob, &b_info, sizeof(b_info));
@@ -5082,6 +5182,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       shader->b.info = b_info;
       shader->info = info;
+      shader->root_descriptor_size = root_descriptor_size;
       shader->agx3_vdm_state_update = agx3_vdm_state_update;
       shader->b.info.binary_size = 0;
       return VK_SUCCESS;
@@ -5101,6 +5202,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 
    shader->b.info = b_info;
    shader->info = info;
+   shader->root_descriptor_size = root_descriptor_size;
    shader->agx3_vdm_state_update = agx3_vdm_state_update;
    shader->code_size = code_size;
    shader->data_size = data_size;
@@ -5204,7 +5306,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
 
-   if (!hk_agx3_shader_binary_version_supported(binary_version))
+   if (binary_version != hk_shader_binary_version(dev->dev.chip))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    mesa_shader_stage stage = blob_read_uint8(blob);
@@ -5565,7 +5667,10 @@ static void
 hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
                     struct blob *blob)
 {
+   struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
+   if (dev->dev.chip == AGX_CHIP_G17P)
+      blob_write_uint32(blob, shader->root_descriptor_size);
    blob_write_bytes(blob, &shader->b.info, sizeof(shader->b.info));
    if (!hk_agx3_vdm_program_cache_serialize(
           blob, &shader->agx3_vdm_state_update))
