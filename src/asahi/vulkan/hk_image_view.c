@@ -908,6 +908,22 @@ hk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
       return result;
    }
 
+   /* Compressed data only decodes through its own channel layout. Only a
+    * mutable image created without a format list under the
+    * hk_mutable_format_srgb_pair application option can reach this. */
+   const struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
+   if (view->plane_count == 1 && view->vk.aspects == VK_IMAGE_ASPECT_COLOR_BIT &&
+       !ail_is_view_compatible(
+          &image->planes[view->planes[0].image_plane].layout,
+          hk_format_to_pipe_format(view->vk.view_format))) {
+      mesa_loge_once("compressed %s image viewed as %s: the "
+                     "hk_mutable_format_srgb_pair assumption does not hold",
+                     util_format_short_name(
+                        hk_format_to_pipe_format(image->vk.format)),
+                     util_format_short_name(
+                        hk_format_to_pipe_format(view->vk.view_format)));
+   }
+
    /* Frame anatomy profiler: the formats that reinterpret a mutable image,
     * which its compression decision could not see without a format list. */
    const struct vk_image *vk_image = view->vk.image;

@@ -6,6 +6,7 @@
  */
 #include "hk_image.h"
 #include "hk_frame_anatomy.h"
+#include "hk_instance.h"
 #include "hk_g17p_compression.h"
 #include "agx_bg_eot_key.h"
 #include "hk_native_descriptor.h"
@@ -400,7 +401,7 @@ static bool
 hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
                 unsigned width, unsigned height, unsigned samples,
                 VkImageCreateFlagBits flags, VkImageUsageFlagBits usage,
-                const void *pNext, bool allow_agx3)
+                const void *pNext, bool allow_agx3, bool srgb_pair_views)
 {
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(format);
@@ -488,10 +489,19 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
       const struct VkImageFormatListCreateInfo *format_list =
          (void *)vk_find_struct_const(pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
 
-      if (!format_list || format_list->viewFormatCount == 0)
-         return false;
+      if (!format_list || format_list->viewFormatCount == 0) {
+         /* Without a list any compatible format may view the image, and
+          * compressed data only decodes through its own channel layout. The
+          * hk_mutable_format_srgb_pair application option asserts that only
+          * the format's sRGB/UNORM twin (same channels) will. */
+         const bool has_twin = util_format_srgb(p_format) != PIPE_FORMAT_NONE ||
+                               util_format_is_srgb(p_format);
+         if (!srgb_pair_views || !has_twin)
+            return false;
+      }
 
-      for (unsigned i = 0; i < format_list->viewFormatCount; ++i) {
+      for (unsigned i = 0; format_list && i < format_list->viewFormatCount;
+           ++i) {
          if (format_list->pViewFormats[i] == VK_FORMAT_UNDEFINED)
             continue;
 
@@ -588,7 +598,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
-                            bool float_image_atomics);
+                            bool float_image_atomics, bool srgb_pair_views);
 
 /* Whether shaders of this device may use atomics on R32_SFLOAT images. */
 static bool
@@ -667,7 +677,8 @@ hk_can_compress_format(const struct agx_device *dev, VkFormat format)
     */
    const bool g17p_shared = hk_g17p_shared_compression_supported(
       dev, format, VK_IMAGE_TYPE_2D, 0, 0, NULL);
-   return hk_can_compress(dev, format, 0, 64, 64, 1, 0, 0, NULL, g17p_shared);
+   return hk_can_compress(dev, format, 0, 64, 64, 1, 0, 0, NULL, g17p_shared,
+                          false);
 }
 
 bool
@@ -1139,7 +1150,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
          if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL) {
             for (unsigned plane = 0; plane < plane_count; ++plane) {
                can_compress |= hk_can_compress_create_info(
-                  &pdev->dev, plane, &device_copy_info, false);
+                  &pdev->dev, plane, &device_copy_info, false, false);
             }
          }
 
@@ -1238,7 +1249,7 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
 static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
-                            bool float_image_atomics)
+                            bool float_image_atomics, bool srgb_pair_views)
 {
    /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
     * AGX3 chips stay plain until their packets are recovered. */
@@ -1268,7 +1279,7 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                           info->extent.height, info->samples, info->flags,
                           m5_storage ? info->usage & ~VK_IMAGE_USAGE_STORAGE_BIT
                                      : info->usage,
-                          info->pNext, allow_agx3);
+                          info->pNext, allow_agx3, srgb_pair_views);
 }
 
 static enum ail_tiling
@@ -1299,8 +1310,10 @@ hk_map_compression(struct hk_device *dev, const VkImageCreateInfo *info,
       return false;
 
    case VK_IMAGE_TILING_OPTIMAL:
-      return hk_can_compress_create_info(&dev->dev, plane, info,
-                                         hk_float_image_atomics(dev));
+      return hk_can_compress_create_info(
+         &dev->dev, plane, info, hk_float_image_atomics(dev),
+         hk_physical_device_instance(hk_device_physical(dev))
+            ->drirc.misc.mutable_format_srgb_pair);
 
    case VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT:
       return ail_is_drm_modifier_compressed(modifier);
@@ -1351,7 +1364,7 @@ choose_drm_format_mod(struct hk_device *dev, uint8_t plane_count,
 
    for (uint8_t plane = 0; plane < plane_count; plane++) {
       if (!hk_can_compress_create_info(&dev->dev, plane, info,
-                                       hk_float_image_atomics(dev)))
+                                       hk_float_image_atomics(dev), false))
          can_compress = false;
    }
 
