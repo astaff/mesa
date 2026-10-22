@@ -505,6 +505,46 @@ TEST(AGX3FetchBanks, SplitSampleCoordinatesReplaceCollects)
    ralloc_free(mem);
 }
 
+/* The M5 3D publication stages its coordinates with the wide scalar COPY, so
+ * it reads them where they live instead of from fresh copies. */
+TEST(AGX3FetchBanks, ScalarPublicationReadsCoordinatesInPlace)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   agx_index c[3] = {agx_mov_imm(b, 32, 5), agx_mov_imm(b, 32, 7),
+                     agx_mov_imm(b, 32, 9)};
+   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 3);
+   agx_instr *collect = agx_collect_to(b, coords, 3);
+   for (unsigned i = 0; i < 3; ++i)
+      collect->src[i] = c[i];
+   agx_index result = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_texture_sample_to(b, result, coords, agx_immediate(0), agx_immediate(0),
+                         agx_uniform(24, AGX_SIZE_64),
+                         agx_uniform(28, AGX_SIZE_64), agx_null(), AGX_DIM_3D,
+                         AGX_LOD_MODE_AUTO_LOD, 15, false, false, false,
+                         AGX_GATHER_NONE, false);
+   agx_unit_test(b, result);
+
+   ASSERT_TRUE(agx3_lower_scalar_texture_publications(b->shader));
+   unsigned publications = 0, moves = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      moves += I->op == AGX_OPCODE_MOV;
+      if (I->op != AGX_OPCODE_PUBLISH_TEXTURE_SCALAR_AGX3)
+         continue;
+      ++publications;
+      for (unsigned i = 0; i < 3; ++i)
+         EXPECT_EQ(I->src[i].value, c[i].value);
+   }
+   EXPECT_EQ(publications, 1u);
+   EXPECT_EQ(moves, 0u);
+   ralloc_free(mem);
+}
+
 TEST(AGX3UniformALU, VertexTextureUniformQualification)
 {
    /* Both operands name the same aligned uniform, a witnessed

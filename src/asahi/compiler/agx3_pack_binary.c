@@ -10451,11 +10451,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             if (retire) {
                /* The mask covers this publication's source producers. An
                 * unrelated r0 generation can still be pending, so carry
-                * the wait on the first coordinate instead of modifying r0. */
-               uint8_t bytes[AGX3_ALU_MAX_LENGTH], len = 0;
-               if (!agx3_alu_band_identity_wait(enc, I->src[0].value, retire,
-                                               bytes, &len) ||
-                   !agx3_append(emission, bytes, len))
+                * the wait on the first coordinate instead of modifying r0.
+                * A wide M5 coordinate may live above half 192, which only
+                * the halfword identity reaches. */
+               if (!agx3_retire_wait_on(emission, enc, I->src[0], retire))
                   AGX3_REFUSE(I);
             }
             outstanding &= (uint16_t)~retire;

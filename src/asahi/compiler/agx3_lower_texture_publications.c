@@ -9,6 +9,8 @@
 #include "util/u_debug.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(m5_scalar_3d_coords, "ASAHI_M5_SCALAR_3D_COORDS", true)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
+                           "ASAHI_M5_WIDE_SCALAR_SOURCES", true)
 
 struct publication {
    agx_index coordinates, reference;
@@ -502,9 +504,12 @@ agx3_lower_scalar_texture_publications(agx_context *ctx)
                }
                agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
                agx_index px = x, py = y, pz = reference;
-               if (m5) {
-                  /* Keep long-lived values unconstrained. Only the actual
-                   * publication operands need the low source bank. */
+               /* The M5 publication stages x, y and z with the wide scalar
+                * COPY, which reads the whole register file, so it reads
+                * them where they live. Only the seven-bit form needs its
+                * operands in the low source bank; copies keep long-lived
+                * values out of that constraint. */
+               if (m5 && !debug_get_option_m5_wide_scalar_sources()) {
                   px = agx_mov(&b, x);
                   py = agx_mov(&b, y);
                   pz = agx_mov(&b, reference);
