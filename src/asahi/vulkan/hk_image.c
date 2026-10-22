@@ -395,6 +395,14 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    if (dev->debug & AGX_DBG_NOCOMPRESS)
       return false;
 
+   /* Copies must preserve the packed word, including non-canonical shared
+    * exponents and NaN payloads. The R32_UINT copy view cannot decode these
+    * formats' compression classes. Apply this to modifier queries too, so
+    * imported images cannot reintroduce a compressed packed-float surface.
+    */
+   if (hk_agx2_packed_float_copy(dev->chip, format))
+      return false;
+
    /* AGX3 compresses only what hk_g17p_compression_eligible() admitted
     * (allow_agx3). That excludes images shared through DRM modifiers or
     * external memory, so hk_can_compress_format() -- which decides whether

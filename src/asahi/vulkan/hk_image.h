@@ -205,6 +205,19 @@ hk_split_depth_stencil(VkFormat format)
           format == VK_FORMAT_D16_UNORM_S8_UINT;
 }
 
+/* Neither packed float representation round-trips all storage bits through
+ * float channels (NaN payloads in R11G11B10, shared exponents in RGB9E5).
+ * AGX2 transfers use an R32_UINT view instead. Such a view requires an
+ * uncompressed image: lossless compression is channel-class dependent.
+ */
+static inline bool
+hk_agx2_packed_float_copy(enum agx_chip chip, VkFormat format)
+{
+   return agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
+          (format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+           format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32);
+}
+
 static inline VkFormat
 hk_depth_stencil_plane_format(VkFormat format, unsigned plane)
 {

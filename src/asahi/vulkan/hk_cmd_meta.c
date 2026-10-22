@@ -741,6 +741,14 @@ canonical_format(VkFormat fmt)
 
 static inline VkFormat hk_meta_bitwise_copy_format(VkFormat format);
 
+static VkFormat
+hk_meta_compute_copy_format(struct vk_device *device, VkFormat format)
+{
+   const struct hk_device *dev = container_of(device, struct hk_device, vk);
+   return hk_agx2_packed_float_copy(dev->dev.chip, format)
+             ? VK_FORMAT_R32_UINT : canonical_format(format);
+}
+
 /*
  * Copy view for a losslessly compressed G17P colour plane.
  *
@@ -1259,7 +1267,7 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
           * alias used for plain G17P copies is incompatible with, for example,
           * a compressed RGBA8 image. Preserve its compression class. */
          VkFormat canonical =
-            !g17p_color ? canonical_format(aspect_fmt)
+            !g17p_color ? hk_meta_compute_copy_format(device, aspect_fmt)
             : hk_image->planes[plane].layout.compressed
                ? hk_meta_compressed_copy_format(aspect_fmt)
                : hk_meta_bitwise_copy_format(aspect_fmt);
@@ -1470,7 +1478,7 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
       for (unsigned layer_offs = 0; layer_offs < layer_iters; ++layer_offs) {
          VkImageAspectFlags aspect = region->imageSubresource.aspectMask;
          VkFormat aspect_fmt = aspect_format(image->format, aspect);
-         VkFormat canonical = canonical_format(aspect_fmt);
+         VkFormat canonical = hk_meta_compute_copy_format(device, aspect_fmt);
          enum pipe_format p_format = hk_format_to_pipe_format(aspect_fmt);
          uint32_t blocksize_B = util_format_get_blocksize(p_format);
          bool is_3d = region->imageExtent.depth > 1;
@@ -1481,8 +1489,7 @@ hk_meta_copy_buffer_to_image2(struct vk_command_buffer *cmd,
             .block_size = blocksize_B,
             .nr_samples = image->samples,
             .src_format = hk_format_to_pipe_format(canonical),
-            .dst_format = canonical_format_pipe(
-               hk_format_to_pipe_format(aspect_format(image->format, aspect))),
+            .dst_format = hk_format_to_pipe_format(canonical),
 
             /* TODO: MSAA path */
             .block_based =
@@ -1629,7 +1636,7 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
              * to follow the source.
              */
             VkFormat aspect_fmt = aspect_format(src_image->format, 1 << aspect);
-            VkFormat canonical = canonical_format(aspect_fmt);
+            VkFormat canonical = hk_meta_compute_copy_format(device, aspect_fmt);
             uint32_t blocksize_B =
                util_format_get_blocksize(hk_format_to_pipe_format(canonical));
 
@@ -1649,8 +1656,8 @@ hk_meta_copy_image2(struct vk_command_buffer *cmd, struct vk_meta_device *meta,
                .block_size = blocksize_B,
                .nr_samples = dst_image->samples,
                .src_format = hk_format_to_pipe_format(canonical),
-               .dst_format = canonical_format_pipe(hk_format_to_pipe_format(
-                  aspect_format(dst_image->format, dst_aspect_mask))),
+               .dst_format = hk_format_to_pipe_format(hk_meta_compute_copy_format(
+                  device, aspect_format(dst_image->format, dst_aspect_mask))),
 
                /* TODO: MSAA path */
                .block_based = (dst_image->image_type != VK_IMAGE_TYPE_1D) &&
@@ -1822,14 +1829,21 @@ hk_meta_bitwise_copy_format(VkFormat format)
 }
 
 static inline struct vk_meta_copy_image_properties
-hk_meta_copy_get_image_properties(struct hk_image *img, bool g17p)
+hk_meta_copy_get_image_properties(struct hk_image *img, struct hk_device *dev)
 {
+   bool g17p = agx_native_graphics(&dev->dev);
+   const bool agx2 =
+      agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
    /* Keep the existing multisample render-target formats: G17P's native
     * multisample tile path does not support these integer aliases yet. */
    g17p &= img->vk.samples == VK_SAMPLE_COUNT_1_BIT;
    struct vk_meta_copy_image_properties props = {
       .tile_size = {16, 16, 1},
-      .depth_stencil_aspect_views = g17p && hk_split_depth_stencil(img->vk.format),
+      /* D32/S8 and D16/S8 are separate allocations on AGX2 too. Selecting
+       * COLOR instead of the original aspect would view the depth plane as
+       * interleaved RG32 data and lose the stencil plane altogether. */
+      .depth_stencil_aspect_views =
+         (g17p || agx2) && hk_split_depth_stencil(img->vk.format),
    };
    const struct vk_format_ycbcr_info *ycbcr =
       vk_format_get_ycbcr_info(img->vk.format);
@@ -1868,7 +1882,8 @@ hk_meta_copy_get_image_properties(struct hk_image *img, bool g17p)
             hk_format_to_pipe_format(props.color.view_format)));
       } else {
          props.color.view_format =
-            (g17p || vk_format_is_compressed(img->vk.format))
+            (g17p || hk_agx2_packed_float_copy(dev->dev.chip, img->vk.format) ||
+             vk_format_is_compressed(img->vk.format))
                ? hk_meta_bitwise_copy_format(img->vk.format)
                : img->vk.format;
       }
@@ -3525,8 +3540,7 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
 
    if (gfx) {
       struct vk_meta_copy_image_properties dst_props =
-         hk_meta_copy_get_image_properties(dst_image,
-                                          agx_native_graphics(&dev->dev));
+         hk_meta_copy_get_image_properties(dst_image, dev);
 
       if (agx_native_graphics(&dev->dev)) {
          /* Native single-slice EOT views already select the mip and array
@@ -3785,11 +3799,9 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
 
    if (gfx) {
       struct vk_meta_copy_image_properties src_props =
-         hk_meta_copy_get_image_properties(src_image,
-                                          agx_native_graphics(&dev->dev));
+         hk_meta_copy_get_image_properties(src_image, dev);
       struct vk_meta_copy_image_properties dst_props =
-         hk_meta_copy_get_image_properties(dst_image,
-                                          agx_native_graphics(&dev->dev));
+         hk_meta_copy_get_image_properties(dst_image, dev);
 
       if (agx_native_graphics(&dev->dev)) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
