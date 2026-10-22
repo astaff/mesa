@@ -56,7 +56,7 @@ Pressure and successful-rendering qualification remain required on each target.
 
 ## Host checks
 
-Build both Gallium Asahi and Honeykrisp with `-Dbuild-tests=true`, then run:
+Build both Gallium Asahi and Borealis with `-Dbuild-tests=true`, then run:
 
 ```
 ninja -C build -j8

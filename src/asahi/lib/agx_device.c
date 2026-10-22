@@ -908,13 +908,13 @@ agx_open_device(void *memctx, struct agx_device *dev)
                  dev->params.num_clusters_total);
       } else if (dev->chip == AGX_CHIP_G17P) {
          fprintf(stderr,
-                 "Apple G17P kernel contract does not match Honeykrisp "
+                 "Apple G17P kernel contract does not match this driver "
                  "(USC %u, HAL %u; expected USC 3, HAL 200)\n",
                  dev->params.usc_generation,
                  dev->params.gpu_hal_generation);
       } else if (dev->chip == AGX_CHIP_G15C) {
          fprintf(stderr,
-                 "Apple G15C kernel parameters do not match Honeykrisp "
+                 "Apple G15C kernel parameters do not match this driver "
                  "(chip %#x, %u dies, %u clusters, USC %u, HAL %u; expected "
                  "chip 0x6031, 1 die, 4 clusters, USC 3, HAL 0)\n",
                  dev->params.chip_id, dev->params.num_dies,
