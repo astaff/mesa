@@ -1139,9 +1139,18 @@ zink_init_screen_caps(struct zink_screen *screen)
 
    /* 1<<27 is required by VK spec */
    assert(screen->info.props.limits.maxStorageBufferRange >= 1 << 27);
-   /* clamp to VK spec minimum */
    caps->max_shader_buffer_size =
       MIN2(get_smallest_buffer_heap(screen), screen->info.props.limits.maxStorageBufferRange);
+
+   /* GLSL std140 rounds the block extent to its base alignment (up to
+    * 32 bytes for double vectors). G17P Honeykrisp advertises INT32_MAX,
+    * so an otherwise valid member near the limit can round the block past
+    * the limit and overflow its signed size. Expose complete alignment
+    * units on this device, leaving the other Honeykrisp paths unchanged.
+    */
+   if (zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP &&
+       screen->info.props.deviceID == 0x8140)
+      caps->max_shader_buffer_size &= ~31u;
 
    caps->fs_coord_origin_upper_left = true;
    caps->fs_coord_pixel_center_half_integer = true;
