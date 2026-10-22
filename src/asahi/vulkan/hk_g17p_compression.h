@@ -463,8 +463,14 @@ hk_m5_depth_msaa_compression_eligible(enum agx_chip chip, unsigned plane,
    const uint64_t capability = DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+   /* The stencil plane of D32_SFLOAT_S8_UINT compresses with depth where the
+    * kernel admits compressed multisample stencil. */
+   const bool plane_ok =
+      plane == 0 ||
+      (plane == 1 && info && info->format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
+       (kernel_features & DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION));
    return opted_in && (kernel_features & capability) &&
-          agx_chip_g17_m5(chip) && plane == 0 && info && !info->pNext &&
+          agx_chip_g17_m5(chip) && plane_ok && info && !info->pNext &&
           info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
           info->arrayLayers == 1 && info->mipLevels == 1 &&
           (info->samples == VK_SAMPLE_COUNT_2_BIT ||
