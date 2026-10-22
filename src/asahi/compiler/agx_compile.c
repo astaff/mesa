@@ -9440,11 +9440,22 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
          (ctx->stage == MESA_SHADER_VERTEX || !ctx->is_preamble)) ||
         (key->g17p_uniform_dma && out->agx3_uniform_dma_count)) &&
        !(agx_compiler_debug & AGX_DBG_NOOPT)) {
+      /* AGX3B main programs use the pressure-aware CSE, which merges only
+       * while the earlier result is still live. Uniform source lowering
+       * copies a uniform into a GPR for each operation that cannot read it in
+       * place, so a value used by a run of selects is copied once per select,
+       * and each copy is read right after it is made. On G17P, also merge
+       * such copies where that keeps the register pressure within the
+       * shader's existing peak. */
       if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
-          ctx->stage != MESA_SHADER_VERTEX)
-         AGX_PASS(ctx, agx_opt_cse_pressure);
-      else
+          ctx->stage != MESA_SHADER_VERTEX) {
+         if (key->dev.chip == AGX_CHIP_G17P)
+            AGX_PASS(ctx, agx_opt_cse_bounded);
+         else
+            AGX_PASS(ctx, agx_opt_cse_pressure);
+      } else {
          AGX_PASS(ctx, agx_opt_cse);
+      }
    }
 
    if (native_cprog && ctx->is_preamble &&
