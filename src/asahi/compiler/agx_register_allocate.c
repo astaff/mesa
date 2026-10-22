@@ -1043,11 +1043,12 @@ pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
 /*
  * G17P texture and image results, texture coordinates and moves from the
  * uniform file name seven-bit half-register fields, so they live in halves
- * 0..127. Lowest first, every other value lands there too, and in a shader at
- * the limit of the register file each constrained definition then evicts an
- * unconstrained value from the low bank. The moved values sit in different
- * registers on the two sides of the next merge, which costs a copy per value
- * at the join.
+ * 0..127, as do M5 texture coordinates, sin/cos operands and its other
+ * bank-constrained values. Lowest first, every other value lands there too,
+ * and in a shader at the limit of the register file each constrained
+ * definition then evicts an unconstrained value from the low bank. The moved
+ * values sit in different registers on the two sides of the next merge, which
+ * costs a copy per value at the join.
  *
  * Once a shader spills, every register up to the bound is in use somewhere,
  * so where a value goes no longer changes the register count. Put values
@@ -1060,11 +1061,13 @@ static bool
 prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
                  enum ra_class cls, unsigned minimum, unsigned limit)
 {
-   if (rctx->shader->key->dev.chip != AGX_CHIP_G17P ||
+   const enum agx_chip chip = rctx->shader->key->dev.chip;
+   if ((chip != AGX_CHIP_G17P && !agx_chip_g17_m5(chip)) ||
        !rctx->shader->has_spill_pcopy_reserved || cls != RA_GPR ||
        minimum != 0 || limit != rctx->bound[cls] ||
        limit <= G17P_LOW_BANK_HALVES ||
-       ssa_has_bank_constraint(rctx, I->dest[d].value))
+       (chip == AGX_CHIP_G17P &&
+        ssa_has_bank_constraint(rctx, I->dest[d].value)))
       return false;
 
    const agx_instr *use = rctx->src_to_collect_phi[I->dest[d].value];
