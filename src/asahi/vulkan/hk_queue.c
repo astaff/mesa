@@ -1478,6 +1478,23 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                 (cs->sync.barrier[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
                  cs->sync.prior[HK_SYNC_VDM] != 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+
+            /* Likewise for compute: when the vertex half depends on less
+             * compute work than the fragment half (image-only producers
+             * ordered by image barriers, fragment-only destinations), the
+             * kernel orders the tiling half after that prefix alone. */
+            STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_stage_prior) ==
+                          sizeof(struct drm_asahi_cmd_render_with_prior) + 16);
+            const bool stage_cdm =
+               agx_chip_g17_m5(dev->dev.chip) && queue->sync.exact_prior &&
+               (dev->dev.params.features &
+                DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS) &&
+               cs->sync.ta_split &&
+               (cs->sync.barrier_ta[HK_SYNC_CDM] !=
+                   cs->sync.barrier[HK_SYNC_CDM] ||
+                cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
+            if (stage_cdm)
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_COMPUTE_STAGE_BARRIERS;
             if (unlikely(anatomy))
                hk_frame_anatomy_render(anatomy, dev, cs, &cmd.legacy, i,
                                        nr_vdm + nr_cdm, payload.size);
@@ -1507,6 +1524,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                header.size = sizeof(extended);
                util_dynarray_append(&payload, header);
                util_dynarray_append_array(&payload, uint8_t, &extended, header.size);
+            } else if (stage_cdm) {
+               const struct drm_asahi_cmd_render_with_stage_prior staged = {
+                  .legacy = cmd,
+                  .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
+                  .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+               };
+               header.size = sizeof(staged);
+               util_dynarray_append(&payload, header);
+               util_dynarray_append_array(&payload, uint8_t, &staged,
+                                          header.size);
             } else {
                util_dynarray_append(&payload, header);
                util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
