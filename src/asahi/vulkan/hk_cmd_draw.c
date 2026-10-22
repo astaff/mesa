@@ -8881,24 +8881,37 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       }
       const struct agx_ppp_hal300_graphics_core state = pack->state;
 
-      struct agx_ptr upload = hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
-      if (!upload.cpu)
-         return;
-      memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
-
-      uint8_t records[AGX_PPP_HAL300_GRAPHICS_RECORDS * AGX_PPP_STATE_LENGTH];
-      uint8_t *cursor = records;
+      /* Each record is a self-contained PPP update and the PPP keeps the
+       * others, so only the records that differ from what the stream latched
+       * are emitted. Every record the PPP processes stalls tiling for about
+       * 50 ns, close to half a microsecond per draw for the whole core. */
+      unsigned changed = 0;
       for (unsigned i = 0; i < AGX_PPP_HAL300_GRAPHICS_RECORDS; ++i) {
-         if (!hk_ppp_emit_state(dev->dev.chip, &cursor,
-                                  upload.gpu + state.offsets[i],
-                                  state.lengths[i])) {
-            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         if (!cs->m5_ppp_emitted_valid ||
+             memcmp(cs->m5_ppp_emitted_state.bytes + state.offsets[i],
+                    state.bytes + state.offsets[i], state.lengths[i]))
+            changed |= BITFIELD_BIT(i);
+      }
+
+      if (changed) {
+         struct agx_ptr upload =
+            hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
+         if (!upload.cpu)
             return;
+         memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
+
+         u_foreach_bit(i, changed) {
+            if (!hk_ppp_emit_state(dev->dev.chip, out,
+                                   upload.gpu + state.offsets[i],
+                                   state.lengths[i])) {
+               vk_command_buffer_set_error(&cmd->vk,
+                                           VK_ERROR_FEATURE_NOT_PRESENT);
+               return;
+            }
          }
       }
-      memcpy(*out, records, sizeof(records));
-      *out += sizeof(records);
       cs->m5_ppp_emitted = fields;
+      cs->m5_ppp_emitted_state = state;
       cs->m5_ppp_emitted_valid = true;
       return;
    }
