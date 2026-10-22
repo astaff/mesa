@@ -690,6 +690,8 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
    }
    if (cs->anatomy_vs_other)
       HK_FA_APPEND(" vs_other=%u", cs->anatomy_vs_other);
+   if (cs->anatomy_covered)
+      HK_FA_APPEND(" cov=%x", cs->anatomy_covered);
    if (cs->anatomy_republish)
       HK_FA_APPEND(" st=r%u:v%u:n%u:p%u", cs->anatomy_republish,
                    cs->anatomy_vdm, cs->anatomy_vdm_new, cs->anatomy_ppp);

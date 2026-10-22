@@ -1233,6 +1233,8 @@ struct hk_cs {
     * vertex-program state updates and how many named a program other than
     * the stream's previous one, and PPP state records emitted. */
    uint32_t anatomy_republish, anatomy_vdm, anatomy_vdm_new, anatomy_ppp;
+   /* Colour attachments whose load the first draw made unnecessary. */
+   uint8_t anatomy_covered;
    uint64_t anatomy_last_program;
    uint64_t anatomy_api_src, anatomy_api_dst;
    uint64_t anatomy_api_src_access, anatomy_api_dst_access;

@@ -3326,6 +3326,7 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->cr.bg.main = bg_main;
    cs->cr.eot.main = eot_main;
    cs->cr.eot.partial = eot_partial;
+   cs->anatomy_covered = covered;
    perf_debug(cmd, "Dropped untouched colour attachments 0x%x, loads of "
               "covered attachments 0x%x", elide, covered);
 }
@@ -3352,7 +3353,8 @@ hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    render->first_draw_seen = true;
    render->color_covered = 0;
-   if (dev->dev.chip != AGX_CHIP_G17P || cmd->in_meta ||
+   if ((dev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(dev->dev.chip)) ||
+       cmd->in_meta ||
        cs != render->zls_first_cs || cs->stats.cmds || cs->m5_continued_pass ||
        hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
                                        cmd->conditional_meta) ||

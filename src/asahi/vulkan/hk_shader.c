@@ -4162,7 +4162,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    const bool writes_external_memory = hk_shader_writes_external_memory(nir);
    const bool reads_images = hk_shader_reads_images(nir);
    /* Facts hk_g17p_note_first_draw() needs, before lowering obscures them. */
-   if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_FRAGMENT)
+   if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+       sw_stage == MESA_SHADER_FRAGMENT)
       shader->info.fs.may_kill = hk_fs_may_kill(nir);
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
@@ -5368,7 +5369,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
     * never qualifies then. */
    const bool vs_covers_clip_square =
       vs_covers >= 0 ? vs_covers > 0
-                     : dev->dev.chip == AGX_CHIP_G17P &&
+                     : (dev->dev.chip == AGX_CHIP_G17P ||
+                        agx_chip_g17_m5(dev->dev.chip)) &&
                           info->stage == MESA_SHADER_VERTEX &&
                           !info->nir->info.io_lowered &&
                           hk_vs_covers_clip_square(info->nir);
@@ -6388,7 +6390,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          }
       }
 
-      vs_covers[i] = dev->dev.chip == AGX_CHIP_G17P &&
+      vs_covers[i] = (dev->dev.chip == AGX_CHIP_G17P ||
+                      agx_chip_g17_m5(dev->dev.chip)) &&
                      nir->info.stage == MESA_SHADER_VERTEX &&
                      hk_vs_covers_clip_square(nir);
       if (!hk_m5_mesh_task_grid(dev, nir, info->flags)) {
