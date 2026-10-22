@@ -1433,7 +1433,7 @@ pick_phi_edge_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
                        unsigned count, unsigned align, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       rctx->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+       !agx_isa_is_agx3(rctx->shader->key->dev.encoding))
       return false;
    enum ra_class cls = ra_class_for_index(I->dest[d]);
    unsigned first = ~0u;
