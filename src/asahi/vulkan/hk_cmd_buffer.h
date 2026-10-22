@@ -863,6 +863,12 @@ struct hk_cs {
     * stream ends first (hk_m5_ordered_draw_hazard()). */
    bool m5_ordered;
 
+   /* M5: every attachment of the continued instances is in an
+    * attachment-only layout, so no descriptor can access one of them and
+    * descriptor sets bound for graphics need not end an ordered continuation
+    * (hk_m5_attachments_exclude_descriptors()). */
+   bool m5_layout_proof;
+
    /* Scratch requirements */
    struct {
       union {

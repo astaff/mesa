@@ -2420,15 +2420,30 @@ hk_m5_pass_merge_dependency(VkPipelineStageFlags2 src_stages,
    return transition ? HK_M5_MERGE_DEP_END : HK_M5_MERGE_DEP_ORDERED;
 }
 
+static bool hk_m5_image_is_attachment(const struct hk_rendering_state *render,
+                                      const struct vk_image *image);
+
 static void
 hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
                           VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
                           VkAccessFlags2 dst_access, bool buffer,
-                          bool transition)
+                          bool transition, const struct vk_image *image)
 {
    struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
    if (!m->valid)
       return;
+
+   /* hk performs no work for a layout transition: of an image that is not an
+    * attachment of the candidate and cannot alias one, it only orders the
+    * image's accesses, as the barrier's scopes describe. A transition of an
+    * attachment, or an ownership transfer, changes what the continued
+    * instance would load. */
+   if (transition && image &&
+       hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P &&
+       !hk_m5_image_is_attachment(&m->render, image) &&
+       !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
+                                VK_IMAGE_CREATE_SPARSE_BINDING_BIT)))
+      transition = false;
 
    switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
                                        transition)) {
@@ -2452,21 +2467,23 @@ hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
       hk_m5_pass_merge_classify(cmd, "memory", b->srcStageMask,
                                 b->dstStageMask, b->dstAccessMask, false,
-                                false);
+                                false, NULL);
    }
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       hk_m5_pass_merge_classify(
          cmd, "buffer", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
-         true, b->srcQueueFamilyIndex != b->dstQueueFamilyIndex);
+         true, b->srcQueueFamilyIndex != b->dstQueueFamilyIndex, NULL);
    }
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      VK_FROM_HANDLE(vk_image, image, b->image);
       hk_m5_pass_merge_classify(
          cmd, "image", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
          false,
          b->oldLayout != b->newLayout ||
-            b->srcQueueFamilyIndex != b->dstQueueFamilyIndex);
+            b->srcQueueFamilyIndex != b->dstQueueFamilyIndex,
+         b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ? NULL : image);
    }
 }
 
@@ -2521,6 +2538,51 @@ hk_m5_ordered_attachment_refusal(const VkRenderingAttachmentInfo *info,
    return NULL;
 }
 
+/* An image subresource accessed through a descriptor must be in the layout
+ * the descriptor was written with, and no sampled-image, combined, storage or
+ * input-attachment descriptor may name an attachment-only layout
+ * (VkDescriptorImageInfo::imageLayout valid usage). */
+static bool
+hk_m5_layout_excludes_descriptors(VkImageLayout layout)
+{
+   switch (layout) {
+   case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Whether no descriptor can access an attachment of the instance while it
+ * renders: every attachment is in an attachment-only layout. Both instances
+ * of a continuation use the same layouts (hk_m5_ordered_attachment_refusal()),
+ * so this holds for the merged pass. Taken on G17P. */
+static bool
+hk_m5_attachments_exclude_descriptors(const struct hk_cmd_buffer *cmd,
+                                      const VkRenderingInfo *info)
+{
+   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P)
+      return false;
+
+   const VkRenderingAttachmentInfo *ds[] = {info->pDepthAttachment,
+                                            info->pStencilAttachment};
+   for (unsigned i = 0; i < ARRAY_SIZE(ds); ++i) {
+      if (ds[i] && ds[i]->imageView &&
+          !hk_m5_layout_excludes_descriptors(ds[i]->imageLayout))
+         return false;
+   }
+   for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+      const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
+      if (att->imageView && !hk_m5_layout_excludes_descriptors(att->imageLayout))
+         return false;
+   }
+   return true;
+}
+
 /*
  * An ordered continuation (HK_M5_MERGE_DEP_ORDERED) is memory-equivalent to
  * the two instances when:
@@ -2539,10 +2601,13 @@ hk_m5_ordered_attachment_refusal(const VkRenderingAttachmentInfo *info,
  *    which the first instance's store would have written and the merged
  *    pass writes only at its end: the attachments are in the same layouts in
  *    both instances, none is in a feedback loop, none can alias another
- *    resource, no descriptor set (whose contents this command buffer cannot
- *    see) is bound for graphics, and no graphics push descriptor recorded so
- *    far names an attachment image; later ones end the stream
- *    (hk_m5_pass_merge_note_push(), hk_m5_pass_merge_note_set_bind()).
+ *    resource, and either every attachment is in an attachment-only layout,
+ *    which no descriptor may name (hk_m5_attachments_exclude_descriptors()),
+ *    or no descriptor set (whose contents this command buffer cannot see) is
+ *    bound for graphics; no graphics push descriptor recorded so far names an
+ *    attachment image, and later ones, or later set binds without the layout
+ *    proof, end the stream (hk_m5_pass_merge_note_push(),
+ *    hk_m5_pass_merge_note_set_bind()).
  *
  * Attachment accesses themselves are ordered by the tile pass, as for a
  * framebuffer-local dependency.
@@ -2573,9 +2638,11 @@ hk_m5_ordered_refusal(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    if (why)
       return why;
 
-   for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
-      if (desc->sets[s] && !(desc->push_active & BITFIELD_BIT(s)))
-         return "descriptor set bound";
+   if (!hk_m5_attachments_exclude_descriptors(cmd, info)) {
+      for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
+         if (desc->sets[s] && !(desc->push_active & BITFIELD_BIT(s)))
+            return "descriptor set bound";
+      }
    }
 
    if (cmd->m5_pushed_images) {
@@ -2629,7 +2696,7 @@ void
 hk_m5_pass_merge_note_set_bind(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.gfx;
-   if (unlikely(cs && cs->m5_ordered))
+   if (unlikely(cs && cs->m5_ordered && !cs->m5_layout_proof))
       cmd->state.m5_ordered_split = true;
 }
 
@@ -2765,6 +2832,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
    cs->g17p_pass_ends = false;
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
+   cs->m5_layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
    cmd->state.m5_ordered_split = false;
    cmd->current_cs.gfx = cs;
 
