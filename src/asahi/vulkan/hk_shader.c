@@ -1307,8 +1307,8 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
 
 struct global_load_lowering {
    bool soft_fault;
-   /* G17P: storage-buffer loads use the soft-fault form as well: load, then
-    * zero the value when the access is out of bounds. */
+   /* G17P and M5: storage-buffer loads use the soft-fault form as well:
+    * load, then zero the value when the access is out of bounds. */
    bool storage_result_select;
    /* M5 diagnostic: single-word bounded loads become predicated loads. */
    bool predicated;
@@ -2957,7 +2957,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    }
    struct global_load_lowering global_loads = {
       .soft_fault = agx_has_soft_fault(&dev->dev),
-      .storage_result_select = dev->dev.chip == AGX_CHIP_G17P,
+      .storage_result_select = dev->dev.chip == AGX_CHIP_G17P ||
+                               agx_chip_g17_m5(dev->dev.chip),
       .predicated = agx_chip_isa_encoding(dev->dev.chip) ==
          AGX_ISA_ENCODING_AGX3C &&
          nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
