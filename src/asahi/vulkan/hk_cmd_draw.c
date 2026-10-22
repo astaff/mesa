@@ -2107,6 +2107,15 @@ hk_g17p_zls_attachment_none(const VkRenderingAttachmentInfo *att)
            att->resolveMode == VK_RESOLVE_MODE_NONE);
 }
 
+static bool
+hk_stencil_face_writes(const struct vk_stencil_test_face_state *face)
+{
+   return face->write_mask &&
+          (face->op.fail != VK_STENCIL_OP_KEEP ||
+           face->op.pass != VK_STENCIL_OP_KEEP ||
+           face->op.depth_fail != VK_STENCIL_OP_KEEP);
+}
+
 static inline void
 hk_g17p_note_depth_use(struct hk_cmd_buffer *cmd)
 {
@@ -2120,12 +2129,23 @@ hk_g17p_note_depth_use(struct hk_cmd_buffer *cmd)
       render->g17p_zls_touched |= VK_IMAGE_ASPECT_DEPTH_BIT;
    if (dyn->ds.stencil.test_enable)
       render->g17p_zls_touched |= VK_IMAGE_ASPECT_STENCIL_BIT;
+
+   /* Depth is written only with the depth test enabled (Vulkan 1.4, "Depth
+    * Test"), stencil only with the stencil test enabled, a nonzero write
+    * mask and an operation other than KEEP for a face ("Stencil Test"). */
+   if (dyn->ds.depth.test_enable && dyn->ds.depth.write_enable)
+      render->g17p_zls_written |= VK_IMAGE_ASPECT_DEPTH_BIT;
+   if (dyn->ds.stencil.test_enable &&
+       (hk_stencil_face_writes(&dyn->ds.stencil.front) ||
+        hk_stencil_face_writes(&dyn->ds.stencil.back)))
+      render->g17p_zls_written |= VK_IMAGE_ASPECT_STENCIL_BIT;
 }
 
 void
 hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
 {
    cmd->state.gfx.render.g17p_zls_touched |= aspects;
+   cmd->state.gfx.render.g17p_zls_written |= aspects;
 }
 
 /* Drop each untouched plane independently. Using stencil must not let an
@@ -2161,6 +2181,35 @@ hk_g17p_zls_elide(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
          control.s_load_tiling = control.s_store_tiling = 0;
          control.s_resolve = false;
       }
+      agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
+         cfg = control;
+      }
+   }
+}
+
+/* An elidable aspect that the pass tested but no draw or clear could have
+ * changed holds, at the end of the pass, exactly what the pass loaded or what
+ * memory already held: drop its store from every stream. Earlier streams of
+ * a split pass then reload from memory that still holds the same values, and
+ * a firmware partial render, which forces load and store, writes back the
+ * unchanged tile. */
+static void
+hk_g17p_zls_elide_store(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
+{
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   if (!aspects || !render->zls_first_cs)
+      return;
+   bool found = false;
+   list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+      if (cs == render->zls_first_cs)
+         found = true;
+      if (!found || cs->type != HK_CS_VDM)
+         continue;
+      agx_unpack(NULL, &cs->cr.zls_control, ZLS_CONTROL, control);
+      if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+         control.z_store = false;
+      if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+         control.s_store = false;
       agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
          cfg = control;
       }
@@ -3065,6 +3114,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    const bool agx3 = agx_chip_native_agx3(dev->dev.chip);
    render->zls_precise = agx3 && z_layout != NULL;
    render->g17p_zls_touched = 0;
+   render->g17p_zls_written = 0;
    render->g17p_zls_elide_mask = 0;
    if (agx3 && !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
                                  VK_RENDERING_RESUMING_BIT))) {
@@ -3426,6 +3476,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    /* Apply after the final control word, including already closed streams. */
    hk_g17p_zls_elide(cmd, zls_elided);
+   hk_g17p_zls_elide_store(cmd, render->g17p_zls_elide_mask &
+                                   render->g17p_zls_touched &
+                                   ~render->g17p_zls_written);
 
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
@@ -9817,6 +9870,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
       gfx->mesh.object_params = hk_pool_upload(cmd, &params, sizeof(params), 8);
    }
    gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_MESH);
+   hk_g17p_note_depth_use(cmd);
    struct agx_draw dummy = {.b = agx_1d(3)};
    bool robust = false, tail = false;
    struct hk_cs *cs = hk_flush_gfx_state(cmd, draw_id, &dummy, &robust,
