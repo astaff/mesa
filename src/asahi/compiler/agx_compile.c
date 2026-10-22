@@ -8404,6 +8404,20 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
       *preamble_size = sizes[0];
 
+      /* M5: check the constant program's constant-offset buffer reads past
+       * 255 bytes in words, so their ends stay immediates
+       * (agx_nir_lower_word_bounds.c). The main program keeps its checks.
+       * A uniform DMA launch drops the byte checks of the reads it copies by
+       * matching their byte form, so leave those programs alone. */
+      if (m5 && !(dma_key && dma_key->g17p_uniform_dma)) {
+         bool words = false;
+         NIR_PASS(words, nir, agx_nir_lower_word_bounds);
+         if (words) {
+            NIR_PASS(_, nir, nir_opt_cse);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
+
       /* Copy what the launch can copy into the uniforms the constant
        * program leaves free, which then computes on the copies instead of
        * loading. Copying first would take uniforms the constant program's
