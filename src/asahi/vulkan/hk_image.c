@@ -537,11 +537,13 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
  * layout, the same layout colour attachments use, so a storage image may also
  * be a colour attachment and a transfer destination: end-of-tile stores,
  * shader image stores, clears and uploads all write it through compressed PBE
- * descriptors. Bits select RGBA16F, RG16F, R16F, R32F, RG32F, RGBA32F, RGBA8
- * UNORM, the other RGBA16 formats, the other RG16 formats and the other RGBA8
- * formats, respectively; zero retains the uncompressed diagnostic control. */
+ * descriptors. Bits 0-10 select RGBA16F, RG16F, R16F, R32F, RG32F, RGBA32F,
+ * RGBA8 UNORM, the other RGBA16 formats, the other RG16 formats, the other
+ * RGBA8 formats and the other R16 formats, respectively; bit 12 admits
+ * mipmapped images, whose levels compress as those of colour attachments
+ * do. Zero retains the uncompressed diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
-                         "ASAHI_M5_STORAGE_COMPRESSION", 1023)
+                         "ASAHI_M5_STORAGE_COMPRESSION", 6143)
 
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
@@ -566,7 +568,9 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
        (info->flags & ~allowed_flags) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
        info->extent.width < 16 || info->extent.height < 16 ||
-       info->mipLevels != 1 || info->arrayLayers != 1 ||
+       (info->mipLevels != 1 &&
+        !(debug_get_option_m5_storage_compression() & 4096)) ||
+       info->arrayLayers != 1 ||
        info->samples != VK_SAMPLE_COUNT_1_BIT ||
        info->tiling != VK_IMAGE_TILING_OPTIMAL ||
        !(info->usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
@@ -601,6 +605,10 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R8G8B8A8_SNORM:
    case VK_FORMAT_R8G8B8A8_UINT:
    case VK_FORMAT_R8G8B8A8_SINT: bit = 512; break;
+   case VK_FORMAT_R16_UNORM:
+   case VK_FORMAT_R16_SNORM:
+   case VK_FORMAT_R16_UINT:
+   case VK_FORMAT_R16_SINT: bit = 1024; break;
    default: return false;
    }
    /* A mutable image's views may be FLOAT when the image is not: the list
