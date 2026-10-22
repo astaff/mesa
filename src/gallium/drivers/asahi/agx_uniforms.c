@@ -4,6 +4,7 @@
  */
 #include <stdio.h>
 #include "pipe/p_state.h"
+#include "util/format/u_format.h"
 #include "util/half_float.h"
 #include "util/macros.h"
 #include "agx_device.h"
@@ -134,6 +135,16 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
          unif->custom_border_sampler_handle[s] = handle;
          memcpy(unif->custom_border[s], st->samplers[s]->custom_border,
                 sizeof(unif->custom_border[s]));
+
+         if (dev->chip == AGX_CHIP_G17P) {
+            const struct pipe_sampler_state *sampler = &st->samplers[s]->base;
+            const struct util_format_description *desc =
+               util_format_description(sampler->border_color_format);
+            unif->custom_border_compare_func[s] = sampler->compare_func;
+            if (util_format_has_depth(desc) &&
+                desc->channel[0].type != UTIL_FORMAT_TYPE_FLOAT)
+               unif->custom_border_compare_func[s] |= AGX_BORDER_COMPARE_CLAMP_REF;
+         }
       }
    }
 

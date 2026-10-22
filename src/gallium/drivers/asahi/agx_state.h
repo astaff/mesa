@@ -206,7 +206,14 @@ struct PACKED agx_stage_uniforms {
 
    /* LOD bias as float16 */
    uint16_t lod_bias[PIPE_MAX_SAMPLERS];
+
+   /* G17P shadow-gather border comparison, in pipe_compare_func order. Kept
+    * after the existing fields so classic shader bindings do not move. Each
+    * halfword has padding for Ioto's dword upload, including sampler 31. */
+   uint32_t custom_border_compare_func[PIPE_MAX_SAMPLERS];
 };
+
+#define AGX_BORDER_COMPARE_CLAMP_REF BITFIELD_BIT(8)
 
 /* In the architecture, there are 512 uniform registers, each 16-bits. In a
  * theoretical worst case, we could push to all of them. We use a worst-case
@@ -1136,6 +1143,7 @@ struct agx_lower_bindings_options {
    bool *uses_bindless_samplers;
    bool g17p_plain_txf_crawl;
    bool g17p_native_sampler_handles;
+   bool g17p_shadow_gather;
    bool g17p_bindless_storage;
    unsigned image_records;
    unsigned bindful_sampler_count;
@@ -1143,7 +1151,7 @@ struct agx_lower_bindings_options {
 
 bool agx_nir_lower_bindings(nir_shader *shader,
                        struct agx_lower_bindings_options *options);
-bool agx_nir_lower_custom_border_g17p(nir_shader *shader);
+bool agx_nir_lower_custom_border_g17p(nir_shader *shader, bool shadow_gather);
 bool agx_nir_rebind_g17p_texture_crawls(nir_shader *shader);
 bool agx_nir_lower_g17p_storage_records(nir_shader *shader,
                                         unsigned record_size_B);

@@ -77,6 +77,26 @@ if with_tests and with_tools.contains('drm-shim')
     ),
     suite : ['asahi'],
   )
+  test(
+    'asahi-g17p-shadow-border',
+    executable(
+      'asahi-g17p-shadow-border',
+      files('tests/test-agx-g17p-shadow-border.c'),
+      include_directories : [
+        inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+        inc_virtio_gpu, inc_virtio_vdrm,
+      ],
+      dependencies : [
+        idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+        idep_libagx_shaders_h, idep_xmlconfig,
+      ],
+      link_with : [
+        libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+        libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+      ],
+    ),
+    suite : ['asahi'],
+  )
 
   asahi_vs_query_test = executable(
     'asahi-vs-query',

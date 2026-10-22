@@ -365,7 +365,7 @@ check_query_lod_custom_border_bindings(void)
          nir_tex_instr_src_index(query, nir_tex_src_sampler_handle);
       assert(handle_idx >= 0);
       nir_def *handle = query->src[handle_idx].src.ssa;
-      const bool lowered = agx_nir_lower_custom_border_g17p(nir);
+      const bool lowered = agx_nir_lower_custom_border_g17p(nir, true);
       unsigned count = 0;
       for (unsigned i = 0; i < query->num_srcs; ++i) {
          if (query->src[i].src_type == nir_tex_src_sampler_handle) {
