@@ -440,6 +440,12 @@ struct hk_rendering_state {
     * hk_g17p_elide_untouched_color(). */
    uint8_t color_written;
    bool color_read;
+
+   /* G17P: the pass's first draw was seen, and the colour attachments it
+    * overwrote at every sample before anything could read them. See
+    * hk_g17p_note_first_draw(). */
+   bool first_draw_seen;
+   uint8_t color_covered;
 };
 
 struct hk_index_buffer_state {

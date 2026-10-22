@@ -73,7 +73,12 @@ struct hk_shader_info {
          uint32_t attribs_read;
          BITSET_DECLARE(attrib_components_read, AGX_MAX_ATTRIBS * 4);
          bool use_prolog;
-         uint8_t _pad[7];
+         /* G17P: the shader places the three vertices of a draw that starts
+          * at vertex 0 and instance 0 by the vertex index alone, on a
+          * triangle covering the whole clip-space square in front of the
+          * viewer (hk_vs_covers_clip_square()). */
+         bool covers_clip_square;
+         uint8_t _pad[6];
       } vs;
 
       struct {
@@ -97,7 +102,10 @@ struct hk_shader_info {
           * "this part tests" (hk_fs_key::static_tests); its epilog must not
           * discard. */
          bool static_tests;
-         uint8_t _pad[4];
+         /* G17P: the shader may leave pixels unwritten: it discards, demotes
+          * or writes the sample mask. */
+         bool may_kill;
+         uint8_t _pad[3];
       } fs;
 
       struct {

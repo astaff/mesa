@@ -2243,7 +2243,7 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       return;
 
    VkRenderingAttachmentInfo atts[HK_MAX_RTS], bg_atts[HK_MAX_RTS];
-   uint8_t elide = 0;
+   uint8_t elide = 0, covered = 0;
    for (uint32_t i = 0; i < render->color_att_count; ++i) {
       const struct hk_attachment *att = &render->color_att[i];
       if (att->load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
@@ -2264,9 +2264,17 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
          atts[i].imageView = VK_NULL_HANDLE;
          bg_atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
          elide |= BITFIELD_BIT(i);
+      } else if (att->iview && att->load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
+                 (render->color_covered & BITFIELD_BIT(i))) {
+         /* The first draw overwrites every sample before anything reads
+          * it (hk_g17p_note_first_draw()): start the tile cleared instead of
+          * loading it. The stores, and the partial render's reload of what
+          * an earlier tile pass stored, are unchanged. */
+         bg_atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+         covered |= BITFIELD_BIT(i);
       }
    }
-   if (!elide)
+   if (!elide && !covered)
       return;
 
    const bool incomplete_render_area =
@@ -2295,7 +2303,98 @@ hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    cs->cr.bg.main = bg_main;
    cs->cr.eot.main = eot_main;
    cs->cr.eot.partial = eot_partial;
-   perf_debug(cmd, "Dropped untouched colour attachments 0x%x", elide);
+   perf_debug(cmd, "Dropped untouched colour attachments 0x%x, loads of "
+              "covered attachments 0x%x", elide, covered);
+}
+
+/* G17P: a pass whose first draw is a direct, non-indexed, single-instance draw
+ * of vertices 0..2, by a vertex shader that places them on a triangle covering
+ * the clip-space square (hk_vs_covers_clip_square()), under a viewport and
+ * scissor that cover the render area, writes every sample of each colour
+ * attachment its fragment shader writes opaquely before anything can read it:
+ * no test can reject a fragment, the fragment shader cannot kill one, and the
+ * attachment's whole write mask is enabled without blending or logic ops.
+ * D3D translation layers load every render target they were not told to clear
+ * or discard, so their full-screen post-processing passes otherwise read each
+ * target only to overwrite it. hk_g17p_elide_untouched_color() turns the
+ * load of those attachments into a clear. */
+static void
+hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                        struct agx_draw draw)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_rendering_state *render = &gfx->render;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   render->first_draw_seen = true;
+   render->color_covered = 0;
+   if (dev->dev.chip != AGX_CHIP_G17P || cmd->in_meta ||
+       cs != render->zls_first_cs || cs->stats.cmds || cs->m5_continued_pass ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       agx_is_indirect(draw.b) || draw.indexed || draw.b.count[0] != 3 ||
+       draw.b.count[1] != 1 || draw.start || draw.start_instance ||
+       render->view_mask || render->layer_count > 1 ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->shaders[MESA_SHADER_MESH])
+      return;
+
+   const struct hk_shader *vs = hk_bound_hw_vs(gfx);
+   const struct hk_shader *fs = hk_bound_fs(cmd);
+   if (!vs || !vs->info.vs.covers_clip_square || !fs ||
+       fs->info.fs.may_kill || fs->b.info.reads_tib)
+      return;
+
+   const unsigned samples = MAX2(dyn->ms.rasterization_samples, 1);
+   const VkPrimitiveTopology topology = dyn->ia.primitive_topology;
+   if ((topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+        topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP &&
+        topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) ||
+       dyn->rs.rasterizer_discard_enable ||
+       dyn->rs.cull_mode != VK_CULL_MODE_NONE ||
+       dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
+       dyn->ms.alpha_to_coverage_enable || dyn->cb.logic_op_enable ||
+       (dyn->ms.sample_mask & BITFIELD_MASK(samples)) != BITFIELD_MASK(samples))
+      return;
+
+   if ((render->depth_att.iview &&
+        ((dyn->ds.depth.test_enable &&
+          dyn->ds.depth.compare_op != VK_COMPARE_OP_ALWAYS) ||
+         dyn->ds.depth.bounds_test.enable)) ||
+       (render->stencil_att.iview && dyn->ds.stencil.test_enable))
+      return;
+
+   const VkRect2D area = render->area;
+   const float ax0 = area.offset.x, ay0 = area.offset.y;
+   const float ax1 = ax0 + area.extent.width, ay1 = ay0 + area.extent.height;
+   if (dyn->vp.viewport_count != 1 || dyn->vp.scissor_count != 1)
+      return;
+   const VkViewport *vp = &dyn->vp.viewports[0];
+   if (MIN2(vp->x, vp->x + vp->width) > ax0 ||
+       MAX2(vp->x, vp->x + vp->width) < ax1 ||
+       MIN2(vp->y, vp->y + vp->height) > ay0 ||
+       MAX2(vp->y, vp->y + vp->height) < ay1)
+      return;
+   const VkRect2D *sc = &dyn->vp.scissors[0];
+   if (sc->offset.x > area.offset.x || sc->offset.y > area.offset.y ||
+       (int64_t)sc->offset.x + sc->extent.width < ax1 ||
+       (int64_t)sc->offset.y + sc->extent.height < ay1)
+      return;
+
+   uint8_t covered = 0;
+   for (uint32_t i = 0; i < render->color_att_count; ++i) {
+      const struct hk_attachment *att = &render->color_att[i];
+      if (!att->iview || !(gfx->fast_link_fs.color_written & BITFIELD_BIT(i)) ||
+          dyn->cb.attachments[i].blend_enable)
+         continue;
+      const unsigned channels = util_format_get_nr_components(
+         vk_format_to_pipe_format(att->iview->vk.format));
+      if ((dyn->cb.attachments[i].write_mask & BITFIELD_MASK(channels)) ==
+          BITFIELD_MASK(channels))
+         covered |= BITFIELD_BIT(i);
+   }
+   render->color_covered = covered;
 }
 
 static void
@@ -9829,6 +9928,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          return;
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
+      if (unlikely(!cmd->state.gfx.render.first_draw_seen))
+         hk_g17p_note_first_draw(cmd, cs, draw_);
 
       /* Each view's draw counts: multiview replays the draw per view. */
       cs->g17p_primitive_bound =
