@@ -1231,6 +1231,36 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          ? hk_frame_anatomy_begin_submit(dev, queue, command_count)
          : NULL;
 
+   /* Anatomy: which waits are still unsignalled at submission; the kernel
+    * holds every command of the submission until they signal. */
+   if (unlikely(anatomy) && submit->wait_count) {
+      unsigned timeline = 0, pending = 0, pending_timeline = 0;
+      for (unsigned i = 0; i < submit->wait_count; ++i) {
+         struct vk_sync *sync = submit->waits[i].sync;
+         if (!vk_sync_type_is_drm_syncobj(sync->type))
+            continue;
+         uint32_t handle = vk_sync_as_drm_syncobj(sync)->syncobj;
+         bool done;
+         if (sync->flags & VK_SYNC_IS_TIMELINE) {
+            uint64_t point = 0;
+            timeline++;
+            done = !drmSyncobjQuery(dev->dev.fd, &handle, &point, 1) &&
+                   point >= submit->waits[i].wait_value;
+         } else {
+            done = !drmSyncobjWait(dev->dev.fd, &handle, 1, 0, 0, NULL);
+         }
+         if (!done) {
+            pending++;
+            pending_timeline += !!(sync->flags & VK_SYNC_IS_TIMELINE);
+         }
+      }
+      hk_frame_anatomy_note(dev, "submit waits=%u timeline=%u pending=%u "
+                            "pending_timeline=%u signals=%u commands=%u",
+                            submit->wait_count, timeline, pending,
+                            pending_timeline, submit->signal_count,
+                            command_count);
+   }
+
    /* Now setup the command structs */
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
