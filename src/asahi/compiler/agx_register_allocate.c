@@ -961,6 +961,38 @@ static bool
 pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
                               unsigned count, unsigned standard, unsigned *out);
 
+/*
+ * G17P texture and image results, texture coordinates and moves from the
+ * uniform file name seven-bit half-register fields, so they live in halves
+ * 0..127. Lowest first, every other value lands there too, and in a shader at
+ * the limit of the register file each constrained definition then evicts an
+ * unconstrained value from the low bank. The moved values sit in different
+ * registers on the two sides of the next merge, which costs a copy per value
+ * at the join.
+ *
+ * Once a shader spills, every register up to the bound is in use somewhere,
+ * so where a value goes no longer changes the register count. Put values
+ * without a bank constraint above the low bank there, within the registers
+ * already used, unless they feed a low-bank collect.
+ */
+#define G17P_LOW_BANK_HALVES 128
+
+static bool
+prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
+                 enum ra_class cls, unsigned minimum, unsigned limit)
+{
+   if (rctx->shader->key->dev.chip != AGX_CHIP_G17P ||
+       !rctx->shader->has_spill_pcopy_reserved || cls != RA_GPR ||
+       minimum != 0 || limit != rctx->bound[cls] ||
+       limit <= G17P_LOW_BANK_HALVES ||
+       ssa_has_bank_constraint(rctx, I->dest[d].value))
+      return false;
+
+   const agx_instr *use = rctx->src_to_collect_phi[I->dest[d].value];
+   return !use || use->op != AGX_OPCODE_COLLECT ||
+          dest_limit(rctx, use, 0) > G17P_LOW_BANK_HALVES;
+}
+
 static unsigned
 find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
           unsigned align)
@@ -972,7 +1004,12 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
    unsigned minimum = dest_minimum(rctx, I, dest_idx);
    unsigned limit = dest_limit(rctx, I, dest_idx);
 
-   bool simple = find_regs_simple(rctx, cls, count, align, minimum, limit, &reg);
+   bool simple = prefer_high_bank(rctx, I, dest_idx, cls, minimum, limit) &&
+                 find_regs_simple(rctx, cls, count, align,
+                                  G17P_LOW_BANK_HALVES,
+                                  MIN2(*rctx->count[cls], limit), &reg);
+   if (!simple)
+      simple = find_regs_simple(rctx, cls, count, align, minimum, limit, &reg);
    unsigned transient;
    if (pick_transient_texture_region(rctx, I, dest_idx, count,
                                     simple ? reg : ~0u, &transient)) {
