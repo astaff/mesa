@@ -309,6 +309,13 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
       return 2;
    }
 
+   if (I->agx3_split_coords && (s == 0 || s == 6 || s == 7)) {
+      assert(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+             I->op == AGX_OPCODE_TEXTURE_LOAD && I->nr_srcs == 8 &&
+             (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS));
+      return 2;
+   }
+
    /* This is a sampler-private value, not a dimensional GPR coordinate. */
    if (agx_texture_resource(I) && s == 0)
       return agx_index_size_16(I->src[s]);

@@ -272,6 +272,103 @@ agx3_lower_scalar_cube_coordinates(agx_context *ctx)
    return progress;
 }
 
+/* An M5 texel fetch stages its coordinates with one COPY per component, and a
+ * multisampled read publishes its sample index with PACK_SMPIR, so the read
+ * never needs its coordinates as a contiguous vector. A collected vector per
+ * read costs a GPR move for every component that already lives elsewhere: a
+ * depth pyramid that reads four samples at each of four texels moves three
+ * words before each of its sixteen reads. Hand the read the components
+ * themselves. */
+static bool
+split_fetch_candidate(const agx_instr *I)
+{
+   return I->op == AGX_OPCODE_TEXTURE_LOAD && I->nr_srcs == 6 &&
+          I->nr_dests == 1 && !I->agx3_tex_coords_staged &&
+          !I->agx3_split_coords && !I->offset && !I->shadow &&
+          !I->query_lod && !I->sparse && I->gather == AGX_GATHER_NONE &&
+          (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_2D_MS) &&
+          I->src[0].type == AGX_INDEX_NORMAL && !I->src[0].memory &&
+          !I->src[0].abs && !I->src[0].neg && I->src[0].size == AGX_SIZE_32 &&
+          agx_channels(I->src[0]) == (I->dim == AGX_DIM_2D_MS ? 3 : 2) &&
+          agx_is_null(I->src[5]);
+}
+
+bool
+agx3_split_fetch_coordinates(agx_context *ctx)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble)
+      return false;
+
+   /* Every M5 stage stages its fetch coordinates (agx3_pack_binary.c). */
+   switch (ctx->stage) {
+   case MESA_SHADER_VERTEX:
+   case MESA_SHADER_FRAGMENT:
+   case MESA_SHADER_COMPUTE:
+   case MESA_SHADER_TESS_CTRL:
+   case MESA_SHADER_GEOMETRY:
+   case MESA_SHADER_MESH:
+   case MESA_SHADER_TASK:
+      break;
+   default:
+      return false;
+   }
+
+   agx_instr **defs = rzalloc_array(ctx, agx_instr *, ctx->alloc);
+   if (!defs)
+      return false;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         defs[I->dest[d].value] = I;
+   }
+
+   bool progress = false;
+   agx_foreach_instr_global_safe(ctx, I) {
+      if (!split_fetch_candidate(I))
+         continue;
+      const unsigned n = agx_channels(I->src[0]);
+      agx_instr *collect = defs[I->src[0].value];
+      if (!collect || collect->op != AGX_OPCODE_COLLECT ||
+          collect->nr_srcs != n)
+         continue;
+      bool eligible = true;
+      for (unsigned c = 0; c < n; ++c) {
+         eligible &= collect->src[c].type == AGX_INDEX_NORMAL &&
+                     scalar_publication_source(collect->src[c]);
+      }
+      if (!eligible)
+         continue;
+
+      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+      agx_instr *fetch = agx_alloc_instr(&b, I->op, 1, 8);
+      memcpy(&fetch->op, &I->op, sizeof(*I) - offsetof(agx_instr, op));
+      fetch->nr_srcs = 8;
+      fetch->dest[0] = I->dest[0];
+      memcpy(fetch->src, I->src, 6 * sizeof(agx_index));
+      for (unsigned c = 0; c < 3; ++c) {
+         agx_index component = c < n ? collect->src[c] : agx_null();
+         /* Liveness is recomputed by RA; drop the collect's annotations. */
+         component.kill = component.cache = component.discard = false;
+         fetch->src[c ? c + 5 : 0] = component;
+      }
+      fetch->agx3_split_coords = true;
+
+      /* Keep the vector's placement as an RA affinity hint: where the
+       * components can sit together, allocation matches the vector's. */
+      if (!ctx->collect_split_hints.data)
+         util_dynarray_init(&ctx->collect_split_hints, ctx);
+      agx_instr *hint = agx_alloc_instr(&b, AGX_OPCODE_COLLECT, 1, n);
+      hint->dest[0] = collect->dest[0];
+      for (unsigned c = 0; c < n; ++c)
+         hint->src[c] = collect->src[c];
+      util_dynarray_append(&ctx->collect_split_hints, hint);
+
+      agx_builder_insert(&b.cursor, fetch);
+      agx_remove_instruction(I);
+      progress = true;
+   }
+   return progress;
+}
+
 static bool
 ssa_preserves_publications(const agx_instr *I)
 {

@@ -1463,6 +1463,41 @@ struct agx3_fetch_group {
    uint16_t coord;
 };
 
+/* Coordinate word c of a texel fetch: that word of its coordinate vector, or
+ * its own scalar source when the fetch takes split coordinates. */
+static agx_index
+agx3_fetch_coord(const agx_instr *I, unsigned c)
+{
+   if (I->agx3_split_coords)
+      return c ? I->src[c + 5] : I->src[0];
+   agx_index coord = I->src[0];
+   coord.value += 2 * c;
+   coord.channels_m1 = 0;
+   return coord;
+}
+
+/* Whether staging coordinate word c is the last read of its register by this
+ * fetch. Split components may name one register twice; only the final read
+ * may discard it. Words are read in order, x, y, then the third word. */
+static bool
+agx3_fetch_coord_discard(const agx_instr *I, unsigned c, unsigned count)
+{
+   const agx_index coord = agx3_fetch_coord(I, c);
+   if (!coord.discard)
+      return false;
+   for (unsigned later = c + 1; later < count; ++later) {
+      if (agx3_fetch_coord(I, later).value == coord.value)
+         return false;
+   }
+   return true;
+}
+
+static unsigned
+agx3_fetch_nr_srcs(const agx_instr *I)
+{
+   return I->agx3_split_coords ? 8 : 6;
+}
+
 /* Consecutive raw 2D reads can consume the same immutable coordinate pair.
  * Do not cross even a single intervening instruction: it may overwrite the
  * GPR pair or publish another sampler-private operand. */
@@ -1470,25 +1505,60 @@ static bool
 agx3_fetch_coordinates_match(const agx_instr *a, const agx_instr *b)
 {
    if (!b || a->op != AGX_OPCODE_TEXTURE_LOAD || b->op != a->op ||
-       a->nr_srcs != 6 || b->nr_srcs != 6 || a->nr_dests != 1 ||
+       a->nr_srcs != agx3_fetch_nr_srcs(a) ||
+       b->nr_srcs != agx3_fetch_nr_srcs(b) || a->nr_dests != 1 ||
        a->dim != AGX_DIM_2D || b->dim != AGX_DIM_2D ||
        a->lod_mode != AGX_LOD_MODE_LOD_MIN || b->lod_mode != a->lod_mode ||
        a->src[1].type != AGX_INDEX_IMMEDIATE ||
        !agx3_tex_imm(b->src[1], a->src[1].value) ||
        a->offset || b->offset || a->shadow || b->shadow ||
        a->sparse || b->sparse || a->query_lod || b->query_lod ||
-       !agx3_tex_plain_reg(a->src[0]) || !agx3_tex_plain_reg(b->src[0]) ||
-       a->src[0].size != AGX_SIZE_32 || b->src[0].size != AGX_SIZE_32 ||
-       agx_channels(a->src[0]) != 2 || agx_channels(b->src[0]) != 2 ||
-       a->src[0].value != b->src[0].value)
+       (!a->agx3_split_coords && agx_channels(a->src[0]) != 2) ||
+       (!b->agx3_split_coords && agx_channels(b->src[0]) != 2))
       return false;
 
    /* Matching physical register numbers do not imply matching values if the
     * first fetch replaces any part of the second fetch's coordinate input. */
-   const unsigned begin = a->src[0].value;
    const unsigned dst = a->dest[0].value;
-   return !agx3_tex_plain_reg(a->dest[0]) ||
-          dst + agx_index_size_16(a->dest[0]) <= begin || dst >= begin + 4;
+   for (unsigned c = 0; c < 2; ++c) {
+      const agx_index x = agx3_fetch_coord(a, c), y = agx3_fetch_coord(b, c);
+      if (!agx3_tex_plain_reg(x) || !agx3_tex_plain_reg(y) ||
+          x.size != AGX_SIZE_32 || y.size != AGX_SIZE_32 ||
+          x.value != y.value)
+         return false;
+      if (agx3_tex_plain_reg(a->dest[0]) &&
+          dst + agx_index_size_16(a->dest[0]) > x.value && dst < x.value + 2)
+         return false;
+   }
+   return true;
+}
+
+/* The coordinate operands of a texel fetch: a vector of `count` words, or,
+ * for a staged M5 2D or multisampled read, `count` independent scalars. */
+static bool
+agx3_fetch_coords_ok(const agx_instr *I, bool m5, bool staged, unsigned count)
+{
+   if (I->agx3_split_coords) {
+      if (!m5 || !staged ||
+          (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_MS) ||
+          (count == 2) != agx_is_null(I->src[7]))
+         return false;
+      for (unsigned c = 0; c < count; ++c) {
+         const agx_index coord = agx3_fetch_coord(I, c);
+         /* x and y use the wide scalar COPY; the sample index keeps
+          * PACK_SMPIR's seven-bit source. */
+         if (!agx3_tex_plain_reg(coord) || coord.size != AGX_SIZE_32 ||
+             agx_channels(coord) != 1 || (coord.value & 1) ||
+             coord.value + 2 > (c == 2 ? 128 : 256))
+            return false;
+      }
+      return true;
+   }
+   return agx3_tex_plain_reg(I->src[0]) && I->src[0].size == AGX_SIZE_32 &&
+          agx_channels(I->src[0]) == count &&
+          (staged ? !(I->src[0].value & 1) &&
+                       I->src[0].value + 2 * count <= 128
+                  : !(I->src[0].value & 3) && I->src[0].value <= 60);
 }
 
 static bool
@@ -1504,7 +1574,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
                         struct agx3_fetch_group *group)
 {
    const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;
-   const bool immediate = I->nr_srcs == 6 &&
+   const bool immediate = I->nr_srcs == agx3_fetch_nr_srcs(I) &&
       I->src[3].type == AGX_INDEX_IMMEDIATE;
    const bool immediate_lod = I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
       I->src[1].type == AGX_INDEX_IMMEDIATE && !I->src[1].memory &&
@@ -1536,7 +1606,9 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
     * agx_emit_texture reserves an eight-channel destination for it (see
     * agx_validate.c's sparse size rule). The encoded result mask stays the
     * four-bit channel mask; the residency component is implicit. */
-   if (I->nr_dests != 1 || I->nr_srcs != 6 ||
+   const unsigned coord_count =
+      (I->dim == AGX_DIM_2D_ARRAY || ms_array || ms_2d || three_d) ? 3 : 2;
+   if (I->nr_dests != 1 || I->nr_srcs != agx3_fetch_nr_srcs(I) ||
        !agx3_tex_plain_reg(I->dest[0]) ||
        (I->dest[0].size != AGX_SIZE_16 &&
         I->dest[0].size != AGX_SIZE_32) ||
@@ -1544,14 +1616,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
        I->dest[0].value >= (m5 ? 256 : 128) ||
        I->dest[0].value + agx_index_size_16(I->dest[0]) > 256 ||
        (I->dest[0].size == AGX_SIZE_32 && (I->dest[0].value & 1)) ||
-       !agx3_tex_plain_reg(I->src[0]) ||
-       I->src[0].size != AGX_SIZE_32 ||
-       agx_channels(I->src[0]) !=
-          ((I->dim == AGX_DIM_2D_ARRAY || ms_array || ms_2d || three_d)
-              ? 3 : 2) ||
-       (stage_coordinates ? ((I->src[0].value & 1) ||
-         I->src[0].value + 2 * agx_channels(I->src[0]) > 128) :
-         ((I->src[0].value & 3) || I->src[0].value > 60)) ||
+       !agx3_fetch_coords_ok(I, m5, stage_coordinates, coord_count) ||
        ((ms_array || ms_2d)
            ? !agx3_tex_imm(I->src[1], 0)
            : (!(I->lod_mode == AGX_LOD_MODE_AUTO_LOD &&
@@ -1620,7 +1685,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    const unsigned ms_banks = m5_ms_banks && !ms_array ?
       CLAMP(debug_get_num_option("ASAHI_M5_MS_FETCH_BANKS", 8), 1, 16) : 4;
    const uint16_t bank_span =
-      m5_ms_banks ? 8 : plain_bank ? 2 * agx_channels(I->src[0])
+      m5_ms_banks ? 8 : plain_bank ? 2 * coord_count
                                  : staging_base + 8;
    uint16_t staging_coord = staging_base;
    uint16_t bank_retire = 0;
@@ -1734,7 +1799,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       }
 
       const unsigned plain_coords =
-         (ms_2d || ms_array || array) ? 2 : agx_channels(I->src[0]);
+         (ms_2d || ms_array || array) ? 2 : coord_count;
       /* The staging COPY carries one wait bit. A fetch whose operands come
        * from several scoreboard slots repeats the first coordinate copy, one
        * outstanding bit each; every repeat writes the same register from the
@@ -1751,13 +1816,20 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
             pending_wait &= (uint16_t)~wait_bit;
          }
          uint8_t copy[AGX3_TEX_MAX_LENGTH], copy_len = 0;
-         if (!agx3_tex_stage_copy_hints(enc, staging_coord + 2 * i,
-                                  I->src[0].value + 2 * i,
-                                  staging_slot, wait_bit,
-                                  m5 ? !(I->src[0].discard && rep + 1 == reps)
-                                     : I->src[0].cache,
-                                  I->src[0].discard && rep + 1 == reps,
-                                  copy, &copy_len) ||
+         const agx_index coord = agx3_fetch_coord(I, i);
+         const bool last =
+            agx3_fetch_coord_discard(I, i, coord_count) && rep + 1 == reps;
+         /* Split coordinates may live anywhere in the register file: stage
+          * them with the wide scalar COPY, as scalar publications do. */
+         const bool copied = I->agx3_split_coords
+            ? agx3_tex_stage_copy_scalar_m5(staging_coord + 2 * i, coord.value,
+                                            staging_slot, wait_bit, !last, last,
+                                            copy, &copy_len)
+            : agx3_tex_stage_copy_hints(enc, staging_coord + 2 * i,
+                                        coord.value, staging_slot, wait_bit,
+                                        m5 ? !last : coord.cache, last,
+                                        copy, &copy_len);
+         if (!copied ||
              !agx3_append(emission, copy, copy_len))
             return false;
        }
@@ -1795,9 +1867,10 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
        * Publish it through native's dedicated integer PACK_SMPIR operand. */
       if (ms_2d) {
          uint8_t packed[AGX3_TEX_MAX_LENGTH], packed_len = 0;
+         const agx_index sample = agx3_fetch_coord(I, 2);
          if (!agx3_tex_stage_ms_sample_at(
-                enc, staging_coord, I->src[0].value + 4, staging_slot, 0,
-                I->src[0].cache, I->src[0].discard,
+                enc, staging_coord, sample.value, staging_slot, 0,
+                sample.cache, sample.discard,
                 packed, &packed_len) ||
              !agx3_append(emission, packed, packed_len))
             return false;

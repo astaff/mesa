@@ -492,6 +492,12 @@ typedef struct {
    bool agx3_tex_coords_staged : 1;
    bool agx3_cube_scalar_coords  : 1;
 
+   /* M5 texel fetch with independent scalar coordinates: src[0] is x,
+    * src[6] is y and src[7] is the sample index of a multisampled read (null
+    * otherwise). The staging COPYs read each component where it lives, so no
+    * contiguous coordinate vector has to be collected for the read. */
+   bool agx3_split_coords : 1;
+
 } agx_instr;
 
 static inline uint32_t
@@ -1199,6 +1205,7 @@ bool agx3_lower_texture_publications(agx_context *ctx);
 bool agx3_fuse_fma_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
+bool agx3_split_fetch_coordinates(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);

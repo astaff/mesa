@@ -10443,6 +10443,10 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       agx_validate(ctx, "scalar texture publications");
       AGX_PASS(ctx, agx_dce, true);
    }
+   if (agx3_split_fetch_coordinates(ctx)) {
+      agx_validate(ctx, "split fetch coordinates");
+      AGX_PASS(ctx, agx_dce, true);
+   }
 
 
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&

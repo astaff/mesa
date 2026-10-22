@@ -1922,7 +1922,8 @@ texture_tail_cost(struct ra_ctx *rctx, agx_instr *I, agx_instr *split,
          continue;
       }
       if (proxy.op == AGX_OPCODE_PRELOAD || proxy.op == AGX_OPCODE_PHI ||
-          proxy.agx3_cube_scalar_coords || proxy.op == AGX_OPCODE_FFS ||
+          proxy.agx3_cube_scalar_coords || proxy.agx3_split_coords ||
+          proxy.op == AGX_OPCODE_FFS ||
           proxy.op == AGX_OPCODE_BFEIL || proxy.op == AGX_OPCODE_BITOP ||
           proxy.op == AGX_OPCODE_IADD)
          goto done;
@@ -3053,16 +3054,19 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       util_dynarray_num_elements(&ctx->collect_split_hints, agx_instr *);
    if (ssa_renumbered || ctx->scratch_size_B) {
       agx_foreach_instr_global(ctx, I) {
-         if (!I->agx3_cube_scalar_coords || I->nr_srcs != 8)
+         if ((!I->agx3_cube_scalar_coords && !I->agx3_split_coords) ||
+             I->nr_srcs != 8)
             continue;
          if (!ctx->collect_split_hints.data)
             util_dynarray_init(&ctx->collect_split_hints, ctx);
+         const unsigned n = agx_is_null(I->src[7]) ? 2 : 3;
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         agx_instr *hint = agx_alloc_instr(&b, AGX_OPCODE_COLLECT, 1, 3);
-         hint->dest[0] = agx_vec_temp(ctx, AGX_SIZE_32, 3);
+         agx_instr *hint = agx_alloc_instr(&b, AGX_OPCODE_COLLECT, 1, n);
+         hint->dest[0] = agx_vec_temp(ctx, AGX_SIZE_32, n);
          hint->src[0] = I->src[0];
          hint->src[1] = I->src[6];
-         hint->src[2] = I->src[7];
+         if (n == 3)
+            hint->src[2] = I->src[7];
          util_dynarray_append(&ctx->collect_split_hints, hint);
       }
    }
@@ -3175,7 +3179,10 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
           (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
            I->op == AGX_OPCODE_TEXTURE_LOAD ||
            I->op == AGX_OPCODE_IMAGE_LOAD)) {
-         if (I->src[0].type == AGX_INDEX_NORMAL)
+         /* Split M5 fetch coordinates stage x and y through the wide scalar
+          * COPY, which reads the whole register file; the sample index keeps
+          * PACK_SMPIR's seven-bit source. */
+         if (I->src[0].type == AGX_INDEX_NORMAL && !I->agx3_split_coords)
             BITSET_SET(texture_gpr, I->src[0].value);
          if (I->agx3_cube_scalar_coords) {
             for (unsigned s = 6; s < 8; ++s) {
@@ -3183,6 +3190,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
                   BITSET_SET(texture_gpr, I->src[s].value);
             }
          }
+         if (I->agx3_split_coords && I->src[7].type == AGX_INDEX_NORMAL)
+            BITSET_SET(texture_gpr, I->src[7].value);
 
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
              I->lod_mode == AGX_LOD_MODE_LOD_GRAD &&
