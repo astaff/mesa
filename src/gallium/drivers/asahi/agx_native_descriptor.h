@@ -34,6 +34,12 @@
 #define AGX_GALLIUM_G17P_QUERY_LOD_BASE \
    (AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE + AGX_GALLIUM_G17P_API_SAMPLERS)
 
+/* Shadow gathers need an unfiltered border mask, independent of the depth
+ * comparison. The zero companion is already non-comparing; this is its
+ * clamp-to-one partner. Keep the ordinary comparison sampler unchanged. */
+#define AGX_GALLIUM_G17P_BORDER_NONCOMPARE_BASE \
+   (AGX_GALLIUM_G17P_QUERY_LOD_BASE + AGX_GALLIUM_G17P_API_SAMPLERS)
+
 /* HAL200's immediate sampler operand names native slots 0..15. Gallium keeps
  * slot zero for texel fetch, leaving API samplers 0..14 directly encodable.
  * Later API samplers use an indirect native-table index instead. */

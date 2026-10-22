@@ -1941,7 +1941,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
         key_->vs.custom_borders) ||
        (so->type == MESA_SHADER_COMPUTE && key_->cs.custom_borders));
    if (custom_borders)
-      NIR_PASS(_, nir, agx_nir_lower_custom_border_g17p);
+      NIR_PASS(_, nir, agx_nir_lower_custom_border_g17p,
+               dev->chip == AGX_CHIP_G17P);
 
    struct agx_unlinked_uvs_layout uvs = {0};
    bool translucent = false;
@@ -4000,11 +4001,13 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
       const bool query_lod = cs->so && cs->so->info.uses_query_lod;
       unsigned count = nr_samplers;
       if (custom_borders)
-         count = AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE +
+         count = (dev->chip == AGX_CHIP_G17P
+                     ? AGX_GALLIUM_G17P_BORDER_NONCOMPARE_BASE
+                     : AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE) +
                  ctx->stage[stage].sampler_count;
       if (query_lod)
-         count = AGX_GALLIUM_G17P_QUERY_LOD_BASE +
-                 ctx->stage[stage].sampler_count;
+         count = MAX2(count, AGX_GALLIUM_G17P_QUERY_LOD_BASE +
+                             ctx->stage[stage].sampler_count);
       struct agx_ptr T = agx_pool_alloc_aligned(
          &batch->pool, sampler_length * count, 64);
       memset(T.cpu, 0, sampler_length * count);
@@ -4044,13 +4047,25 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
                uint8_t *clamp = (uint8_t *)T.cpu +
                                 sampler_length * clamp_handle;
-               const struct agx_gallium_native_sampler clamp_state =
+               struct agx_gallium_native_sampler clamp_state =
                   agx_native_sampler_state(
                      state, AGX_BORDER_COLOUR_TRANSPARENT_BLACK);
+               if (dev->chip == AGX_CHIP_G17P)
+                  clamp_state.compare_enable = false;
                if (!agx_gallium_pack_native_sampler(dev->chip, (void *)clamp,
                                                     &clamp_state))
                   agx_native_descriptor_rejected(dev,
                                                  "custom-border sampler");
+
+               if (dev->chip == AGX_CHIP_G17P) {
+                  clamp_state.border_colour = AGX_BORDER_COLOUR_OPAQUE_WHITE;
+                  uint8_t *probe = (uint8_t *)T.cpu + sampler_length *
+                     (AGX_GALLIUM_G17P_BORDER_NONCOMPARE_BASE + i);
+                  if (!agx_gallium_pack_native_sampler(dev->chip, (void *)probe,
+                                                       &clamp_state))
+                     agx_native_descriptor_rejected(dev,
+                                                    "custom-border probe sampler");
+               }
             }
          } else {
             const struct agx_gallium_native_sampler null_state = {
@@ -4156,9 +4171,13 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
       agx_upload_samplers(batch, cs, stage);
 
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
+   const size_t size = agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P
+                          ? sizeof(*unif)
+                          : offsetof(struct agx_stage_uniforms,
+                                     custom_border_compare_func);
 
    batch->uniforms.tables[AGX_SYSVAL_STAGE(stage)] =
-      agx_pool_upload_aligned(&batch->pool, unif, sizeof(*unif), 16);
+      agx_pool_upload_aligned(&batch->pool, unif, size, 16);
 }
 
 struct agx_g17p_graphics_template {
