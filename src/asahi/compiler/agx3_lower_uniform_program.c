@@ -230,12 +230,13 @@ agx3_lower_uniform_half_exports(agx_context *ctx)
 
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
       /* COPY writes an aligned word. Keep the live half in its original
-       * lane and clear only the unoccupied neighbour. A late DCE can leave
+       * lane; the unoccupied neighbour is padding that nothing reads, so
+       * leave it undefined rather than clearing it. A late DCE can leave
        * just the odd half of an allocated pair live. */
       agx_index word = agx_temp(ctx, AGX_SIZE_32);
       agx_instr *collect = agx_collect_to(&b, word, 2);
       collect->src[base & 1] = value;
-      collect->src[(base & 1) ^ 1] = agx_immediate(0);
+      collect->src[(base & 1) ^ 1] = agx_undef(AGX_SIZE_16);
       I->src[0] = word;
       I->src[1] = agx_immediate(base & ~1u);
       if (ctx->out)
