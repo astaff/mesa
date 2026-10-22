@@ -13,9 +13,10 @@
  * usage: g17p-vulkan-compressed-mip-blit [--shim] [--expect-compute]
  *                                         [--bench] [--grid]
  *   --shim            no-op DRM shim: nothing executes, skip readback
- *   --expect-compute  require that recording the blit chains logs no render
- *                     pass and that the images are compressed (needs
- *                     ASAHI_MESA_DEBUG=perf)
+ *   --expect-compute  require that recording the blit chains logs a render
+ *                     pass only for the levels hk stores through the PBE
+ *                     (HK_G17P_MIP_PBE_MIN_TEXELS) and that the images are
+ *                     compressed (needs ASAHI_MESA_DEBUG=perf)
  *   --bench           instead time whole blit chains (ms per chain) of
  *                     common sizes and contents, on a compressed render
  *                     target and on a plain storage image
@@ -415,8 +416,14 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
                      VK_IMAGE_LAYOUT_GENERAL, 1, &to_plain, VK_FILTER_LINEAR);
       barrier(cmd);
    }
-   if (expect_compute && capture_end("Rendering ")) {
-      fprintf(stderr, "%s: FAIL: a blit recorded a render pass\n", name);
+   /* Levels of HK_G17P_MIP_PBE_MIN_TEXELS (1 << 17) texels and more take
+    * a render pass, the rest compute */
+   unsigned passes = 0;
+   for (uint32_t l = 1; l < levels; ++l)
+      passes += (uint64_t)minify(w, l) * minify(h, l) >= (1u << 17);
+   if (expect_compute && capture_end("Rendering ") != passes) {
+      fprintf(stderr, "%s: FAIL: the blits did not record %u render passes\n",
+              name, passes);
       failures++;
    }
 

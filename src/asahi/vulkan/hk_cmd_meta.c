@@ -2064,13 +2064,15 @@ hk_g17p_compressed_blit_supported(const struct hk_device *dev,
                                                  info->filter, true))
          return false;
 
-      /* Marking a level's tiles uncompressed needs all of its texels */
+      /* Marking a level's tiles uncompressed needs all of its texels, and
+       * large compressed levels are cheaper stored compressed by a pass */
       const uint32_t level = region->dstSubresource.mipLevel;
+      const uint32_t width = u_minify(dst->vk.extent.width, level);
+      const uint32_t height = u_minify(dst->vk.extent.height, level);
       if (ail_is_level_logically_compressed(&dst->planes[0].layout, level) &&
-          ((uint32_t)region->dstOffsets[1].x !=
-              u_minify(dst->vk.extent.width, level) ||
-           (uint32_t)region->dstOffsets[1].y !=
-              u_minify(dst->vk.extent.height, level)))
+          ((uint32_t)region->dstOffsets[1].x != width ||
+           (uint32_t)region->dstOffsets[1].y != height ||
+           hk_g17p_mip_level_through_pbe(width, height)))
          return false;
    }
    return true;

@@ -116,9 +116,31 @@ check_layout(uint32_t width, uint32_t height)
    }
 }
 
+/* Which levels of common chains are stored compressed by a render pass */
+static void
+check_mip_split(void)
+{
+   EXPECT(hk_g17p_mip_level_through_pbe(1920, 1080),
+          "3840x2160 level 1 should take a render pass");
+   EXPECT(hk_g17p_mip_level_through_pbe(2048, 2048),
+          "4096x4096 level 1 should take a render pass");
+   EXPECT(hk_g17p_mip_level_through_pbe(1280, 720),
+          "2560x1440 level 1 should take a render pass");
+   EXPECT(hk_g17p_mip_level_through_pbe(960, 540),
+          "1920x1080 level 1 should take a render pass");
+   EXPECT(hk_g17p_mip_level_through_pbe(640, 360),
+          "1280x720 level 1 should take a render pass");
+   EXPECT(!hk_g17p_mip_level_through_pbe(480, 270),
+          "1920x1080 level 2 should take compute");
+   EXPECT(!hk_g17p_mip_level_through_pbe(256, 256),
+          "512x512 level 1 should take compute");
+   EXPECT(!hk_g17p_mip_level_through_pbe(1, 1), "1x1 should take compute");
+}
+
 int
 main(void)
 {
+   check_mip_split();
    for (uint32_t h = 1; h <= 70; ++h) {
       for (uint32_t w = 1; w <= 70; ++w)
          check_grid(w, h);
