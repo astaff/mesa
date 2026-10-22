@@ -1897,6 +1897,26 @@ agx_emit_store_preamble(agx_builder *b, nir_intrinsic_instr *instr)
    unsigned stride = agx_size_align_16(vec.size);
    unsigned nr = nir_src_num_components(instr->src[0]);
 
+   /* An AGX3C uniform export is one 32-bit copy per word, so a 64-bit export
+    * is two copies however it is spelled (agx3_pack_binary). Most 64-bit
+    * fragment exports are texture and sampler handles built as
+    * pack_64_2x32_split(word, 0): collecting the two words into an aligned
+    * register pair first costs a move per word on top of the copies. Export
+    * each word straight from its own register instead, into the same
+    * uniform halves, in the same order and at the same program point. */
+   nir_alu_instr *pack = nir_def_as_alu_or_null(instr->src[0].ssa);
+   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && nr == 1 &&
+       vec.size == AGX_SIZE_64 && pack &&
+       pack->op == nir_op_pack_64_2x32_split) {
+      for (unsigned w = 0; w < 2; ++w) {
+         agx_index word = agx_extract_nir_src(b, pack->src[w].src,
+                                              pack->src[w].swizzle[0]);
+         agx_uniform_store(b, word, agx_immediate(base + 2 * w), 1);
+      }
+
+      return NULL;
+   }
+
    for (unsigned i = 0; i < nr; i += (4 / stride)) {
       agx_index data[4] = {0};
       unsigned count = MIN2(4 / stride, nr - i);
