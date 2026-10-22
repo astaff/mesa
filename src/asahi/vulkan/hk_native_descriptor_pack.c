@@ -282,6 +282,19 @@ hk_pack_native_pbe(unsigned generation,
       !legacy->unk_mipmapped &&
       (legacy->samples == AGX_SAMPLE_COUNT_2 ||
        legacy->samples == AGX_SAMPLE_COUNT_4);
+   /* RGBA8/BGRA8 (UNORM and sRGB) share the R32_UINT texel size and so its
+    * compressed multisample metadata layout; see
+    * agx_pbe_agx3_2d_multisample_pack(). */
+   const bool compressed_msaa_rgba8 =
+      generation == 10 &&
+      legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
+      legacy->layout == AGX_LAYOUT_GPU &&
+      legacy->channels == AGX_CHANNELS_R8G8B8A8 &&
+      legacy->type == AGX_TEXTURE_TYPE_UNORM &&
+      legacy->layers == 1 && legacy->level == 0 && legacy->levels == 1 &&
+      !legacy->unk_mipmapped &&
+      (legacy->samples == AGX_SAMPLE_COUNT_2 ||
+       legacy->samples == AGX_SAMPLE_COUNT_4);
    if ((!layered && !multisample &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        (legacy->layout == AGX_LAYOUT_LINEAR &&
@@ -298,14 +311,15 @@ hk_pack_native_pbe(unsigned generation,
                        !(generation == 10 && legacy->samples == AGX_SAMPLE_COUNT_8))
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
        (legacy->compressed && !compressed_2d && !compressed_msaa_r32_uint &&
-                          !compressed_msaa_rgba16) ||
+                          !compressed_msaa_rgba16 && !compressed_msaa_rgba8) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && legacy->layers != 1) ||
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
                         legacy->unk_mipmapped ||
                         (legacy->compressed && !compressed_msaa_r32_uint &&
-                          !compressed_msaa_rgba16))) ||
+                          !compressed_msaa_rgba16 &&
+                          !compressed_msaa_rgba8))) ||
        (legacy->extended != legacy->compressed) ||
        (legacy->layout == AGX_LAYOUT_LINEAR || interchange
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4

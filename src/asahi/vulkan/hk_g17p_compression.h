@@ -334,8 +334,28 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
           hk_g17p_compression_color_format(info->format);
 }
 
+/* Multisample colour formats with a qualified compressed metadata shape:
+ * RGBA16F, and the 4-byte RGBA8/BGRA8 UNORM and sRGB formats, which share the
+ * R32_UINT texel size of the witnessed raw copy packet. */
+static inline bool
+hk_m5_msaa_color_compression_format(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
+
 /* Qualified multisample metadata shapes. The sample mask retains an
- * explicit diagnostic opt-out. Sharing and aliasing flags are not admitted.
+ * explicit diagnostic opt-out. Sharing and aliasing flags are not admitted;
+ * a mutable format is, and hk_can_compress() then requires a format list of
+ * compression-compatible views.
  */
 static inline bool
 hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
@@ -346,12 +366,23 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-   return chip == AGX_CHIP_G17S && plane == 0 && info && !info->pNext &&
-          !info->flags && info->imageType == VK_IMAGE_TYPE_2D &&
+   if (chip != AGX_CHIP_G17S || plane != 0 || !info)
+      return false;
+
+   for (const void *next = info->pNext; next;) {
+      VkBaseInStructure ext;
+      memcpy(&ext, next, sizeof(ext));
+      if (ext.sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)
+         return false;
+      next = ext.pNext;
+   }
+
+   return !(info->flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+          info->imageType == VK_IMAGE_TYPE_2D &&
           info->extent.depth == 1 && info->extent.width >= 16 &&
           info->extent.height >= 16 && info->arrayLayers == 1 &&
           info->mipLevels == 1 &&
-          info->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+          hk_m5_msaa_color_compression_format(info->format) &&
           (info->samples == VK_SAMPLE_COUNT_2_BIT ||
            info->samples == VK_SAMPLE_COUNT_4_BIT) &&
           (enabled_samples & info->samples) &&
