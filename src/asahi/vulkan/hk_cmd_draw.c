@@ -3705,24 +3705,25 @@ hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
    struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
    if (!m->valid)
       return;
-   if (m->render.tilebuffer.nr_samples > 1 && transition) {
-      m->valid = false;
-      hk_frame_anatomy_note(hk_cmd_buffer_device(cmd),
-                            "MSAA pass merge ended by a layout or ownership transition");
-      return;
-   }
 
    /* hk performs no work for a layout transition: of an image that is not an
     * attachment of the candidate and cannot alias one, it only orders the
     * image's accesses, as the barrier's scopes describe. A transition of an
     * attachment, or an ownership transfer, changes what the continued
     * instance would load. */
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    if (transition && image &&
-       hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P &&
+       (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
        !hk_m5_image_is_attachment(&m->render, image) &&
        !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
                                 VK_IMAGE_CREATE_SPARSE_BINDING_BIT)))
       transition = false;
+   if (m->render.tilebuffer.nr_samples > 1 && transition) {
+      m->valid = false;
+      hk_frame_anatomy_note(hk_cmd_buffer_device(cmd),
+                            "MSAA pass merge ended by a layout or ownership transition");
+      return;
+   }
 
    switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
                                        transition)) {
@@ -3850,12 +3851,13 @@ hk_m5_layout_excludes_descriptors(VkImageLayout layout)
 /* Whether no descriptor can access an attachment of the instance while it
  * renders: every attachment is in an attachment-only layout. Both instances
  * of a continuation use the same layouts (hk_m5_ordered_attachment_refusal()),
- * so this holds for the merged pass. Taken on G17P. */
+ * so this holds for the merged pass. Taken on G17P and M5. */
 static bool
 hk_m5_attachments_exclude_descriptors(const struct hk_cmd_buffer *cmd,
                                       const VkRenderingInfo *info)
 {
-   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P)
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   if (chip != AGX_CHIP_G17P && !agx_chip_g17_m5(chip))
       return false;
 
    const VkRenderingAttachmentInfo *ds[] = {info->pDepthAttachment,
