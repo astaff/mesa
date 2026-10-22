@@ -1488,7 +1488,8 @@ static bool
 pick_phi_source_agreement(struct ra_ctx *rctx, agx_instr *I, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       rctx->shader->key->dev.chip != AGX_CHIP_G17P)
+       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
+        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[0]);
@@ -1525,7 +1526,8 @@ pick_phi_unclaimed(struct ra_ctx *rctx, agx_instr *I, unsigned d,
                    unsigned count, unsigned align, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       rctx->shader->key->dev.chip != AGX_CHIP_G17P)
+       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
+        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[d]);
