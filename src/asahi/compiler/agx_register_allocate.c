@@ -413,9 +413,23 @@ dest_minimum(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
 static bool
 ssa_has_bank_constraint(const struct ra_ctx *rctx, unsigned ssa)
 {
-   return BITSET_TEST(rctx->low_gpr, ssa) ||
-          BITSET_TEST(rctx->texture_gpr, ssa) ||
-          BITSET_TEST(rctx->log2_gpr, ssa) ||
+   if (rctx->shader->key->dev.chip != AGX_CHIP_G17P ||
+       rctx->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B)
+      return BITSET_TEST(rctx->low_gpr, ssa) ||
+             BITSET_TEST(rctx->texture_gpr, ssa) ||
+             BITSET_TEST(rctx->log2_gpr, ssa) ||
+             BITSET_TEST(rctx->high_gpr, ssa);
+
+   /* A bank restriction cannot prevent relocation when the complete register
+    * file fits inside that bank. In particular, pinning a texture coordinate
+    * in a 112-half allocation can strand the only partly free eight-half
+    * region, even though every possible new home satisfies its 128-half
+    * encoding limit. Keep the restriction for genuinely narrower banks.
+    */
+   const unsigned bound = rctx->bound[RA_GPR];
+   return (BITSET_TEST(rctx->low_gpr, ssa) && bound > rctx->tile_gpr_limit) ||
+          (BITSET_TEST(rctx->texture_gpr, ssa) && bound > 128) ||
+          (BITSET_TEST(rctx->log2_gpr, ssa) && bound > 192) ||
           BITSET_TEST(rctx->high_gpr, ssa);
 }
 

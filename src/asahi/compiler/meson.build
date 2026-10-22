@@ -185,6 +185,7 @@ if with_tests
          'test/test-buffer-format-groups.cpp',
          'test/test-scalarize-int64.cpp',
          'test/test-spill-fallback.cpp',
+         'test/test-rt-register-pressure.cpp',
          'test/test-uniform-remat.cpp',
          'test/test-lower-pseudo.cpp',
          'test/test-lower-parallel-copy.cpp',
