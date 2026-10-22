@@ -8900,6 +8900,7 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
             return;
          memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
 
+         uint8_t *start = *out;
          u_foreach_bit(i, changed) {
             if (!hk_ppp_emit_state(dev->dev.chip, out,
                                    upload.gpu + state.offsets[i],
@@ -8909,6 +8910,8 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
                return;
             }
          }
+         if (unlikely(dev->frame_anatomy))
+            cs->anatomy_ppp += (*out - start) / AGX_PPP_STATE_LENGTH;
       }
       cs->m5_ppp_emitted = fields;
       cs->m5_ppp_emitted_state = state;
@@ -9900,6 +9903,12 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    gfx->g17p_vdm_update_memo.valid = true;
 
 tail:
+   if (unlikely(dev->frame_anatomy)) {
+      cs->anatomy_vdm++;
+      if (pipeline_program != cs->anatomy_last_program)
+         cs->anatomy_vdm_new++;
+      cs->anatomy_last_program = pipeline_program;
+   }
    if (agx_native_graphics(&dev->dev)) {
       if (!hk_g17p_emit_native_bind_tail(cmd, cs, &out,
                                            tail_known_match)) {
@@ -9950,6 +9959,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    if (!hk_gfx_republishes_render_state(cmd))
       return;
+   if (unlikely(dev->frame_anatomy))
+      cs->anatomy_republish++;
 
    struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
 

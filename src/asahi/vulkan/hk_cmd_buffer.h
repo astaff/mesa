@@ -1229,6 +1229,11 @@ struct hk_cs {
     * their source and destination stage masks). */
    uint32_t anatomy_api_barriers;
    uint16_t anatomy_api_mem, anatomy_api_buf, anatomy_api_img;
+   /* Frame anatomy profiler only: draws that republished render state,
+    * vertex-program state updates and how many named a program other than
+    * the stream's previous one, and PPP state records emitted. */
+   uint32_t anatomy_republish, anatomy_vdm, anatomy_vdm_new, anatomy_ppp;
+   uint64_t anatomy_last_program;
    uint64_t anatomy_api_src, anatomy_api_dst;
    uint64_t anatomy_api_src_access, anatomy_api_dst_access;
 
