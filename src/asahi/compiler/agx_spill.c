@@ -989,10 +989,10 @@ loop_room_for_live_through(struct spill_ctx *ctx, BITSET_WORD *used)
 
 /*
  * Hack's thesis sorts the live-in set (+ destinations of phis) by next-use
- * distance and takes as much as fits. On G17P, values read in the loop are
- * taken first that way, and values live through the loop then fill only the
- * room the loop leaves them (section 4.2 of the paper). A remat-only pass must
- * not spill, so it keeps the thesis heuristic.
+ * distance and takes as much as fits. On G17P and M5, values read in the loop
+ * are taken first that way, and values live through the loop then fill only
+ * the room the loop leaves them (section 4.2 of the paper). A remat-only pass
+ * must not spill, so it keeps the thesis heuristic.
  */
 static ATTRIBUTE_NOINLINE void
 compute_w_entry_loop_header(struct spill_ctx *ctx)
@@ -1016,7 +1016,9 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
 
    BITSET_WORD *used = NULL;
    unsigned room = 0;
-   if (ctx->shader->key->dev.chip == AGX_CHIP_G17P && !ctx->remat_only) {
+   if ((ctx->shader->key->dev.chip == AGX_CHIP_G17P ||
+        agx_chip_g17_m5(ctx->shader->key->dev.chip)) &&
+       !ctx->remat_only) {
       used = BITSET_CALLOC(ctx->n);
       room = loop_room_for_live_through(ctx, used);
    }
