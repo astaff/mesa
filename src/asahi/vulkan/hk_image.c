@@ -395,10 +395,11 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    if (dev->debug & AGX_DBG_NOCOMPRESS)
       return false;
 
-   /* AGX3 compresses only what hk_g17p_compression_eligible() admitted
-    * (allow_agx3). That excludes images shared through DRM modifiers or
-    * external memory, so hk_can_compress_format() -- which decides whether
-    * the compressed modifier is advertised -- is always false on AGX3. */
+   /* AGX3 compresses only what its policies in hk_g17p_compression.h
+    * admitted (allow_agx3). The private policy excludes images shared through
+    * external memory; G17P shares colour images compressed only through the
+    * GPU_TILED_COMPRESSED modifier (hk_g17p_shared_compression_eligible()),
+    * which is all hk_can_compress_format() advertises on AGX3. */
    if (hk_descriptor_generation_is_agx3(
           agx_chip_descriptor_generation(dev->chip)) &&
        !allow_agx3) {
@@ -486,6 +487,59 @@ static bool
 hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info);
 
+/* Compressed data is only decodable through its own channel class. Every
+ * G17P writer of a colour image is a PBE; the end-of-tile PBE may store a
+ * different format from the image (agx_g17p_rt0_pbe_format packs
+ * R11G11B10/RGB9E5 into R32_UINT words). Never compress an image whose store
+ * class would differ from the class its textures read. */
+static bool
+hk_g17p_store_class_matches(const struct agx_device *dev, VkFormat format)
+{
+   const enum pipe_format p_format = hk_format_to_pipe_format(format);
+   const enum pipe_format store = agx_g17p_rt0_pbe_format(
+      util_format_linear(hk_padded_image_format(p_format)));
+   if (ail_formats_compatible(p_format, store))
+      return true;
+
+   perf_debug_dev(dev, "No compression: G17P stores %s through class of %s",
+                  util_format_short_name(p_format),
+                  util_format_short_name(store));
+   return false;
+}
+
+/* DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED on G17P: the shape
+ * hk_g17p_shared_compression_shape() admits, a matching PBE store class, and
+ * views only of compatible formats. pNext may be NULL (format queries). */
+static bool
+hk_g17p_shared_compression_supported(const struct agx_device *dev,
+                                     VkFormat format, VkImageType type,
+                                     VkImageCreateFlags flags,
+                                     VkImageUsageFlags usage,
+                                     const void *pNext)
+{
+   if ((dev->debug & AGX_DBG_NOCOMPRESS) ||
+       !hk_g17p_shared_compression_shape(dev->chip, format, type, flags,
+                                         usage) ||
+       !hk_g17p_store_class_matches(dev, format))
+      return false;
+
+   if (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+      const struct VkImageFormatListCreateInfo *list =
+         pNext ? vk_find_struct_const(pNext, IMAGE_FORMAT_LIST_CREATE_INFO)
+               : NULL;
+      if (!list || !list->viewFormatCount)
+         return false;
+      const enum pipe_format p_format = hk_format_to_pipe_format(format);
+      for (unsigned i = 0; i < list->viewFormatCount; ++i) {
+         if (list->pViewFormats[i] != VK_FORMAT_UNDEFINED &&
+             !ail_formats_compatible(
+                p_format, hk_format_to_pipe_format(list->pViewFormats[i])))
+            return false;
+      }
+   }
+   return true;
+}
+
 bool
 hk_can_compress_format(const struct agx_device *dev, VkFormat format)
 {
@@ -494,8 +548,13 @@ hk_can_compress_format(const struct agx_device *dev, VkFormat format)
     * small images, but that's ok.
     *
     * Likewise, we do not set flags as flags only disable compression.
+    *
+    * On AGX3 only G17P advertises the modifier, for the colour formats it
+    * shares compressed (hk_g17p_shared_compression_supported()).
     */
-   return hk_can_compress(dev, format, 0, 64, 64, 1, 0, 0, NULL, false);
+   const bool g17p_shared = hk_g17p_shared_compression_supported(
+      dev, format, VK_IMAGE_TYPE_2D, 0, 0, NULL);
+   return hk_can_compress(dev, format, 0, 64, 64, 1, 0, 0, NULL, g17p_shared);
 }
 
 bool
@@ -718,6 +777,19 @@ hk_GetPhysicalDeviceImageFormatProperties2(
                                  pImageFormatInfo->usage, pImageFormatInfo->pNext))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
+   const bool g17p_compressed =
+      pdev->dev.chip == AGX_CHIP_G17P &&
+      pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+      drm_mod_info &&
+      drm_mod_info->drmFormatModifier ==
+         DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED;
+   if (g17p_compressed &&
+       !hk_g17p_shared_compression_supported(
+          &pdev->dev, pImageFormatInfo->format, pImageFormatInfo->type,
+          pImageFormatInfo->flags, pImageFormatInfo->usage,
+          pImageFormatInfo->pNext))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    const uint32_t max_dim = pImageFormatInfo->type == VK_IMAGE_TYPE_3D
                                ? pdev->vk.properties.maxImageDimension3D
                                : 16384;
@@ -746,7 +818,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
    uint32_t maxMipLevels = util_logbase2(max_dim) + 1;
    if (ycbcr_info != NULL || pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR)
       maxMipLevels = 1;
-   if (interchange) {
+   if (interchange || g17p_compressed) {
       maxMipLevels = 1;
       maxArraySize = 1;
    }
@@ -1055,25 +1127,13 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
 {
    /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
     * AGX3 chips stay plain until their packets are recovered. */
-   bool allow_agx3 = hk_g17p_compression_eligible(dev->chip, plane, info);
+   bool allow_agx3 =
+      hk_g17p_compression_eligible(dev->chip, plane, info) ||
+      hk_g17p_shared_compression_eligible(dev->chip, plane, info);
 
-   /* Compressed data is only decodable through its own channel class. Every
-    * G17P writer of a colour image is a PBE; the end-of-tile PBE may store a
-    * different format from the image (agx_g17p_rt0_pbe_format packs
-    * R11G11B10/RGB9E5 into R32_UINT words). Never compress an image whose
-    * store class would differ from the class its textures read. */
-   if (allow_agx3 && !vk_format_is_depth_or_stencil(info->format)) {
-      const enum pipe_format p_format = hk_format_to_pipe_format(info->format);
-      const enum pipe_format store = agx_g17p_rt0_pbe_format(
-         util_format_linear(hk_padded_image_format(p_format)));
-      if (!ail_formats_compatible(p_format, store)) {
-         perf_debug_dev(dev,
-                        "No compression: G17P stores %s through class of %s",
-                        util_format_short_name(p_format),
-                        util_format_short_name(store));
-         allow_agx3 = false;
-      }
-   }
+   if (allow_agx3 && !vk_format_is_depth_or_stencil(info->format) &&
+       !hk_g17p_store_class_matches(dev, info->format))
+      allow_agx3 = false;
 
    return hk_can_compress(dev, info->format, plane, info->extent.width,
                           info->extent.height, info->samples, info->flags,
@@ -1126,13 +1186,14 @@ modifier_get_score(uint64_t mod)
       return 10;
 
    /* Display-native compressed layout, scanned out by DCP directly.  Below
-    * GPU_TILED too: AGX3 never advertises GPU_TILED_COMPRESSED (see
-    * hk_can_compress()), so a compositor's main tranche built from this
-    * driver's modifier list is {GPU_TILED, interchange, LINEAR} and must keep
-    * choosing GPU_TILED.  Interchange then wins only against LINEAR, i.e. in a
-    * display (scanout) list that cannot take GPU tiling.  Such a list must
-    * come from the display plane (IN_FORMATS) or the compositor, never from
-    * the GPU capability list.  A linear-only G17P plane thus stays linear. */
+    * GPU_TILED too, so a compositor's main tranche built from this driver's
+    * modifier list keeps choosing a GPU-tiled layout: GPU_TILED_COMPRESSED
+    * where hk_can_compress_create_info() admits the image (G17P colour
+    * images, hk_g17p_shared_compression_eligible()), GPU_TILED otherwise.
+    * Interchange then wins only against LINEAR, i.e. in a display (scanout)
+    * list that cannot take GPU tiling.  Such a list must come from the
+    * display plane (IN_FORMATS) or the compositor, never from the GPU
+    * capability list.  A linear-only G17P plane thus stays linear. */
    case DRM_FORMAT_MOD_APPLE_INTERCHANGE:
       return 3;
 
@@ -1276,6 +1337,17 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
                           "interchange plane row pitch 0x%" PRIx64 " != 0x%" PRIx64,
                           mod_explicit_info->pPlaneLayouts[0].rowPitch, pitch_B);
    }
+
+   /* G17P shares compressed colour images only in the shape both sides
+    * allocate identically (hk_g17p_shared_compression_eligible()). */
+   if (image->vk.drm_format_mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
+       dev->dev.chip == AGX_CHIP_G17P &&
+       !(hk_g17p_shared_compression_supported(
+            &dev->dev, pCreateInfo->format, pCreateInfo->imageType,
+            pCreateInfo->flags, pCreateInfo->usage, pCreateInfo->pNext) &&
+         hk_g17p_shared_compression_eligible(dev->dev.chip, 0, pCreateInfo)))
+      return vk_errorf(dev, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+                       "compressed modifier on an ineligible G17P image");
 
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(pCreateInfo->format);

@@ -33,8 +33,9 @@
  *    upload kernel.
  *
  * Images that may be shared with another process or device (external
- * memory, WSI, DRM modifiers) stay plain: the compositor and display paths
- * have their own compressed-format contracts.
+ * memory, WSI, DRM modifiers) stay plain under this private policy. Colour
+ * images are shared compressed only through the GPU_TILED_COMPRESSED
+ * modifier contract, see hk_g17p_shared_compression_eligible().
  *
  * This is the only G17P policy: every eligible image is compressed, with no
  * runtime opt-out.
@@ -193,4 +194,61 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
 
    return hk_g17p_compression_depth_format(info->format) &&
           info->mipLevels == 1;
+}
+
+/* G17P colour images shared through DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED.
+ *
+ * The modifier is the sharing contract. With one level, one layer and one
+ * sample, the G17P (legacy AIL policy) compressed allocation is a function of
+ * the format's block size and the extent alone: GPU tiling, the image, then
+ * its metadata, in one memory plane. Exporter and importer therefore derive
+ * the same layout, and import already follows the modifier through
+ * hk_map_compression(). The packets that read and write it are the ones the
+ * private policy above uses for single-level colour images: the compressed
+ * 2D PBE (end-of-tile stores, meta copies and uploads) and the compressed
+ * texture descriptor, with clears through the metadata fast clear.
+ *
+ * The shape is the private colour policy's restricted to one level, without
+ * its exclusion of external memory and WSI images and without a
+ * colour-attachment requirement: hk_image_init() makes every transfer
+ * destination renderable, so a swapchain image written only by blits or
+ * copies also takes the compressed PBE. WSI creates every swapchain image
+ * with ALIAS; aliasing images of identical parameters derive the same
+ * layout. Storage and host-transfer usages stay excluded. Feedback-loop
+ * usage is accepted on import only (zink adds it to every imported
+ * render-target dma-buf) and never chosen at allocation (hk_can_compress()
+ * refuses it). hk_image.c adds the PBE store-class check.
+ */
+static inline bool
+hk_g17p_shared_compression_shape(enum agx_chip chip, VkFormat format,
+                                 VkImageType type, VkImageCreateFlags flags,
+                                 VkImageUsageFlags usage)
+{
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+      VK_IMAGE_CREATE_ALIAS_BIT;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+
+   return chip == AGX_CHIP_G17P && type == VK_IMAGE_TYPE_2D &&
+          !(flags & ~allowed_flags) && !(usage & ~allowed_usage) &&
+          hk_g17p_compression_color_format(format);
+}
+
+static inline bool
+hk_g17p_shared_compression_eligible(enum agx_chip chip, unsigned plane,
+                                    const VkImageCreateInfo *info)
+{
+   return plane == 0 && info &&
+          info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+          hk_g17p_shared_compression_shape(chip, info->format,
+                                           info->imageType, info->flags,
+                                           info->usage) &&
+          info->extent.depth == 1 && info->mipLevels == 1 &&
+          info->arrayLayers == 1 && info->samples == VK_SAMPLE_COUNT_1_BIT &&
+          info->extent.width >= 16 && info->extent.height >= 16;
 }

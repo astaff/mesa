@@ -40,9 +40,20 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
    }
 
    /* Don't advertise compression for the uncompressable */
-   if (mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
-       !hk_can_compress_format(dev, vk_format))
-      return 0;
+   if (mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED) {
+      if (!hk_can_compress_format(dev, vk_format))
+         return 0;
+
+      /* G17P shares compressed images without storage or host-copy access
+       * (hk_g17p_shared_compression_shape()). */
+      if (dev->chip == AGX_CHIP_G17P)
+         return props->optimalTilingFeatures &
+                ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
+                  VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
+   }
 
    /* Interchange: the 32-bit RGBA formats on G17P; never storage or host
     * copies (compressed). */
