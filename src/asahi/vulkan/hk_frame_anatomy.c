@@ -655,6 +655,10 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
                    cs->tib.spilled[rt] ? "/spill" : "");
    }
 
+   if (cs->anatomy_area.extent.width)
+      HK_FA_APPEND(" area=%ux%u+%d+%d", cs->anatomy_area.extent.width,
+                   cs->anatomy_area.extent.height, cs->anatomy_area.offset.x,
+                   cs->anatomy_area.offset.y);
    HK_FA_APPEND(" pet=%u scratch=%c%c", cs->cr.process_empty_tiles ? 1 : 0,
                 (c->flags & DRM_ASAHI_RENDER_VERTEX_SCRATCH) ? 'v' : '-',
                 c->fragment_helper.data ? 'f' : '-');
@@ -695,6 +699,12 @@ hk_frame_anatomy_render(struct hk_frame_anatomy_submit *s,
    if (cs->anatomy_republish)
       HK_FA_APPEND(" st=r%u:v%u:n%u:p%u", cs->anatomy_republish,
                    cs->anatomy_vdm, cs->anatomy_vdm_new, cs->anatomy_ppp);
+   if (cs->anatomy_pass[0] | cs->anatomy_pass[1] | cs->anatomy_pass[2] |
+       cs->anatomy_pass[3])
+      HK_FA_APPEND(" pt=o%u:t%u:p%u:tp%u:nm%u:zw%u:lz%u", cs->anatomy_pass[0],
+                   cs->anatomy_pass[1], cs->anatomy_pass[2],
+                   cs->anatomy_pass[3], cs->anatomy_nomerge,
+                   cs->anatomy_zwrite, cs->anatomy_late_z);
    if (cs->anatomy_api_barriers)
       HK_FA_APPEND(" apibar=%u:%" PRIx64 ":%" PRIx64 ":%" PRIx64 ":%" PRIx64,
                    cs->anatomy_api_barriers, cs->anatomy_api_src,
@@ -733,6 +743,18 @@ hk_frame_anatomy_note_grid(struct hk_cs *cs, const struct hk_shader *shader,
          return;
       }
    }
+}
+
+void
+hk_frame_anatomy_note_m5_fragment(struct hk_cs *cs)
+{
+   if (!cs->m5_ppp_emitted_valid)
+      return;
+   const struct agx_ppp_hal300_graphics_fields *f = &cs->m5_ppp_emitted;
+   cs->anatomy_pass[f->fragment_pass & 3]++;
+   cs->anatomy_nomerge += f->disable_tri_merging;
+   cs->anatomy_zwrite += f->depth_active && f->depth_write;
+   cs->anatomy_late_z += f->fragment_depth_mode != 3;
 }
 
 void

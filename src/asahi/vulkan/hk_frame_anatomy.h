@@ -63,6 +63,7 @@ void hk_frame_anatomy_note(struct hk_device *dev, const char *fmt, ...)
  * fragment shader). Called only while the profiler is enabled. */
 void hk_frame_anatomy_note_fs(struct hk_cs *cs, const struct hk_shader *fs);
 void hk_frame_anatomy_note_vs(struct hk_cs *cs, const struct hk_shader *vs);
+void hk_frame_anatomy_note_m5_fragment(struct hk_cs *cs);
 void hk_frame_anatomy_note_grid(struct hk_cs *cs, const struct hk_shader *cs_shader,
                                  uint64_t threads, uint64_t groups, bool indirect);
 

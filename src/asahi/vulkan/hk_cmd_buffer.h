@@ -1235,6 +1235,14 @@ struct hk_cs {
    uint32_t anatomy_republish, anatomy_vdm, anatomy_vdm_new, anatomy_ppp;
    /* Colour attachments whose load the first draw made unnecessary. */
    uint8_t anatomy_covered;
+   /* Frame anatomy profiler only, M5: draws by the latched fragment pass type
+    * (opaque, translucent, punch-through, translucent punch-through), and
+    * draws with triangle merging disabled, with depth writes, and with a
+    * depth mode other than UNCHANGED (shader depth or side effects). */
+   uint32_t anatomy_pass[4], anatomy_nomerge, anatomy_zwrite, anatomy_late_z;
+   /* Frame anatomy profiler only: the render area of a pass that does not
+    * cover its whole framebuffer (zero extent otherwise). */
+   VkRect2D anatomy_area;
    uint64_t anatomy_last_program;
    uint64_t anatomy_api_src, anatomy_api_dst;
    uint64_t anatomy_api_src_access, anatomy_api_dst_access;

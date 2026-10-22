@@ -4825,6 +4825,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       resolved_clear || resolved_clear_z || loaded_resolve;
    render->process_empty_tiles_without_z = resolved_clear || loaded_resolve;
    cs->cr.process_empty_tiles = process_empty_tiles;
+   if (unlikely(dev->frame_anatomy) && incomplete_render_area)
+      cs->anatomy_area = render->area;
    if (clear_count > 0 &&
        (incomplete_render_area || clear_spills || clear_wide_multisample)) {
       const VkClearRect clear_rect = {
@@ -11953,6 +11955,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       if (unlikely(dev->frame_anatomy)) {
          hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
          hk_frame_anatomy_note_vs(cs, hk_bound_hw_vs(&cmd->state.gfx));
+         hk_frame_anatomy_note_m5_fragment(cs);
       }
       cs->stats.cmds++;
    }
@@ -12456,6 +12459,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    if (unlikely(dev->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, hk_bound_fs(cmd));
       hk_frame_anatomy_note_vs(cs, hk_bound_hw_vs(gfx));
+      hk_frame_anatomy_note_m5_fragment(cs);
    }
    cs->stats.cmds++;
 }
