@@ -529,35 +529,35 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 }
 
 /* M5 lossless storage compression of formats without image atomics: the
- * half-float formats, RG32F, RGBA32F and RGBA8 have none, and R32F has them
- * only with the float32 image atomic features, so it is compressed only when
- * the device did not enable them (and its views cannot reinterpret it). The
- * single-layer/level native read/write packets use the allocator's
- * recovered Gen10 metadata layout, the same layout colour attachments use,
- * so a storage image may also be a colour attachment and a transfer
- * destination: end-of-tile stores, shader image stores, clears and uploads
- * all write it through compressed PBE descriptors. Bits select RGBA16F,
- * RG16F, R16F, R32F, RG32F, RGBA32F and RGBA8, respectively; zero retains
- * the uncompressed diagnostic control. */
+ * half-float formats, RG32F, RGBA32F and the 8- and 16-bit-channel integer
+ * and normalized formats have none, and R32F has them only with the float32
+ * image atomic features, so it is compressed only when the device did not
+ * enable them (and its views cannot reinterpret it). The single-layer/level
+ * native read/write packets use the allocator's recovered Gen10 metadata
+ * layout, the same layout colour attachments use, so a storage image may also
+ * be a colour attachment and a transfer destination: end-of-tile stores,
+ * shader image stores, clears and uploads all write it through compressed PBE
+ * descriptors. Bits select RGBA16F, RG16F, R16F, R32F, RG32F, RGBA32F, RGBA8
+ * UNORM, the other RGBA16 formats, the other RG16 formats and the other RGBA8
+ * formats, respectively; zero retains the uncompressed diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
-                         "ASAHI_M5_STORAGE_COMPRESSION", 127)
+                         "ASAHI_M5_STORAGE_COMPRESSION", 1023)
 
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
                                  const VkImageCreateInfo *info,
                                  bool float_image_atomics)
 {
-   /* Typeless RGBA8 resources of D3D translation layers are mutable and
-    * list their view formats. Every RGBA8 view shares the image's channels
-    * and none has image atomics, so such an image compresses when
-    * hk_can_compress() finds only compatible formats in the list. */
-   const bool rgba8 = info->format == VK_FORMAT_R8G8B8A8_UNORM;
+   /* Typeless resources of D3D translation layers are mutable and list
+    * their view formats: the formats of one channel layout (UNORM, SNORM,
+    * UINT, SINT, FLOAT). None of these formats has image atomics, so such an
+    * image compresses when hk_can_compress() finds only formats of the
+    * image's channel layout in the list. */
    const VkImageCreateFlags allowed_flags =
-      VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
-      (rgba8 ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+      VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
    const VkBaseInStructure *ext = info->pNext;
    const bool format_list_only =
-      rgba8 && (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && ext &&
+      (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && ext &&
       ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
       !ext->pNext;
 
@@ -590,8 +590,23 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R32G32_SFLOAT: bit = 16; break;
    case VK_FORMAT_R32G32B32A32_SFLOAT: bit = 32; break;
    case VK_FORMAT_R8G8B8A8_UNORM: bit = 64; break;
+   case VK_FORMAT_R16G16B16A16_UNORM:
+   case VK_FORMAT_R16G16B16A16_SNORM:
+   case VK_FORMAT_R16G16B16A16_UINT:
+   case VK_FORMAT_R16G16B16A16_SINT: bit = 128; break;
+   case VK_FORMAT_R16G16_UNORM:
+   case VK_FORMAT_R16G16_SNORM:
+   case VK_FORMAT_R16G16_UINT:
+   case VK_FORMAT_R16G16_SINT: bit = 256; break;
+   case VK_FORMAT_R8G8B8A8_SNORM:
+   case VK_FORMAT_R8G8B8A8_UINT:
+   case VK_FORMAT_R8G8B8A8_SINT: bit = 512; break;
    default: return false;
    }
+   /* A mutable image's views may be FLOAT when the image is not: the list
+    * check in hk_can_compress() keeps them to the image's channel layout. */
+   if ((info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !format_list_only)
+      return false;
    return debug_get_option_m5_storage_compression() & bit;
 }
 
