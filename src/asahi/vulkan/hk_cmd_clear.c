@@ -203,7 +203,9 @@ hk_CmdClearColorImage(VkCommandBuffer commandBuffer, VkImage _image,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   uint64_t lo, hi;
+   hk_image_va_range(image, &lo, &hi);
+   hk_sync_xfer_begin_dst(cmd, lo, hi, false);
    hk_xfer_clearcolorimage(commandBuffer, _image, imageLayout, pColor, rangeCount, pRanges);
    hk_sync_xfer_end(cmd);
 }
@@ -226,7 +228,9 @@ hk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   uint64_t lo, hi;
+   hk_image_va_range(image, &lo, &hi);
+   hk_sync_xfer_begin_dst(cmd, lo, hi, false);
    hk_xfer_cleardepthstencilimage(commandBuffer, _image, imageLayout, pDepthStencil, rangeCount, pRanges);
    hk_sync_xfer_end(cmd);
 }

@@ -373,6 +373,112 @@ hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    }
 }
 
+static void hk_sync_stream_wait(struct hk_cs *cs,
+                                const struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
+
+/* G17P transfer writes: see hk_sync.h. Drop the notes of streams positioned
+ * at or before seq on the compute subqueue: a dependency orders them. */
+static void
+xfer_forget_upto(struct hk_sync_state *st, uint32_t seq)
+{
+   unsigned kept = 0;
+   for (unsigned i = 0; i < st->xfer_write_count; ++i) {
+      if (st->xfer_writes[i].cs->sync.seq > seq)
+         st->xfer_writes[kept++] = st->xfer_writes[i];
+   }
+   if (kept != st->xfer_write_count) {
+      st->xfer_write_count = kept;
+      st->xfer_version++;
+   }
+   if (st->xfer_any && st->xfer_any->sync.seq <= seq) {
+      st->xfer_any = NULL;
+      st->xfer_version++;
+   }
+}
+
+void
+hk_sync_note_xfer_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   const struct hk_sync_xfer_dst *dst = &st->xfer_dst;
+   assert(cs->type == HK_CS_CDM);
+
+   if (dst->valid && !dst->device_address) {
+      /* The common case: the same transfer launching again. */
+      for (unsigned i = 0; i < st->xfer_write_count; ++i) {
+         struct hk_sync_xfer_write *w = &st->xfer_writes[i];
+         if (w->cs == cs && dst->lo <= w->hi && w->lo <= dst->hi) {
+            if (dst->lo < w->lo || dst->hi > w->hi) {
+               w->lo = MIN2(w->lo, dst->lo);
+               w->hi = MAX2(w->hi, dst->hi);
+               st->xfer_version++;
+            }
+            return;
+         }
+      }
+
+      if (st->xfer_write_count < HK_SYNC_XFER_WRITES) {
+         st->xfer_writes[st->xfer_write_count++] = (struct hk_sync_xfer_write){
+            .lo = dst->lo,
+            .hi = dst->hi,
+            .cs = cs,
+         };
+         st->xfer_version++;
+         return;
+      }
+   }
+
+   /* Unknown, reachable through a device address, or no room: any graphics
+    * work may access it. */
+   struct hk_cs *any = hk_sync_later(st->xfer_any, cs);
+   if (any != st->xfer_any) {
+      st->xfer_any = any;
+      st->xfer_version++;
+   }
+}
+
+struct hk_cs *
+hk_sync_xfer_match(const struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi,
+                   struct hk_cs *best)
+{
+   const struct hk_sync_state *st = &cmd->sync;
+   for (unsigned i = 0; i < st->xfer_write_count; ++i) {
+      const struct hk_sync_xfer_write *w = &st->xfer_writes[i];
+      if (lo < w->hi && w->lo < hi)
+         best = hk_sync_later(best, w->cs);
+   }
+   return hk_sync_later(best, st->xfer_any);
+}
+
+struct hk_cs *
+hk_sync_xfer_match_all(const struct hk_cmd_buffer *cmd, struct hk_cs *best)
+{
+   const struct hk_sync_state *st = &cmd->sync;
+   for (unsigned i = 0; i < st->xfer_write_count; ++i)
+      best = hk_sync_later(best, st->xfer_writes[i].cs);
+   return hk_sync_later(best, st->xfer_any);
+}
+
+void
+hk_sync_order_xfer(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   assert(cs->type == HK_CS_CDM);
+
+   /* Graphics streams created from now on, then the ones that exist: the
+    * render of the open pass instance, both halves, and its pre-graphics
+    * work, which the transfer prefix precedes. */
+   hk_sync_after_stream(cmd, cs, HK_SYNC_GFX);
+   if (st->in_pass) {
+      const struct hk_sync_dep dep[HK_SYNC_NUM_SQ] = {{0}, {.cut = cs}};
+      if (cmd->current_cs.gfx)
+         hk_sync_stream_wait(cmd->current_cs.gfx, dep);
+      if (cmd->current_cs.pre_gfx)
+         hk_sync_stream_wait(cmd->current_cs.pre_gfx, dep);
+   }
+   xfer_forget_upto(st, cs->sync.seq);
+}
+
 void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
@@ -380,6 +486,13 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    cmd->sync.epoch++;
    if (!src_kinds || !dst_kinds)
       return;
+
+   /* A dependency from the transfer stage into any graphics stage orders
+    * every noted transfer write as the application asked. */
+   if ((src_kinds & HK_SYNC_XFER) &&
+       (dst_kinds & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG)) &&
+       hk_sync_xfer_pending(&cmd->sync))
+      xfer_forget_upto(&cmd->sync, UINT32_MAX);
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, src_kinds, NULL, dep);
@@ -799,6 +912,26 @@ replace_pointer(struct hk_cs **slot, struct hk_cs *from, struct hk_cs *to)
       *slot = to;
 }
 
+/* Transfer write notes follow a stream that moves (to != NULL) or is removed
+ * with nothing before it on its subqueue (to == NULL). */
+static void
+xfer_replace_stream(struct hk_sync_state *st, struct hk_cs *from,
+                    struct hk_cs *to)
+{
+   unsigned kept = 0;
+   for (unsigned i = 0; i < st->xfer_write_count; ++i) {
+      struct hk_sync_xfer_write w = st->xfer_writes[i];
+      if (w.cs == from)
+         w.cs = to;
+      if (w.cs)
+         st->xfer_writes[kept++] = w;
+   }
+   st->xfer_write_count = kept;
+   if (st->xfer_any == from)
+      st->xfer_any = to;
+   st->xfer_version++;
+}
+
 /* Every reference to cs moves to its predecessor on the subqueue: a prefix
  * that ended at cs now ends just before it. */
 void
@@ -817,6 +950,7 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    replace_pointer(&st->last_any[sq], cs, prev);
    replace_pointer(&st->internal[sq].cut, cs, prev);
    replace_pointer(&st->pass_vdm, cs, NULL);
+   xfer_replace_stream(st, cs, prev);
    if (st->pass_tile_first == cs) {
       st->pass_tile_first = st->pass_tile_last = NULL;
    } else if (st->pass_tile_last == cs &&
@@ -892,6 +1026,7 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
    replace_pointer(&st->last_any[sq], from, into);
    replace_pointer(&st->internal[sq].cut, from, into);
    records_replace_stream(cmd, from, into);
+   xfer_replace_stream(st, from, into);
 
    list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
       if (it != into && it != from) {

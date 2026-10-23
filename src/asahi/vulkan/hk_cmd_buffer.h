@@ -1360,14 +1360,41 @@ struct hk_cmd_buffer {
 static inline void
 hk_sync_xfer_begin(struct hk_cmd_buffer *cmd)
 {
-   cmd->sync.xfer_depth++;
+   /* An outermost transfer without a known destination may write anything
+    * (hk_sync_note_xfer_write()). */
+   if (cmd->sync.xfer_depth++ == 0)
+      cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){0};
+}
+
+/* As hk_sync_xfer_begin(), for a transfer whose writes stay inside the GPU
+ * VA range [lo, hi). device_address says shaders may also reach the range
+ * through a buffer device address. A nested transfer widens the range of the
+ * outermost one. */
+static inline void
+hk_sync_xfer_begin_dst(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi,
+                       bool device_address)
+{
+   struct hk_sync_xfer_dst *dst = &cmd->sync.xfer_dst;
+   if (cmd->sync.xfer_depth++ == 0) {
+      *dst = (struct hk_sync_xfer_dst){
+         .lo = lo,
+         .hi = hi,
+         .valid = lo < hi,
+         .device_address = device_address,
+      };
+   } else if (dst->valid) {
+      dst->lo = MIN2(dst->lo, lo);
+      dst->hi = MAX2(dst->hi, hi);
+      dst->device_address |= device_address;
+   }
 }
 
 static inline void
 hk_sync_xfer_end(struct hk_cmd_buffer *cmd)
 {
    assert(cmd->sync.xfer_depth > 0);
-   cmd->sync.xfer_depth--;
+   if (--cmd->sync.xfer_depth == 0)
+      cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){0};
 }
 
 /*
@@ -1794,6 +1821,11 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       hk_flush_query_resets(cmd, *ptr);
    if (compute && cmd->state.as_build_recording)
       (*ptr)->as_build = true;
+   /* Transfer entry points also reuse an open CDM stream, so note each use,
+    * not just stream creation (hk_sync_note_xfer_write()). */
+   if (compute && unlikely(cmd->sync.xfer_depth) && !cmd->sync.in_pass &&
+       hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P)
+      hk_sync_note_xfer_write(cmd, *ptr);
    return *ptr;
 }
 

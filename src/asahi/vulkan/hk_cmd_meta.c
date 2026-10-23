@@ -4465,6 +4465,31 @@ hk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
+/* Transfer entry points name their destination for the G17P transfer write
+ * tracking (hk_sync_xfer_write in hk_sync.h). */
+static void
+hk_xfer_begin_image(struct hk_cmd_buffer *cmd, VkImage _image)
+{
+   VK_FROM_HANDLE(hk_image, image, _image);
+   uint64_t lo, hi;
+   hk_image_va_range(image, &lo, &hi);
+   hk_sync_xfer_begin_dst(cmd, lo, hi, false);
+}
+
+static void
+hk_xfer_begin_buffer(struct hk_cmd_buffer *cmd, VkBuffer _buffer,
+                     uint64_t lo_B, uint64_t hi_B)
+{
+   VK_FROM_HANDLE(hk_buffer, buffer, _buffer);
+   const uint64_t base = vk_buffer_address(&buffer->vk, 0);
+   /* A sparse buffer is also read through its shadow mapping. */
+   const bool device_address =
+      (buffer->vk.usage & VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT) ||
+      buffer->va;
+   hk_sync_xfer_begin_dst(cmd, base + lo_B, base + MIN2(hi_B, buffer->vk.size),
+                          device_address);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdBlitImage2(VkCommandBuffer commandBuffer,
                  const VkBlitImageInfo2 *pBlitImageInfo)
@@ -4473,7 +4498,7 @@ hk_CmdBlitImage2(VkCommandBuffer commandBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   hk_xfer_begin_image(cmd, pBlitImageInfo->dstImage);
    hk_xfer_blitimage2(commandBuffer, pBlitImageInfo);
    hk_sync_xfer_end(cmd);
 }
@@ -4486,7 +4511,7 @@ hk_CmdResolveImage2(VkCommandBuffer commandBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   hk_xfer_begin_image(cmd, pResolveImageInfo->dstImage);
    hk_xfer_resolveimage2(commandBuffer, pResolveImageInfo);
    hk_sync_xfer_end(cmd);
 }
@@ -4510,7 +4535,12 @@ hk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info)
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   uint64_t lo = UINT64_MAX, hi = 0;
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      lo = MIN2(lo, info->pRegions[r].dstOffset);
+      hi = MAX2(hi, info->pRegions[r].dstOffset + info->pRegions[r].size);
+   }
+   hk_xfer_begin_buffer(cmd, info->dstBuffer, lo, hi);
    hk_xfer_copybuffer2(commandBuffer, info);
    hk_sync_xfer_end(cmd);
    cmd->state.deferred_clear_hold = false;
@@ -4524,7 +4554,7 @@ hk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   hk_xfer_begin_image(cmd, pCopyBufferToImageInfo->dstImage);
    hk_xfer_copybuffertoimage2(commandBuffer, pCopyBufferToImageInfo);
    hk_sync_xfer_end(cmd);
 }
@@ -4537,7 +4567,7 @@ hk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   hk_xfer_begin_buffer(cmd, pCopyImageToBufferInfo->dstBuffer, 0, UINT64_MAX);
    hk_xfer_copyimagetobuffer2(commandBuffer, pCopyImageToBufferInfo);
    hk_sync_xfer_end(cmd);
 }
@@ -4550,7 +4580,7 @@ hk_CmdCopyImage2(VkCommandBuffer commandBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   hk_xfer_begin_image(cmd, pCopyImageInfo->dstImage);
    hk_xfer_copyimage2(commandBuffer, pCopyImageInfo);
    hk_sync_xfer_end(cmd);
 }
@@ -4570,7 +4600,12 @@ hk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   {
+      VK_FROM_HANDLE(hk_buffer, buffer, dstBuffer);
+      hk_xfer_begin_buffer(cmd, dstBuffer, dstOffset,
+                           dstOffset +
+                              vk_buffer_range(&buffer->vk, dstOffset, dstRange));
+   }
    hk_xfer_fillbuffer(commandBuffer, dstBuffer, dstOffset, dstRange, data);
    hk_sync_xfer_end(cmd);
    cmd->state.deferred_clear_hold = false;
@@ -4591,7 +4626,7 @@ hk_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */
-   hk_sync_xfer_begin(cmd);
+   hk_xfer_begin_buffer(cmd, dstBuffer, dstOffset, dstOffset + dstRange);
    hk_xfer_updatebuffer(commandBuffer, dstBuffer, dstOffset, dstRange, pData);
    hk_sync_xfer_end(cmd);
    cmd->state.deferred_clear_hold = false;
