@@ -206,6 +206,79 @@ compute_clear_pass(struct hk_cmd_buffer *cmd, const void *image,
 }
 
 static void
+test_loaded_color_preservation(void)
+{
+   const void *image = (void *)0x1234;
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *clear = compute_clear_pass(cmd, image, 0, true);
+   struct hk_cs *load = render_pass(cmd, image, 1, true);
+   T("full-area color load waits on its compute clear",
+     load->sync.dep[HK_SYNC_CDM].cut == clear &&
+     !load->sync.dep[HK_SYNC_VDM].cut);
+   struct hk_queue *queue = new_queue(true);
+   T("loaded color submit", submit(queue, cmd));
+   T("loaded color names the exact compute producer",
+     load->sync.barrier[HK_SYNC_CDM] == clear->sync.index &&
+     load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+
+   cmd = new_cmd();
+   clear = compute_clear_pass(cmd, image, 0, true);
+   struct hk_cs *other = render_pass(cmd, (void *)0x5678, 1, true);
+   T("unrelated loaded image remains independent",
+     !other->sync.dep[HK_SYNC_CDM].cut &&
+     !other->sync.dep[HK_SYNC_VDM].cut);
+   struct hk_cs *overwrite = render_pass(cmd, image, 1, false);
+   T("complete clear or discard does not preserve prior color",
+     !overwrite->sync.dep[HK_SYNC_CDM].cut &&
+     !overwrite->sync.dep[HK_SYNC_VDM].cut);
+
+   struct hk_cmd_buffer *a = new_cmd(), *b = new_cmd();
+   clear = compute_clear_pass(a, image, 0, true);
+   load = render_pass(b, image, 1, true);
+   queue = new_queue(true);
+   struct hk_cmd_buffer *pair[] = {a, b};
+   T("loaded color across command buffers submit",
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+   T("loaded color across command buffers retains compute clear",
+     load->sync.barrier[HK_SYNC_CDM] == clear->sync.index &&
+     load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+
+   a = new_cmd(); b = new_cmd();
+   compute_clear_pass(a, image, 0, true);
+   load = render_pass(b, (void *)0x5678, 1, true);
+   pair[0] = a; pair[1] = b;
+   queue = new_queue(true);
+   T("unrelated color across command buffers submit",
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+   T("unrelated color across command buffers stays independent",
+     load->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+     load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+
+   cmd = new_cmd();
+   clear = compute_clear_pass(cmd, image, 1, true);
+   load = render_pass(cmd, image, 1, true);
+   T("loaded layer zero does not wait on disjoint layer one",
+     !load->sync.dep[HK_SYNC_CDM].cut);
+   load = render_pass(cmd, image, 2, true);
+   T("loaded layer range waits on overlapping compute clear",
+     load->sync.dep[HK_SYNC_CDM].cut == clear);
+
+   a = new_cmd(); b = new_cmd();
+   clear = compute_clear_pass(a, image, 0, true);
+   load = render_pass(b, image, 1, true);
+   queue = new_queue(true);
+   queue->drm.timeline_value = 1;
+   T("loaded color producer submission", submit(queue, a));
+   queue->drm.timeline_value = 2;
+   struct hk_cmd_buffer *single[] = {b};
+   T("loaded color consumer submission",
+     hk_sync_resolve_submit(queue, single, 1, false, false, 0));
+   T("loaded color waits on prior compute history",
+     load->sync.barrier[HK_SYNC_CDM] == 0 &&
+     load->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+}
+
+static void
 test_compute_clear_layer_preservation(void)
 {
    const void *image = (void *)0x1234;
@@ -659,6 +732,7 @@ main(void)
       return EXIT_FAILURE;
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
+   test_loaded_color_preservation();
    test_pass_software_graphics_dependencies();
    test_image_barrier_vertex_class();
    test_chain_first_skips_empty_buffers();

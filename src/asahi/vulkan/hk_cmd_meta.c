@@ -2971,6 +2971,10 @@ hk_g17p_copy_buffer_to_image_supported(
             plane_vk_format = VK_FORMAT_R32_UINT;
          else if (plane_vk_format == VK_FORMAT_D16_UNORM)
             plane_vk_format = VK_FORMAT_R16_UINT;
+      } else if (region->imageSubresource.aspectMask ==
+                 VK_IMAGE_ASPECT_STENCIL_BIT) {
+         /* Likewise the stencil plane renders through its raw R8_UINT view. */
+         plane_vk_format = VK_FORMAT_R8_UINT;
       }
       const enum pipe_format plane_pipe =
          hk_format_to_pipe_format(plane_vk_format);
