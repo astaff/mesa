@@ -1693,7 +1693,11 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
     * Heap and index are independent operands, and the state operand's form
     * is independent of f70 (normalized data): int and uint encode alike. */
    const bool heap_state =
-      agx3_tex_plain_uniform64(I->src[3]) && !(I->src[3].value & 3) &&
+      I->src[3].type == AGX_INDEX_UNIFORM && I->src[3].size == AGX_SIZE_64 &&
+      agx_channels(I->src[3]) == 1 && !(I->src[3].value & 3) &&
+      I->src[3].value <= 508 && !I->src[3].memory && !I->src[3].abs &&
+      !I->src[3].neg && !I->src[3].kill && !I->src[3].cache &&
+      !I->src[3].discard &&
       agx3_tex_plain_reg(I->src[4]) &&
       I->src[4].size == AGX_SIZE_32 && agx_channels(I->src[4]) == 1 &&
       !(I->src[4].value & 1) && I->src[4].value <= 126 &&
@@ -10937,7 +10941,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                   AGX3_REFUSE(I);
                for (unsigned j=0;j<2;j++) {
                   agx_index word=I->src[2+j];
-                  uint8_t copy[AGX3_STAGE_MAX_LENGTH], n;
+                  uint8_t copy[16], n;
                   if (!agx3_src_is_register(word) || word.size!=AGX_SIZE_32 ||
                       word.memory || word.abs || word.neg || (word.value&1) ||
                       !agx3_rt_gen1_encode_launch_word(j,word.value,copy,&n) ||

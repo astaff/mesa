@@ -1245,6 +1245,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
       /* G15C executes the same AGX3B encoding as G15S with no extra
        * scheduling rules, so it runs the G15S build of the programs. */
       dev->libagx_programs = libagx_g15s;
+   } else if (dev->chip == AGX_CHIP_G16G) {
+      dev->libagx_programs = libagx_g16g;
    } else {
       dev->libagx_programs = NULL;
    }
