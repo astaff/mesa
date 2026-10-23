@@ -2385,7 +2385,10 @@ hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint8_t covered = 0;
    for (uint32_t i = 0; i < render->color_att_count; ++i) {
       const struct hk_attachment *att = &render->color_att[i];
+      /* A disabled colour write keeps the attachment (preserve_rt in the
+       * epilog), so it is not covered even when its write mask is full. */
       if (!att->iview || !(gfx->fast_link_fs.color_written & BITFIELD_BIT(i)) ||
+          !(dyn->cb.color_write_enables & BITFIELD_BIT(i)) ||
           dyn->cb.attachments[i].blend_enable)
          continue;
       const unsigned channels = util_format_get_nr_components(
