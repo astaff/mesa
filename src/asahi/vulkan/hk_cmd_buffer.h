@@ -412,13 +412,20 @@ struct hk_rendering_state {
    struct agx_zls_control_packed zls_control_only, zls_control_last;
    const void *zls_first_cs;
 
-   /* Preserve untouched NONE/NONE attachments, and (HK_G17P_ZLS_ELIDE_
-    * UNTOUCHED, default on) LOAD/STORE ones. The pass may drop its
-    * depth/stencil attachment from every control stream when no draw or
-    * clear in it tests, writes, bounds-tests or clears depth/stencil (see
-    * hk_g17p_zls_elide()). */
-   bool g17p_zls_elide_ok;
-   bool g17p_depth_touched;
+   /* Track depth and stencil independently: an untouched aspect can be
+    * removed from every stream even when the other aspect is cleared or
+    * used. NONE/NONE aspects must retain their memory contents; eliding
+    * untouched LOAD/STORE aspects also avoids redundant traffic.
+    */
+   VkImageAspectFlags g17p_zls_elide_mask;
+   VkImageAspectFlags g17p_zls_touched;
+
+   /* Of the touched aspects, those a draw or clear may have changed. A pass
+    * that only tests an elidable aspect leaves its memory contents as they
+    * were, so it keeps the load and drops the store
+    * (hk_g17p_zls_elide_store()).
+    */
+   VkImageAspectFlags g17p_zls_written;
 
    /* AGX3 dead depth store: the "only" ZLS word with the depth store
     * dropped, and whether the pass processes empty tiles without that store,
@@ -427,6 +434,18 @@ struct hk_rendering_state {
    bool no_z_store_ok;
    bool process_empty_tiles_without_z;
    struct agx_zls_control_packed zls_control_only_no_z_store;
+
+   /* G17P: colour attachments a draw or clear of the pass may write, and
+    * whether a fragment shader reads the tilebuffer. See
+    * hk_g17p_elide_untouched_color(). */
+   uint8_t color_written;
+   bool color_read;
+
+   /* G17P: the pass's first draw was seen, and the colour attachments it
+    * overwrote at every sample before anything could read them. See
+    * hk_g17p_note_first_draw(). */
+   bool first_draw_seen;
+   uint8_t color_covered;
 };
 
 struct hk_index_buffer_state {
@@ -674,6 +693,10 @@ struct hk_graphics_state {
       struct hk_shader *shader;
       struct hk_fast_link_key_fs key;
       bool valid;
+      /* Colour attachments the linked fragment program writes, and whether
+       * it reads the tilebuffer. */
+      uint8_t color_written;
+      bool reads_tib;
    } fast_link_fs;
 
    /* Exact last VS/FS loader identities. These are recording-only selectors;
@@ -855,6 +878,12 @@ struct hk_cs {
     * leave the merge memory-equivalent to the two separate instances, or the
     * stream ends first (hk_m5_ordered_draw_hazard()). */
    bool m5_ordered;
+
+   /* M5: every attachment of the continued instances is in an
+    * attachment-only layout, so no descriptor can access one of them and
+    * descriptor sets bound for graphics need not end an ordered continuation
+    * (hk_m5_attachments_exclude_descriptors()). */
+   bool m5_layout_proof;
 
    /* Scratch requirements */
    struct {
@@ -1648,7 +1677,8 @@ hk_pool_vdm_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 
 bool hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 /* A depth/stencil clear touched the pass's attachment (ZLS elision). */
-void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd);
+void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd,
+                              VkImageAspectFlags aspects);
 
 uint32_t hk_default_sample_positions(unsigned nr_samples);
 
@@ -2037,6 +2067,14 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    hk_reserve_scratch_slow(cmd, cs, s);
+}
+
+/* Whether image barriers of the command buffer order only the vertex work
+ * that reads images (hk_sync.h, HK_SYNC_GFX_IMG). */
+static inline bool
+hk_sync_image_class(const struct hk_cmd_buffer *cmd)
+{
+   return hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P;
 }
 
 /* AGX2 returns its shader-base-relative USC offset.  G17P returns the absolute

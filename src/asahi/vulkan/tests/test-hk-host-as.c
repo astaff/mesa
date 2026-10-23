@@ -3,6 +3,7 @@
  */
 #include "hk_host_as.h"
 #include "vk_acceleration_structure.h"
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>

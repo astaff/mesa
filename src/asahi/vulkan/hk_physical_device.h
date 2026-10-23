@@ -14,6 +14,15 @@
 #include "vk_sync.h"
 #include "wsi_common.h"
 
+/*
+ * User-visible driver identity, reported in VkPhysicalDeviceDriverProperties
+ * by every physical device this driver opens.  It does not depend on the chip,
+ * so a newly enabled GPU reports it with no further change.  driverID stays
+ * VK_DRIVER_ID_MESA_HONEYKRISP until Borealis has its own registered ID.
+ */
+#define HK_DRIVER_NAME "Borealis"
+#define HK_DRIVER_INFO_SUFFIX ", Borealis, derived from Honeykrisp"
+
 struct hk_instance;
 struct hk_physical_device;
 

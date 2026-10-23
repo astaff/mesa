@@ -1,10 +1,10 @@
 /* Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  */
-#undef NDEBUG
 #include "agx_nir_ray_query.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/glsl_types.h"
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>

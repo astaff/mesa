@@ -4,6 +4,7 @@
 #include "hk_execution_allowance.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_cmd_buffer.h"
+#undef NDEBUG
 #include <assert.h>
 
 /* The production merge copies or links bytes before combining metadata. A

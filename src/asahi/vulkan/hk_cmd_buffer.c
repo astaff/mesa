@@ -933,7 +933,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     */
    if (cmd->sync.in_pass) {
       uint8_t src_kinds, dst_kinds;
-      hk_sync_dependency_kinds(pDependencyInfo, &src_kinds, &dst_kinds);
+      hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
+                            &src_kinds, &dst_kinds);
       const uint32_t reasons = hk_classify_pass_barrier(cmd, pDependencyInfo);
       if (reasons) {
          if (hk_cmd_buffer_end_graphics(cmd)) {
@@ -951,7 +952,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    }
 
    uint8_t src_kinds, dst_kinds;
-   hk_sync_dependency_kinds(pDependencyInfo, &src_kinds, &dst_kinds);
+   hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
+                            &src_kinds, &dst_kinds);
 
    /* Compute work that stays in the open compute stream is ordered by the
     * stream itself; what it needs at a barrier is visibility. Every native
@@ -1327,11 +1329,14 @@ hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
 {
    u_foreach_bit(set_idx, desc->push_dirty) {
       struct hk_push_descriptor_set *push_set = desc->push[set_idx];
-      const uint64_t push_set_addr = hk_pool_upload(
-         cmd, push_set->data, sizeof(push_set->data), HK_MIN_UBO_ALIGNMENT);
+      /* Only the bytes the pushed layout uses; the rest is never read */
+      const uint32_t size = MAX2(push_set->size, HK_MIN_UBO_ALIGNMENT);
+      assert(size <= sizeof(push_set->data));
+      const uint64_t push_set_addr =
+         hk_pool_upload(cmd, push_set->data, size, HK_MIN_UBO_ALIGNMENT);
 
       desc->root.sets[set_idx] = push_set_addr;
-      desc->set_sizes[set_idx] = sizeof(push_set->data);
+      desc->set_sizes[set_idx] = size;
    }
 
    desc->root_dirty = true;

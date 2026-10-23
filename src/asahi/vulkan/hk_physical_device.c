@@ -1522,9 +1522,9 @@ hk_get_device_properties(const struct agx_device *dev,
    static_assert(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
    memcpy(properties->driverUUID, instance->driver_build_sha, VK_UUID_SIZE);
 
-   strncpy(properties->driverName, "Honeykrisp", VK_MAX_DRIVER_NAME_SIZE);
+   strncpy(properties->driverName, HK_DRIVER_NAME, VK_MAX_DRIVER_NAME_SIZE);
    snprintf(properties->driverInfo, VK_MAX_DRIVER_INFO_SIZE,
-            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
+            "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 HK_DRIVER_INFO_SUFFIX);
 
    /* We don't use the layouts ATM so just report all layouts from
     * extensions that we support as compatible.

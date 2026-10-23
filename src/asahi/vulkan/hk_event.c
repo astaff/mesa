@@ -122,7 +122,8 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
 
    assert(pDependencyInfo->sType == VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
    uint8_t src_kinds, dst_kinds;
-   hk_sync_dependency_kinds(pDependencyInfo, &src_kinds, &dst_kinds);
+   hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
+                            &src_kinds, &dst_kinds);
 
    hk_event_write(cmd, event, src_kinds, VK_EVENT_SET);
 }
@@ -163,7 +164,8 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
       assert(pDependencyInfos[i].sType == VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
 
       uint8_t src_kinds, dst_kinds;
-      hk_sync_dependency_kinds(&pDependencyInfos[i], &src_kinds, &dst_kinds);
+      hk_sync_dependency_kinds(&pDependencyInfos[i], hk_sync_image_class(cmd),
+                               &src_kinds, &dst_kinds);
 
       /* Vulkan 1.3, 7.5: the first synchronization scope of vkCmdWaitEvents2
        * is the union of the set operations' scopes, which are earlier in

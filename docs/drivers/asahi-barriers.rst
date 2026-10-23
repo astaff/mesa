@@ -1,5 +1,5 @@
-Honeykrisp render-pass barriers
-===============================
+Borealis render-pass barriers
+=============================
 
 ``hk_barrier_classify()`` decides whether an in-pass dependency needs a
 physical render boundary. Its result is a set of reasons, rather than a

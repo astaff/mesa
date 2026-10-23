@@ -722,3 +722,44 @@ hk_g17p_image_blit_slice(enum agx_chip chip, VkImageType src_type,
    out->dstSubresource.layerCount = 1;
    return true;
 }
+
+bool
+hk_g17p_metadata_grid_init(uint32_t width_tl, uint32_t height_tl,
+                           struct hk_g17p_metadata_grid *grid)
+{
+   if (grid)
+      memset(grid, 0, sizeof(*grid));
+   if (!grid || !width_tl || !height_tl || width_tl > UINT16_MAX ||
+       height_tl > UINT16_MAX)
+      return false;
+
+   *grid = (struct hk_g17p_metadata_grid){
+      .width_tl = width_tl,
+      .height_tl = height_tl,
+      .interleave_bits = util_logbase2_ceil(MIN2(width_tl, height_tl)),
+      .major_is_x = width_tl > height_tl,
+   };
+   return true;
+}
+
+static uint32_t
+hk_g17p_spread_bits(uint32_t v)
+{
+   v &= 0xffff;
+   v = (v | (v << 8)) & 0x00ff00ff;
+   v = (v | (v << 4)) & 0x0f0f0f0f;
+   v = (v | (v << 2)) & 0x33333333;
+   return (v | (v << 1)) & 0x55555555;
+}
+
+uint32_t
+hk_g17p_metadata_tile_index(const struct hk_g17p_metadata_grid *grid,
+                            uint32_t x_tl, uint32_t y_tl)
+{
+   const uint32_t mask = (1u << grid->interleave_bits) - 1;
+   const uint32_t major = grid->major_is_x ? x_tl : y_tl;
+
+   return (hk_g17p_spread_bits(x_tl & mask) |
+           (hk_g17p_spread_bits(y_tl & mask) << 1)) +
+          ((major & ~mask) << grid->interleave_bits);
+}

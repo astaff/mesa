@@ -1596,7 +1596,15 @@ fail:
 VkResult
 hk_device_init_accel_struct_state(struct hk_device *dev)
 {
-   dev->g17p_native_as = hk_g17p_rt_enabled(&dev->dev);
+   /* The native state below is large and lives as long as the device: the
+    * ray query program image with its fixed binds, the AS tables, and, through
+    * gen1_native_graphics_rq/fragment_rq, a render SCS reservation in every
+    * queue's kernel context that sizes that context's render free list. A
+    * device enabling no ray-tracing feature cannot reach any of it, so it
+    * keeps the state every device without native ray tracing has. Shader
+    * cache keys tell the two kinds of device apart (HK_FEAT_RAY_TRACING). */
+   dev->g17p_native_as = hk_g17p_rt_enabled(&dev->dev) &&
+                         hk_rt_features_enabled(&dev->vk.enabled_features);
    const char *capture=getenv("ASAHI_G17P_RQ_CAPTURE_DIR");
    if(capture && dev->g17p_native_as && !hk_gen1_rq_init(dev,capture))
       return vk_error(dev,VK_ERROR_INITIALIZATION_FAILED);

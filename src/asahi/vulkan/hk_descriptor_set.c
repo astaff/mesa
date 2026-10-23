@@ -794,6 +794,7 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
    memcpy(push_set->layout_hash, layout->vk.blake3,
           sizeof(push_set->layout_hash));
    push_set->layout_flags = layout->vk.flags;
+   push_set->size = layout->non_variable_descriptor_buffer_size;
    assert(layout->non_variable_descriptor_buffer_size < sizeof(push_set->data));
    struct hk_descriptor_set set = {
       .layout = layout,
@@ -1324,6 +1325,7 @@ hk_push_descriptor_set_update_template(
    memcpy(push_set->layout_hash, layout->vk.blake3,
           sizeof(push_set->layout_hash));
    push_set->layout_flags = layout->vk.flags;
+   push_set->size = layout->non_variable_descriptor_buffer_size;
    struct hk_descriptor_set tmp_set = {
       .layout = layout,
       .size = sizeof(push_set->data),
