@@ -346,6 +346,11 @@ asahi_append_compute_attachments(struct hk_device *dev,
                                  struct util_dynarray *payload,
                                  const struct hk_cs *cs)
 {
+   /* Attachment spans are hints for the native AGX3 firmware interface.
+    * AGX2 has never sent them, so G13 and G14 keep that submission. */
+   if (!agx_native_graphics(&dev->dev))
+      return;
+
    const struct hk_drm_attachment_set *set = &cs->compute_attachments;
    const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
    const struct drm_asahi_cmd_header header = {
@@ -366,6 +371,10 @@ asahi_append_fragment_attachments(struct hk_device *dev,
                                   struct util_dynarray *payload,
                                   const struct hk_cs *cs)
 {
+   /* See asahi_append_compute_attachments(). */
+   if (!agx_native_graphics(&dev->dev))
+      return;
+
    const struct hk_drm_attachment_set *set = &cs->fragment_attachments;
    const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
    const struct drm_asahi_cmd_header header = {
