@@ -81,17 +81,28 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
    _mesa_blake3_update(ctx, values, sizeof(values));
 }
 
+/* VK_KHR_shader_fma: G17P with its explicit-RTE tininess repair
+ * (agx_nir_lower_fma_rte()) and M5. G13-G15 do not pass the newly exposed
+ * cases. */
+static bool
+hk_shader_fma_supported(enum agx_chip chip)
+{
+   return (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
+          agx_chip_exact_fma32(chip);
+}
+
 static void
 hk_get_device_extensions(const struct agx_device *dev,
                          const struct hk_instance *instance,
                          struct vk_device_extension_table *ext)
 {
    /* Keep the upstream AGX2 extension profile until the newly added common
-    * implementations have been qualified there. Native AGX3 keeps its
-    * existing exposure.
+    * implementations have been qualified there. Native AGX3 and M5 keep
+    * their existing exposure.
     */
-   const bool native_agx3 = agx_native_graphics(dev) &&
-                            dev->params.gpu_generation > 15;
+   const bool native_agx3 = (agx_native_graphics(dev) &&
+                             dev->params.gpu_generation > 15) ||
+                            agx_chip_g17_m5(dev->chip);
 
    /*
     * VK_KHR_ray_query and everything it depends on.  Software traversal:
@@ -595,8 +606,8 @@ hk_get_device_features(
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_fma */
-      .shaderFmaFloat16 = (dev->chip == AGX_CHIP_G17P && agx_chip_exact_fma32(dev->chip)),
-      .shaderFmaFloat32 = (dev->chip == AGX_CHIP_G17P && agx_chip_exact_fma32(dev->chip)),
+      .shaderFmaFloat16 = hk_shader_fma_supported(dev->chip),
+      .shaderFmaFloat32 = hk_shader_fma_supported(dev->chip),
       .shaderFmaFloat64 = false,
 
       /* VK_KHR_shader_maximal_reconvergence */
@@ -1870,8 +1881,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    /* VK_KHR_shader_fma makes shaderFmaFloat32 mandatory. */
-   if (pdev->dev.chip != AGX_CHIP_G17P ||
-       !agx_chip_exact_fma32(pdev->dev.chip))
+   if (!hk_shader_fma_supported(pdev->dev.chip))
       supported_extensions.KHR_shader_fma = false;
 
    if (pdev->dev.chip == AGX_CHIP_G17P) {

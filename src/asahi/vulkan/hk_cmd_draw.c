@@ -4696,8 +4696,10 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
     * load the earlier pass's stored colour without an application barrier.
     * The native dependency tracker otherwise permits full-tile passes to
     * overlap. Retain upstream ordering on AGX2, including across command
-    * buffers/submissions through the tracker's prior requirements. */
-   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev))
+    * buffers/submissions through the tracker's prior requirements. M5
+    * schedules its render passes like native AGX3. */
+   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
+       !agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
 
    if (continuable && !need_resolve && cs->end == end_before &&
@@ -9023,11 +9025,14 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       .prolog.statistics = in->statistics,
       .prolog.cull_distance_size = in->cull_distance_size,
       /* AGX2 must apply the API mask before an explicit-early main part
-       * counts samples, just as upstream does. Only the native path folds
-       * that mask into its forced-early coverage word. */
+       * counts samples, just as upstream does. Only the native and M5 paths
+       * fold that mask into their forced-early coverage word
+       * (agx_nir_apply_api_mask_to_force_early()). */
       .prolog.api_sample_mask =
          has_sample_mask && !defer_api_sample_mask &&
-               (!agx_native_graphics(&dev->dev) || !nontrivial_force_early)
+               ((!agx_native_graphics(&dev->dev) &&
+                 !agx_chip_g17_m5(dev->dev.chip)) ||
+                !nontrivial_force_early)
             ? api_sample_mask
             : 0xff,
       .prolog.nr_samples = native_samples ? samples : 0,
