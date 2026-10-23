@@ -193,7 +193,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
-   uint64_t used = p_atomic_read(&heap->used);
+   uint64_t used = p_atomic_read(heap->used);
    if (used > heap->size || aligned_size > heap->size - used)
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
@@ -256,7 +256,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);
 
-   uint64_t heap_used = p_atomic_add_return(&heap->used, mem->bo->size);
+   uint64_t heap_used = p_atomic_add_return(heap->used, mem->bo->size);
    if (heap_used > heap->size) {
       hk_FreeMemory(device, hk_device_memory_to_handle(mem), pAllocator);
       return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
@@ -299,7 +299,7 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    const VkMemoryType *type = &pdev->mem_types[mem->vk.memory_type_index];
    struct hk_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
-   p_atomic_add(&heap->used, -((int64_t)mem->bo->size));
+   p_atomic_add(heap->used, -((int64_t)mem->bo->size));
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_remove_ext_bo(dev, mem->bo);

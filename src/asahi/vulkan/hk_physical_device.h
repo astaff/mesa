@@ -31,10 +31,24 @@ struct hk_queue_family {
    uint32_t queue_count;
 };
 
+/* VK_EXT_memory_budget: "A heap's usage is an estimate of how much memory
+ * the process is currently using in that heap." Every VkInstance enumerates
+ * its own hk_physical_device, so the counters live in one record per render
+ * node, shared by every physical device of that node in the process.
+ */
+struct hk_heap_usage {
+   struct hk_heap_usage *next;
+   dev_t render_dev;
+   unsigned refcount;
+   uint64_t used[3];
+   p_atomic_uint64_t cached[3];
+};
+
 struct hk_memory_heap {
    uint64_t size;
-   uint64_t used;
-   p_atomic_uint64_t cached;
+   /* Point into the physical device's hk_heap_usage. */
+   uint64_t *used;
+   p_atomic_uint64_t *cached;
    VkMemoryHeapFlags flags;
 };
 
@@ -51,6 +65,7 @@ struct hk_physical_device {
    uint8_t device_uuid[VK_UUID_SIZE];
 
    // TODO: add mapable VRAM heap if possible
+   struct hk_heap_usage *heap_usage;
    struct hk_memory_heap mem_heaps[3];
    VkMemoryType mem_types[3];
    uint8_t mem_heap_count;
