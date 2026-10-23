@@ -984,12 +984,14 @@ struct hk_cs {
     * attachment command must travel with the control stream it describes. */
    struct hk_drm_attachment_set fragment_attachments;
 
-   /* Active restart index if one is set. Zero if there is no restart index set
-    * yet, since Vulkan does not allow zero restart indices (unlike OpenGL).
+   /* The restart index last emitted to this stream, valid once
+    * restart_index_set. VK_EXT_primitive_restart_index makes every value,
+    * zero included, a legal custom index, so no value can mean "unset".
     * This is used in place of dirty tracking, because dirty tracking
     * restart indices is complicated and just checking the saved value is cheap.
     */
    uint32_t restart_index;
+   bool restart_index_set;
 };
 
 static inline unsigned

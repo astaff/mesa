@@ -8553,7 +8553,10 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
                           dev->chip, out, &draw, primitive,
                           info->restart_index, draw_state_offset);
    } else {
-      out = (void *)agx_vdm_draw((uint32_t *)out, dev->chip, draw, primitive);
+      out = (void *)agx_vdm_draw(
+         (uint32_t *)out, dev->chip, draw, primitive,
+         draw.restart ? info->restart_index
+                      : agx_primitive_restart_index(draw.index_size));
    }
 
    /* Barrier transform feedback writes on themselves for consistency.
