@@ -179,6 +179,7 @@ if with_tests
          'test/test-rte-fma.cpp',
          'test/test-border-index.cpp',
          'test/test-aligned-bounds.cpp',
+         'test/test-agx2-image-acquire.cpp',
          'test/test-byte-swap.cpp',
          'test/test-minmax-canonical.cpp',
          'test/test-selected-f2i.cpp',

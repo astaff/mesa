@@ -26,12 +26,24 @@ extern "C" {
  * layouts are rejected before any fields are consumed. */
 #define HK_AGX3_SHADER_BINARY_VERSION 35u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 34u
+/* AGX2 image-acquire binaries now include memory-to-texture visibility. */
+#define HK_AGX2_SHADER_BINARY_VERSION 36u
 
 static inline uint32_t
 hk_shader_binary_version(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17P ? HK_AGX3_SHADER_BINARY_VERSION
-                                : HK_CLASSIC_SHADER_BINARY_VERSION;
+   switch (chip) {
+   case AGX_CHIP_G13G:
+   case AGX_CHIP_G13X:
+   case AGX_CHIP_G14G:
+   case AGX_CHIP_G14X:
+   case AGX_CHIP_G15P:
+      return HK_AGX2_SHADER_BINARY_VERSION;
+   case AGX_CHIP_G17P:
+      return HK_AGX3_SHADER_BINARY_VERSION;
+   default:
+      return HK_CLASSIC_SHADER_BINARY_VERSION;
+   }
 }
 
 /* API outputs include position. Unlinked shaders additionally reserve a

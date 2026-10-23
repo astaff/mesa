@@ -3165,6 +3165,17 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       if (needs_image_barriers) {
          agx_image_barrier_3(b);
          agx_image_barrier_4(b);
+
+         /* Image atomics are lowered to global memory, while imageLoad uses
+          * the texture cache. After acquiring another invocation's atomic
+          * payload, retire the old texture-cache contents just as
+          * fence_mem_to_tex_agx does for a local image atomic. The image/PBE
+          * barrier train alone does not include this memory-to-texture step.
+          * A release-only barrier has no subsequent reads to make visible.
+          */
+         if (nir_intrinsic_memory_semantics(instr) &
+             (NIR_MEMORY_ACQUIRE | NIR_MEMORY_MAKE_VISIBLE))
+            agx_flush_memory_to_texture(b);
       }
 
       return NULL;
