@@ -1238,6 +1238,243 @@ m5_vectorize_bounded_loads(nir_shader *nir)
    return count != 0;
 }
 
+struct m5_word_read {
+   nir_intrinsic_instr *load;
+   /* The 64-bit base and, for a robust read, the descriptor's byte size. */
+   nir_def *base, *bound;
+   /* The read's 32-bit byte offset from base. */
+   nir_def *offset_def;
+   struct m5_bounded_offset offset;
+};
+
+static int
+m5_word_read_cmp(const void *pa, const void *pb)
+{
+   const struct m5_word_read *a = pa, *b = pb;
+   const nir_intrinsic_instr *x = a->load, *y = b->load;
+#define M5_CMP(u, v) if ((u) != (v)) return (u) < (v) ? -1 : 1
+   M5_CMP(x->intrinsic, y->intrinsic);
+   M5_CMP(a->base->index, b->base->index);
+   M5_CMP(a->bound ? a->bound->index + 1 : 0, b->bound ? b->bound->index + 1 : 0);
+   M5_CMP(nir_intrinsic_access(x), nir_intrinsic_access(y));
+   M5_CMP(a->offset.term.def ? a->offset.term.def->index + 1 : 0,
+          b->offset.term.def ? b->offset.term.def->index + 1 : 0);
+   M5_CMP(a->offset.term.comp, b->offset.term.comp);
+   M5_CMP(a->offset.scale, b->offset.scale);
+   M5_CMP(a->offset.constant, b->offset.constant);
+   M5_CMP(x->instr.index, y->instr.index);
+#undef M5_CMP
+   return 0;
+}
+
+
+static bool
+m5_word_reads_same_record(const struct m5_word_read *a, const struct m5_word_read *b)
+{
+   return a->load->intrinsic == b->load->intrinsic && a->base == b->base &&
+          a->bound == b->bound &&
+          nir_intrinsic_access(a->load) == nir_intrinsic_access(b->load) &&
+          a->offset.term.def == b->offset.term.def &&
+          a->offset.term.comp == b->offset.term.comp &&
+          a->offset.scale == b->offset.scale;
+}
+
+static bool
+m5_word_reads_adjacent(const struct m5_word_read *a, const struct m5_word_read *b)
+{
+   return m5_word_reads_same_record(a, b) &&
+          b->offset.constant == a->offset.constant + 4;
+}
+
+/* Match a 64-bit address base + u2u64(offset) with a 32-bit offset. */
+static bool
+m5_split_address(nir_def *addr, nir_def **base, nir_def **offset)
+{
+   nir_scalar s = nir_scalar_resolved(addr, 0);
+   if (addr->bit_size != 64 || !is_op(s, nir_op_iadd))
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar u = nir_scalar_chase_alu_src(s, i);
+      nir_scalar other = nir_scalar_chase_alu_src(s, 1 - i);
+      if (is_op(u, nir_op_u2u64) && other.def->num_components == 1) {
+         nir_scalar off = nir_scalar_chase_alu_src(u, 0);
+         if (off.def->bit_size == 32 && off.def->num_components == 1 &&
+             !is_op(other, nir_op_u2u64)) {
+            *base = other.def;
+            *offset = off.def;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+/* M5: a structure read field by field (a light record in a loop) issues one
+ * load per 32-bit word, each with its own address. Merge the reads of up to
+ * four consecutive words at one base and offset term into one vector load.
+ *
+ * Buffer reads address base + u2u64(X + c) with a 32-bit offset, so the words
+ * of one vector load differ from their separate reads only where X + c wraps
+ * 2^32. Such an offset lies past the end of any buffer: undefined without
+ * robustness, and zeroed by the robust forms here. A robust read (soft fault:
+ * load, then zero the word when its end lies past the descriptor's byte size)
+ * keeps each word's own check:
+ *
+ *    word j of a load at X: bounds_agx(v.j, uadd_sat(X, 4 * (j + 1)), size)
+ *
+ * which is exact, except that a word whose offset wraps is now zeroed instead
+ * of read at its wrapped offset. Only such a word's address differs from its
+ * separate read, and soft fault covers it. */
+static bool
+m5_merge_buffer_words(nir_shader *nir)
+{
+   bool any = false;
+   struct util_dynarray reads;
+   util_dynarray_init(&reads, NULL);
+   nir_foreach_function_impl(impl, nir) {
+      bool progress = false;
+      nir_index_ssa_defs(impl);
+      nir_index_instrs(impl);
+      nir_foreach_block(block, impl) {
+         util_dynarray_clear(&reads);
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            if (in->num_components != 1 || in->def.bit_size != 32 ||
+                !nir_intrinsic_can_reorder(in) || nir_intrinsic_align(in) < 4)
+               continue;
+            struct m5_word_read r = {.load = in};
+            switch (in->intrinsic) {
+            case nir_intrinsic_load_global_bounded:
+            case nir_intrinsic_load_global_constant_bounded:
+               r.bound = in->src[2].ssa;
+               FALLTHROUGH;
+            case nir_intrinsic_load_global_constant_offset:
+               r.base = in->src[0].ssa;
+               r.offset_def = in->src[1].ssa;
+               break;
+            case nir_intrinsic_load_global:
+            case nir_intrinsic_load_global_constant:
+               if (!m5_split_address(in->src[0].ssa, &r.base, &r.offset_def))
+                  continue;
+               break;
+            default:
+               continue;
+            }
+            if (r.offset_def->bit_size != 32)
+               continue;
+            r.offset = m5_bounded_offset(nir_scalar_resolved(r.offset_def, 0), 12);
+            if (r.offset.valid)
+               util_dynarray_append(&reads, r);
+         }
+
+         unsigned n = util_dynarray_num_elements(&reads, struct m5_word_read);
+         if (n < 2)
+            continue;
+         struct m5_word_read *r = reads.data;
+         qsort(r, n, sizeof(*r), m5_word_read_cmp);
+
+         for (unsigned g = 0; g < n;) {
+            /* The reads of one record: one base, size and offset term. */
+            unsigned g_end = g + 1, earliest = g;
+            while (g_end < n && m5_word_reads_same_record(&r[g], &r[g_end])) {
+               if (r[g_end].load->instr.index < r[earliest].load->instr.index)
+                  earliest = g_end;
+               g_end++;
+            }
+
+            /* Split the record into loads of up to four consecutive words. */
+            unsigned units[64][2], nr_units = 0;
+            for (unsigned i = g; i < g_end && nr_units < ARRAY_SIZE(units);) {
+               unsigned count = 1;
+               while (i + count < g_end && count < 4 &&
+                      m5_word_reads_adjacent(&r[i + count - 1], &r[i + count]))
+                  count++;
+               while (count > 1) {
+                  unsigned first = i, last = i;
+                  for (unsigned j = i + 1; j < i + count; j++) {
+                     if (r[j].load->instr.index < r[first].load->instr.index)
+                        first = j;
+                     if (r[j].load->instr.index > r[last].load->instr.index)
+                        last = j;
+                  }
+                  if (m5_bounded_can_move(&r[first].load->instr, &r[last].load->instr))
+                     break;
+                  count = 1;
+               }
+               units[nr_units][0] = i;
+               units[nr_units][1] = count;
+               nr_units++;
+               i += count;
+            }
+            const unsigned covered = units[nr_units - 1][0] +
+                                     units[nr_units - 1][1] - g;
+
+            bool merged = false;
+            for (unsigned u = 0; u < nr_units; u++)
+               merged |= units[u][1] > 1;
+            if (covered != g_end - g || !merged) {
+               g = g_end;
+               continue;
+            }
+
+            nir_builder b = nir_builder_at(nir_before_instr(&r[earliest].load->instr));
+            nir_def *x_min = nir_iadd_imm(&b, r[earliest].offset_def,
+               (uint32_t)(r[g].offset.constant - r[earliest].offset.constant));
+
+            for (unsigned u = 0; u < nr_units; u++) {
+               const unsigned i = units[u][0], count = units[u][1];
+               if (count < 2)
+                  continue;
+
+               unsigned first = i;
+               for (unsigned j = i + 1; j < i + count; j++) {
+                  if (r[j].load->instr.index < r[first].load->instr.index)
+                     first = j;
+               }
+               const uint32_t delta = r[i].offset.constant - r[g].offset.constant;
+               b.cursor = nir_before_instr(&r[first].load->instr);
+
+               nir_intrinsic_instr *low = r[i].load;
+               const unsigned align_mul = nir_intrinsic_align_mul(low);
+               const unsigned align_offset = nir_intrinsic_align_offset(low);
+               enum gl_access_qualifier access = nir_intrinsic_access(low);
+               const bool constant =
+                  low->intrinsic == nir_intrinsic_load_global_constant ||
+                  low->intrinsic == nir_intrinsic_load_global_constant_offset ||
+                  low->intrinsic == nir_intrinsic_load_global_constant_bounded;
+               if (r[i].bound && constant)
+                  access |= ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
+
+               nir_def *x = nir_iadd_imm(&b, x_min, delta);
+               nir_def *addr = nir_iadd(&b, r[i].base, nir_u2u64(&b, x));
+               nir_def *v = constant
+                  ? nir_load_global_constant(&b, count, 32, addr,
+                       .align_mul = align_mul, .align_offset = align_offset,
+                       .access = access)
+                  : nir_load_global(&b, count, 32, addr,
+                       .align_mul = align_mul, .align_offset = align_offset,
+                       .access = access);
+               for (unsigned j = 0; j < count; j++) {
+                  nir_def *word = nir_channel(&b, v, j);
+                  if (r[i].bound) {
+                     nir_def *end = nir_uadd_sat(&b, x, nir_imm_int(&b, 4 * (j + 1)));
+                     word = nir_bounds_agx(&b, word, end, r[i].bound);
+                  }
+                  nir_def_replace(&r[i + j].load->def, word);
+               }
+            }
+            progress = true;
+            g = g_end;
+         }
+      }
+      any |= nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   util_dynarray_fini(&reads);
+   return any;
+}
+
 static nir_def *
 bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
 {
@@ -2965,6 +3202,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
          !dev->vk.enabled_features.sparseResidencyBuffer &&
          debug_get_bool_option("ASAHI_M5_PREDICATED_LOAD_PROBE", false),
    };
+   if (agx_chip_g17_m5(dev->dev.chip) && global_loads.soft_fault &&
+       !global_loads.predicated) {
+      /* Reads of one descriptor share its base and size only after CSE. */
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, m5_merge_buffer_words);
+   }
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &global_loads);
