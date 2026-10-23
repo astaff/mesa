@@ -4061,10 +4061,15 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    if (cs->timestamp.start.handle || cs->timestamp.end.handle)
       return false;
 
+   /* M5: a multisample clear-only pass stays a render. As compute it is a
+    * separate job that every later render's vertex half must wait for; as a
+    * render that writes only its attachments it is not. */
+   const bool m5_ms_clear = agx_chip_g17_m5(dev->dev.chip) &&
+                            cs->cr.process_empty_tiles && cs->tib.nr_samples > 1;
    if (native_eot &&
        (continuation ||
         (cs->cr.process_empty_tiles &&
-         (output_only_through_eot ||
+         (output_only_through_eot || m5_ms_clear ||
           !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4))))) {
       /* Normally supplied by the first draw. A clear has no application
        * sample-location state; use the attachment sample count and leave
