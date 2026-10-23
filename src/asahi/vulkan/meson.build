@@ -397,6 +397,11 @@ libhk = static_library(
   gnu_symbol_visibility : 'hidden',
 )
 
+# The tests below replace driver functions with -Wl,--wrap. Link-time
+# optimisation resolves calls inside the driver libraries before the linker
+# applies the wrap, so link them from the regular objects of fat LTO builds.
+hk_wrap_test_link_args = cc.get_supported_link_arguments('-fno-lto')
+
 if with_tests
   test('hk_rt_inlining', executable('hk_rt_inlining_test',
     files('tests/test-hk-rt-inlining.c'),
@@ -409,7 +414,7 @@ if with_tests
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
-    link_args : [ld_args_gc_sections,
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
       '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=agx_bo_cache_evict_all',
       '-Wl,--wrap=agx_bo_export',
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf']),
@@ -486,13 +491,14 @@ if with_tests and ld_args_gc_sections.length() > 0
       files('tests/test-hk-host-as.c', 'hk_host_as.c'),
       include_directories : [include_directories('.'), inc_include, inc_src],
       dependencies : [hk_deps],
-      link_args : [ld_args_gc_sections, '-Wl,--wrap=util_flush_range']), suite : ['asahi'])
+      link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
+        '-Wl,--wrap=util_flush_range']), suite : ['asahi'])
   test('hk_as_registry', executable('hk_as_registry_test',
     files('tests/test-hk-as-registry.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk],
-    link_args : [ld_args_gc_sections, '-Wl,--wrap=agx_bo_create',
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args, '-Wl,--wrap=agx_bo_create',
       '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=_mesa_hash_table_insert']),
     timeout : 60, suite : ['asahi'])
   test('hk_host_as_lifetime', executable('hk_host_as_lifetime_test',
@@ -500,14 +506,14 @@ if with_tests and ld_args_gc_sections.length() > 0
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk],
-    link_args : [ld_args_gc_sections, '-Wl,--wrap=hk_meta_begin',
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args, '-Wl,--wrap=hk_meta_begin',
       '-Wl,--wrap=hk_meta_end']), suite : ['asahi'])
   test('hk_rt_on_demand', executable('hk_rt_on_demand_test',
     files('tests/test-hk-rt-on-demand.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk],
-    link_args : [ld_args_gc_sections,
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
       '-Wl,--wrap=agx_va_alloc', '-Wl,--wrap=agx_va_free',
       '-Wl,--wrap=agx_bo_create', '-Wl,--wrap=agx_bo_unreference',
       '-Wl,--wrap=agx_bo_bind', '-Wl,--wrap=__vk_errorf']), suite : ['asahi'])
@@ -524,6 +530,7 @@ if with_tests and ld_args_gc_sections.length() > 0
       link_with : [libhk],
       link_args : [
         ld_args_gc_sections,
+        hk_wrap_test_link_args,
         '-Wl,--wrap=vk_pipeline_shader_stage_to_nir',
         '-Wl,--wrap=hk_compile_shader',
         '-Wl,--wrap=hk_api_shader_destroy',
@@ -546,6 +553,7 @@ if with_tests and ld_args_gc_sections.length() > 0
       link_with : [libhk],
       link_args : [
         ld_args_gc_sections,
+        hk_wrap_test_link_args,
         '-Wl,--wrap=vk_pipeline_shader_stage_to_nir',
         '-Wl,--wrap=vk_common_CreatePipelineBinariesKHR',
         '-Wl,--wrap=vk_common_GetPipelineKeyKHR',
