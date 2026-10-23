@@ -57,6 +57,9 @@ enum agx_va_flags {
 
    /* Ordinary allocations never occupy the capture/replay address region. */
    AGX_VA_CAPTURE_REPLAY = (1 << 2),
+
+   /* Take the lowest free address instead of the heap's default end. */
+   AGX_VA_LOW = (1 << 3),
 };
 
 struct agx_va {

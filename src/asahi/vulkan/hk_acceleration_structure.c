@@ -87,7 +87,6 @@ static const uint32_t agx3_refit_spv[] = {
 };
 
 static void hk_flush_buffer_write_cp(VkCommandBuffer);
-static uint64_t hk_as_native_va(struct vk_acceleration_structure *);
 static VkResult hk_host_as_init(struct hk_device *dev);
 static void hk_as_phase_begin(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
@@ -235,18 +234,21 @@ hk_gen1_as_metadata_addr(struct hk_cmd_buffer *cmd,
       hk_gen1_as_id(hk_cmd_buffer_device(cmd), as));
 }
 
+/* address is the structure's own address (also its Vulkan device address);
+ * base is the traversal base the AS table hands to the hardware. */
 static void
-hk_gen1_as_publish_address(struct hk_device *dev, uint32_t id, uint64_t address)
+hk_gen1_as_publish_address(struct hk_device *dev, uint32_t id, uint64_t address,
+                           uint64_t base)
 {
    uint64_t *slot = hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, id);
    uint64_t *table = hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages, id);
    if (slot)
       __atomic_store_n(slot, address, __ATOMIC_RELEASE);
    if (table)
-      __atomic_store_n(table, address, __ATOMIC_RELEASE);
+      __atomic_store_n(table, base, __ATOMIC_RELEASE);
    if (dev->gen1_as_query_bank && id < HK_GEN1_AS_TABLE_AS_SLOTS)
       __atomic_store_n((uint64_t *)agx_bo_map(dev->gen1_as_query_bank) + 2 * id,
-                       address, __ATOMIC_RELEASE);
+                       base, __ATOMIC_RELEASE);
    util_post_flush_fence();
 }
 
@@ -256,7 +258,239 @@ hk_gen1_as_bound_va(const struct vk_acceleration_structure *as)
    uint64_t address = as->buffer ? as->buffer->device_address : as->addr;
    if (!address)
       return 0;
-   return ALIGN_POT(address + (as->buffer ? as->offset : 0), UINT64_C(16384));
+   return address + (as->buffer ? as->offset : 0);
+}
+
+/* ---------------------------------------------------------------- */
+/* Traversal bases for structures that are not 16 KiB-aligned        */
+
+/*
+ * G17P reads a structure's BVH base from its AS table entry with the low 14
+ * address bits ignored, starts traversal at the base's first slot and follows
+ * forward 32-bit slot references from the base (libagx/gen1_as.h). Vulkan
+ * places a structure at any 256-byte buffer offset, so a structure that is
+ * not 16 KiB-aligned is given a base from a window:
+ *
+ * - a window is 256 consecutive 16 KiB pages of address space;
+ * - pages 0..254 all map one device-wide object of 255 pages, whose page j
+ *   holds a one-child node forwarding to slot j of page 255;
+ * - page 255 maps the window's own trampoline page, whose slot j holds a
+ *   one-child node forwarding to the root of the structure based at page j.
+ *
+ * Each such structure costs one 64-byte trampoline and 16 KiB of address
+ * space, and its image stays where Vulkan placed it; its child references
+ * carry the slot distance from its base (hk_gen1_as_slot_bias()). A
+ * structure that is 16 KiB-aligned is its own base, as before. Windows are
+ * allocated from the bottom of the address space because a structure must
+ * lie above its base.
+ */
+#define HK_GEN1_AS_WINDOW_PAGE ((uint64_t)LIBAGX_GEN1_AS_BASE_ALIGNMENT)
+#define HK_GEN1_AS_WINDOW_BASES 255u
+#define HK_GEN1_AS_WINDOW_BYTES ((HK_GEN1_AS_WINDOW_BASES + 1) * HK_GEN1_AS_WINDOW_PAGE)
+#define HK_GEN1_AS_PAGE_SLOTS (HK_GEN1_AS_WINDOW_PAGE / LIBAGX_GEN1_AS_SLOT_BYTES)
+#define HK_GEN1_AS_REACH ((UINT64_C(1) << 32) * LIBAGX_GEN1_AS_SLOT_BYTES)
+
+/* A one-child internal node whose box covers [-2^126, 2^126] on each axis:
+ * base -2^126 (upper half 0xfe80), exponent 254 (a 2^127 grid), child cells
+ * 0..1, in the encoding agx3_leaf.comp uses for internal nodes. */
+static void
+hk_gen1_as_forward_node(uint32_t *node, uint32_t child)
+{
+   const uint64_t words[8] = {
+      0xa0u | (254u << 8) | (UINT64_C(1) << 36) | (UINT64_C(1) << 29) |
+         (UINT64_C(1) << 22),
+      0xfe80, 0xfe80, 0xfe80, (254u << 8) | 254u,
+      child >> 16, child & 0xffffu, 0x1f00u | 1u,
+   };
+   for (unsigned i = 0; i < 8; ++i) {
+      node[2 * i] = (uint32_t)words[i];
+      node[2 * i + 1] = (uint32_t)(words[i] >> 32);
+   }
+}
+
+static struct agx_bo *
+hk_gen1_as_window_roots(struct hk_device *dev)
+{
+   if (dev->gen1_as_window_roots)
+      return dev->gen1_as_window_roots;
+   const uint64_t bytes = HK_GEN1_AS_WINDOW_BASES * HK_GEN1_AS_WINDOW_PAGE;
+   struct agx_bo *bo = agx_bo_create(&dev->dev, bytes, HK_GEN1_AS_WINDOW_PAGE,
+                                     0, "Gen1 AS window roots");
+   if (!bo)
+      return NULL;
+   uint8_t *map = agx_bo_map(bo);
+   memset(map, 0, bytes);
+   for (uint32_t j = 0; j < HK_GEN1_AS_WINDOW_BASES; ++j)
+      hk_gen1_as_forward_node((uint32_t *)(map + j * HK_GEN1_AS_WINDOW_PAGE),
+         (HK_GEN1_AS_WINDOW_BASES - j) * HK_GEN1_AS_PAGE_SLOTS + j);
+   util_post_flush_fence();
+   dev->gen1_as_window_roots = bo;
+   return bo;
+}
+
+static void
+hk_gen1_as_window_destroy(struct hk_device *dev, struct agx_va *va,
+                          struct agx_bo *trampolines)
+{
+   if (va) {
+      agx_bo_bind(&dev->dev, NULL, va->addr, HK_GEN1_AS_WINDOW_BYTES, 0,
+                  DRM_ASAHI_BIND_UNBIND);
+      agx_va_free(&dev->dev, va, false);
+   }
+   agx_bo_unreference(&dev->dev, trampolines);
+}
+
+/* Caller holds gen1_as_lock. Returns the new window's index, or UINT32_MAX. */
+static uint32_t
+hk_gen1_as_window_create(struct hk_device *dev)
+{
+   struct agx_bo *roots = hk_gen1_as_window_roots(dev);
+   if (!roots)
+      return UINT32_MAX;
+   struct agx_va *va = agx_va_alloc(&dev->dev, HK_GEN1_AS_WINDOW_BYTES,
+                                    HK_GEN1_AS_WINDOW_PAGE, AGX_VA_LOW, 0);
+   struct agx_bo *trampolines = va ?
+      agx_bo_create(&dev->dev, HK_GEN1_AS_WINDOW_PAGE, HK_GEN1_AS_WINDOW_PAGE,
+                    0, "Gen1 AS window trampolines") : NULL;
+   const uint64_t roots_bytes = HK_GEN1_AS_WINDOW_BASES * HK_GEN1_AS_WINDOW_PAGE;
+   if (!trampolines ||
+       agx_bo_bind(&dev->dev, roots, va->addr, roots_bytes, 0,
+                   DRM_ASAHI_BIND_READ) ||
+       agx_bo_bind(&dev->dev, trampolines, va->addr + roots_bytes,
+                   HK_GEN1_AS_WINDOW_PAGE, 0, DRM_ASAHI_BIND_READ)) {
+      hk_gen1_as_window_destroy(dev, va, trampolines);
+      return UINT32_MAX;
+   }
+   memset(agx_bo_map(trampolines), 0, HK_GEN1_AS_WINDOW_PAGE);
+   util_post_flush_fence();
+   struct hk_gen1_as_window *window =
+      util_dynarray_grow(&dev->gen1_as_windows, struct hk_gen1_as_window, 1);
+   if (!window) {
+      hk_gen1_as_window_destroy(dev, va, trampolines);
+      return UINT32_MAX;
+   }
+   *window = (struct hk_gen1_as_window){.va = va, .trampolines = trampolines};
+   return util_dynarray_num_elements(&dev->gen1_as_windows,
+                                     struct hk_gen1_as_window) - 1;
+}
+
+/* Lowest free base page of a window, or HK_GEN1_AS_WINDOW_BASES. */
+static uint32_t
+hk_gen1_as_window_free_base(const struct hk_gen1_as_window *window)
+{
+   for (uint32_t i = 0; i < ARRAY_SIZE(window->used); ++i) {
+      uint32_t free = ~window->used[i];
+      if (i == ARRAY_SIZE(window->used) - 1)
+         free &= 0x7fffffffu; /* page 255 holds the trampolines */
+      if (free)
+         return i * 32 + ffs(free) - 1;
+   }
+   return HK_GEN1_AS_WINDOW_BASES;
+}
+
+/* Caller holds gen1_as_lock and slot has no window. Returns the traversal
+ * base for a structure at address, or 0 if none can be assigned. */
+static uint64_t
+hk_gen1_as_window_assign(struct hk_device *dev, struct hk_gen1_as_slot *slot,
+                         uint64_t address)
+{
+   if (!address || !(address % HK_GEN1_AS_WINDOW_PAGE))
+      return address;
+   const uint32_t count = util_dynarray_num_elements(&dev->gen1_as_windows,
+                                                     struct hk_gen1_as_window);
+   for (uint32_t k = 0; k <= count; ++k) {
+      uint32_t index = k < count ? (dev->gen1_as_window_hint + k) % count
+                                 : hk_gen1_as_window_create(dev);
+      if (index == UINT32_MAX)
+         return 0;
+      struct hk_gen1_as_window *window = util_dynarray_element(
+         &dev->gen1_as_windows, struct hk_gen1_as_window, index);
+      const uint32_t j = hk_gen1_as_window_free_base(window);
+      const uint64_t base = window->va->addr + j * HK_GEN1_AS_WINDOW_PAGE;
+      if (j == HK_GEN1_AS_WINDOW_BASES || base >= address ||
+          address - base >= HK_GEN1_AS_REACH)
+         continue;
+      window->used[j / 32] |= 1u << (j % 32);
+      ++window->live;
+      uint8_t *trampolines = agx_bo_map(window->trampolines);
+      hk_gen1_as_forward_node(
+         (uint32_t *)(trampolines + j * LIBAGX_GEN1_AS_SLOT_BYTES),
+         (uint32_t)((address - base) / LIBAGX_GEN1_AS_SLOT_BYTES));
+      util_post_flush_fence();
+      slot->window = index;
+      slot->window_base = j;
+      dev->gen1_as_window_hint = index;
+      return base;
+   }
+   return 0;
+}
+
+/* Caller holds gen1_as_lock. */
+static void
+hk_gen1_as_window_release(struct hk_device *dev, struct hk_gen1_as_slot *slot)
+{
+   if (slot->window != UINT32_MAX) {
+      struct hk_gen1_as_window *window = util_dynarray_element(
+         &dev->gen1_as_windows, struct hk_gen1_as_window, slot->window);
+      const uint32_t j = slot->window_base;
+      assert(window->used[j / 32] & (1u << (j % 32)));
+      window->used[j / 32] &= ~(1u << (j % 32));
+      --window->live;
+      memset((uint8_t *)agx_bo_map(window->trampolines) +
+                j * LIBAGX_GEN1_AS_SLOT_BYTES, 0, LIBAGX_GEN1_AS_SLOT_BYTES);
+      util_post_flush_fence();
+   }
+   slot->window = UINT32_MAX;
+   slot->base = 0;
+}
+
+static void
+hk_gen1_as_windows_finish(struct hk_device *dev)
+{
+   util_dynarray_foreach(&dev->gen1_as_windows, struct hk_gen1_as_window, w)
+      hk_gen1_as_window_destroy(dev, w->va, w->trampolines);
+   util_dynarray_fini(&dev->gen1_as_windows);
+   agx_bo_unreference(&dev->dev, dev->gen1_as_window_roots);
+   dev->gen1_as_window_roots = NULL;
+   dev->gen1_as_window_hint = 0;
+}
+
+/* Slots from a structure's traversal base to its image. Build and copy
+ * commands encode child references with it. */
+static uint32_t
+hk_gen1_as_slot_bias(struct hk_device *dev, struct vk_acceleration_structure *as)
+{
+   uint32_t bias = 0;
+   simple_mtx_lock(&dev->gen1_as_lock);
+   struct hash_entry *entry = dev->gen1_as_ids ?
+      _mesa_hash_table_search(dev->gen1_as_ids, as) : NULL;
+   if (entry) {
+      const struct hk_gen1_as_slot *slot = util_dynarray_element(
+         &dev->gen1_ases, struct hk_gen1_as_slot,
+         hk_gen1_as_id_to_index((uint32_t)(uintptr_t)entry->data));
+      const uint64_t address = hk_gen1_as_bound_va(as);
+      if (slot->base && address >= slot->base)
+         bias = (uint32_t)((address - slot->base) / LIBAGX_GEN1_AS_SLOT_BYTES);
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+   return bias;
+}
+
+/* Caller holds gen1_as_lock. Assigns a base if the structure has none yet
+ * (its buffer had no address at creation) and publishes both addresses. */
+static bool
+hk_gen1_as_publish_slot(struct hk_device *dev, uint32_t index,
+                        struct hk_gen1_as_slot *slot)
+{
+   const uint64_t address = hk_gen1_as_bound_va(slot->as);
+   if (address && !slot->base) {
+      slot->base = hk_gen1_as_window_assign(dev, slot, address);
+      if (!slot->base)
+         return false;
+   }
+   hk_gen1_as_publish_address(dev, hk_gen1_as_index_to_id(index), address,
+                              slot->base);
+   return true;
 }
 
 void
@@ -268,9 +502,10 @@ hk_gen1_publish_buffer_as_addresses(struct hk_device *dev,
    simple_mtx_lock(&dev->gen1_as_lock);
    uint32_t index = 0;
    util_dynarray_foreach(&dev->gen1_ases, struct hk_gen1_as_slot, slot) {
-      if (slot->as && slot->as->buffer == buffer)
-         hk_gen1_as_publish_address(dev, hk_gen1_as_index_to_id(index),
-                                    hk_gen1_as_bound_va(slot->as));
+      if (slot->as && slot->as->buffer == buffer &&
+          !hk_gen1_as_publish_slot(dev, index, slot))
+         mesa_loge("G17P: no traversal base below 0x%" PRIx64 " for an "
+                   "acceleration structure", hk_gen1_as_bound_va(slot->as));
       ++index;
    }
    simple_mtx_unlock(&dev->gen1_as_lock);
@@ -293,7 +528,7 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
    if (result != VK_SUCCESS || !dev->g17p_native_as)
       return result;
    VK_FROM_HANDLE(vk_acceleration_structure, as, *out);
-   if (replay_address && hk_as_native_va(as) != replay_address) {
+   if (replay_address && vk_acceleration_structure_get_va(as) != replay_address) {
       vk_common_DestroyAccelerationStructureKHR(device, *out, alloc);
       *out = VK_NULL_HANDLE;
       return vk_error(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS);
@@ -316,7 +551,7 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
       if (slot) {
          if (reuse)
             dev->gen1_as_free_head = slot->next_free;
-         *slot = (struct hk_gen1_as_slot){.as = as};
+         *slot = (struct hk_gen1_as_slot){.as = as, .window = UINT32_MAX};
          inserted = true;
       }
    }
@@ -325,8 +560,14 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
       hk_gen1_as_free_slot(dev, index);
       inserted = false;
    }
-   if (inserted)
-      hk_gen1_as_publish_address(dev, id, hk_gen1_as_bound_va(as));
+   if (inserted &&
+       !hk_gen1_as_publish_slot(dev, index, util_dynarray_element(
+          &dev->gen1_ases, struct hk_gen1_as_slot, index))) {
+      /* No address space below the structure for a traversal base. */
+      _mesa_hash_table_remove_key(dev->gen1_as_ids, as);
+      hk_gen1_as_free_slot(dev, index);
+      inserted = false;
+   }
    simple_mtx_unlock(&dev->gen1_as_lock);
    if (!inserted) {
       vk_common_DestroyAccelerationStructureKHR(device, *out, alloc);
@@ -356,10 +597,12 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
       if (entry) {
          const uint32_t id = (uint32_t)(uintptr_t)entry->data;
          const uint32_t index = hk_gen1_as_id_to_index(id);
-         assert(util_dynarray_element(&dev->gen1_ases,
-                     struct hk_gen1_as_slot, index)->as == as);
+         struct hk_gen1_as_slot *slot = util_dynarray_element(&dev->gen1_ases,
+                     struct hk_gen1_as_slot, index);
+         assert(slot->as == as);
+         hk_gen1_as_publish_address(dev, id, 0, 0);
+         hk_gen1_as_window_release(dev, slot);
          hk_gen1_as_free_slot(dev, index);
-         hk_gen1_as_publish_address(dev, id, 0);
          _mesa_hash_table_remove(dev->gen1_as_ids, entry);
       }
       simple_mtx_unlock(&dev->gen1_as_lock);
@@ -521,7 +764,7 @@ VkResult
 hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                         const struct hk_agx3_plan_args *args,
                         VkDeviceAddress node_status,
-                        VkDeviceAddress envelope_status)
+                        VkDeviceAddress envelope_status, uint32_t slot_bias)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -573,6 +816,7 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
 
    const struct hk_agx3_leaf_args encode = {
       .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
+      .slot_bias = slot_bias,
    };
    const struct hk_agx3_envelope_args finish = {
       .jobs = args->envelope, .status = envelope_status, .job_count = 1,
@@ -654,7 +898,7 @@ hk_agx3_retained_offset(const struct vk_acceleration_structure_build_state *stat
    struct hk_agx3_as_layout layout;
    if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
       return 0;
-   return ALIGN_POT(layout.as_bytes - LIBAGX_GEN1_AS_ALIGNMENT_SLACK +
+   return ALIGN_POT(layout.as_bytes +
       (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
           ? (uint64_t)state->leaf_node_count * 80 : 0), 8);
 }
@@ -682,8 +926,7 @@ hk_get_native_as_size(const struct vk_acceleration_structure_build_state *state)
       return 0;
    if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
       return hk_agx3_retained_offset(state) + sizeof(struct vk_ir_header) +
-             (uint64_t)state->internal_node_count * sizeof(struct vk_ir_box_node) +
-             LIBAGX_GEN1_AS_ALIGNMENT_SLACK;
+             (uint64_t)state->internal_node_count * sizeof(struct vk_ir_box_node);
    return layout.as_bytes +
       (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
           ? (uint64_t)state->leaf_node_count * 80 : 0);
@@ -697,9 +940,9 @@ hk_vertex_table_layout(const struct hk_device *dev,
    if (!hk_vertex_table_wanted(dev, state))
       return false;
    const uint64_t base = hk_get_native_as_size(state);
-   if (base <= LIBAGX_GEN1_AS_ALIGNMENT_SLACK)
+   if (!base)
       return false;
-   out->offset = ALIGN_POT(base - LIBAGX_GEN1_AS_ALIGNMENT_SLACK, UINT64_C(16));
+   out->offset = ALIGN_POT(base, UINT64_C(16));
    out->geometry_count = state->build_info->geometryCount;
    out->primitives = state->leaf_node_count;
    out->vertices_offset = ALIGN_POT(16 + 4 * out->geometry_count, 16);
@@ -715,7 +958,7 @@ hk_get_as_size(VkDevice _device,
    if (dev->g17p_native_as) {
       struct hk_vertex_table_layout table;
       if (hk_vertex_table_layout(dev, state, &table))
-         return table.offset + table.bytes + LIBAGX_GEN1_AS_ALIGNMENT_SLACK;
+         return table.offset + table.bytes;
       return hk_get_native_as_size(state);
    }
    return hk_as_size(vk_get_as_geometry_type(state->build_info),
@@ -733,20 +976,19 @@ hk_get_encode_scratch_size(VkDevice _device,
                   sizeof(struct vk_ir_header) : 0;
 }
 
+/* The native image lives at the Vulkan address; see libagx/gen1_as.h. */
 static uint64_t
 hk_as_native_va(struct vk_acceleration_structure *as)
 {
-   /* Native G17P BVHState masks the low 14 address bits. */
-   return ALIGN_POT(vk_acceleration_structure_get_va(as), UINT64_C(16384));
+   return vk_acceleration_structure_get_va(as);
 }
 
 VKAPI_ATTR VkDeviceAddress VKAPI_CALL
 hk_GetAccelerationStructureDeviceAddressKHR(
    VkDevice _device, const VkAccelerationStructureDeviceAddressInfoKHR *info)
 {
-   VK_FROM_HANDLE(hk_device, dev, _device);
    VK_FROM_HANDLE(vk_acceleration_structure, as, info->accelerationStructure);
-   return dev->g17p_native_as ? hk_as_native_va(as) : vk_acceleration_structure_get_va(as);
+   return vk_acceleration_structure_get_va(as);
 }
 
 /* ---------------------------------------------------------------- */
@@ -948,7 +1190,8 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
          if (!native_plan.metadata)
             return;
          VkResult result = hk_cmd_build_agx3_from_ir(commandBuffer, &native_plan,
-            encode + native.node_status, encode + native.envelope_status);
+            encode + native.node_status, encode + native.envelope_status,
+            hk_gen1_as_slot_bias(dev, dst));
          if (result != VK_SUCCESS) {
             vk_command_buffer_set_error(&cmd->vk, result);
             return;
@@ -1256,6 +1499,7 @@ hk_gen1_rq_finish(struct hk_device *dev)
          _mesa_hash_table_destroy(dev->gen1_as_ids, NULL);
          dev->gen1_as_ids = NULL;
       }
+      hk_gen1_as_windows_finish(dev);
       hk_gen1_sparse_finish(dev, &dev->gen1_as_table_pages);
       hk_gen1_sparse_finish(dev, &dev->gen1_as_metadata_pages);
       hk_gen1_sparse_finish(dev, &dev->gen1_as_address_pages);
@@ -1655,6 +1899,7 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
    if (dev->g17p_native_as) {
       simple_mtx_init(&dev->gen1_as_lock, mtx_plain);
       util_dynarray_init(&dev->gen1_ases, NULL);
+      util_dynarray_init(&dev->gen1_as_windows, NULL);
       dev->gen1_as_free_head = UINT32_MAX;
       dev->gen1_as_lock_ready=true;
       dev->gen1_vertex_tables = _mesa_pointer_hash_table_create(NULL);
@@ -2041,6 +2286,24 @@ hk_GetDeviceAccelerationStructureCompatibilityKHR(
  * stays false, so a conformant application never reaches them.  They fail
  * loudly rather than silently returning success on an untouched structure.
  */
+/* Moves the image at image (serialized: inside a serialized blob) by delta
+ * slots relative to its traversal base, then restores the instance-record
+ * slots the node scan cannot tell apart from nodes, from source. bytes bounds
+ * the image. Nothing is recorded for delta 0. */
+static void
+hk_gen1_as_rebase(struct hk_cmd_buffer *cmd, uint64_t image, bool serialized,
+                  uint64_t bytes, uint32_t delta, uint64_t source,
+                  bool source_serialized, uint64_t metadata)
+{
+   if (!delta)
+      return;
+   libagx_gen1_as_rebase(cmd, agx_1d(DIV_ROUND_UP(bytes, LIBAGX_GEN1_AS_SLOT_BYTES)),
+                         AGX_BARRIER_ALL, image, serialized, delta);
+   libagx_gen1_as_restore_records(cmd, agx_1d(MAX2(bytes / 128, 1)),
+                                  AGX_BARRIER_ALL, image, serialized, source,
+                                  source_serialized, metadata);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdCopyAccelerationStructureKHR(
    VkCommandBuffer commandBuffer, const VkCopyAccelerationStructureInfoKHR *info)
@@ -2055,10 +2318,8 @@ hk_CmdCopyAccelerationStructureKHR(
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   const uint64_t padding = hk_as_native_va(src) -
-                            vk_acceleration_structure_get_va(src);
-   if (padding > src->size || src->size - padding < 192 ||
-       DIV_ROUND_UP(src->size - padding, 16) > UINT32_MAX) {
+   if (src->size < LIBAGX_GEN1_AS_EMPTY_BYTES ||
+       DIV_ROUND_UP(src->size, 16) > UINT32_MAX) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -2067,10 +2328,13 @@ hk_CmdCopyAccelerationStructureKHR(
    uint64_t src_metadata = hk_gen1_as_metadata_addr(cmd, src);
    if (!dst_metadata || !src_metadata)
       return;
-   libagx_gen1_as_copy(cmd, agx_1d(DIV_ROUND_UP(src->size - padding, 16)),
+   libagx_gen1_as_copy(cmd, agx_1d(DIV_ROUND_UP(src->size, 16)),
                       AGX_BARRIER_ALL, hk_as_native_va(dst),
                       hk_as_native_va(src), dst_metadata, src_metadata, dst_id,
                       info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR);
+   hk_gen1_as_rebase(cmd, hk_as_native_va(dst), false, src->size,
+                     hk_gen1_as_slot_bias(dev, dst) - hk_gen1_as_slot_bias(dev, src),
+                     hk_as_native_va(src), false, src_metadata);
    if (info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR &&
        dev->gen1_vertex_tables) {
       struct hk_vertex_table_layout table;
@@ -2144,18 +2408,21 @@ hk_CmdCopyAccelerationStructureToMemoryKHR(VkCommandBuffer commandBuffer,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   uint64_t padding = hk_as_native_va(src) - vk_acceleration_structure_get_va(src);
-   if (padding > src->size || src->size - padding < LIBAGX_GEN1_AS_EMPTY_BYTES ||
-       DIV_ROUND_UP(src->size - padding, 16) > UINT32_MAX) {
+   if (src->size < LIBAGX_GEN1_AS_EMPTY_BYTES ||
+       DIV_ROUND_UP(src->size, 16) > UINT32_MAX) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
    uint64_t metadata = hk_gen1_as_metadata_addr(cmd, src);
    uint64_t uuid = hk_gen1_as_serial_uuid(cmd);
    if (!metadata || !uuid) return;
-   libagx_gen1_as_serialize(cmd, agx_1d(DIV_ROUND_UP(src->size - padding, 16)),
+   libagx_gen1_as_serialize(cmd, agx_1d(DIV_ROUND_UP(src->size, 16)),
       AGX_BARRIER_ALL, info->dst.deviceAddress, hk_as_native_va(src),
-      metadata, uuid, src->size - padding);
+      metadata, uuid, src->size);
+   /* Serialized images are stored relative to their own first slot. */
+   hk_gen1_as_rebase(cmd, info->dst.deviceAddress, true, src->size,
+                     -hk_gen1_as_slot_bias(dev, src), hk_as_native_va(src),
+                     false, metadata);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2169,9 +2436,8 @@ hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   uint64_t padding = hk_as_native_va(dst) - vk_acceleration_structure_get_va(dst);
-   if (padding > dst->size || dst->size - padding < LIBAGX_GEN1_AS_EMPTY_BYTES ||
-       DIV_ROUND_UP(dst->size - padding, 16) > UINT32_MAX) {
+   if (dst->size < LIBAGX_GEN1_AS_EMPTY_BYTES ||
+       DIV_ROUND_UP(dst->size, 16) > UINT32_MAX) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
@@ -2180,17 +2446,20 @@ hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
    uint64_t uuid = hk_gen1_as_serial_uuid(cmd);
    uint64_t map = hk_gen1_as_address_map(cmd, &map_count);
    if (!metadata || !uuid || !map) return;
-   uint32_t invocations = DIV_ROUND_UP(dst->size - padding, 16);
+   uint32_t invocations = DIV_ROUND_UP(dst->size, 16);
    libagx_gen1_as_deserialize(cmd, agx_1d(invocations), AGX_BARRIER_ALL,
-      hk_as_native_va(dst), info->src.deviceAddress, metadata, uuid, dst->size - padding, id);
+      hk_as_native_va(dst), info->src.deviceAddress, metadata, uuid, dst->size, id);
    simple_mtx_lock(&dev->gen1_as_lock);
    const uint32_t id_bound = hk_gen1_as_index_to_id(
       util_dynarray_num_elements(&dev->gen1_ases, struct hk_gen1_as_slot));
    simple_mtx_unlock(&dev->gen1_as_lock);
    libagx_gen1_as_deserialize_references(cmd,
-      agx_1d((dst->size - padding) / 128), AGX_BARRIER_ALL,
+      agx_1d(dst->size / 128), AGX_BARRIER_ALL,
       hk_as_native_va(dst), info->src.deviceAddress, map, map_count,
-      dev->gen1_as_address_pages.va->addr, id_bound, uuid, dst->size - padding);
+      dev->gen1_as_address_pages.va->addr, id_bound, uuid, dst->size);
+   hk_gen1_as_rebase(cmd, hk_as_native_va(dst), false, dst->size,
+                     hk_gen1_as_slot_bias(dev, dst), info->src.deviceAddress,
+                     true, metadata);
 }
 
 #define HK_HOST_AS_QUEUE_INDEX 0xffffu

@@ -194,7 +194,7 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
       if (!metadata)
          return;
       libagx_gen1_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
-         libagx_gen1_as_native_address(vk_acceleration_structure_get_va(as)),
+         vk_acceleration_structure_get_va(as),
          metadata, hk_query_report_addr(dev, pool, firstQuery + i),
          queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? 0 :
          queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? 1 :

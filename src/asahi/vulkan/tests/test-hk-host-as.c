@@ -77,8 +77,7 @@ static void instances(unsigned count, bool pointers)
    assert(g.geometry.instances.data.deviceAddress == va + layout.data);
    for (unsigned i = 0; i < count; ++i) {
       VkAccelerationStructureInstanceKHR expected = items[i];
-      expected.accelerationStructureReference = i % 17
-         ? ((as[i].addr + 16383) & ~UINT64_C(16383)) : 0;
+      expected.accelerationStructureReference = i % 17 ? as[i].addr : 0;
       assert(!memcmp(map + layout.data + (uint64_t)i * 64, &expected, sizeof(expected)));
       vk_object_base_finish(&as[i].base);
    }
