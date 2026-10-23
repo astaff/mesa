@@ -2578,8 +2578,19 @@ zink_create_texture_handle(struct pipe_context *pctx, struct pipe_sampler_view *
       bd->ds.db.offset = view->u.buf.offset;
       bd->ds.db.size = view->u.buf.size;
    } else {
-      if (!sv->image_view)
+      /* A handle keeps the image view it was created with: rebinding the
+       * resource refreshes bound views and attachments, not handles. Under
+       * lazy feedback-loop usage any draw may sample a resident handle of
+       * one of its attachments, so give a render-target image its
+       * feedback-loop usage now, before the handle takes its view.
+       */
+      if (unlikely(ctx->lazy_feedback) &&
+          (res->base.b.bind & PIPE_BIND_RENDER_TARGET))
+         zink_resource_object_init_feedback_loop(ctx, res);
+      if (!sv->image_view || sv->rebind_count != res->rebind_count) {
+         sv->rebind_count = res->rebind_count;
          init_sampler_view(ctx, sv);
+      }
       bd->ds.surface = sv->image_view;
       bd->first_layer = view->u.tex.first_layer;
       bd->last_layer = view->u.tex.last_layer;
@@ -6384,12 +6395,14 @@ attachment_is_sampled(struct zink_context *ctx, struct zink_resource *res,
 }
 
 /* driver_workarounds.lazy_feedback_loop_usage: before a draw samples one of
- * its colour attachments, or while an attachment is resident as a bindless
- * texture (which any draw may sample), give that attachment's image
- * ATTACHMENT_FEEDBACK_LOOP usage. general_layout never detects feedback loops
- * itself (add_implicit_feedback_loop() is not reached), so this is the only
- * place the driver learns about one. Draws call it only after framebuffer,
- * sampler-view, shader or bindless state changed (ctx->lazy_feedback_dirty).
+ * its colour attachments, give that attachment's image
+ * ATTACHMENT_FEEDBACK_LOOP usage. Render-target images get it when a texture
+ * handle is created for them (zink_create_texture_handle()), so a bindless
+ * handle never keeps a view of a replaced image. general_layout never
+ * detects feedback loops itself (add_implicit_feedback_loop() is not
+ * reached), so this is the only place the driver learns about one. Draws
+ * call it only after framebuffer, sampler-view, shader or bindless state
+ * changed (ctx->lazy_feedback_dirty).
  */
 void
 zink_update_lazy_feedback_loops(struct zink_context *ctx)
@@ -6402,8 +6415,7 @@ zink_update_lazy_feedback_loops(struct zink_context *ctx)
       if (!res || (res->base.b.flags & ZINK_RESOURCE_FLAG_FEEDBACK_LOOP) ||
           (res->obj->vkusage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT))
          continue;
-      if (!res->bindless[0] &&
-          (!res->sampler_bind_count[0] || !attachment_is_sampled(ctx, res, psurf)))
+      if (!res->sampler_bind_count[0] || !attachment_is_sampled(ctx, res, psurf))
          continue;
       replaced |= zink_resource_object_init_feedback_loop(ctx, res);
    }
