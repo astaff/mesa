@@ -169,6 +169,42 @@ struct hk_sync_recent {
    enum hk_sync_sq sq;
 };
 
+/*
+ * G17P transfer writes that nothing orders before graphics work yet.
+ *
+ * Vulkan does not order a transfer before a later render pass without a
+ * dependency, and G17P overlaps the two when there is none. Some
+ * applications (and the CTS ray_query null_as cases) clear a resource, name
+ * only a non-graphics stage in the following barrier, then use the resource
+ * in a draw. Be stricter there, but only where the pass can actually access
+ * what the transfer wrote: each transfer recorded outside a pass notes its
+ * destination VA range and compute stream, a dependency from the transfer
+ * stage into graphics drops the notes, and a render pass begin (attachments)
+ * or draw (descriptors, vertex, index and indirect buffers) that may access a
+ * noted range orders that stream's prefix before its graphics work. Work that
+ * does not touch a noted range keeps the full overlap.
+ *
+ * Shaders can reach a buffer through its device address, and a transfer
+ * whose destination is unknown may write anything: such notes, and writes
+ * that no longer fit in the set, match every pass (xfer_any). Only one
+ * command buffer is tracked, and aliasing between different resources is
+ * covered only where their VA ranges overlap.
+ */
+#define HK_SYNC_XFER_WRITES 8
+
+struct hk_sync_xfer_write {
+   /* GPU VA range [lo, hi) the stream writes. */
+   uint64_t lo, hi;
+   struct hk_cs *cs;
+};
+
+/* The destination of the transfer command being recorded. */
+struct hk_sync_xfer_dst {
+   uint64_t lo, hi;
+   bool valid;
+   bool device_address;
+};
+
 /* Per-stream state, embedded in hk_cs. */
 struct hk_sync_stream {
    /* Recording order. Equal to list order for every pair the tracking
@@ -255,6 +291,25 @@ struct hk_sync_state {
 
    /* Depth of transfer entry points on the stack. */
    uint16_t xfer_depth;
+
+   /* G17P transfer writes not yet ordered before graphics (see
+    * hk_sync_xfer_write): the destination of the transfer being recorded,
+    * the noted writes, and the latest stream with a write any graphics work
+    * may access. xfer_version changes whenever the notes do. */
+   struct hk_sync_xfer_dst xfer_dst;
+   struct hk_sync_xfer_write xfer_writes[HK_SYNC_XFER_WRITES];
+   uint8_t xfer_write_count;
+   struct hk_cs *xfer_any;
+   uint32_t xfer_version;
+
+   /* The draw state the last draw-time check found no noted write in: valid
+    * while xfer_version, the descriptor and vertex buffer generations and the
+    * index buffer are unchanged (hk_cmd_draw.c). */
+   struct {
+      bool valid;
+      uint32_t version;
+      uint64_t descriptors, vertex_buffers, index;
+   } xfer_clean;
 
    /* A top-of-pipe timestamp waiting for the next stream to carry it as its
     * start timestamp. */
@@ -353,6 +408,31 @@ void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                              VkPipelineStageFlags2 stage,
                              struct agx_timestamp_req req);
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
+
+/* G17P transfer writes (see hk_sync_xfer_write). Note that the transfer
+ * being recorded writes into cs. */
+void hk_sync_note_xfer_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
+static inline bool
+hk_sync_xfer_pending(const struct hk_sync_state *st)
+{
+   return st->xfer_write_count || st->xfer_any;
+}
+
+/* The latest stream of best and the noted streams that write [lo, hi). */
+struct hk_cs *hk_sync_xfer_match(const struct hk_cmd_buffer *cmd,
+                                 uint64_t lo, uint64_t hi, struct hk_cs *best);
+
+/* The latest stream of best and every noted stream: graphics work that may
+ * access memory this command buffer cannot see. */
+struct hk_cs *hk_sync_xfer_match_all(const struct hk_cmd_buffer *cmd,
+                                     struct hk_cs *best);
+
+/* Order the prefix of the compute subqueue up to cs before every graphics
+ * stream from now on, including the open render and its pre-graphics stream.
+ * The caller has made the prefix's writes visible and closed cs to further
+ * work. Drops the notes the prefix covers. */
+void hk_sync_order_xfer(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* Render pass instance boundaries. */
 void hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming);

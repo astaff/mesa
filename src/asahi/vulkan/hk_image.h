@@ -94,6 +94,22 @@ hk_image_base_address(const struct hk_image *image, uint8_t plane)
    return hk_image_plane_base_address(&image->planes[plane]);
 }
 
+/* The GPU VA range [*lo, *hi) covering every bound plane of the image. Empty
+ * (*lo >= *hi) while no plane is bound. */
+static inline void
+hk_image_va_range(const struct hk_image *image, uint64_t *lo, uint64_t *hi)
+{
+   *lo = UINT64_MAX;
+   *hi = 0;
+   for (unsigned p = 0; p < image->plane_count; ++p) {
+      const struct hk_image_plane *plane = &image->planes[p];
+      if (!plane->addr)
+         continue;
+      *lo = MIN2(*lo, plane->addr);
+      *hi = MAX2(*hi, plane->addr + plane->layout.size_B);
+   }
+}
+
 /* Packed 4:2:2 contains two luma samples and one pair of chroma samples
  * per four-component word. The shader reconstructs the full-resolution texels. */
 static inline unsigned

@@ -31,6 +31,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_native_vertex_template.h"
 #include "asahi/lib/agx_vdm_mesh_core.h"
+#include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
@@ -2462,6 +2463,282 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
 }
 
 /*
+ * G17P transfer writes (hk_sync_xfer_write in hk_sync.h): a render pass
+ * begin or draw that may access a transfer destination no dependency orders
+ * before it waits for the transfer's compute prefix.
+ */
+
+/* Make every noted write up to cs visible, close cs to further work and
+ * order the prefix before graphics. */
+static void
+hk_xfer_order(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_sync_state *st = &cmd->sync;
+
+   struct hk_cs *flush[HK_SYNC_XFER_WRITES + 1];
+   unsigned n = 0;
+   for (unsigned i = 0; i <= st->xfer_write_count; ++i) {
+      struct hk_cs *w =
+         i < st->xfer_write_count ? st->xfer_writes[i].cs : st->xfer_any;
+      if (!w || w->sync.seq > cs->sync.seq)
+         continue;
+      bool seen = false;
+      for (unsigned j = 0; j < n; ++j)
+         seen |= flush[j] == w;
+      if (!seen)
+         flush[n++] = w;
+   }
+
+   /* Each launch ends in a weak ordering record; strengthen the last one
+    * into a cache flush, as a barrier does (hk_CmdPipelineBarrier2()). */
+   for (unsigned i = 0; i < n; ++i) {
+      struct hk_cs *w = flush[i];
+      if (w->stats.cmds > 0 && w->current != w->strong_flush_end) {
+         hk_ensure_cs_has_space(cmd, w, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_cache_flush(dev, w);
+      }
+   }
+
+   perf_debug(cmd, "Ordering an unsynchronized transfer before graphics");
+   if (cmd->current_cs.cs == cs)
+      hk_cmd_buffer_end_compute(cmd);
+   hk_sync_order_xfer(cmd, cs);
+}
+
+static inline struct hk_cs *
+hk_xfer_match_image(const struct hk_cmd_buffer *cmd,
+                    const struct hk_image_view *iview, struct hk_cs *best)
+{
+   if (!iview)
+      return best;
+   uint64_t lo, hi;
+   hk_image_va_range(container_of(iview->vk.image, struct hk_image, vk), &lo,
+                     &hi);
+   return lo < hi ? hk_sync_xfer_match(cmd, lo, hi, best) : best;
+}
+
+/* A render pass instance loads, stores and resolves its attachments. */
+static void
+hk_xfer_check_attachments(struct hk_cmd_buffer *cmd)
+{
+   const struct hk_rendering_state *render = &cmd->state.gfx.render;
+   struct hk_cs *best = NULL;
+
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      best = hk_xfer_match_image(cmd, render->color_att[i].iview, best);
+      best = hk_xfer_match_image(cmd, render->color_att[i].resolve_iview, best);
+   }
+   best = hk_xfer_match_image(cmd, render->depth_att.iview, best);
+   best = hk_xfer_match_image(cmd, render->depth_att.resolve_iview, best);
+   best = hk_xfer_match_image(cmd, render->stencil_att.iview, best);
+   best = hk_xfer_match_image(cmd, render->stencil_att.resolve_iview, best);
+
+   if (best)
+      hk_xfer_order(cmd, best);
+}
+
+/* The address a Gen9 texture or PBE word at desc points at (Address, bits
+ * 64..107, in units of 16 bytes). */
+static inline uint64_t
+hk_xfer_gen9_texture_address(const uint8_t *desc)
+{
+   uint64_t word;
+   memcpy(&word, desc + 8, sizeof(word));
+   return (word & BITFIELD64_MASK(44)) << 4;
+}
+
+static inline struct hk_cs *
+hk_xfer_match_point(const struct hk_cmd_buffer *cmd, uint64_t addr,
+                    struct hk_cs *best)
+{
+   return addr ? hk_sync_xfer_match(cmd, addr, addr + 1, best) : best;
+}
+
+/* Descriptors one check reads at most before treating the bound sets as
+ * accessing everything. */
+#define HK_XFER_MAX_DESCRIPTORS 1024
+
+/* The latest noted stream the descriptors bound for graphics may access.
+ * What recording cannot see (push descriptors, sets that may be updated
+ * after binding, mutable or unknown types) may access everything. */
+static struct hk_cs *
+hk_xfer_match_descriptors(const struct hk_cmd_buffer *cmd, struct hk_cs *best)
+{
+   const struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   const unsigned sampled_stride = hk_sampled_image_descriptor_layout(9).stride;
+   unsigned budget = HK_XFER_MAX_DESCRIPTORS;
+
+   if (desc->push_active)
+      return hk_sync_xfer_match_all(cmd, best);
+
+   for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
+      const struct hk_descriptor_set *set = desc->sets[s];
+      if (!set)
+         continue;
+
+      const struct hk_descriptor_set_layout *layout = set->layout;
+      if (layout->descriptor_generation != 9)
+         return hk_sync_xfer_match_all(cmd, best);
+
+      for (unsigned b = 0; b < layout->binding_count; ++b) {
+         const struct hk_descriptor_set_binding_layout *bl = &layout->binding[b];
+         if (bl->flags & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT)
+            return hk_sync_xfer_match_all(cmd, best);
+
+         switch (bl->type) {
+         case VK_DESCRIPTOR_TYPE_SAMPLER:
+         case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+         /* Read from the root below. */
+         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+            continue;
+         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+         case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+         case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+         case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+            break;
+         default:
+            return hk_sync_xfer_match_all(cmd, best);
+         }
+
+         if (!bl->stride || bl->offset >= set->size)
+            continue;
+         const uint32_t count =
+            MIN2(bl->array_size, (set->size - bl->offset) / bl->stride);
+         if (count > budget)
+            return hk_sync_xfer_match_all(cmd, best);
+         budget -= count;
+
+         const uint8_t *base = (const uint8_t *)set->mapped_ptr + bl->offset;
+         for (uint32_t e = 0; e < count; ++e) {
+            const uint8_t *d = base + (size_t)e * bl->stride;
+            switch (bl->type) {
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+               /* One record per plane. */
+               for (unsigned p = 0; (p + 1) * sampled_stride <= bl->stride; ++p)
+                  best = hk_xfer_match_point(
+                     cmd, hk_xfer_gen9_texture_address(d + p * sampled_stride),
+                     best);
+               break;
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+               best = hk_xfer_match_point(
+                  cmd, hk_xfer_gen9_texture_address(d), best);
+               best = hk_xfer_match_point(
+                  cmd, hk_xfer_gen9_texture_address(d + HK_TEXTURE_DESCRIPTOR_AGX3_SIZE),
+                  best);
+               break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+               best = hk_xfer_match_point(
+                  cmd, hk_xfer_gen9_texture_address(d), best);
+               if (bl->stride >= AGX_G17P_BUFFER_TEXTURE_METADATA_OFFSET +
+                                    sizeof(struct hk_g17p_buffer_texture_metadata)) {
+                  struct hk_g17p_buffer_texture_metadata meta;
+                  memcpy(&meta, d + AGX_G17P_BUFFER_TEXTURE_METADATA_OFFSET,
+                         sizeof(meta));
+                  best = hk_xfer_match_point(cmd, meta.address, best);
+               }
+               break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+               struct hk_buffer_address addr;
+               memcpy(&addr, d, sizeof(addr));
+               if (addr.size)
+                  best = hk_sync_xfer_match(cmd, addr.base_addr,
+                                            addr.base_addr + addr.size, best);
+               break;
+            }
+            case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+               uint64_t addr;
+               memcpy(&addr, d, sizeof(addr));
+               best = hk_xfer_match_point(cmd, addr, best);
+               break;
+            }
+            default:
+               UNREACHABLE("filtered above");
+            }
+         }
+      }
+   }
+
+   for (unsigned i = 0; i < desc->dynamic_buffer_end; ++i) {
+      const struct hk_buffer_address *addr = &desc->root.dynamic_buffers[i];
+      if (addr->size)
+         best = hk_sync_xfer_match(cmd, addr->base_addr,
+                                   addr->base_addr + addr->size, best);
+   }
+
+   return best;
+}
+
+/* Before a draw records anything: whether its graphics work may access a
+ * noted transfer write, through the bound descriptors, vertex and index
+ * buffers, [extra_lo, extra_hi) (indirect parameters) or the conditional
+ * rendering predicate. Shader stores to transform feedback buffers are
+ * matched against everything. */
+static void
+hk_xfer_check_draw_slow(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
+                        uint64_t extra_hi)
+{
+   struct hk_sync_state *st = &cmd->sync;
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_cs *best = NULL;
+
+   if (extra_lo < extra_hi)
+      best = hk_sync_xfer_match(cmd, extra_lo, extra_hi, best);
+   if (cmd->state.conditional.active)
+      best = hk_xfer_match_point(cmd, cmd->state.conditional.address, best);
+   if (gfx->xfb_enabled)
+      best = hk_sync_xfer_match_all(cmd, best);
+
+   const bool clean =
+      st->xfer_clean.valid && st->xfer_clean.version == st->xfer_version &&
+      st->xfer_clean.descriptors == gfx->descriptors.generation &&
+      st->xfer_clean.vertex_buffers == gfx->vertex_buffer_generation &&
+      st->xfer_clean.index == gfx->index.buffer.addr;
+
+   if (!clean) {
+      struct hk_cs *state = hk_xfer_match_descriptors(cmd, NULL);
+      for (unsigned i = 0; i < ARRAY_SIZE(gfx->vb); ++i) {
+         if (gfx->vb[i].range)
+            state = hk_sync_xfer_match(cmd, gfx->vb[i].addr,
+                                       gfx->vb[i].addr + gfx->vb[i].range,
+                                       state);
+      }
+      if (gfx->index.buffer.range)
+         state = hk_sync_xfer_match(
+            cmd, gfx->index.buffer.addr,
+            gfx->index.buffer.addr + gfx->index.buffer.range, state);
+
+      st->xfer_clean.valid = state == NULL;
+      st->xfer_clean.version = st->xfer_version;
+      st->xfer_clean.descriptors = gfx->descriptors.generation;
+      st->xfer_clean.vertex_buffers = gfx->vertex_buffer_generation;
+      st->xfer_clean.index = gfx->index.buffer.addr;
+      best = hk_sync_later(best, state);
+   }
+
+   if (best)
+      hk_xfer_order(cmd, best);
+}
+
+static inline void
+hk_xfer_check_draw(struct hk_cmd_buffer *cmd, uint64_t extra_lo,
+                   uint64_t extra_hi)
+{
+   if (unlikely(hk_sync_xfer_pending(&cmd->sync)) && !cmd->in_meta)
+      hk_xfer_check_draw_slow(cmd, extra_lo, extra_hi);
+}
+
+/*
  * M5 render pass continuation.
  *
  * Two consecutive render pass instances on the same attachments, where the
@@ -3425,6 +3702,11 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
    if (render->flags & VK_RENDERING_RESUMING_BIT)
       return;
+
+   /* G17P: a transfer the application did not order before graphics work
+    * may have written an attachment. */
+   if (unlikely(hk_sync_xfer_pending(&cmd->sync)) && !cmd->in_meta)
+      hk_xfer_check_attachments(cmd);
 
    /* The first control stream of the render pass is special since it gets
     * the clears. Create it and swap in the clear.
@@ -9808,6 +10090,15 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
        (draw_.b.count[0] == 0 || draw_.b.count[1] == 0))
       return;
 
+   /* G17P: before anything is recorded for the draw, order a transfer the
+    * application did not order before graphics work if the draw may access
+    * what it wrote (hk_xfer_check_draw_slow()). */
+   if (agx_is_indirect(draw_.b))
+      hk_xfer_check_draw(cmd, draw_.b.ptr,
+                         draw_.b.ptr + (draw_.indexed ? 5 : 4) * 4);
+   else
+      hk_xfer_check_draw(cmd, 0, 0);
+
    hk_g17p_note_depth_use(cmd);
 
    draw_.restart = dyn->ia.primitive_restart_enable && draw_.indexed;
@@ -10165,6 +10456,9 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
       return;
    }
    gfx->mesh.grid = grid;
+   hk_xfer_check_draw(cmd, grid, grid + 3 * sizeof(uint32_t));
+   if (count_address)
+      hk_xfer_check_draw(cmd, count_address, count_address + sizeof(uint32_t));
    
 
    const struct hk_mesh_info *mesh_info =
@@ -10775,6 +11069,11 @@ hk_draw_indirect_count(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    uint64_t patched = hk_pool_alloc(cmd, out_stride * maxDrawCount, 4).gpu;
    uint64_t in = hk_buffer_address_ro(buffer, offset);
    uint64_t count_addr = hk_buffer_address_ro(count_buffer, countBufferOffset);
+
+   /* The predicate below reads both buffers before the draw is recorded. */
+   hk_xfer_check_draw(cmd, in, in + (uint64_t)stride * (maxDrawCount - 1) +
+                                  out_stride);
+   hk_xfer_check_draw(cmd, count_addr, count_addr + sizeof(uint32_t));
 
    libagx_predicate_indirect(cmd, agx_1d(maxDrawCount),
                              AGX_BARRIER_ALL | AGX_PREGFX, patched, in,

@@ -130,6 +130,163 @@ render_pass(struct hk_cmd_buffer *cmd, const void *image, uint32_t layers,
    return cs;
 }
 
+
+/* Transfer one range [lo, hi) into a new compute stream, as the G17P
+ * transfer entry points and hk_cmd_buffer_get_cs_general() do. */
+static struct hk_cs *
+xfer_write(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi, bool bda)
+{
+   cmd->sync.xfer_depth = 1;
+   cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){
+      .lo = lo, .hi = hi, .valid = lo < hi, .device_address = bda};
+   struct hk_cs *cs = add(cmd, true);
+   hk_sync_note_xfer_write(cmd, cs);
+   cmd->sync.xfer_depth = 0;
+   cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){0};
+   return cs;
+}
+
+/* G17P transfer writes: only work that may access the written range is
+ * ordered after the transfer, everything else keeps its overlap. */
+static void
+test_xfer_write_order(void)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *xfer = xfer_write(cmd, 0x10000, 0x20000, false);
+   /* CTS null_as: the AS-build destination is never executed. */
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_COMPUTE);
+   T("non-graphics destination keeps the note", cmd->sync.xfer_write_count == 1);
+   T("an access inside the written range matches",
+     hk_sync_xfer_match(cmd, 0x18000, 0x18001, NULL) == xfer);
+   T("an unrelated resource does not match",
+     hk_sync_xfer_match(cmd, 0x20000, 0x30000, NULL) == NULL &&
+        hk_sync_xfer_match(cmd, 0x0, 0x10000, NULL) == NULL);
+   hk_sync_begin_rendering(cmd, false);
+   struct hk_cs *gfx = add(cmd, false);
+   T("a pass that does not access it keeps the overlap",
+     gfx->sync.dep[HK_SYNC_CDM].cut == NULL &&
+        gfx->sync.dep_ta[HK_SYNC_CDM].cut == NULL);
+   cmd->current_cs.gfx = gfx;
+   struct hk_cs *pre = test_alloc(sizeof(*pre));
+   pre->type = HK_CS_CDM;
+   list_addtail(&pre->node, &gfx->node);
+   hk_sync_stream_created(cmd, pre, &cmd->current_cs.pre_gfx, true);
+   cmd->current_cs.pre_gfx = pre;
+   T("pre-graphics work starts unordered", pre->sync.dep[HK_SYNC_CDM].cut == NULL);
+   /* A draw binds the cleared image. */
+   hk_sync_order_xfer(cmd, xfer);
+   /* The render already waits on its pre-graphics stream, a later prefix. */
+   T("the open render waits in both halves",
+     gfx->sync.dep[HK_SYNC_CDM].cut &&
+        gfx->sync.dep[HK_SYNC_CDM].cut->sync.seq >= xfer->sync.seq &&
+        gfx->sync.dep_ta[HK_SYNC_CDM].cut &&
+        gfx->sync.dep_ta[HK_SYNC_CDM].cut->sync.seq >= xfer->sync.seq);
+   T("its pre-graphics work waits", pre->sync.dep[HK_SYNC_CDM].cut == xfer);
+   T("the ordered note is dropped", !hk_sync_xfer_pending(&cmd->sync));
+   cmd->current_cs.pre_gfx = NULL;
+   cmd->current_cs.gfx = NULL;
+   hk_sync_end_rendering(cmd);
+   hk_sync_begin_rendering(cmd, false);
+   struct hk_cs *gfx2 = add(cmd, false);
+   T("later graphics stays ordered", gfx2->sync.dep[HK_SYNC_CDM].cut == xfer);
+   hk_sync_end_rendering(cmd);
+   struct hk_queue *queue = new_queue(true);
+   T("ordered transfer resolves", submit(queue, cmd));
+   T("pre-graphics waits for the exact transfer ordinal",
+     pre->sync.barrier[HK_SYNC_CDM] == xfer->sync.index);
+
+   /* Ordered at the next pass begin (an attachment). */
+   cmd = new_cmd();
+   xfer = xfer_write(cmd, 0x10000, 0x20000, false);
+   hk_sync_begin_rendering(cmd, false);
+   T("attachment match", hk_sync_xfer_match(cmd, 0x10000, 0x10001, NULL) == xfer);
+   hk_sync_order_xfer(cmd, xfer);
+   gfx = add(cmd, false);
+   T("the render created after waits in both halves",
+     gfx->sync.dep[HK_SYNC_CDM].cut == xfer &&
+        gfx->sync.dep_ta[HK_SYNC_CDM].cut == xfer);
+   T("robustness does not import earlier command buffers",
+     cmd->sync.req[0][HK_SYNC_CDM].prior == 0);
+   hk_sync_end_rendering(cmd);
+
+   /* Dependencies the application records into graphics stages. */
+   const uint8_t gfx_dsts[] = {HK_SYNC_GFX, HK_SYNC_GFX_FRAG,
+                               HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG, HK_SYNC_ALL};
+   for (unsigned i = 0; i < ARRAY_SIZE(gfx_dsts); ++i) {
+      cmd = new_cmd();
+      xfer_write(cmd, 0x10000, 0x20000, false);
+      hk_sync_barrier(cmd, HK_SYNC_XFER, gfx_dsts[i]);
+      T("a transfer-to-graphics dependency drops the note",
+        !hk_sync_xfer_pending(&cmd->sync));
+   }
+   cmd = new_cmd();
+   xfer_write(cmd, 0x10000, 0x20000, false);
+   hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+   T("a compute-to-graphics dependency does not cover a transfer",
+     hk_sync_xfer_pending(&cmd->sync));
+   hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+   T("ALL_COMMANDS covers it", !hk_sync_xfer_pending(&cmd->sync));
+   xfer = xfer_write(cmd, 0x10000, 0x20000, false);
+   T("a write after the dependency is noted again",
+     hk_sync_xfer_match(cmd, 0x10000, 0x20000, NULL) == xfer);
+
+   /* The same stream launching again for one transfer is one note. */
+   cmd = new_cmd();
+   xfer = xfer_write(cmd, 0x10000, 0x20000, false);
+   cmd->sync.xfer_depth = 1;
+   cmd->sync.xfer_dst = (struct hk_sync_xfer_dst){
+      .lo = 0x20000, .hi = 0x28000, .valid = true};
+   hk_sync_note_xfer_write(cmd, xfer);
+   cmd->sync.xfer_depth = 0;
+   T("an adjacent launch widens the note",
+     cmd->sync.xfer_write_count == 1 && cmd->sync.xfer_writes[0].hi == 0x28000);
+
+   /* What a draw cannot see matches every access. */
+   cmd = new_cmd();
+   xfer = xfer_write(cmd, 0x10000, 0x20000, true);
+   T("a device-address buffer matches any access",
+     hk_sync_xfer_match(cmd, 0x90000, 0x90001, NULL) == xfer);
+   cmd = new_cmd();
+   xfer = xfer_write(cmd, 0, 0, false);
+   T("an unknown destination matches any access",
+     hk_sync_xfer_match(cmd, 0x90000, 0x90001, NULL) == xfer);
+   cmd = new_cmd();
+   struct hk_cs *last = NULL;
+   for (unsigned i = 0; i <= HK_SYNC_XFER_WRITES; ++i)
+      last = xfer_write(cmd, 0x10000 * (i + 1), 0x10000 * (i + 1) + 0x100, false);
+   T("a write past the bound matches any access",
+     cmd->sync.xfer_write_count == HK_SYNC_XFER_WRITES &&
+        hk_sync_xfer_match(cmd, 0x900000, 0x900001, NULL) == last);
+   T("and every noted stream is matched by match_all",
+     hk_sync_xfer_match_all(cmd, NULL) == last);
+   /* Ordering a middle stream drops only the notes it covers. */
+   struct hk_cs *mid = cmd->sync.xfer_writes[3].cs;
+   hk_sync_order_xfer(cmd, mid);
+   T("a prefix covers the notes at or before it",
+     cmd->sync.xfer_write_count == HK_SYNC_XFER_WRITES - 4 &&
+        cmd->sync.xfer_any == last);
+
+   /* Application compute is never noted. */
+   cmd = new_cmd();
+   add(cmd, true);
+   T("application compute is not a transfer write",
+     !hk_sync_xfer_pending(&cmd->sync));
+
+   /* Stream bookkeeping. */
+   cmd = new_cmd();
+   xfer = xfer_write(cmd, 0x10000, 0x20000, false);
+   struct hk_cs *later = xfer_write(cmd, 0x30000, 0x40000, false);
+   hk_sync_merge(cmd, xfer, later);
+   T("a merged stream's note follows it",
+     hk_sync_xfer_match(cmd, 0x30000, 0x30001, NULL) == xfer);
+   hk_sync_forget_stream(cmd, xfer);
+   T("a removed first stream's notes are dropped",
+     !hk_sync_xfer_pending(&cmd->sync));
+   xfer_write(cmd, 0x10000, 0x20000, true);
+   hk_sync_reset(cmd);
+   T("command buffer reset drops the notes", !hk_sync_xfer_pending(&cmd->sync));
+}
+
 static void
 test_multiview_layer_preservation(void)
 {
@@ -730,6 +887,7 @@ main(void)
    test_classic_submission_order();
    if (!test_context)
       return EXIT_FAILURE;
+   test_xfer_write_order();
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
    test_loaded_color_preservation();

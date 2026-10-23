@@ -100,6 +100,15 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+/* Query resets are not transfers. */
+void
+hk_sync_note_xfer_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
 int
 main(void)
 {
