@@ -259,6 +259,22 @@ if with_tests
   )
 
   test(
+    'hk_g17p_metadata_grid',
+    executable(
+      'hk_g17p_metadata_grid_test',
+      files('tests/test-hk-g17p-metadata-grid.c',
+            'hk_g17p_meta_copy_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util,
+                      idep_vulkan_runtime_headers],
+      link_with : [libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_image_layout_core',
     executable(
       'hk_image_layout_core_test',
@@ -564,6 +580,25 @@ if with_tests
   executable(
     'g17p-vulkan-multiview-clear',
     files('tests/g17p_vulkan_multiview_clear.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  # Also no-op shim tests, registered with the shim in ../meson.build.
+  g17p_vulkan_compressed_mip_blit = executable(
+    'g17p-vulkan-compressed-mip-blit',
+    files('tests/g17p_vulkan_compressed_mip_blit.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  g17p_vulkan_compressed_layer_copy = executable(
+    'g17p-vulkan-compressed-layer-copy',
+    files('tests/g17p_vulkan_compressed_layer_copy.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],

@@ -6278,8 +6278,13 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       return hk_g17p_bind_tail_refused(__LINE__);
 
    struct agx_ppp_w_clamp_cull2_core w_cull2_record;
+   /* Only G17P mesh draws consult the environment: this runs for every
+    * draw that publishes vertex state. */
+   const bool g17p_mesh = dev->dev.chip == AGX_CHIP_G17P &&
+                          vs->info.stage == MESA_SHADER_MESH;
    const char *native_mesh_primitive_address =
-      getenv("ASAHI_MESH_NATIVE_PRIMITIVE_ADDRESS_DIAGNOSTIC");
+      g17p_mesh ? getenv("ASAHI_MESH_NATIVE_PRIMITIVE_ADDRESS_DIAGNOSTIC")
+                : NULL;
    const bool native_mesh_primitive_address_enabled =
       native_mesh_primitive_address &&
       !strcmp(native_mesh_primitive_address, "1") &&
@@ -6288,7 +6293,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       vs->info.uvs.mesh_primitive_page &&
       vs->info.mesh.primitive_stride_B != 0;
    const char *native_mesh_wclamp =
-      getenv("ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC");
+      g17p_mesh ? getenv("ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC") : NULL;
    const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
       .w_clamp_raw = native_mesh_wclamp && !strcmp(native_mesh_wclamp, "1") &&
                      dev->dev.chip == AGX_CHIP_G17P &&

@@ -3257,6 +3257,21 @@ init_driver_workarounds(struct zink_screen *screen)
    if (zink_debug & ZINK_DEBUG_NOGENERAL)
       screen->driver_workarounds.general_layout = false;
 
+   /* Honeykrisp decides lossless compression once, at image creation, and
+    * refuses it for colour images with ATTACHMENT_FEEDBACK_LOOP usage: a
+    * compressed tile being stored can be read torn by a draw that samples
+    * other texels of it. Adding that usage to every render target therefore
+    * leaves every GL colour target uncompressed. With general_layout zink
+    * never selects a feedback-loop layout or enables a feedback loop on an
+    * attachment, so the usage is only that hint: create colour images without
+    * it and recreate an image with it before a draw or copy first reads the
+    * image while writing it (zink_update_lazy_feedback_loops()).
+    */
+   screen->driver_workarounds.lazy_feedback_loop_usage =
+      zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP &&
+      screen->driver_workarounds.general_layout &&
+      screen->info.have_EXT_attachment_feedback_loop_layout;
+
    if (!screen->info.have_EXT_vertex_input_dynamic_state || !screen->info.have_EXT_transform_feedback)
       screen->info.have_KHR_device_address_commands = false;
 

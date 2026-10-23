@@ -299,6 +299,154 @@ check_zink(void)
    CHECK(!ELIGIBLE(hic));
 }
 
+#define SHARED(i) hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 0, &(i))
+
+static VkImageCreateInfo
+swapchain_image(VkFormat format, uint32_t w, uint32_t h,
+                VkImageUsageFlags usage)
+{
+   VkImageCreateInfo i = image(format, w, h, 1, usage);
+   i.flags = VK_IMAGE_CREATE_ALIAS_BIT;
+   i.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   return i;
+}
+
+static void
+check_shared(void)
+{
+   /* vkmark's swapchain (headless and Wayland): one colour attachment. The
+    * WSI image carries ALIAS, the Mesa WSI marker and external memory, all
+    * of which the shared contract admits. */
+   VkExternalMemoryImageCreateInfo external = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   VkBaseInStructure wsi = {
+      .sType = HK_G17P_WSI_IMAGE_CREATE_INFO_MESA,
+      .pNext = (const VkBaseInStructure *)&external,
+   };
+   VkImageCreateInfo vkmark = swapchain_image(
+      VK_FORMAT_B8G8R8A8_SRGB, 1920, 1080, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+   vkmark.pNext = &wsi;
+   CHECK(SHARED(vkmark));
+   /* The private policy keeps refusing it: sharing goes through the
+    * modifier contract only. */
+   CHECK(!ELIGIBLE(vkmark));
+   vkmark.tiling = VK_IMAGE_TILING_OPTIMAL;
+   CHECK(!SHARED(vkmark));
+   vkmark.tiling = VK_IMAGE_TILING_LINEAR;
+   CHECK(!SHARED(vkmark));
+
+   /* Every private colour format, and nothing else (depth, stencil,
+    * 16-byte texels, packed RGB, YCbCr, block compression). */
+   unsigned shared = 0;
+   for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
+      VkImageCreateInfo i = swapchain_image((VkFormat)f, 64, 64,
+                                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      CHECK(SHARED(i) == hk_g17p_compression_color_format((VkFormat)f));
+      shared += SHARED(i);
+   }
+   CHECK(shared == 46);
+   static const VkFormat refused_formats[] = {
+      VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT_S8_UINT,
+      VK_FORMAT_S8_UINT, VK_FORMAT_R32G32B32A32_SFLOAT,
+      VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,
+      VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+   };
+   for (unsigned r = 0;
+        r < sizeof(refused_formats) / sizeof(refused_formats[0]); ++r) {
+      VkImageCreateInfo i = swapchain_image(refused_formats[r], 64, 64,
+                                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      CHECK(!SHARED(i));
+   }
+
+   const VkImageCreateInfo base = swapchain_image(
+      VK_FORMAT_R8G8B8A8_UNORM, 2408, 1506,
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   CHECK(SHARED(base));
+
+   /* G17P only, plane 0 only. */
+   for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
+      CHECK(hk_g17p_shared_compression_eligible((enum agx_chip)chip, 0,
+                                                &base) ==
+            (chip == AGX_CHIP_G17P));
+   CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 1, &base));
+   CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 0, NULL));
+
+   /* Usage: texture/PBE usages plus import-side feedback loops. Storage and
+    * host transfer access the image raw. */
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   for (unsigned bit = 0; bit < 32; ++bit) {
+      VkImageCreateInfo i = base;
+      i.usage |= 1u << bit;
+      CHECK(SHARED(i) == !!((1u << bit) & allowed_usage));
+   }
+   /* No colour-attachment requirement: a blit-only swapchain is a transfer
+    * destination, which hk_image_init() makes renderable. */
+   VkImageCreateInfo blit_only = base;
+   blit_only.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   CHECK(SHARED(blit_only));
+
+   /* Flags: mutable/extended views and WSI's ALIAS only. */
+   for (unsigned bit = 0; bit < 32; ++bit) {
+      VkImageCreateInfo i = base;
+      i.flags = 1u << bit;
+      CHECK(SHARED(i) == ((1u << bit) == VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT ||
+                          (1u << bit) == VK_IMAGE_CREATE_EXTENDED_USAGE_BIT ||
+                          (1u << bit) == VK_IMAGE_CREATE_ALIAS_BIT));
+   }
+
+   /* One level, one layer, one sample, 2D, at least 16x16. */
+   VkImageCreateInfo i = base;
+   i.mipLevels = 2;
+   CHECK(!SHARED(i));
+   i = base; i.arrayLayers = 2;
+   CHECK(!SHARED(i));
+   i = base; i.extent.depth = 2;
+   CHECK(!SHARED(i));
+   i = base; i.imageType = VK_IMAGE_TYPE_3D;
+   CHECK(!SHARED(i));
+   i = base; i.imageType = VK_IMAGE_TYPE_1D;
+   CHECK(!SHARED(i));
+   for (unsigned s = 2; s <= 64; s <<= 1) {
+      i = base; i.samples = (VkSampleCountFlagBits)s;
+      CHECK(!SHARED(i));
+   }
+   i = base; i.extent.width = 15;
+   CHECK(!SHARED(i));
+   i = base; i.extent.height = 15;
+   CHECK(!SHARED(i));
+   i = base; i.extent.width = 16; i.extent.height = 16;
+   CHECK(SHARED(i));
+   i = base; i.extent.width = 16384; i.extent.height = 16384;
+   CHECK(SHARED(i));
+
+   /* The format-query shape (no extent) agrees with the create shape. */
+   CHECK(hk_g17p_shared_compression_shape(AGX_CHIP_G17P, base.format,
+                                          base.imageType, base.flags,
+                                          base.usage));
+   CHECK(!hk_g17p_shared_compression_shape(AGX_CHIP_G17P, base.format,
+                                           base.imageType, base.flags,
+                                           VK_IMAGE_USAGE_STORAGE_BIT));
+   CHECK(!hk_g17p_shared_compression_shape(AGX_CHIP_G14G, base.format,
+                                           base.imageType, base.flags,
+                                           base.usage));
+
+   /* zink's kopper swapchain and imports carry feedback-loop usage. The
+    * shape admits it so an import of a compressed buffer succeeds;
+    * hk_can_compress() still refuses it when allocating. */
+   VkImageCreateInfo kopper = base;
+   kopper.usage |= VK_IMAGE_USAGE_SAMPLED_BIT |
+                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                   VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   CHECK(SHARED(kopper));
+}
+
 int
 main(void)
 {
@@ -312,6 +460,7 @@ main(void)
    check_shape(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
    check_minecraft();
    check_zink();
+   check_shared();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }
