@@ -1400,7 +1400,9 @@ hk_sync_submit_needs_completed(const struct hk_queue *queue,
                                unsigned count)
 {
    const struct hk_sync_queue *q = &queue->sync;
-   if (!q->recent_count)
+   /* A serialized queue never overlaps two commands, so no earlier
+    * submission can share a tile with this one while it runs. */
+   if (q->serialize || !q->recent_count)
       return false;
    for (unsigned i = 0; i < count; ++i) {
       if (util_dynarray_num_elements(&cmdbufs[i]->sync_pass_records,
@@ -1705,9 +1707,12 @@ hk_sync_resolve_submit(struct hk_queue *queue,
    }
 
    /* Every footprint of this ioctl stays live on the queue until the
-    * timeline point it signals (queue_submit has already advanced it). */
-   util_dynarray_foreach(&submitted, struct submit_footprint, e)
-      recent_add(&queue->sync, &e->fp, queue->drm.timeline_value, e->sq);
+    * timeline point it signals (queue_submit has already advanced it).
+    * Serialized queues order the next submission after this one whole. */
+   if (!queue->sync.serialize) {
+      util_dynarray_foreach(&submitted, struct submit_footprint, e)
+         recent_add(&queue->sync, &e->fp, queue->drm.timeline_value, e->sq);
+   }
    util_dynarray_fini(&submitted);
 
    if (queue->sync.exact_prior) {

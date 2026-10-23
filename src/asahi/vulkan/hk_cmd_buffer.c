@@ -3176,21 +3176,11 @@ hk_apply_conditional_rendering(struct hk_cmd_buffer *cmd, uint64_t source,
    return vk_command_buffer_has_error(&cmd->vk) ? 0 : output.gpu;
 }
 
-bool
-hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+static void
+hk_cs_capture_fragment_attachments(const struct hk_device *dev,
+                                   const struct hk_rendering_state *render,
+                                   struct hk_cs *cs)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct hk_rendering_state *render = &cmd->state.gfx.render;
-   uint8_t *map = cs->current;
-
-   /* Even a clear-only stream needs a stable root alias before EndCommandBuffer.
-    * Linked chunks acquire theirs in hk_cmd_buffer_emit_cs_jump. */
-   if (hk_g17p_vdm_low_window_enabled(&dev->dev) &&
-       !hk_g17p_vdm_compact(cmd, cs->addr))
-      return false;
-
-   hk_drm_attachment_set_init(&cs->fragment_attachments);
-
    /* Retain the image allocation spans now. A command buffer may contain
     * several VDM commands with different render state, while queue submission
     * happens only after all of them have been recorded. */
@@ -3265,6 +3255,26 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
       hk_drm_attachment_set_add(&cs->fragment_attachments, plane->addr, size);
    }
+}
+
+bool
+hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   uint8_t *map = cs->current;
+
+   /* Even a clear-only stream needs a stable root alias before EndCommandBuffer.
+    * Linked chunks acquire theirs in hk_cmd_buffer_emit_cs_jump. */
+   if (hk_g17p_vdm_low_window_enabled(&dev->dev) &&
+       !hk_g17p_vdm_compact(cmd, cs->addr))
+      return false;
+
+   hk_drm_attachment_set_init(&cs->fragment_attachments);
+
+   /* Only the native AGX3 path submits the spans (hk_queue.c). */
+   if (agx_native_graphics(&dev->dev))
+      hk_cs_capture_fragment_attachments(dev, render, cs);
 
    if (agx_native_graphics(&dev->dev)) {
       /* The kext preserves a zero final VDM word when this selector is the

@@ -346,6 +346,11 @@ asahi_append_compute_attachments(struct hk_device *dev,
                                  struct util_dynarray *payload,
                                  const struct hk_cs *cs)
 {
+   /* Attachment spans are hints for the native AGX3 firmware interface.
+    * AGX2 has never sent them, so G13 and G14 keep that submission. */
+   if (!agx_native_graphics(&dev->dev))
+      return;
+
    const struct hk_drm_attachment_set *set = &cs->compute_attachments;
    const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
    const struct drm_asahi_cmd_header header = {
@@ -366,6 +371,10 @@ asahi_append_fragment_attachments(struct hk_device *dev,
                                   struct util_dynarray *payload,
                                   const struct hk_cs *cs)
 {
+   /* See asahi_append_compute_attachments(). */
+   if (!agx_native_graphics(&dev->dev))
+      return;
+
    const struct hk_drm_attachment_set *set = &cs->fragment_attachments;
    const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
    const struct drm_asahi_cmd_header header = {
@@ -1176,8 +1185,11 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    /* Every command's barrier fields come from recorded dependencies. Legacy
     * kernels attach input syncs only to the first command, requiring a chain.
-    * A kernel advertising per-command waits needs no such execution edge. */
-   if (!hk_sync_resolve_submit(queue,
+    * A kernel advertising per-command waits needs no such execution edge.
+    * A serialized queue without exact priors replaces every field below
+    * (hk_drm_serialize_prefix), and keeps no ordinals, so it skips this. */
+   const bool resolve = !queue->sync.serialize || queue->sync.exact_prior;
+   if (resolve && !hk_sync_resolve_submit(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, flush_sstt,
                           wait_count > 0 &&
@@ -1466,10 +1478,17 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
    }
 
    queue->vk.driver_submit = hk_queue_submit;
-   queue->sync.exact_prior =
-      (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
    queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
                            dev->dev.params.gpu_generation <= 14;
+   /* A serialized queue orders every command after both engines' complete
+    * prefixes, earlier submissions included. The legacy header encodes that
+    * exactly (a zero barrier names every earlier command), so exact prior
+    * ordinals carry no information there. They only make the kernel resolve
+    * a historical dependency per engine for every command, which costs
+    * single-submission latency on G13 and G14. Keep upstream's payload. */
+   queue->sync.exact_prior =
+      !queue->sync.serialize &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
    queue->drm.id = UINT32_MAX;
    queue->drm.virt_ring_idx = drm_priority + 1;
