@@ -1296,7 +1296,12 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderDenormFlushToZeroFloat32 = true,
       .shaderDenormFlushToZeroFloat64 = false,
       .shaderRoundingModeRTEFloat16 = true,
-      .shaderRoundingModeRTEFloat32 = dev->params.gpu_generation > 15,
+      /* FP32 arithmetic rounds to nearest even on every generation. On
+       * G13-G15 an RTE execution mode leaves the program unchanged, as
+       * upstream does; G17P adds its FMA repair (agx_nir_lower_fma_rte).
+       * VK_KHR_shader_fma is gated separately.
+       */
+      .shaderRoundingModeRTEFloat32 = true,
       .shaderRoundingModeRTEFloat64 = false,
       .shaderRoundingModeRTZFloat16 = false,
       .shaderRoundingModeRTZFloat32 = false,
