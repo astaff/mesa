@@ -781,6 +781,53 @@ cs_reusable(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t kinds)
    return true;
 }
 
+/* Whether the compute stream cs already waits for the render r: directly,
+ * or through the compute prefix it waits on, each stream of which completes
+ * only after the renders it waits on. */
+static bool
+cdm_waits_for_render(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
+                     const struct hk_cs *r)
+{
+   const struct hk_cs *v = cs->sync.dep[HK_SYNC_VDM].cut;
+   if (v && v->sync.seq >= r->sync.seq)
+      return true;
+
+   const struct hk_cs *prefix = cs->sync.dep[HK_SYNC_CDM].cut;
+   if (!prefix || prefix == cs)
+      return false;
+
+   list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
+      if (it->type != HK_CS_CDM || it == cs ||
+          it->sync.seq > prefix->sync.seq)
+         continue;
+      v = it->sync.dep[HK_SYNC_VDM].cut;
+      if (v && v->sync.seq >= r->sync.seq)
+         return true;
+   }
+   return false;
+}
+
+/* M5: whether a requirement on the render subqueue would make the work a
+ * compute stream already holds wait for a render it does not wait for yet.
+ * A requirement recorded after that work (a barrier between two dispatches)
+ * has none of it in its second scope, so the work keeps the requirements it
+ * was recorded under and only later work takes the new one. */
+static bool
+cdm_raise_delays_work(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
+                      const struct hk_cs *r)
+{
+   return r && cs->stats.cmds &&
+          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+          !cdm_waits_for_render(cmd, cs, r);
+}
+
+bool
+hk_sync_merge_delays(struct hk_cmd_buffer *cmd, const struct hk_cs *into,
+                     const struct hk_cs *from)
+{
+   return cdm_raise_delays_work(cmd, into, from->sync.dep[HK_SYNC_VDM].cut);
+}
+
 void
 hk_sync_check_cs(struct hk_cmd_buffer *cmd)
 {
@@ -795,9 +842,18 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
       return;
    }
 
-   /* The stream absorbs the requirement of the work it now carries. */
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    req_for_kinds(cmd, kinds, dep);
+
+   /* The new work goes into a stream of its own, created under the whole
+    * requirement; a first scope that names compute work orders it after
+    * this stream through last[]. */
+   if (cdm_raise_delays_work(cmd, cs, dep[HK_SYNC_VDM].cut)) {
+      hk_cmd_buffer_end_compute(cmd);
+      return;
+   }
+
+   /* The stream absorbs the requirement of the work it now carries. */
    hk_sync_stream_wait(cs, dep);
    cs->sync.kind |= kinds;
    if (cs->sync.kind != HK_SYNC_GFX)

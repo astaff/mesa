@@ -357,6 +357,11 @@ void hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
                    struct hk_cs *from);
 
+/* M5: merging compute stream from into the adjacent stream into would make
+ * the work into already holds wait for a render it does not wait for. */
+bool hk_sync_merge_delays(struct hk_cmd_buffer *cmd, const struct hk_cs *into,
+                          const struct hk_cs *from);
+
 /* Obtain the general compute stream, ended and recreated if it is not
  * positioned after dep. The returned stream carries dep. */
 struct hk_cs *hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,

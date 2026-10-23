@@ -806,7 +806,9 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
  * buffer. However, it is challenging to avoid constructing such sequences due
  * to the gymnastics required to reorder compute around graphics. Merging at
  * EndCommandBuffer is cheap O(# of control streams) and lets us get away with
- * the sloppiness.
+ * the sloppiness. On M5 a stream that waits for a render the one before it
+ * does not wait for stays separate (hk_sync_merge_delays()): merged, the
+ * earlier work would wait for that render too.
  */
 static void
 merge_control_streams(struct hk_cmd_buffer *cmd)
@@ -817,7 +819,8 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM &&
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
-          !(last->timestamp.start.handle && cs->timestamp.start.handle)) {
+          !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
+          !hk_sync_merge_delays(cmd, last, cs)) {
 
          hk_sync_merge(cmd, last, cs);
          hk_cs_merge_cdm(last, cs);
