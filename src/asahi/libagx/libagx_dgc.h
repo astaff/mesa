@@ -345,9 +345,13 @@ agx_cdm_launch(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_grid grid,
    return out;
 }
 
+/* `restart_index` is the value an indexed draw's indices are compared with
+ * when draw.restart is set. Index List records that carry their own restart
+ * State Update write it there; older records take it from the separate
+ * VDM_STATE_RESTART_INDEX the caller emits. */
 static inline GLOBAL uint32_t *
 agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
-             enum agx_primitive topology)
+             enum agx_primitive topology, uint32_t restart_index)
 {
    uint64_t ib = draw.indexed ? agx_draw_index_buffer(draw) : 0;
 
@@ -362,11 +366,7 @@ agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
             size_valid && agx_vdm_index_list_indirect_pack_words(
                              chip, (uint8_t)topology, draw.indexed,
                              draw.restart, (uint8_t)draw.index_size, ib,
-                             draw.b.ptr,
-                             draw.indexed
-                                ? agx_primitive_restart_index(
-                                     draw.index_size)
-                                : 0,
+                             draw.b.ptr, draw.indexed ? restart_index : 0,
                              size_word, &words);
          assert(valid);
          if (!valid)
@@ -874,6 +874,7 @@ static inline GLOBAL uint32_t *
 agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
                           struct agx_draw draw,
                           enum agx_primitive topology,
+                          uint32_t restart_index,
                           uint32_t draw_state_context_offset,
                           bool render_state_emitted,
                           uint64_t empty_draw_jump)
@@ -922,7 +923,7 @@ agx_vdm_draw_robust_index(GLOBAL uint32_t *out, enum agx_chip chip,
             *out++ = draw_state_context_offset;
 
          *out++ = 0x40000001u;
-         *out++ = agx_primitive_restart_index(draw.index_size);
+         *out++ = restart_index;
       }
 
       for (unsigned i = 0; i < words.count; ++i)

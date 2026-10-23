@@ -6583,6 +6583,25 @@ translate_ppp_vertex(unsigned vtx)
    return vtx + 1;
 }
 
+/* The value a draw's indices are compared with for primitive restart. An
+ * application draw restarts at the dynamic index, the custom one from
+ * VK_EXT_primitive_restart_index or the default of the bound index type.
+ * Geometry shading and transform feedback instead draw an index buffer that
+ * poly generates, which restarts at the all-ones value of its own index size;
+ * the same fixed value is kept for draws that do not restart.
+ */
+static uint32_t
+hk_draw_restart_index(struct hk_cmd_buffer *cmd, struct agx_draw draw)
+{
+   if (!draw.indexed)
+      return 0;
+
+   if (!draw.restart || cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY])
+      return agx_primitive_restart_index(draw.index_size);
+
+   return cmd->vk.dynamic_graphics_state.ia.primitive_restart_index;
+}
+
 static void
 hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -6598,7 +6617,7 @@ hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    /* VDM State updates are relatively expensive, so only emit them when the
     * restart index changes. This is simpler than accurate dirty tracking.
     */
-   if (cs->restart_index != index) {
+   if (!cs->restart_index_set || cs->restart_index != index) {
       uint8_t *out = cs->current;
       agx_push(out, VDM_STATE, cfg) {
          cfg.restart_index_present = true;
@@ -6610,6 +6629,7 @@ hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
       cs->current = out;
       cs->restart_index = index;
+      cs->restart_index_set = true;
    }
 }
 
@@ -9803,12 +9823,8 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
             draw.indexed ? agx_index_size_to_B(draw.index_size) : 0,
          .restart_enable = draw.restart,
          /* Geometry/XFB lowers a non-indexed API draw to a synthetic
-          * indexed draw.  Derive the fixed Vulkan restart value from
-          * that draw, not from the original bound-index state. */
-         .restart_index = draw.indexed
-                             ? agx_primitive_restart_index(
-                                  draw.index_size)
-                             : 0,
+          * indexed draw, which restarts at its own fixed value. */
+         .restart_index = hk_draw_restart_index(cmd, draw),
          .index_buffer = draw.index_buffer,
          .index_buffer_range_B = draw.index_buffer_range_B,
          /* Unlike PPP and stream-link pointers, the Index List
@@ -9861,9 +9877,7 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
 
       const uint64_t ib = draw.index_buffer + offset_B;
       w[n++] = UINT32_C(0x40000001);
-      w[n++] = index_size_B == 1   ? UINT32_C(0xff)
-               : index_size_B == 2 ? UINT32_C(0xffff)
-                                   : UINT32_MAX;
+      w[n++] = hk_draw_restart_index(cmd, draw);
       w[n++] = UINT32_C(0x61f00000) | (uint32_t)((ib >> 32) & 0xff) |
                ((uint32_t)topology << 8) |
                ((uint32_t)draw.index_size << 17) |
@@ -9967,6 +9981,7 @@ struct hk_robust_index_batch {
    uint32_t count;
    struct hk_cs *cs;
    struct agx_draw draw;
+   uint32_t restart_index;
 };
 
 static void
@@ -9984,6 +9999,7 @@ hk_flush_robust_index_batch(struct hk_cmd_buffer *cmd,
                                   dev->dev.printf_buffer_address,
                                   draw->index_buffer,
                                   draw->index_buffer_range_B, draw->restart,
+                                  batch->restart_index,
                                   agx_chip_record_family(dev->dev.chip),
                                   cmd->state.gfx.topology, draw->index_size);
    batch->cs->stats.robust_index_dispatches++;
@@ -10032,6 +10048,7 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .draw_state_offset = draw_state_offset,
       .render_state_emitted = tail_emitted,
    };
+   const uint32_t restart_index = hk_draw_restart_index(cmd, draw);
    cs->stats.robust_index_draws++;
    if (batch) {
       assert(batch->count == 0 || batch->cs == cs);
@@ -10039,11 +10056,12 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          job;
       batch->cs = cs;
       batch->draw = draw;
+      batch->restart_index = restart_index;
    } else {
       libagx_draw_robust_index(
          cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX, target, hk_heap(cmd),
          dev->dev.printf_buffer_address, draw.b.ptr, draw.index_buffer,
-         draw.index_buffer_range_B, draw.restart,
+         draw.index_buffer_range_B, draw.restart, restart_index,
          agx_chip_record_family(dev->dev.chip), topology, draw_state_offset,
          tail_emitted, empty_draw_jump, draw.index_size);
       cs->stats.robust_index_dispatches++;
@@ -10427,8 +10445,9 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                                    g17p_native_bind_tail_emitted))
                return;
          } else {
-            cs->current = (void *)agx_vdm_draw((uint32_t *)out,
-                                               dev->dev.chip, draw, topology);
+            cs->current = (void *)agx_vdm_draw(
+               (uint32_t *)out, dev->dev.chip, draw, topology,
+               hk_draw_restart_index(cmd, draw));
          }
       }
 

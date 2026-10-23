@@ -338,7 +338,7 @@ test_agx3_live_vdm_draw(void)
          true);
       CHECK_EQ(agx_vdm_draw_size(chips[i], nonindexed), hal300 ? 20 : 16);
       uint32_t *end =
-         agx_vdm_draw(packed, chips[i], nonindexed, (enum agx_primitive)6);
+         agx_vdm_draw(packed, chips[i], nonindexed, (enum agx_primitive)6, 0);
       CHECK_EQ((uintptr_t)end - (uintptr_t)packed, hal300 ? 20 : 16);
       ++checks;
       if (memcmp(packed, hal300 ? nonindexed_hal300 : nonindexed_g15,
@@ -355,7 +355,8 @@ test_agx3_live_vdm_draw(void)
       CHECK_EQ(agx_vdm_draw_supported(chips[i], indexed, (enum agx_primitive)9),
                true);
       CHECK_EQ(agx_vdm_draw_size(chips[i], indexed), hal300 ? 32 : 28);
-      end = agx_vdm_draw(packed, chips[i], indexed, (enum agx_primitive)9);
+      end = agx_vdm_draw(packed, chips[i], indexed, (enum agx_primitive)9,
+                         UINT32_MAX);
       CHECK_EQ((uintptr_t)end - (uintptr_t)packed, hal300 ? 32 : 28);
       ++checks;
       if (memcmp(packed, hal300 ? indexed_hal300 : indexed_g15,
@@ -373,7 +374,7 @@ test_agx3_live_vdm_draw(void)
       CHECK_EQ(agx_vdm_draw_size(chips[i], indirect_nonindexed),
                hal300 ? 16 : 12);
       end = agx_vdm_draw(packed, chips[i], indirect_nonindexed,
-                         (enum agx_primitive)6);
+                         (enum agx_primitive)6, 0);
       CHECK_EQ((uintptr_t)end - (uintptr_t)packed, hal300 ? 16 : 12);
       ++checks;
       if (memcmp(packed,
@@ -395,7 +396,7 @@ test_agx3_live_vdm_draw(void)
       CHECK_EQ(agx_vdm_draw_size(chips[i], indirect_indexed),
                hal300 ? 36 : 32);
       end = agx_vdm_draw(packed, chips[i], indirect_indexed,
-                         (enum agx_primitive)9);
+                         (enum agx_primitive)9, UINT32_MAX);
       CHECK_EQ((uintptr_t)end - (uintptr_t)packed, hal300 ? 36 : 32);
       ++checks;
       if (memcmp(packed,
@@ -403,6 +404,21 @@ test_agx3_live_vdm_draw(void)
                  hal300 ? sizeof(indirect_indexed_hal300)
                         : sizeof(indirect_indexed_g15))) {
          fprintf(stderr, "AGX3 live indirect indexed VDM mismatch\n");
+         exit(1);
+      }
+
+      /* VK_EXT_primitive_restart_index: a custom index, zero included,
+       * replaces the type's all-ones value in the record's restart State
+       * Update and nothing else. */
+      uint32_t custom[9] = {0};
+      agx_vdm_draw(custom, chips[i], indirect_indexed, (enum agx_primitive)9,
+                   0);
+      CHECK_EQ(custom[0], UINT32_C(0x40000001));
+      CHECK_EQ(custom[1], 0);
+      custom[1] = UINT32_MAX;
+      ++checks;
+      if (memcmp(custom, packed, hal300 ? 36 : 32)) {
+         fprintf(stderr, "AGX3 custom restart index changed other words\n");
          exit(1);
       }
    }
@@ -434,8 +450,8 @@ test_agx3_live_vdm_draw(void)
    CHECK_EQ(libagx_draw_robust_index_vdm_size(AGX_CHIP_G17P, false),
             sizeof(robust_g17p));
    uint32_t *robust_end = agx_vdm_draw_robust_index(
-      robust_packed, AGX_CHIP_G17P, robust_draw, (enum agx_primitive)9, 0,
-      false, 0);
+      robust_packed, AGX_CHIP_G17P, robust_draw, (enum agx_primitive)9,
+      UINT32_MAX, 0, false, 0);
    CHECK_EQ((uintptr_t)robust_end - (uintptr_t)robust_packed,
             sizeof(robust_g17p));
    ++checks;
@@ -449,13 +465,27 @@ test_agx3_live_vdm_draw(void)
             sizeof(robust_g17p_with_state));
    robust_end = agx_vdm_draw_robust_index(
       robust_packed, AGX_CHIP_G17P, robust_draw, (enum agx_primitive)9,
-      UINT32_C(0x48000), true, 0);
+      UINT32_MAX, UINT32_C(0x48000), true, 0);
    CHECK_EQ((uintptr_t)robust_end - (uintptr_t)robust_packed,
             sizeof(robust_g17p_with_state));
    ++checks;
    if (memcmp(robust_packed, robust_g17p_with_state,
               sizeof(robust_g17p_with_state))) {
       fprintf(stderr, "G17P robust indexed state/body mismatch\n");
+      exit(1);
+   }
+
+   /* The repaired draw keeps the application's custom restart index. */
+   memset(robust_packed, 0, sizeof(robust_packed));
+   agx_vdm_draw_robust_index(robust_packed, AGX_CHIP_G17P, robust_draw,
+                             (enum agx_primitive)9, 1, UINT32_C(0x48000),
+                             true, 0);
+   CHECK_EQ(robust_packed[2], 1);
+   robust_packed[2] = UINT32_MAX;
+   ++checks;
+   if (memcmp(robust_packed, robust_g17p_with_state,
+              sizeof(robust_g17p_with_state))) {
+      fprintf(stderr, "G17P robust custom restart index mismatch\n");
       exit(1);
    }
 
@@ -466,7 +496,7 @@ test_agx3_live_vdm_draw(void)
             sizeof(indexed_g15));
    robust_end = agx_vdm_draw_robust_index(
       robust_packed, AGX_CHIP_G15G, robust_draw, (enum agx_primitive)9,
-      UINT32_C(0x48000), true, 0);
+      UINT32_MAX, UINT32_C(0x48000), true, 0);
    CHECK_EQ((uintptr_t)robust_end - (uintptr_t)robust_packed,
             sizeof(indexed_g15));
    ++checks;
@@ -481,11 +511,11 @@ test_agx3_live_vdm_draw(void)
    agx2_draw.index_buffer = UINT64_C(0x3456789abc);
    uint32_t *agx2_expected_end =
       agx_vdm_draw(agx2_expected, AGX_CHIP_G13G, agx2_draw,
-                   (enum agx_primitive)9);
+                   (enum agx_primitive)9, UINT32_MAX);
    uint32_t *agx2_robust_end =
       agx_vdm_draw_robust_index(agx2_robust, AGX_CHIP_G13G, agx2_draw,
-                                (enum agx_primitive)9, UINT32_C(0x48000),
-                                true, 0);
+                                (enum agx_primitive)9, UINT32_MAX,
+                                UINT32_C(0x48000), true, 0);
    const size_t agx2_size =
       (uintptr_t)agx2_expected_end - (uintptr_t)agx2_expected;
    CHECK_EQ((uintptr_t)agx2_robust_end - (uintptr_t)agx2_robust, agx2_size);
@@ -509,7 +539,7 @@ test_agx3_live_vdm_draw(void)
    memset(robust_packed, 0xcd, sizeof(robust_packed));
    robust_end = agx_vdm_draw_robust_index(
       robust_packed, AGX_CHIP_G17P, empty_draw,
-      (enum agx_primitive)9, UINT32_C(0x48000), true,
+      (enum agx_primitive)9, UINT32_MAX, UINT32_C(0x48000), true,
       UINT64_C(0x5a12345678));
    CHECK_EQ((uintptr_t)robust_end - (uintptr_t)robust_packed,
             sizeof(empty_jump_with_state));
@@ -526,7 +556,7 @@ test_agx3_live_vdm_draw(void)
    memset(robust_packed, 0xcd, sizeof(robust_packed));
    robust_end = agx_vdm_draw_robust_index(
       robust_packed, AGX_CHIP_G17P, empty_draw,
-      (enum agx_primitive)9, UINT32_C(0x48000), true,
+      (enum agx_primitive)9, UINT32_MAX, UINT32_C(0x48000), true,
       UINT64_C(0x5a12345678));
    CHECK_EQ((uintptr_t)robust_end - (uintptr_t)robust_packed,
             sizeof(empty_jump_with_state));
@@ -544,7 +574,7 @@ test_agx3_live_vdm_draw(void)
    memset(robust_packed, 0xcd, sizeof(robust_packed));
    robust_end = agx_vdm_draw_robust_index(
       robust_packed, AGX_CHIP_G17P, empty_draw,
-      (enum agx_primitive)9, 0, false, UINT64_C(0x5a12345678));
+      (enum agx_primitive)9, UINT32_MAX, 0, false, UINT64_C(0x5a12345678));
    CHECK_EQ((uintptr_t)robust_end - (uintptr_t)robust_packed,
             sizeof(empty_jump_without_state));
    ++checks;

@@ -87,12 +87,22 @@ static uint sub_group_broadcast(uint x,uint from) {
  assert(from==0); if(lane==0) broadcast_value=x; return broadcast_value;
 }
 static void agx_vdm_draw_robust_index(uint32_t *vdm,enum agx_chip chip,
- struct agx_draw draw,enum agx_primitive topology,uint state,bool emitted,uint64_t jump) {
- (void)vdm;(void)chip;(void)topology; assert(state==12 && emitted && jump==64);
+ struct agx_draw draw,enum agx_primitive topology,uint32_t restart_index,uint state,
+ bool emitted,uint64_t jump) {
+ (void)vdm;(void)chip;(void)topology; assert(restart_index==0xffff);
+ assert(state==12 && emitted && jump==64);
  captured=draw; emissions++;
 }
 static struct agx_grid agx_3d(uint x,uint y,uint z) {return (struct agx_grid){{x,y,z}};}
 '''
+
+OLD_STUB = (
+    "enum agx_primitive topology,uint32_t restart_index,uint state,\n"
+    " bool emitted,uint64_t jump) {\n"
+    " (void)vdm;(void)chip;(void)topology; assert(restart_index==0xffff);\n",
+    "enum agx_primitive topology,uint state,bool emitted,uint64_t jump) {\n"
+    " (void)vdm;(void)chip;(void)topology;\n",
+)
 
 TESTS = r'''
 static uint status_words[4];
@@ -102,8 +112,8 @@ static void repair(struct poly_heap *h, VkDrawIndexedIndirectCommand *cmd,
   .command=(uintptr_t)cmd,.empty_draw_jump=64,.draw_state_offset=12,.render_state_emitted=1}};
  emissions=0; group=1;
  for(lane=0;lane<32;lane++) {
-  if(batch) libagx_draw_robust_index_batch(jobs,h,FAILURE_ARG (uintptr_t)in,range,true,chip,topology,width);
-  else libagx_draw_robust_index(NULL,h,FAILURE_ARG cmd,(uintptr_t)in,range,true,chip,topology,12,1,64,width);
+  if(batch) libagx_draw_robust_index_batch(jobs,h,FAILURE_ARG (uintptr_t)in,range,true,0xffff,chip,topology,width);
+  else libagx_draw_robust_index(NULL,h,FAILURE_ARG cmd,(uintptr_t)in,range,true,0xffff,chip,topology,12,1,64,width);
  }
  assert(emissions==1);
 }
@@ -261,7 +271,12 @@ def kernels(revision=None, mutation=None):
     if mutation == "drop-points":
         code = code.replace("if (topology == AGX_PRIMITIVE_POINTS)", "if (false)")
     code += "#define FAILURE_ARG " + ("status_words," if "printf_buffer" in cl else "") + "\n"
-    return code + TESTS
+    tests = TESTS
+    if "uint32_t restart_index" not in cl:
+        # Kernels from before they took the custom primitive restart index.
+        code = code.replace(OLD_STUB[0], OLD_STUB[1])
+        tests = tests.replace(",true,0xffff,", ",true,")
+    return code + tests
 
 
 API_PREFIX = r'''

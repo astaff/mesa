@@ -210,8 +210,9 @@ libagx_draw_robust_index_impl(
    global uint32_t *vdm, global struct poly_heap *heap,
    global uint32_t *printf_buffer,
    constant VkDrawIndexedIndirectCommand *cmd, uint64_t in_buf_ptr,
-   uint32_t in_buf_range_B, ushort restart, enum agx_chip chip,
-   enum agx_primitive topology, uint32_t draw_state_context_offset,
+   uint32_t in_buf_range_B, ushort restart, uint32_t restart_index,
+   enum agx_chip chip, enum agx_primitive topology,
+   uint32_t draw_state_context_offset,
    uint32_t render_state_emitted, uint64_t empty_draw_jump,
    enum agx_index_size index_size__3)
 {
@@ -299,7 +300,7 @@ libagx_draw_robust_index_impl(
    }
 
    if (first) {
-      agx_vdm_draw_robust_index(vdm, chip, draw, topology,
+      agx_vdm_draw_robust_index(vdm, chip, draw, topology, restart_index,
                                 draw_state_context_offset,
                                 render_state_emitted != 0, empty_draw_jump);
    }
@@ -311,17 +312,17 @@ libagx_draw_robust_index(global uint32_t *vdm, global struct poly_heap *heap,
                          global uint32_t *printf_buffer,
                          constant VkDrawIndexedIndirectCommand *cmd,
                          uint64_t in_buf_ptr, uint32_t in_buf_range_B,
-                         ushort restart, enum agx_chip chip,
-                         enum agx_primitive topology,
+                         ushort restart, uint32_t restart_index,
+                         enum agx_chip chip, enum agx_primitive topology,
                          uint32_t draw_state_context_offset,
                          uint32_t render_state_emitted,
                          uint64_t empty_draw_jump,
                          enum agx_index_size index_size__3)
 {
    libagx_draw_robust_index_impl(
-      vdm, heap, printf_buffer, cmd, in_buf_ptr, in_buf_range_B, restart, chip,
-      topology, draw_state_context_offset, render_state_emitted, empty_draw_jump,
-      index_size__3);
+      vdm, heap, printf_buffer, cmd, in_buf_ptr, in_buf_range_B, restart,
+      restart_index, chip, topology, draw_state_context_offset,
+      render_state_emitted, empty_draw_jump, index_size__3);
 }
 
 KERNEL(32)
@@ -329,15 +330,16 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
                                global struct poly_heap *heap,
                                global uint32_t *printf_buffer,
                                uint64_t in_buf_ptr, uint32_t in_buf_range_B,
-                               ushort restart, enum agx_chip chip,
-                               enum agx_primitive topology,
+                               ushort restart, uint32_t restart_index,
+                               enum agx_chip chip, enum agx_primitive topology,
                                enum agx_index_size index_size__3)
 {
    constant struct libagx_robust_index_draw *draw = draws + get_group_id(0);
    libagx_draw_robust_index_impl(
       (global uint32_t *)draw->vdm, heap, printf_buffer,
       (constant VkDrawIndexedIndirectCommand *)draw->command, in_buf_ptr,
-      in_buf_range_B, restart, chip, topology, draw->draw_state_offset,
+      in_buf_range_B, restart, restart_index, chip, topology,
+      draw->draw_state_offset,
       draw->render_state_emitted, draw->empty_draw_jump, index_size__3);
 }
 

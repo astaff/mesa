@@ -315,7 +315,7 @@ swapchain_attempt(struct hk_device *dev, uint64_t image_size)
    assert(!dev->dev.bo_cache.size);
    for (unsigned i = 0; i < exported_count; ++i)
       assert(fcntl(exported_fds[i], F_GETFD) == -1 && errno == EBADF);
-   assert(!hk_device_physical(dev)->mem_heaps[0].used);
+   assert(!*hk_device_physical(dev)->mem_heaps[0].used);
    assert(!kernel_oom_attempts);
 }
 
@@ -333,8 +333,12 @@ main(void)
    vk_object_base_init(&dev->vk, &dev->vk.base, VK_OBJECT_TYPE_DEVICE);
    vk_object_base_init(NULL, &pdev->vk.base, VK_OBJECT_TYPE_PHYSICAL_DEVICE);
    dev->dev.chip = AGX_CHIP_G17P;
+   static struct hk_heap_usage heap_usage;
+   pdev->heap_usage = &heap_usage;
    pdev->mem_types[0].heapIndex = 0;
    pdev->mem_heaps[0].size = 8 * 1024 * MIB;
+   pdev->mem_heaps[0].used = &heap_usage.used[0];
+   pdev->mem_heaps[0].cached = &heap_usage.cached[0];
    simple_mtx_init(&dev->dev.bo_map_lock, mtx_plain);
    simple_mtx_init(&dev->dev.bo_cache.lock, mtx_plain);
    simple_mtx_init(&dev->dev.vma_lock, mtx_plain);

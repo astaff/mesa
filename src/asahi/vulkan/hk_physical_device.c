@@ -1712,6 +1712,57 @@ hk_get_sysmem_heap_size(struct hk_physical_device *pdev)
                                &instance->drirc.misc.heap_memory_percent);
 }
 
+static simple_mtx_t hk_heap_usage_lock = SIMPLE_MTX_INITIALIZER;
+static struct hk_heap_usage *hk_heap_usages;
+
+/* Return the process-wide usage record for a render node, creating it on
+ * first use. It outlives any one instance, so it is not allocated with an
+ * instance's allocation callbacks. */
+static struct hk_heap_usage *
+hk_heap_usage_get(dev_t render_dev)
+{
+   simple_mtx_lock(&hk_heap_usage_lock);
+
+   struct hk_heap_usage *usage = hk_heap_usages;
+   while (usage && usage->render_dev != render_dev)
+      usage = usage->next;
+
+   if (usage) {
+      usage->refcount++;
+   } else {
+      usage = calloc(1, sizeof(*usage));
+      if (usage) {
+         usage->render_dev = render_dev;
+         usage->refcount = 1;
+         usage->next = hk_heap_usages;
+         hk_heap_usages = usage;
+      }
+   }
+
+   simple_mtx_unlock(&hk_heap_usage_lock);
+   return usage;
+}
+
+static void
+hk_heap_usage_put(struct hk_heap_usage *usage)
+{
+   if (!usage)
+      return;
+
+   simple_mtx_lock(&hk_heap_usage_lock);
+
+   if (--usage->refcount == 0) {
+      struct hk_heap_usage **link = &hk_heap_usages;
+      while (*link != usage)
+         link = &(*link)->next;
+
+      *link = usage->next;
+      free(usage);
+   }
+
+   simple_mtx_unlock(&hk_heap_usage_lock);
+}
+
 static uint64_t
 hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
 {
@@ -1720,8 +1771,8 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
    uint64_t total_used = 0;
    for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
       const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
-      uint64_t used = p_atomic_read(&heap->used) +
-                         p_atomic_read(&heap->cached.value);
+      uint64_t used = p_atomic_read(heap->used) +
+                         p_atomic_read(&heap->cached->value);
       total_used += used;
    }
 
@@ -1899,9 +1950,17 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       goto fail_disk_cache;
    }
 
+   pdev->heap_usage = hk_heap_usage_get(render_dev);
+   if (!pdev->heap_usage) {
+      result = vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto fail_disk_cache;
+   }
+
    uint32_t sysmem_heap_idx = pdev->mem_heap_count++;
    pdev->mem_heaps[sysmem_heap_idx] = (struct hk_memory_heap){
       .size = sysmem_size_B,
+      .used = &pdev->heap_usage->used[sysmem_heap_idx],
+      .cached = &pdev->heap_usage->cached[sysmem_heap_idx],
       .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
    };
 
@@ -1993,6 +2052,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    return VK_SUCCESS;
 
 fail_disk_cache:
+   hk_heap_usage_put(pdev->heap_usage);
    hk_physical_device_free_disk_cache(pdev);
    vk_physical_device_finish(&pdev->vk);
 fail_agx_device:
@@ -2019,6 +2079,7 @@ hk_physical_device_destroy(struct vk_physical_device *vk_pdev)
       close(pdev->master_fd);
 
    simple_mtx_destroy(&pdev->debug_compile_lock);
+   hk_heap_usage_put(pdev->heap_usage);
    hk_physical_device_free_disk_cache(pdev);
    agx_close_device(&pdev->dev);
    vk_physical_device_finish(&pdev->vk);
@@ -2056,8 +2117,8 @@ hk_GetPhysicalDeviceMemoryProperties2(
 
          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
             const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
-            uint64_t used = p_atomic_read(&heap->used) +
-                            p_atomic_read(&heap->cached.value);
+            uint64_t allocated = p_atomic_read(heap->used);
+            uint64_t used = allocated + p_atomic_read(&heap->cached->value);
 
             /* From the Vulkan 1.3.278 spec:
              *
@@ -2066,9 +2127,13 @@ hk_GetPhysicalDeviceMemoryProperties2(
              *    for each memory heap. A heap’s usage is an estimate of how
              *    much memory the process is currently using in that heap."
              *
+             * Idle BOs in the BO cache are reclaimable, and an allocation
+             * that reuses one must still raise the reported usage, so they
+             * only lower the budget below.
+             *
              * TODO: Include internal allocations?
              */
-            p->heapUsage[i] = used;
+            p->heapUsage[i] = allocated;
 
             /* Set the budget at 90% to avoid thrashing. */
             float percent = 0.9f;
