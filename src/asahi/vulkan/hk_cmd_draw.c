@@ -2107,46 +2107,294 @@ hk_g17p_zls_attachment_none(const VkRenderingAttachmentInfo *att)
            att->resolveMode == VK_RESOLVE_MODE_NONE);
 }
 
+static bool
+hk_stencil_face_writes(const struct vk_stencil_test_face_state *face)
+{
+   return face->write_mask &&
+          (face->op.fail != VK_STENCIL_OP_KEEP ||
+           face->op.pass != VK_STENCIL_OP_KEEP ||
+           face->op.depth_fail != VK_STENCIL_OP_KEEP);
+}
+
 static inline void
 hk_g17p_note_depth_use(struct hk_cmd_buffer *cmd)
 {
    struct hk_rendering_state *render = &cmd->state.gfx.render;
-   if (likely(!render->g17p_zls_elide_ok) || render->g17p_depth_touched)
+   if (likely(!render->g17p_zls_elide_mask))
       return;
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
    if (dyn->ds.depth.test_enable || dyn->ds.depth.write_enable ||
-       dyn->ds.depth.bounds_test.enable || dyn->ds.stencil.test_enable)
-      render->g17p_depth_touched = true;
+       dyn->ds.depth.bounds_test.enable)
+      render->g17p_zls_touched |= VK_IMAGE_ASPECT_DEPTH_BIT;
+   if (dyn->ds.stencil.test_enable)
+      render->g17p_zls_touched |= VK_IMAGE_ASPECT_STENCIL_BIT;
+
+   /* Depth is written only with the depth test enabled (Vulkan 1.4, "Depth
+    * Test"), stencil only with the stencil test enabled, a nonzero write
+    * mask and an operation other than KEEP for a face ("Stencil Test"). */
+   if (dyn->ds.depth.test_enable && dyn->ds.depth.write_enable)
+      render->g17p_zls_written |= VK_IMAGE_ASPECT_DEPTH_BIT;
+   if (dyn->ds.stencil.test_enable &&
+       (hk_stencil_face_writes(&dyn->ds.stencil.front) ||
+        hk_stencil_face_writes(&dyn->ds.stencil.back)))
+      render->g17p_zls_written |= VK_IMAGE_ASPECT_STENCIL_BIT;
 }
 
 void
-hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd)
+hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
 {
-   cmd->state.gfx.render.g17p_depth_touched = true;
+   cmd->state.gfx.render.g17p_zls_touched |= aspects;
+   cmd->state.gfx.render.g17p_zls_written |= aspects;
 }
 
-/* Returns whether the pass's depth/stencil attachment was dropped. */
-static bool
-hk_g17p_zls_elide(struct hk_cmd_buffer *cmd)
+/* Drop each untouched plane independently. Using stencil must not let an
+ * intermediate stream store uninitialized depth from a NONE/NONE attachment,
+ * and using depth must not do the same to an untouched stencil attachment.
+ */
+static void
+hk_g17p_zls_elide(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
 {
    struct hk_rendering_state *render = &cmd->state.gfx.render;
-   if (!render->g17p_zls_elide_ok || render->g17p_depth_touched ||
-       !render->zls_first_cs)
-      return false;
+   if (!aspects || !render->zls_first_cs)
+      return;
    bool found = false;
    list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
       if (cs == render->zls_first_cs)
          found = true;
       if (!found || cs->type != HK_CS_VDM)
          continue;
-      /* An absent attachment must also have zero layer strides. The
-       * kernel rejects a nonzero stride with a zero base address. */
-      memset(&cs->cr.depth, 0, sizeof(cs->cr.depth));
-      memset(&cs->cr.stencil, 0, sizeof(cs->cr.stencil));
-      memset(&cs->cr.zls_control, 0, sizeof(cs->cr.zls_control));
+      agx_unpack(NULL, &cs->cr.zls_control, ZLS_CONTROL, control);
+      /* An absent attachment must also have zero layer strides. */
+      if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
+         memset(&cs->cr.depth, 0, sizeof(cs->cr.depth));
+         control.z_load = control.z_store = false;
+         control.z_load_compress = control.z_store_compress = false;
+         control.z_load_tiling = control.z_store_tiling = 0;
+         control.z_format = 0;
+         control.z_resolve = false;
+      }
+      if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
+         memset(&cs->cr.stencil, 0, sizeof(cs->cr.stencil));
+         control.s_load = control.s_store = false;
+         control.s_load_compress = control.s_store_compress = false;
+         control.s_load_tiling = control.s_store_tiling = 0;
+         control.s_resolve = false;
+      }
+      agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
+         cfg = control;
+      }
    }
-   return true;
+}
+
+/* An elidable aspect that the pass tested but no draw or clear could have
+ * changed holds, at the end of the pass, exactly what the pass loaded or what
+ * memory already held: drop its store from every stream. Earlier streams of
+ * a split pass then reload from memory that still holds the same values, and
+ * a firmware partial render, which forces load and store, writes back the
+ * unchanged tile. */
+static void
+hk_g17p_zls_elide_store(struct hk_cmd_buffer *cmd, VkImageAspectFlags aspects)
+{
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   if (!aspects || !render->zls_first_cs)
+      return;
+   bool found = false;
+   list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+      if (cs == render->zls_first_cs)
+         found = true;
+      if (!found || cs->type != HK_CS_VDM)
+         continue;
+      agx_unpack(NULL, &cs->cr.zls_control, ZLS_CONTROL, control);
+      if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
+         control.z_store = false;
+      if (aspects & VK_IMAGE_ASPECT_STENCIL_BIT)
+         control.s_store = false;
+      agx_pack(&cs->cr.zls_control, ZLS_CONTROL, cfg) {
+         cfg = control;
+      }
+   }
+}
+
+/* G17P: a colour attachment that a single-stream, single-sample pass loads
+ * and stores, but that no draw or clear wrote and no fragment shader read,
+ * keeps its memory contents as they are. Its end-of-tile stores, partial-
+ * render ones included, are dropped, and the main background program clears
+ * its tile instead of loading it: the end-of-tile program then carries no
+ * operation for it, as for storeOp DONT_CARE, and the background program a
+ * load-op clear, as for loadOp CLEAR. The partial-render background program
+ * still reloads it, from the memory no store touched. The rebuild is exact
+ * only for attachments without clear, resolve or flags, so other passes keep
+ * their programs. A continuation of the pass restores the full programs
+ * (hk_m5_pass_merge_begin()). */
+static void
+hk_g17p_elide_untouched_color(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   if (dev->dev.chip != AGX_CHIP_G17P || cs != render->zls_first_cs ||
+       cmd->in_meta || render->color_read || render->view_mask ||
+       render->layer_count > 1 || render->tilebuffer.nr_samples > 1 ||
+       agx_tilebuffer_spills(&render->tilebuffer) ||
+       render->g17p_direct_color_resolve ||
+       (render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                         VK_RENDERING_RESUMING_BIT |
+                         VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)))
+      return;
+
+   VkRenderingAttachmentInfo atts[HK_MAX_RTS], bg_atts[HK_MAX_RTS];
+   uint8_t elide = 0, covered = 0;
+   for (uint32_t i = 0; i < render->color_att_count; ++i) {
+      const struct hk_attachment *att = &render->color_att[i];
+      if (att->load_op == VK_ATTACHMENT_LOAD_OP_CLEAR ||
+          att->resolve_mode != VK_RESOLVE_MODE_NONE || att->flags)
+         return;
+
+      atts[i] = (VkRenderingAttachmentInfo){
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .imageView = hk_image_view_to_handle(att->iview),
+         .imageLayout = att->layout,
+         .loadOp = att->load_op,
+         .storeOp = att->store_op,
+      };
+      bg_atts[i] = atts[i];
+      if (att->iview && att->load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
+          att->store_op == VK_ATTACHMENT_STORE_OP_STORE &&
+          !(render->color_written & BITFIELD_BIT(i))) {
+         atts[i].imageView = VK_NULL_HANDLE;
+         bg_atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+         elide |= BITFIELD_BIT(i);
+      } else if (att->iview && att->load_op == VK_ATTACHMENT_LOAD_OP_LOAD &&
+                 (render->color_covered & BITFIELD_BIT(i))) {
+         /* The first draw overwrites every sample before anything reads
+          * it (hk_g17p_note_first_draw()): start the tile cleared instead of
+          * loading it. The stores, and the partial render's reload of what
+          * an earlier tile pass stored, are unchanged. */
+         bg_atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+         covered |= BITFIELD_BIT(i);
+      }
+   }
+   if (!elide && !covered)
+      return;
+
+   const bool incomplete_render_area =
+      render->area.offset.x > 0 || render->area.offset.y > 0 ||
+      render->area.extent.width < render->cr.width ||
+      render->area.extent.height < render->cr.height;
+   const VkRenderingInfo info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = render->area,
+      .layerCount = render->layer_count,
+      .viewMask = render->view_mask,
+      .colorAttachmentCount = render->color_att_count,
+      .pColorAttachments = atts,
+   };
+   VkRenderingInfo bg_info = info;
+   bg_info.pColorAttachments = bg_atts;
+   const struct hk_bg_eot bg_main = hk_build_bg_eot(
+      cmd, &bg_info, false, false, incomplete_render_area, NULL);
+   const struct hk_bg_eot eot_main =
+      hk_build_bg_eot(cmd, &info, true, false, incomplete_render_area, NULL);
+   const struct hk_bg_eot eot_partial =
+      hk_build_bg_eot(cmd, &info, true, true, incomplete_render_area, NULL);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   cs->cr.bg.main = bg_main;
+   cs->cr.eot.main = eot_main;
+   cs->cr.eot.partial = eot_partial;
+   perf_debug(cmd, "Dropped untouched colour attachments 0x%x, loads of "
+              "covered attachments 0x%x", elide, covered);
+}
+
+/* G17P: a pass whose first draw is a direct, non-indexed, single-instance draw
+ * of vertices 0..2, by a vertex shader that places them on a triangle covering
+ * the clip-space square (hk_vs_covers_clip_square()), under a viewport and
+ * scissor that cover the render area, writes every sample of each colour
+ * attachment its fragment shader writes opaquely before anything can read it:
+ * no test can reject a fragment, the fragment shader cannot kill one, and the
+ * attachment's whole write mask is enabled without blending or logic ops.
+ * D3D translation layers load every render target they were not told to clear
+ * or discard, so their full-screen post-processing passes otherwise read each
+ * target only to overwrite it. hk_g17p_elide_untouched_color() turns the
+ * load of those attachments into a clear. */
+static void
+hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                        struct agx_draw draw)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_rendering_state *render = &gfx->render;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+
+   render->first_draw_seen = true;
+   render->color_covered = 0;
+   if (dev->dev.chip != AGX_CHIP_G17P || cmd->in_meta ||
+       cs != render->zls_first_cs || cs->stats.cmds || cs->m5_continued_pass ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       agx_is_indirect(draw.b) || draw.indexed || draw.b.count[0] != 3 ||
+       draw.b.count[1] != 1 || draw.start || draw.start_instance ||
+       render->view_mask || render->layer_count > 1 ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] || gfx->shaders[MESA_SHADER_MESH])
+      return;
+
+   const struct hk_shader *vs = hk_bound_hw_vs(gfx);
+   const struct hk_shader *fs = hk_bound_fs(cmd);
+   if (!vs || !vs->info.vs.covers_clip_square || !fs ||
+       fs->info.fs.may_kill || fs->b.info.reads_tib)
+      return;
+
+   const unsigned samples = MAX2(dyn->ms.rasterization_samples, 1);
+   const VkPrimitiveTopology topology = dyn->ia.primitive_topology;
+   if ((topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+        topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP &&
+        topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) ||
+       dyn->rs.rasterizer_discard_enable ||
+       dyn->rs.cull_mode != VK_CULL_MODE_NONE ||
+       dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL ||
+       dyn->ms.alpha_to_coverage_enable || dyn->cb.logic_op_enable ||
+       (dyn->ms.sample_mask & BITFIELD_MASK(samples)) != BITFIELD_MASK(samples))
+      return;
+
+   if ((render->depth_att.iview &&
+        ((dyn->ds.depth.test_enable &&
+          dyn->ds.depth.compare_op != VK_COMPARE_OP_ALWAYS) ||
+         dyn->ds.depth.bounds_test.enable)) ||
+       (render->stencil_att.iview && dyn->ds.stencil.test_enable))
+      return;
+
+   const VkRect2D area = render->area;
+   const float ax0 = area.offset.x, ay0 = area.offset.y;
+   const float ax1 = ax0 + area.extent.width, ay1 = ay0 + area.extent.height;
+   if (dyn->vp.viewport_count != 1 || dyn->vp.scissor_count != 1)
+      return;
+   const VkViewport *vp = &dyn->vp.viewports[0];
+   if (MIN2(vp->x, vp->x + vp->width) > ax0 ||
+       MAX2(vp->x, vp->x + vp->width) < ax1 ||
+       MIN2(vp->y, vp->y + vp->height) > ay0 ||
+       MAX2(vp->y, vp->y + vp->height) < ay1)
+      return;
+   const VkRect2D *sc = &dyn->vp.scissors[0];
+   if (sc->offset.x > area.offset.x || sc->offset.y > area.offset.y ||
+       (int64_t)sc->offset.x + sc->extent.width < ax1 ||
+       (int64_t)sc->offset.y + sc->extent.height < ay1)
+      return;
+
+   uint8_t covered = 0;
+   for (uint32_t i = 0; i < render->color_att_count; ++i) {
+      const struct hk_attachment *att = &render->color_att[i];
+      if (!att->iview || !(gfx->fast_link_fs.color_written & BITFIELD_BIT(i)) ||
+          dyn->cb.attachments[i].blend_enable)
+         continue;
+      const unsigned channels = util_format_get_nr_components(
+         vk_format_to_pipe_format(att->iview->vk.format));
+      if ((dyn->cb.attachments[i].write_mask & BITFIELD_MASK(channels)) ==
+          BITFIELD_MASK(channels))
+         covered |= BITFIELD_BIT(i);
+   }
+   render->color_covered = covered;
 }
 
 static void
@@ -2353,15 +2601,30 @@ hk_m5_pass_merge_dependency(VkPipelineStageFlags2 src_stages,
    return transition ? HK_M5_MERGE_DEP_END : HK_M5_MERGE_DEP_ORDERED;
 }
 
+static bool hk_m5_image_is_attachment(const struct hk_rendering_state *render,
+                                      const struct vk_image *image);
+
 static void
 hk_m5_pass_merge_classify(struct hk_cmd_buffer *cmd, const char *what,
                           VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst,
                           VkAccessFlags2 dst_access, bool buffer,
-                          bool transition)
+                          bool transition, const struct vk_image *image)
 {
    struct hk_pass_merge_candidate *m = &cmd->state.pass_merge;
    if (!m->valid)
       return;
+
+   /* hk performs no work for a layout transition: of an image that is not an
+    * attachment of the candidate and cannot alias one, it only orders the
+    * image's accesses, as the barrier's scopes describe. A transition of an
+    * attachment, or an ownership transfer, changes what the continued
+    * instance would load. */
+   if (transition && image &&
+       hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P &&
+       !hk_m5_image_is_attachment(&m->render, image) &&
+       !(image->create_flags & (VK_IMAGE_CREATE_ALIAS_BIT |
+                                VK_IMAGE_CREATE_SPARSE_BINDING_BIT)))
+      transition = false;
 
    switch (hk_m5_pass_merge_dependency(src, dst, dst_access, buffer,
                                        transition)) {
@@ -2385,21 +2648,23 @@ hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
       const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
       hk_m5_pass_merge_classify(cmd, "memory", b->srcStageMask,
                                 b->dstStageMask, b->dstAccessMask, false,
-                                false);
+                                false, NULL);
    }
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
       const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
       hk_m5_pass_merge_classify(
          cmd, "buffer", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
-         true, b->srcQueueFamilyIndex != b->dstQueueFamilyIndex);
+         true, b->srcQueueFamilyIndex != b->dstQueueFamilyIndex, NULL);
    }
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
       const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      VK_FROM_HANDLE(vk_image, image, b->image);
       hk_m5_pass_merge_classify(
          cmd, "image", b->srcStageMask, b->dstStageMask, b->dstAccessMask,
          false,
          b->oldLayout != b->newLayout ||
-            b->srcQueueFamilyIndex != b->dstQueueFamilyIndex);
+            b->srcQueueFamilyIndex != b->dstQueueFamilyIndex,
+         b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ? NULL : image);
    }
 }
 
@@ -2454,6 +2719,51 @@ hk_m5_ordered_attachment_refusal(const VkRenderingAttachmentInfo *info,
    return NULL;
 }
 
+/* An image subresource accessed through a descriptor must be in the layout
+ * the descriptor was written with, and no sampled-image, combined, storage or
+ * input-attachment descriptor may name an attachment-only layout
+ * (VkDescriptorImageInfo::imageLayout valid usage). */
+static bool
+hk_m5_layout_excludes_descriptors(VkImageLayout layout)
+{
+   switch (layout) {
+   case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Whether no descriptor can access an attachment of the instance while it
+ * renders: every attachment is in an attachment-only layout. Both instances
+ * of a continuation use the same layouts (hk_m5_ordered_attachment_refusal()),
+ * so this holds for the merged pass. Taken on G17P. */
+static bool
+hk_m5_attachments_exclude_descriptors(const struct hk_cmd_buffer *cmd,
+                                      const VkRenderingInfo *info)
+{
+   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G17P)
+      return false;
+
+   const VkRenderingAttachmentInfo *ds[] = {info->pDepthAttachment,
+                                            info->pStencilAttachment};
+   for (unsigned i = 0; i < ARRAY_SIZE(ds); ++i) {
+      if (ds[i] && ds[i]->imageView &&
+          !hk_m5_layout_excludes_descriptors(ds[i]->imageLayout))
+         return false;
+   }
+   for (uint32_t i = 0; i < info->colorAttachmentCount; ++i) {
+      const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
+      if (att->imageView && !hk_m5_layout_excludes_descriptors(att->imageLayout))
+         return false;
+   }
+   return true;
+}
+
 /*
  * An ordered continuation (HK_M5_MERGE_DEP_ORDERED) is memory-equivalent to
  * the two instances when:
@@ -2472,10 +2782,13 @@ hk_m5_ordered_attachment_refusal(const VkRenderingAttachmentInfo *info,
  *    which the first instance's store would have written and the merged
  *    pass writes only at its end: the attachments are in the same layouts in
  *    both instances, none is in a feedback loop, none can alias another
- *    resource, no descriptor set (whose contents this command buffer cannot
- *    see) is bound for graphics, and no graphics push descriptor recorded so
- *    far names an attachment image; later ones end the stream
- *    (hk_m5_pass_merge_note_push(), hk_m5_pass_merge_note_set_bind()).
+ *    resource, and either every attachment is in an attachment-only layout,
+ *    which no descriptor may name (hk_m5_attachments_exclude_descriptors()),
+ *    or no descriptor set (whose contents this command buffer cannot see) is
+ *    bound for graphics; no graphics push descriptor recorded so far names an
+ *    attachment image, and later ones, or later set binds without the layout
+ *    proof, end the stream (hk_m5_pass_merge_note_push(),
+ *    hk_m5_pass_merge_note_set_bind()).
  *
  * Attachment accesses themselves are ordered by the tile pass, as for a
  * framebuffer-local dependency.
@@ -2506,9 +2819,11 @@ hk_m5_ordered_refusal(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    if (why)
       return why;
 
-   for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
-      if (desc->sets[s] && !(desc->push_active & BITFIELD_BIT(s)))
-         return "descriptor set bound";
+   if (!hk_m5_attachments_exclude_descriptors(cmd, info)) {
+      for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
+         if (desc->sets[s] && !(desc->push_active & BITFIELD_BIT(s)))
+            return "descriptor set bound";
+      }
    }
 
    if (cmd->m5_pushed_images) {
@@ -2562,7 +2877,7 @@ void
 hk_m5_pass_merge_note_set_bind(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.gfx;
-   if (unlikely(cs && cs->m5_ordered))
+   if (unlikely(cs && cs->m5_ordered && !cs->m5_layout_proof))
       cmd->state.m5_ordered_split = true;
 }
 
@@ -2686,9 +3001,23 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
     * stream has when it is created (hk_cs_init_graphics()). */
    cs->current = m->resume_current;
    cs->cr.eot.main = prev->cr.eot.partial;
+   /* EndRendering may also have dropped untouched colour attachments from
+    * the tile programs (hk_g17p_elide_untouched_color()). */
+   cs->cr.bg = prev->cr.bg;
+   cs->cr.eot.partial = prev->cr.eot.partial;
+   /* EndRendering may have elided untouched depth/stencil planes or replaced
+    * the forced intermediate stores with the final store operations. A later
+    * draw in this continued stream can use those planes, and a split can need
+    * their stores again. Restore the recording state along with the EOT. The
+    * final EndRendering still elides the whole stream if it remains untouched.
+    */
+   cs->cr.depth = prev->cr.depth;
+   cs->cr.stencil = prev->cr.stencil;
+   cs->cr.zls_control = prev->cr.zls_control;
    cs->g17p_pass_ends = false;
    cs->m5_continued_pass = true;
    cs->m5_ordered = ordered;
+   cs->m5_layout_proof = hk_m5_attachments_exclude_descriptors(cmd, info);
    cmd->state.m5_ordered_split = false;
    cmd->current_cs.gfx = cs;
 
@@ -3037,18 +3366,20 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
    const bool agx3 = agx_chip_native_agx3(dev->dev.chip);
    render->zls_precise = agx3 && z_layout != NULL;
-   render->g17p_depth_touched = false;
-   const bool preserve_none = hk_g17p_zls_attachment_none(attach_z) &&
-                              hk_g17p_zls_attachment_none(attach_s);
-   render->g17p_zls_elide_ok =
-      agx3 &&
-      (preserve_none ||
-       !(render->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) &&
-      (z_layout != NULL || s_layout != NULL) &&
-      !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
-                         VK_RENDERING_RESUMING_BIT)) &&
-      hk_g17p_zls_attachment_elidable(attach_z) &&
-      hk_g17p_zls_attachment_elidable(attach_s);
+   render->g17p_zls_touched = 0;
+   render->g17p_zls_written = 0;
+   render->g17p_zls_elide_mask = 0;
+   if (agx3 && !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
+                                 VK_RENDERING_RESUMING_BIT))) {
+      const bool secondary =
+         render->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+      if (z_layout && hk_g17p_zls_attachment_elidable(attach_z) &&
+          (!secondary || hk_g17p_zls_attachment_none(attach_z)))
+         render->g17p_zls_elide_mask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+      if (s_layout && hk_g17p_zls_attachment_elidable(attach_s) &&
+          (!secondary || hk_g17p_zls_attachment_none(attach_s)))
+         render->g17p_zls_elide_mask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+   }
    if (render->zls_precise) {
       hk_pack_zls_control_final(&render->zls_control_only, z_layout,
                                 s_layout, attach_z, attach_s,
@@ -3351,16 +3682,23 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    void *const resume_current = cs ? cs->current : NULL;
    void *const end_before = cs ? cs->end : NULL;
 
+   /* An in-pass barrier may have closed the final stream already. Elide
+    * untouched planes from the whole pass even then: NONE/NONE attachments
+    * must not retain a forced store of uninitialized tile contents.
+    */
+   const VkImageAspectFlags zls_elided =
+      render->g17p_zls_elide_mask & ~render->g17p_zls_touched;
+
    if (cs) {
       cs->cr.eot.main = render->cr.eot.main;
       cs->g17p_pass_ends = !(render->flags & VK_RENDERING_SUSPENDING_BIT);
-      const bool zls_elided = hk_g17p_zls_elide(cmd);
+      hk_g17p_elide_untouched_color(cmd, cs);
 
       /* Precise depth store: see hk_pack_zls_control_final(). A
        * suspended pass continues in a later command buffer, which reloads
        * depth, so it keeps the forced store. An elided pass has no
-       * depth/stencil to store. */
-      if (render->zls_precise && !zls_elided &&
+       * depth/stencil to store after the per-aspect elision below. */
+      if (render->zls_precise &&
           !(render->flags & VK_RENDERING_SUSPENDING_BIT)) {
          cs->cr.zls_control = cs == render->zls_first_cs
                                  ? render->zls_control_only
@@ -3372,7 +3710,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       const struct hk_image_view *z_view = render->depth_att.iview;
       const struct hk_image *z_image =
          z_view ? container_of(z_view->vk.image, struct hk_image, vk) : NULL;
-      if (render->no_z_store_ok && !zls_elided && !cmd->in_meta &&
+      if (render->no_z_store_ok &&
+          !(zls_elided & VK_IMAGE_ASPECT_DEPTH_BIT) && !cmd->in_meta &&
           cs == render->zls_first_cs && cs->stats.cmds > 0 &&
           !render->view_mask &&
           !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
@@ -3388,6 +3727,12 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
          };
       }
    }
+
+   /* Apply after the final control word, including already closed streams. */
+   hk_g17p_zls_elide(cmd, zls_elided);
+   hk_g17p_zls_elide_store(cmd, render->g17p_zls_elide_mask &
+                                   render->g17p_zls_touched &
+                                   ~render->g17p_zls_written);
 
    perf_debug(cmd, "End rendering");
    hk_cmd_buffer_end_graphics(cmd);
@@ -7541,6 +7886,27 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    return true;
 }
 
+/* Colour attachments a draw with this fragment link key writes: the
+ * attachment is mapped to a location the shader writes (location 0 for
+ * every attachment with gl_FragColor broadcast) and its write mask is not
+ * empty. */
+static uint8_t
+hk_fs_color_written(const struct hk_fast_link_key_fs *key)
+{
+   const struct agx_fs_epilog_link_info *link = &key->epilog.link;
+   uint8_t mask = 0;
+   for (unsigned rt = 0; rt < ARRAY_SIZE(key->epilog.remap); ++rt) {
+      const int loc = key->epilog.remap[rt];
+      if (loc < 0)
+         continue;
+      const unsigned src = link->broadcast_rt0 ? 0 : loc;
+      if ((link->loc_written & BITFIELD_BIT(src)) &&
+          key->epilog.blend.rt[rt].colormask)
+         mask |= BITFIELD_BIT(rt);
+   }
+   return mask;
+}
+
 static bool
 hk_fill_fast_link_key_fs(struct hk_cmd_buffer *cmd, struct hk_shader *fs,
                          struct hk_shader *hw_vs,
@@ -8060,7 +8426,11 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          cs->current = out;
          return;
       }
+      gfx->fast_link_fs.color_written = hk_fs_color_written(&key);
+      gfx->fast_link_fs.reads_tib = fs->b.info.reads_tib;
    }
+   gfx->render.color_written |= gfx->fast_link_fs.color_written;
+   gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
 
    /* Direct draws use an immutable parameter block, reused while the values
     * match. Indirect draws always retain the execution-time GPU pointer. */
@@ -9386,6 +9756,27 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 }
 
+/* G17P: a draw whose pre-rasterization shaders may read images orders its
+ * render's vertex half after the image barriers before it (HK_SYNC_GFX_IMG).
+ * Software tessellation, geometry, task and mesh stages are assumed to
+ * read. */
+static inline void
+hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (!hk_sync_image_class(cmd) ||
+       (cs->sync.vtx_images && cs->sync.vtx_images_epoch == cmd->sync.epoch))
+      return;
+
+   const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
+   if (!hw_vs || hw_vs->info.reads_images ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
+       gfx->shaders[MESA_SHADER_MESH])
+      hk_sync_vertex_images(cmd, cs);
+}
+
 static __attribute__((hot)) void
 hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
              struct hk_robust_index_batch *batch)
@@ -9537,6 +9928,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          return;
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
+      if (unlikely(!cmd->state.gfx.render.first_draw_seen))
+         hk_g17p_note_first_draw(cmd, cs, draw_);
 
       /* Each view's draw counts: multiview replays the draw per view. */
       cs->g17p_primitive_bound =
@@ -9730,6 +10123,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       }
 
       hk_g17p_note_layer_zero_draw(cmd, cs);
+      hk_note_pre_raster_images(cmd, cs);
       cs->stats.cmds++;
    }
 }
@@ -9779,6 +10173,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
       gfx->mesh.object_params = hk_pool_upload(cmd, &params, sizeof(params), 8);
    }
    gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_MESH);
+   hk_g17p_note_depth_use(cmd);
    struct agx_draw dummy = {.b = agx_1d(3)};
    bool robust = false, tail = false;
    struct hk_cs *cs = hk_flush_gfx_state(cmd, draw_id, &dummy, &robust,
@@ -9808,6 +10203,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid, uint32_t draw_id,
 
    cs->stats.calls++;
    hk_upload_stat(cmd, draws, 1);
+   hk_note_pre_raster_images(cmd, cs);
    cs->stats.cmds++;
    vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
@@ -10142,6 +10538,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       return;
    }
    hk_g17p_note_layer_zero_draw(cmd, cs);
+   hk_note_pre_raster_images(cmd, cs);
    cs->stats.cmds++;
 }
 

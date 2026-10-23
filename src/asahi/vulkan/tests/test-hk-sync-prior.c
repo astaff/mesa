@@ -389,6 +389,85 @@ test_pass_software_graphics_dependencies(void)
  * command belongs to the first command buffer that emits a stream: chaining
  * onto a subqueue with no earlier command gives the kernel a barrier it
  * rejects with EINVAL. */
+/* G17P image barriers order a render's vertex half only once it draws with a
+ * pre-rasterization shader that reads images (HK_SYNC_GFX_IMG). */
+static void
+test_image_barrier_vertex_class(void)
+{
+   const VkImageMemoryBarrier2 image = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+   };
+   const VkMemoryBarrier2 memory = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+   };
+   const VkDependencyInfo image_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 1,
+      .pImageMemoryBarriers = &image,
+   };
+   const VkDependencyInfo memory_dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &memory,
+   };
+   uint8_t src, dst;
+   hk_sync_dependency_kinds(&image_dep, true, &src, &dst);
+   T("image barrier names the fragment and image classes",
+     src == HK_SYNC_GFX && dst == (HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG));
+   hk_sync_dependency_kinds(&image_dep, false, &src, &dst);
+   T("without the image class an image barrier names graphics",
+     dst == HK_SYNC_GFX);
+   hk_sync_dependency_kinds(&memory_dep, true, &src, &dst);
+   T("memory barrier still names graphics", dst == HK_SYNC_GFX);
+
+   struct hk_cmd_buffer *cmd = new_cmd();
+   struct hk_cs *producer = add(cmd, false);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   struct hk_cs *plain = add(cmd, false);
+   T("fragment half waits on the image producer",
+     plain->sync.dep[HK_SYNC_VDM].cut == producer);
+   T("vertex half without image reads does not",
+     !plain->sync.dep_ta[HK_SYNC_VDM].cut);
+   struct hk_cs *reader = add(cmd, false);
+   hk_sync_vertex_images(cmd, reader);
+   T("image-reading vertex half waits on the image producer",
+     reader->sync.dep_ta[HK_SYNC_VDM].cut == producer);
+   struct hk_queue *queue = new_queue(true);
+   T("image class submit", submit(queue, cmd));
+   T("plain render splits its vertex half off",
+     plain->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     plain->sync.prior_ta[HK_SYNC_VDM] == 0 &&
+     (plain->sync.barrier[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
+      plain->sync.prior[HK_SYNC_VDM] != 0));
+   T("image-reading render keeps its vertex half ordered",
+     reader->sync.barrier_ta[HK_SYNC_VDM] ==
+        reader->sync.barrier[HK_SYNC_VDM] &&
+     reader->sync.prior_ta[HK_SYNC_VDM] == reader->sync.prior[HK_SYNC_VDM]);
+
+   /* Carried into a later command buffer of the same submission. */
+   struct hk_cmd_buffer *a = new_cmd(), *b = new_cmd();
+   producer = add(a, false);
+   hk_sync_barrier(a, HK_SYNC_GFX, HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG);
+   plain = add(b, false);
+   reader = add(b, false);
+   hk_sync_vertex_images(b, reader);
+   queue = new_queue(true);
+   struct hk_cmd_buffer *pair[] = {a, b};
+   T("carried image class submit",
+     hk_sync_resolve_submit(queue, pair, 2, false, false, 0));
+   T("carried image class leaves a plain vertex half unordered",
+     plain->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+     plain->sync.prior_ta[HK_SYNC_VDM] == 0);
+   T("carried image class orders an image-reading vertex half",
+     reader->sync.barrier_ta[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
+     reader->sync.prior_ta[HK_SYNC_VDM] != 0);
+}
+
 static void
 test_chain_first_skips_empty_buffers(void)
 {
@@ -581,6 +660,7 @@ main(void)
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
    test_pass_software_graphics_dependencies();
+   test_image_barrier_vertex_class();
    test_chain_first_skips_empty_buffers();
    test_rt_kernel_gate();
    /* Each matching destination retains the exact old source prefix, including
