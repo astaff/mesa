@@ -487,6 +487,14 @@ devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
 
 if with_tests and ld_args_gc_sections.length() > 0
   test(
+    'hk_sparse_formats', executable('hk_sparse_formats_test',
+      files('tests/test-hk-sparse-formats.c'),
+      include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+        inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+      dependencies : [hk_deps], link_with : [libhk, libasahi_layout],
+      link_args : [ld_args_gc_sections],
+      gnu_symbol_visibility : 'hidden'), suite : ['asahi'])
+  test(
     'hk_host_as', executable('hk_host_as_test',
       files('tests/test-hk-host-as.c', 'hk_host_as.c'),
       include_directories : [include_directories('.'), inc_include, inc_src],

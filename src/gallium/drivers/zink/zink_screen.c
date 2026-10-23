@@ -2806,6 +2806,31 @@ zink_get_sparse_texture_virtual_page_size(struct pipe_screen *pscreen,
                                  VK_IMAGE_USAGE_STORAGE_BIT;
    use_flags |= is_zs ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    VkImageUsageFlags flags = zink_get_format_props(screen, pformat)->optimalTilingFeatures & use_flags;
+   if (zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP &&
+       screen->info.props.deviceID == 0x8140) {
+      /* Admit sparse textures per target/format. A missing page size is
+       * represented by NUM_VIRTUAL_PAGE_SIZES = 0, without disabling sparse
+       * textures for the other targets. Format feature bits and image usage
+       * bits are different namespaces; their bitwise intersection above is
+       * not an image usage mask. Query the sampled usage we need here.
+       */
+      if ((type == VK_IMAGE_TYPE_2D &&
+           !screen->info.feats.features.sparseResidencyImage2D) ||
+          (type == VK_IMAGE_TYPE_3D &&
+           !screen->info.feats.features.sparseResidencyImage3D))
+         return 0;
+
+      flags = VK_IMAGE_USAGE_SAMPLED_BIT;
+      VkImageFormatProperties image_props;
+      VkResult result = VKSCR(GetPhysicalDeviceImageFormatProperties)(
+         screen->pdev, format, type, VK_IMAGE_TILING_OPTIMAL, flags,
+         VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
+         &image_props);
+      if (result != VK_SUCCESS ||
+          !(image_props.sampleCounts &
+            (multi_sample ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_1_BIT)))
+         return 0;
+   }
    VkSparseImageFormatProperties props[4]; //planar?
    unsigned prop_count = ARRAY_SIZE(props);
    VKSCR(GetPhysicalDeviceSparseImageFormatProperties)(screen->pdev, format, type,

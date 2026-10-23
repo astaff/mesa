@@ -371,6 +371,14 @@ pages, rather than tiles to tiles. It is not a spatial data structure in itself.
 Rather, it inherits the tiling of the image by virtue of the addresses mapped.
 This presumably simplifies the hardware implementation.
 
+G17P sparse 3D images use the same slice layout as 2D arrays. Their Vulkan
+sparse blocks contain a 2x2 group of hardware tiles in a single Z slice,
+totalling 64 KiB. These are nonstandard 3D block dimensions, reported with
+``VK_SPARSE_IMAGE_FORMAT_NONSTANDARD_BLOCK_SIZE_BIT``; they do not imply
+support for the standard 3D block shape. Residency is limited to optimal
+tiling and one sample. Block-compressed coordinates in sparse binds are
+measured in format blocks, including when selecting a tile in a Z slice.
+
 Gallium performance counters
 ----------------------------
 

@@ -27,6 +27,7 @@
 #include "hk_execution_allowance.h"
 #include "hk_image.h"
 #include "hk_physical_device.h"
+#include "hk_sparse.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -869,8 +870,9 @@ bind_hw_tile(struct hk_bind_builder *b, struct hk_device_memory *mem,
              VkOffset3D offset, VkExtent3D extent, struct ail_tile std_size_el,
              unsigned mem_offset, unsigned x, unsigned y, unsigned z)
 {
-   uint64_t bo_offset_B = ail_get_twiddled_block_B(
-      layout, level, offset.x + x, offset.y + y, layer + offset.z + z);
+   uint64_t bo_offset_B = hk_sparse_image_tile_offset_B(
+      b->dev->dev.chip, layout, level, offset.x + x, offset.y + y,
+      layer + offset.z + z);
 
    /* Consider the standard tiles in the bound memory to be in raster order, and
     * address accordingly in standard tiles.

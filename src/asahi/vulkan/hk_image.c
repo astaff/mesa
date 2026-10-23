@@ -682,6 +682,17 @@ hk_GetPhysicalDeviceImageFormatProperties2(
       if (!pdev->vk.supported_features.sparseBinding)
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
+      if (pdev->dev.chip == AGX_CHIP_G17P &&
+          (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) {
+         const struct vk_features *supported = &pdev->vk.supported_features;
+         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_OPTIMAL ||
+             (pImageFormatInfo->type == VK_IMAGE_TYPE_2D &&
+              !supported->sparseResidencyImage2D) ||
+             (pImageFormatInfo->type == VK_IMAGE_TYPE_3D &&
+              !supported->sparseResidencyImage3D))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      }
+
       features &= ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
 
       /* We also do not support sparse RESIDENCY on a format whose texel block
@@ -857,6 +868,14 @@ hk_GetPhysicalDeviceImageFormatProperties2(
             pdev->vk.properties.framebufferStencilSampleCounts;
       sampleCounts &= attachmentSampleCounts;
    }
+
+   /* Residency sample counts must agree with the feature bits. In
+    * particular, exposing ordinary 2x/4x attachments does not enable sparse
+    * multisampling. The sparse format query delegates to this query too.
+    */
+   if (pdev->dev.chip == AGX_CHIP_G17P &&
+       (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
+      sampleCounts &= VK_SAMPLE_COUNT_1_BIT;
 
    /* From the Vulkan 1.2.199 spec:
     *
@@ -1056,7 +1075,7 @@ hk_GetPhysicalDeviceImageFormatProperties2(
 
 static VkSparseImageFormatProperties
 hk_fill_sparse_image_fmt_props(enum pipe_format format, unsigned samples,
-                               VkImageAspectFlags aspects)
+                               VkImageAspectFlags aspects, bool sliced_3d)
 {
    /* Apple tile sizes are exactly 16KiB. The Vulkan standard block sizes are
     * sized to be exactly 64KiB. Fortunately, they correspond directly to the
@@ -1075,7 +1094,8 @@ hk_fill_sparse_image_fmt_props(enum pipe_format format, unsigned samples,
 
    return (VkSparseImageFormatProperties){
       .aspectMask = aspects,
-      .flags = VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT,
+      .flags = VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT |
+               (sliced_3d ? VK_SPARSE_IMAGE_FORMAT_NONSTANDARD_BLOCK_SIZE_BIT : 0),
       .imageGranularity = granularity,
    };
 }
@@ -1086,6 +1106,7 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
    const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
    uint32_t *pPropertyCount, VkSparseImageFormatProperties2 *pProperties)
 {
+   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
    VkResult result;
 
    /* Check if the given format info is valid first before returning sparse
@@ -1129,7 +1150,8 @@ hk_GetPhysicalDeviceSparseImageFormatProperties2(
    {
       props->properties = hk_fill_sparse_image_fmt_props(
          vk_format_to_pipe_format(pFormatInfo->format), pFormatInfo->samples,
-         aspects);
+         aspects, pdev->dev.chip == AGX_CHIP_G17P &&
+                     pFormatInfo->type == VK_IMAGE_TYPE_3D);
    }
 }
 
@@ -1727,11 +1749,11 @@ hk_GetDeviceImageMemoryRequirements(VkDevice device,
 
 static VkSparseImageMemoryRequirements
 hk_fill_sparse_image_memory_reqs(const struct ail_layout *layout,
-                                 VkImageAspectFlags aspects)
+                                 VkImageAspectFlags aspects, bool sliced_3d)
 {
    VkSparseImageFormatProperties sparse_format_props =
       hk_fill_sparse_image_fmt_props(layout->format, layout->sample_count_sa,
-                                     aspects);
+                                     aspects, sliced_3d);
 
    unsigned tail_level = layout->mip_tail_first_lod;
    assert(tail_level <= layout->levels);
@@ -1791,7 +1813,10 @@ hk_get_image_sparse_memory_requirements(
    vk_outarray_append_typed(VkSparseImageMemoryRequirements2, &out, reqs)
    {
       reqs->memoryRequirements =
-         hk_fill_sparse_image_memory_reqs(&image->planes[0].layout, aspects);
+         hk_fill_sparse_image_memory_reqs(
+            &image->planes[0].layout, aspects,
+            dev->dev.chip == AGX_CHIP_G17P &&
+               image->vk.image_type == VK_IMAGE_TYPE_3D);
    };
 }
 
