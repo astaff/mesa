@@ -2744,6 +2744,12 @@ zink_create_image_handle(struct pipe_context *pctx, const struct pipe_image_view
       debug_printf("couldn't create storage image!");
       return 0;
    }
+   /* As for texture handles: give a render-target image its feedback-loop
+    * usage before the handle takes its view (zink_create_texture_handle()).
+    */
+   if (unlikely(ctx->lazy_feedback) && res->base.b.target != PIPE_BUFFER &&
+       (res->base.b.bind & PIPE_BIND_RENDER_TARGET))
+      zink_resource_object_init_feedback_loop(ctx, res);
    bd = calloc(1, sizeof(struct zink_bindless_descriptor));
    if (!bd)
       return 0;
