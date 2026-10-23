@@ -19,6 +19,7 @@ libasahi_agx_files = files(
   'agx_nir_lower_cull_distance.c',
   'agx_nir_lower_fminmax.c',
   'agx_nir_lower_word_bounds.c',
+  'agx_nir_share_bounds.c',
   'agx_nir_lower_frag_sidefx.c',
   'agx_nir_lower_sample_mask.c',
   'agx_nir_lower_discard_zs_emit.c',

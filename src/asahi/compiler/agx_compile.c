@@ -8418,6 +8418,17 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          }
       }
 
+      /* M5: let the main program's robust reads of one structure share their
+       * end computation (agx_nir_share_bounds.c). */
+      if (m5) {
+         bool shared = false;
+         NIR_PASS(shared, nir, agx_nir_share_bounds);
+         if (shared) {
+            NIR_PASS(_, nir, nir_opt_copy_prop);
+            NIR_PASS(_, nir, nir_opt_dce);
+         }
+      }
+
       /* Copy what the launch can copy into the uniforms the constant
        * program leaves free, which then computes on the copies instead of
        * loading. Copying first would take uniforms the constant program's
