@@ -3266,9 +3266,13 @@ init_driver_workarounds(struct zink_screen *screen)
     * attachment, so the usage is only that hint: create colour images without
     * it and recreate an image with it before a draw or copy first reads the
     * image while writing it (zink_update_lazy_feedback_loops()).
+    *
+    * Only G17P (device ID 0x8140) compresses on this rule; other Honeykrisp
+    * parts keep the usage on every render target.
     */
    screen->driver_workarounds.lazy_feedback_loop_usage =
       zink_driverid(screen) == VK_DRIVER_ID_MESA_HONEYKRISP &&
+      screen->info.props.deviceID == 0x8140 &&
       screen->driver_workarounds.general_layout &&
       screen->info.have_EXT_attachment_feedback_loop_layout;
 

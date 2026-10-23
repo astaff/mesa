@@ -11,24 +11,17 @@
  * level 0 into a plain (storage) image must match level 1.
  *
  * usage: g17p-vulkan-compressed-mip-blit [--shim] [--expect-compute]
- *                                         [--bench] [--grid]
  *   --shim            no-op DRM shim: nothing executes, skip readback
  *   --expect-compute  require that recording the blit chains logs a render
  *                     pass only for the levels hk stores through the PBE
  *                     (HK_G17P_MIP_PBE_MIN_TEXELS) and that the images are
  *                     compressed (needs ASAHI_MESA_DEBUG=perf)
- *   --bench           instead time whole blit chains (ms per chain) of
- *                     common sizes and contents, on a compressed render
- *                     target and on a plain storage image
- *   --grid            instead time single mip levels each way hk can
- *                     generate them (see grid())
  */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
@@ -514,221 +507,15 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
       vkDestroyImage(dev, plain, NULL);
 }
 
-static double
-now_ms(void)
-{
-   struct timespec t;
-   clock_gettime(CLOCK_MONOTONIC, &t);
-   return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
-}
-
-enum content { CONTENT_GRADIENT, CONTENT_TEXTURE, CONTENT_NOISE };
-static const char *content_names[] = {"gradient", "texture", "noise"};
-
-/* Fill one level with a smooth gradient (compresses well), the gradient
- * with +-4 per-texel noise (closer to rendered content), or noise. */
-static void
-fill_level(VkImage image, uint32_t level, uint32_t w, uint32_t h,
-           enum content content)
-{
-   uint8_t *data;
-   VkBuffer staging =
-      buffer_create(4ull * w * h, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &data);
-   uint32_t seed = 0x9e3779b9u ^ w ^ (h << 16);
-   for (uint32_t y = 0; y < h; ++y) {
-      for (uint32_t x = 0; x < w; ++x) {
-         uint8_t *t = &data[4ull * (y * (uint64_t)w + x)];
-         const uint32_t base[4] = {x * 255 / w, y * 255 / h,
-                                   (x + y) * 255 / (w + h), 255};
-         for (unsigned c = 0; c < 4; ++c) {
-            seed = seed * 1664525u + 1013904223u;
-            int v = content == CONTENT_NOISE ? (int)(seed >> 24)
-                    : content == CONTENT_TEXTURE
-                       ? (int)base[c] + (int)((seed >> 29) & 7) - 4
-                       : (int)base[c];
-            t[c] = v < 0 ? 0 : v > 255 ? 255 : v;
-         }
-      }
-   }
-   VkCommandBuffer cmd = begin();
-   const VkBufferImageCopy up = {
-      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1},
-      .imageExtent = {w, h, 1},
-   };
-   vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_GENERAL, 1,
-                          &up);
-   barrier(cmd);
-   submit(cmd);
-   vkDestroyBuffer(dev, staging, NULL);
-}
-
-static VkImage
-bench_image(VkFormat format, uint32_t w, uint32_t h, uint32_t levels,
-            bool storage)
-{
-   /* A render target is compressed on G17P; storage keeps it plain */
-   VkImage image = image_create(
-      format, w, h, levels,
-      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-         (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0));
-   VkCommandBuffer cmd = begin();
-   to_general(cmd, image);
-   submit(cmd);
-   return image;
-}
-
-static void
-record_blit(VkCommandBuffer cmd, VkImage src, uint32_t src_level,
-            uint32_t sw, uint32_t sh, VkImage dst, uint32_t dst_level,
-            uint32_t dw, uint32_t dh)
-{
-   const VkImageBlit blit = {
-      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, src_level, 0, 1},
-      .srcOffsets = {{0, 0, 0}, {sw, sh, 1}},
-      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, dst_level, 0, 1},
-      .dstOffsets = {{0, 0, 0}, {dw, dh, 1}},
-   };
-   vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_GENERAL, dst,
-                  VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
-   barrier(cmd);
-}
-
-/* Submit cmd, wait, and return the elapsed ms divided by count */
-static double
-execute(VkCommandBuffer cmd, unsigned count)
-{
-   CHECK(vkEndCommandBuffer(cmd));
-   const VkSubmitInfo info = {
-      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-      .commandBufferCount = 1,
-      .pCommandBuffers = &cmd,
-   };
-   const double t0 = now_ms();
-   CHECK(vkQueueSubmit(queue, 1, &info, VK_NULL_HANDLE));
-   CHECK(vkQueueWaitIdle(queue));
-   const double ms = (now_ms() - t0) / count;
-   vkFreeCommandBuffers(dev, pool, 1, &cmd);
-   return ms;
-}
-
-/* ms per whole mip chain of a w x h RGBA8 image: GPU execution (submit to
- * idle) and CPU recording, best of 3 */
-static double
-bench_chains(uint32_t w, uint32_t h, bool storage, enum content content,
-             unsigned chains, double *record_ms)
-{
-   const uint32_t levels = level_count(w, h);
-   VkImage image =
-      bench_image(VK_FORMAT_R8G8B8A8_UNORM, w, h, levels, storage);
-   fill_level(image, 0, w, h, content);
-
-   double best = 1e30;
-   *record_ms = 1e30;
-   for (unsigned round = 0; round < 3; ++round) {
-      const double r0 = now_ms();
-      VkCommandBuffer cmd = begin();
-      for (unsigned c = 0; c < chains; ++c) {
-         for (uint32_t l = 1; l < levels; ++l)
-            record_blit(cmd, image, l - 1, minify(w, l - 1), minify(h, l - 1),
-                        image, l, minify(w, l), minify(h, l));
-      }
-      const double recorded = (now_ms() - r0) / chains;
-      *record_ms = recorded < *record_ms ? recorded : *record_ms;
-      const double ms = execute(cmd, chains);
-      best = ms < best ? ms : best;
-   }
-   vkDestroyImage(dev, image, NULL);
-   return best;
-}
-
-/* ms per blit of src (sw x sh, level 0) into dst (dw x dh, level 0), each
- * blit waiting for the one before, as in a mip chain; best of 3 */
-static double
-time_blits(VkImage src, uint32_t sw, uint32_t sh, VkImage dst, uint32_t dw,
-           uint32_t dh)
-{
-   const uint64_t texels = (uint64_t)dw * dh;
-   const unsigned reps =
-      texels >= (1u << 21) ? 32 : texels >= (1u << 16) ? 128 : 512;
-   double best = 1e30;
-   for (unsigned round = 0; round < 3; ++round) {
-      VkCommandBuffer cmd = begin();
-      for (unsigned r = 0; r < reps; ++r)
-         record_blit(cmd, src, 0, sw, sh, dst, 0, dw, dh);
-      const double ms = execute(cmd, reps);
-      best = ms < best ? ms : best;
-   }
-   return best;
-}
-
-/*
- * One mip level at a time, every way hk can generate it, for the levels of
- * common chains. The source is level 0 of an image of the previous level's
- * size holding the given content.
- *   compressed  RGBA8 render target into an RGBA8 render target: hk's
- *               compressed path for the build (compute if it takes it)
- *   pbe         the same into a BGRA8 render target: formats differ, so
- *               always the graphics (render pass, compressed store) path
- *   plain       storage images on both sides: the uncompressed compute path
- */
-static void
-grid(void)
-{
-   static const uint32_t chains[][2] = {
-      {4096, 4096}, {3840, 2160}, {2560, 1440}, {1920, 1080}, {1280, 720},
-   };
-   printf("grid content dst_w dst_h texels compressed_ms pbe_ms plain_ms\n");
-   for (unsigned content = 0; content < 3; ++content) {
-      for (unsigned c = 0; c < sizeof(chains) / sizeof(chains[0]); ++c) {
-         const uint32_t w = chains[c][0], h = chains[c][1];
-         for (uint32_t l = 1; l < level_count(w, h); ++l) {
-            const uint32_t sw = minify(w, l - 1), sh = minify(h, l - 1);
-            const uint32_t dw = minify(w, l), dh = minify(h, l);
-            VkImage src_c =
-               bench_image(VK_FORMAT_R8G8B8A8_UNORM, sw, sh, 1, false);
-            VkImage src_p =
-               bench_image(VK_FORMAT_R8G8B8A8_UNORM, sw, sh, 1, true);
-            VkImage dst_c =
-               bench_image(VK_FORMAT_R8G8B8A8_UNORM, dw, dh, 1, false);
-            VkImage dst_b =
-               bench_image(VK_FORMAT_B8G8R8A8_UNORM, dw, dh, 1, false);
-            VkImage dst_p =
-               bench_image(VK_FORMAT_R8G8B8A8_UNORM, dw, dh, 1, true);
-            fill_level(src_c, 0, sw, sh, content);
-            fill_level(src_p, 0, sw, sh, content);
-
-            const double compressed = time_blits(src_c, sw, sh, dst_c, dw, dh);
-            const double pbe = time_blits(src_c, sw, sh, dst_b, dw, dh);
-            const double plain = time_blits(src_p, sw, sh, dst_p, dw, dh);
-            printf("grid %s %u %u %llu %.4f %.4f %.4f\n",
-                   content_names[content], dw, dh,
-                   (unsigned long long)dw * dh, compressed, pbe, plain);
-            fflush(stdout);
-
-            vkDestroyImage(dev, src_c, NULL);
-            vkDestroyImage(dev, src_p, NULL);
-            vkDestroyImage(dev, dst_c, NULL);
-            vkDestroyImage(dev, dst_b, NULL);
-            vkDestroyImage(dev, dst_p, NULL);
-         }
-      }
-   }
-}
-
 int
 main(int argc, char **argv)
 {
-   bool shim = false, expect_compute = false, bench = false, do_grid = false;
+   bool shim = false, expect_compute = false;
    for (int i = 1; i < argc; ++i) {
       if (!strcmp(argv[i], "--shim"))
          shim = true;
       else if (!strcmp(argv[i], "--expect-compute"))
          expect_compute = true;
-      else if (!strcmp(argv[i], "--bench"))
-         bench = true;
-      else if (!strcmp(argv[i], "--grid"))
-         do_grid = true;
    }
 
    const VkApplicationInfo app = {
@@ -765,39 +552,6 @@ main(int argc, char **argv)
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
    };
    CHECK(vkCreateCommandPool(dev, &pool_info, NULL, &pool));
-
-   if (bench) {
-      static const struct {
-         uint32_t w, h;
-         unsigned chains;
-      } sizes[] = {{3840, 2160, 20}, {2560, 1440, 40}, {1920, 1080, 60},
-                   {1280, 720, 100}, {256, 256, 500}};
-      printf("chain content w h rt_execute_ms rt_record_ms "
-             "storage_execute_ms storage_record_ms\n");
-      for (unsigned content = 0; content < 3; ++content) {
-         for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
-            double compressed_rec, plain_rec;
-            const double compressed =
-               bench_chains(sizes[i].w, sizes[i].h, false, content,
-                            sizes[i].chains, &compressed_rec);
-            const double plain =
-               bench_chains(sizes[i].w, sizes[i].h, true, content,
-                            sizes[i].chains, &plain_rec);
-            printf("chain %s %u %u %.4f %.4f %.4f %.4f\n",
-                   content_names[content], sizes[i].w, sizes[i].h,
-                   compressed, compressed_rec, plain, plain_rec);
-            fflush(stdout);
-         }
-      }
-   }
-   if (do_grid)
-      grid();
-   if (bench || do_grid) {
-      vkDestroyCommandPool(dev, pool, NULL);
-      vkDestroyDevice(dev, NULL);
-      vkDestroyInstance(instance, NULL);
-      return 0;
-   }
 
    /* Even and odd chains, wide and tall metadata grids, a level 0 whose
     * levels soon fall below the 16-pixel compression limit, and BGRA. */
