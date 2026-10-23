@@ -39,7 +39,16 @@ TYPE(libagx_gen1_as_metadata, 8);
 #endif
 
 /* Retained binary topology for native refits. Only internal nodes and header
- * persist; updated leaf data is read directly from application buffers. */
+ * persist; updated leaf data is read directly from application buffers.
+ *
+ * After them, at HK_AGX3_RETAINED_PLAN_OFFSET, an updatable structure keeps
+ * the native plan of its last full build: the plan state, then one record
+ * per encoding job {IR node index, root slot, child slot}. An update keeps
+ * the topology, so it restores this plan instead of planning again: refit
+ * phase 5 or 6 copies it to scratch and plan phase 4 rebuilds each job from
+ * its IR node with the same bounded walk as emit (no root walks or atomics).
+ * The walk's leaf counts are kept in the retained internal nodes' bvh_offset
+ * field, which nothing else reads after the common build. */
 struct hk_agx3_refit_args {
    VOID_REF retained;
    VOID_REF metadata;
@@ -50,7 +59,21 @@ struct hk_agx3_refit_args {
    uint32_t leaf_bound;
    uint32_t node_bound;
    uint32_t phase;
+   /* Phases 4..6: the plan in encode scratch. Phases 5 and 6 leave the job
+    * records in the plan-node array, which an update does not use. */
+   VOID_REF plan_nodes;
+   VOID_REF plan_jobs;
+   VOID_REF plan_state;
 };
+
+#define HK_AGX3_RETAINED_JOB_WORDS 3u
+#define HK_AGX3_RETAINED_PLAN_STATE_BYTES 32u
+/* Retained-plan offset from the retained base: past the IR header and the
+ * internal-node bound, 16-byte aligned. */
+#define HK_AGX3_RETAINED_PLAN_OFFSET(header_bytes, box_bytes, internal_bound) \
+   (((header_bytes) + (internal_bound) * (box_bytes) + 15u) / 16u * 16u)
+#define HK_AGX3_RETAINED_PLAN_BYTES(jobs) \
+   (HK_AGX3_RETAINED_PLAN_STATE_BYTES + (jobs) * (HK_AGX3_RETAINED_JOB_WORDS * 4u))
 
 
 struct hk_encode_args {
@@ -185,7 +208,9 @@ struct hk_agx3_plan_args {
    uint32_t phase;
    uint32_t resource_id;
    uint32_t geometry_type;
-   uint32_t reserved;
+   /* Phases 0..3 were replaced by a restored plan (an update): phase 4
+    * rebuilds the jobs from the records in nodes. */
+   uint32_t plan_restored;
    VOID_REF metadata;
    uint64_t retained_offset;
    uint32_t build_flags;
