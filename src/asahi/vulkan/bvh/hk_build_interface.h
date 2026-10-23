@@ -123,7 +123,13 @@ struct hk_agx3_leaf_args {
    /* Slots from the traversal base to output_bvh, added to every child
     * reference (see libagx/gen1_as.h). Zero when output_bvh is the base. */
    uint32_t slot_bias;
+   /* When nonzero, the number of jobs written by planning (its first word),
+    * which the indirect dispatch rounds up to whole workgroups. */
+   VOID_REF counts;
 };
+
+/* Node jobs per encoding workgroup, eight lanes each. */
+#define HK_AGX3_NODE_JOBS_PER_GROUP 4u
 
 #define HK_AGX3_LEAF_SUCCESS 0
 #define HK_AGX3_LEAF_INVALID_COUNT 1
@@ -178,7 +184,9 @@ struct hk_agx3_plan_node {
 };
 
 struct hk_agx3_plan_state {
-   /* First three words are VkDispatchIndirectCommand for node encoding. */
+   /* The node encoding dispatch (VkDispatchIndirectCommand, workgroups of
+    * HK_AGX3_NODE_JOBS_PER_GROUP jobs) follows this state, at
+    * HK_AGX3_PLAN_ENCODE_DISPATCH; plan phase 4 writes it. */
    uint32_t job_count;
    uint32_t groups_y;
    uint32_t groups_z;
@@ -217,6 +225,7 @@ struct hk_agx3_plan_args {
    uint32_t keep_retained;
 };
 
+#define HK_AGX3_PLAN_ENCODE_DISPATCH 32u /* bytes after hk_agx3_plan_state */
 #define HK_AGX3_PLAN_INDEX 1
 #define HK_AGX3_PLAN_CYCLE 2
 #define HK_AGX3_PLAN_ALLOCATION 4

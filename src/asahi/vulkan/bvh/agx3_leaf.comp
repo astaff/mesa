@@ -2,10 +2,13 @@
  * SPDX-License-Identifier: MIT
  *
  * Native M5 Gen3 nodes, derived from the saved 2/4/8/64-triangle AGX
- * captures and agx_rt_blas_gen3.h. One workgroup encodes one independent
- * node: one lane per triangle, two lanes for QTBs, lane zero for the root.
- * Inner nodes read child bounds from the same common build IR.
- * No CPU readback, cross-workgroup synchronization, or global allocator.
+ * captures and agx_rt_blas_gen3.h. Eight lanes encode one independent node,
+ * and a workgroup encodes HK_AGX3_NODE_JOBS_PER_GROUP of them, so a SIMD
+ * group is not three-quarters idle: one lane per child for its bounds, its
+ * root quantization and its QTB vertex bytes, the first lanes for the QTB
+ * headers, lane zero for the root bounds. Inner nodes read child bounds from
+ * the same common build IR. No CPU readback, cross-workgroup
+ * synchronization, or global allocator.
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -20,19 +23,26 @@
 
 #include "hk_build_interface.h"
 
-layout(local_size_x = 8) in;
+#define JOBS HK_AGX3_NODE_JOBS_PER_GROUP
+layout(local_size_x = 8 * JOBS) in;
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_leaf_args args;
 };
 
-shared vec3 vertices[24];
-shared vec3 lower[8], upper[8];
-shared uint primitive[8];
-shared uint geometry_id[8];
-shared uint triangle_type[8];
-shared uint bad;
-shared uint64_t root[8];
+/* Per job (slot): children at slot * 8 + child, vertices at slot * 24. */
+shared vec3 vertices[24 * JOBS];
+shared vec3 lower[8 * JOBS], upper[8 * JOBS];
+shared uint primitive[8 * JOBS];
+shared uint geometry_id[8 * JOBS];
+shared uint triangle_type[8 * JOBS];
+shared uint bad[JOBS];
+shared uint64_t root[8 * JOBS];
+shared vec3 root_base[JOBS];
+shared uvec3 root_exponent[JOBS];
+shared vec3 qtb_base[2 * JOBS];
+shared uvec3 qtb_exponent[2 * JOBS];
+shared uint qtb_words[32 * JOBS];
 
 bool
 finite(float x)
@@ -81,6 +91,7 @@ fit_root(vec3 lo, vec3 hi, out vec3 base, out uvec3 exponent)
 bool
 fit_qtb(uint first, uint count, out vec3 base, out uvec3 exponent)
 {
+   /* first is a shared child index (slot * 8 + child). */
    vec3 lo = lower[first], hi = upper[first];
    for (uint t = first + 1; t < first + count; ++t) {
       lo = min(lo, lower[t]);
@@ -205,140 +216,195 @@ encode_instance(hk_agx3_leaf_job job, uint lane)
 void
 main()
 {
-   uint id = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
-   if (id >= args.job_count)
-      return;
-   hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));
-   uint count = job.child_count;
-   bool leaf = job.node_kind == HK_AGX3_NODE_LEAF;
-   bool instances = job.node_kind == HK_AGX3_NODE_INSTANCES;
-   bool aabbs = job.node_kind == HK_AGX3_NODE_AABBS;
-   if (count < 1u || count > 8 ||
-       job.node_kind > HK_AGX3_NODE_AABBS) {
-      if (lane == 0)
-         DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_INVALID_COUNT;
-      return;
+   uint slot = gl_LocalInvocationID.x / 8u, lane = gl_LocalInvocationID.x % 8u;
+   uint id = gl_WorkGroupID.x * JOBS + slot;
+   uint first = slot * 8u, vfirst = slot * 24u;
+   /* Every lane reaches every barrier; a job that has no node to encode, or
+    * fails a check, only stops doing work. */
+   uint jobs = args.job_count;
+   if (args.counts != 0ul)
+      jobs = min(jobs, DEREF(REF(uint32_t)(args.counts)));
+   bool live = id < jobs;
+   hk_agx3_leaf_job job;
+   uint count = 0;
+   if (live) {
+      job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));
+      count = job.child_count;
+      if (count < 1u || count > 8 || job.node_kind > HK_AGX3_NODE_AABBS) {
+         if (lane == 0)
+            DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_INVALID_COUNT;
+         live = false;
+      }
    }
-   uint capacity = min(count, 4u), blocks = (count + capacity - 1u) / capacity;
+   const bool valid = live;
+   bool leaf = live && job.node_kind == HK_AGX3_NODE_LEAF;
+   bool instances = live && job.node_kind == HK_AGX3_NODE_INSTANCES;
+   bool aabbs = live && job.node_kind == HK_AGX3_NODE_AABBS;
+   uint capacity = max(min(count, 4u), 1u), blocks = (count + capacity - 1u) / capacity;
    if (lane == 0)
-      bad = 0;
+      bad[slot] = 0;
    barrier();
-   if (lane < count) {
+   if (live && lane < count) {
+      uint c = first + lane;
       if (!leaf) {
          REF(vk_ir_node)
          src = REF(vk_ir_node)(
             OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
          if (aabbs) {
             REF(vk_ir_aabb_node) box = REF(vk_ir_aabb_node)(src);
-            geometry_id[lane] = DEREF(box).geometry_id_and_flags;
-            primitive[lane] = DEREF(box).primitive_id;
+            geometry_id[c] = DEREF(box).geometry_id_and_flags;
+            primitive[c] = DEREF(box).primitive_id;
          }
-         lower[lane] = DEREF(src).aabb.min;
-         upper[lane] = DEREF(src).aabb.max;
+         lower[c] = DEREF(src).aabb.min;
+         upper[c] = DEREF(src).aabb.max;
          for (uint a = 0; a < 3; ++a) {
-            if (!finite(lower[lane][a]) || !finite(upper[lane][a]))
-               atomicOr(bad, HK_AGX3_LEAF_NONFINITE);
-            if (lower[lane][a] > upper[lane][a])
-               atomicOr(bad, HK_AGX3_LEAF_RANGE);
+            if (!finite(lower[c][a]) || !finite(upper[c][a]))
+               atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
+            if (lower[c][a] > upper[c][a])
+               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
          }
       } else {
          REF(vk_ir_triangle_node)
          src = REF(vk_ir_triangle_node)(
             OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
          uint geometry_flags = DEREF(src).geometry_id_and_flags;
-         geometry_id[lane] = geometry_flags & ~VK_GEOMETRY_OPAQUE;
+         geometry_id[c] = geometry_flags & ~VK_GEOMETRY_OPAQUE;
          /* Native Gen1 extractor 0x218e084c4..0x218e087f4 accepts the
           * same triangle record for types8 and16, then compares type8
           * to set the extracted geometry's opaque field. */
-         triangle_type[lane] =
+         triangle_type[c] =
             (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
-         primitive[lane] = DEREF(src).triangle_id;
+         primitive[c] = DEREF(src).triangle_id;
+         uint v0 = vfirst + lane * 3u;
          for (uint v = 0; v < 3; ++v) {
             vec3 p;
             for (uint a = 0; a < 3; ++a) {
                p[a] = DEREF(src).coords[v][a];
                if (!finite(p[a]))
-                  atomicOr(bad, HK_AGX3_LEAF_NONFINITE);
+                  atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
             }
-            vertices[lane * 3u + v] = p;
+            vertices[v0 + v] = p;
          }
-         lower[lane] = min(vertices[lane * 3u], min(vertices[lane * 3u + 1u],
-                                                    vertices[lane * 3u + 2u]));
-         upper[lane] = max(vertices[lane * 3u], max(vertices[lane * 3u + 1u],
-                                                    vertices[lane * 3u + 2u]));
+         lower[c] = min(vertices[v0], min(vertices[v0 + 1u], vertices[v0 + 2u]));
+         upper[c] = max(vertices[v0], max(vertices[v0 + 1u], vertices[v0 + 2u]));
       }
    }
    barrier();
-   if (bad != 0) {
-      if (lane == 0)
-         DEREF(INDEX(uint32_t, args.status, id)) = bad;
-      return;
-   }
+   live = live && bad[slot] == 0;
 
-   vec3 qbase = vec3(0);
-   uvec3 qexp = uvec3(0);
-   if (leaf && lane < blocks &&
-       !fit_qtb(lane * capacity, min(capacity, count - lane * capacity), qbase,
-                qexp))
-      atomicOr(bad, HK_AGX3_LEAF_RANGE);
-   if (lane == 0) {
-      vec3 lo = lower[0], hi = upper[0], base;
+   /* QTB headers (one lane per block) and the root bounds (lane zero). */
+   if (leaf && live && lane < blocks) {
+      vec3 qbase;
+      uvec3 qexp;
+      if (!fit_qtb(first + lane * capacity, min(capacity, count - lane * capacity),
+                   qbase, qexp)) {
+         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+      } else {
+         uint b = slot * 2u + lane;
+         qtb_base[b] = qbase;
+         qtb_exponent[b] = qexp;
+         qtb_words[b * 16u] =
+            6u | (qexp.z << 8) | (floatBitsToUint(qbase.x) & 0xffff0000u);
+         qtb_words[b * 16u + 1u] = (floatBitsToUint(qbase.y) >> 16) |
+                                  (floatBitsToUint(qbase.z) & 0xffff0000u);
+         qtb_words[b * 16u + 2u] = qexp.x | (qexp.y << 8);
+         for (uint w = 3; w < 16; ++w)
+            qtb_words[b * 16u + w] = 0;
+      }
+   }
+   if (live && lane == 0) {
+      vec3 lo = lower[first], hi = upper[first], base;
       uvec3 exponent;
       for (uint t = 1; t < count; ++t) {
-         lo = min(lo, lower[t]);
-         hi = max(hi, upper[t]);
+         lo = min(lo, lower[first + t]);
+         hi = max(hi, upper[first + t]);
       }
       if (!fit_root(lo, hi, base, exponent)) {
-         atomicOr(bad, HK_AGX3_LEAF_RANGE);
+         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
       } else {
-         for (uint t = 0; t < 8; ++t)
-            root[t] = uint64_t(0);
-         root[0] =
-            uint64_t((instances ? 0xe1u : 0xa0u) |
-                     (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
-         for (uint a = 0; a < 3; ++a)
-            root[a + 1] = uint64_t(floatBitsToUint(base[a]) >> 16);
-         root[4] = uint64_t((exponent.y << 8) | exponent.z);
-         uint child = job.child_slot + args.slot_bias;
-         root[5] = uint64_t(child >> 16);
-         root[6] = uint64_t(child & 65535u);
-         root[7] = instances ? uint64_t(0x1a00u | (count == 8u ? 0x3fu : count << 3))
-                   : aabbs ? uint64_t(0x18c0u | (count == 8u ? 0x3fu : count << 3))
-                   : leaf ? uint64_t(0x40c0u | (triangle_type[0] << 8) |
-                                             (count == 8u ? 0x3fu : count << 3))
-                          : uint64_t(0x1f00u | (count == 8u ? 0u : count));
-         const uint shifts[6] = uint[6](57, 50, 43, 36, 29, 22);
-         for (uint t = 0; t < count; ++t) {
-            if (leaf || instances || aabbs)
-               root[t] |= uint64_t((t << 16) | (1u << 20));
-            for (uint a = 0; a < 3; ++a) {
-               float s = step(exponent[a]);
-               uint qlo =
-                  uint(clamp(floor((lower[t][a] - base[a]) / s), 0.0, 127.0));
-               uint qhi =
-                  uint(clamp(ceil((upper[t][a] - base[a]) / s), 0.0, 127.0));
-               precise float rlo = base[a] + float(qlo) * s;
-               precise float rhi = base[a] + float(qhi) * s;
-               while (rlo > lower[t][a] && qlo > 0u) {
-                  --qlo;
-                  rlo = base[a] + float(qlo) * s;
-               }
-               while (rhi < upper[t][a] && qhi < 127u) {
-                  ++qhi;
-                  rhi = base[a] + float(qhi) * s;
-               }
-               if (rlo > lower[t][a] || rhi < upper[t][a])
-                  atomicOr(bad, HK_AGX3_LEAF_RANGE);
-               root[t] |= uint64_t(qlo) << shifts[a];
-               root[t] |= uint64_t(qhi) << shifts[a + 3];
-            }
-         }
+         root_base[slot] = base;
+         root_exponent[slot] = exponent;
       }
    }
    barrier();
-   if (bad != 0) {
+   live = live && bad[slot] == 0;
+
+   /* Root word of child lane: its header bits, then its quantized bounds;
+    * and its triangle's QTB vertex bytes, each in bits of its own. */
+   if (live) {
+      vec3 base = root_base[slot];
+      uvec3 exponent = root_exponent[slot];
+      uint t = lane;
+      uint64_t word = uint64_t(0);
+      if (t == 0)
+         word = uint64_t((instances ? 0xe1u : 0xa0u) |
+                         (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
+      else if (t <= 3)
+         word = uint64_t(floatBitsToUint(base[t - 1u]) >> 16);
+      else if (t == 4)
+         word = uint64_t((exponent.y << 8) | exponent.z);
+      else if (t == 5)
+         word = uint64_t((job.child_slot + args.slot_bias) >> 16);
+      else if (t == 6)
+         word = uint64_t((job.child_slot + args.slot_bias) & 65535u);
+      else
+         word = instances ? uint64_t(0x1a00u | (count == 8u ? 0x3fu : count << 3))
+                : aabbs ? uint64_t(0x18c0u | (count == 8u ? 0x3fu : count << 3))
+                : leaf ? uint64_t(0x40c0u | (triangle_type[first] << 8) |
+                                          (count == 8u ? 0x3fu : count << 3))
+                       : uint64_t(0x1f00u | (count == 8u ? 0u : count));
+      if (t < count) {
+         uint c = first + t;
+         const uint shifts[6] = uint[6](57, 50, 43, 36, 29, 22);
+         if (leaf || instances || aabbs)
+            word |= uint64_t((t << 16) | (1u << 20));
+         for (uint a = 0; a < 3; ++a) {
+            float s = step(exponent[a]);
+            uint qlo =
+               uint(clamp(floor((lower[c][a] - base[a]) / s), 0.0, 127.0));
+            uint qhi =
+               uint(clamp(ceil((upper[c][a] - base[a]) / s), 0.0, 127.0));
+            precise float rlo = base[a] + float(qlo) * s;
+            precise float rhi = base[a] + float(qhi) * s;
+            while (rlo > lower[c][a] && qlo > 0u) {
+               --qlo;
+               rlo = base[a] + float(qlo) * s;
+            }
+            while (rhi < upper[c][a] && qhi < 127u) {
+               ++qhi;
+               rhi = base[a] + float(qhi) * s;
+            }
+            if (rlo > lower[c][a] || rhi < upper[c][a])
+               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+            word |= uint64_t(qlo) << shifts[a];
+            word |= uint64_t(qhi) << shifts[a + 3];
+         }
+      }
+      root[first + t] = word;
+      if (leaf && t < count) {
+         uint block = t / capacity, in_block = t % capacity;
+         uint b = slot * 2u + block;
+         vec3 qbase = qtb_base[b];
+         uvec3 qexp = qtb_exponent[b];
+         const uint order[4] = uint[4](2, 2, 1, 0);
+         for (uint v = 0; v < 4; ++v)
+            for (uint a = 0; a < 3; ++a) {
+               /* Power-of-two scaling avoids reciprocal overflow on small
+                * axes, including the minimum normal binary32 exponent. */
+               uint q = quantize_vertex(
+                  vertices[vfirst + t * 3u + order[v]][a], qbase[a], qexp[a]);
+               uint byte_offset = 16u + in_block * 12u + v * 3u + 2u - a;
+               atomicOr(qtb_words[b * 16u + byte_offset / 4u],
+                        q << ((byte_offset % 4u) * 8u));
+            }
+      }
+   }
+   barrier();
+   if (!valid)
+      return;
+   if (bad[slot] != 0) {
       if (lane == 0)
-         DEREF(INDEX(uint32_t, args.status, id)) = bad;
+         DEREF(INDEX(uint32_t, args.status, id)) = bad[slot];
       return;
    }
 
@@ -348,60 +414,44 @@ main()
       /* Native Gen1 marker24 selects the static bounding-box leaf. Its
        * payload starts at+4: xyz min/max then geometry/primitive words.
        * Bit31 of the geometry word is opacity; each root child uses64B. */
+      uint c = first + lane;
       uint64_t geometry = children + uint64_t(lane) * 64ul;
       for (uint i = 0; i < 16; ++i)
          store32(geometry + uint64_t(i) * 4ul, 0);
       store32(geometry, 24);
       for (uint a = 0; a < 3; ++a) {
-         store32(geometry + 4ul + uint64_t(a) * 4ul, floatBitsToUint(lower[lane][a]));
-         store32(geometry + 16ul + uint64_t(a) * 4ul, floatBitsToUint(upper[lane][a]));
+         store32(geometry + 4ul + uint64_t(a) * 4ul, floatBitsToUint(lower[c][a]));
+         store32(geometry + 16ul + uint64_t(a) * 4ul, floatBitsToUint(upper[c][a]));
       }
-      store32(geometry + 28ul, geometry_id[lane]);
-      store32(geometry + 32ul, primitive[lane]);
+      store32(geometry + 28ul, geometry_id[c]);
+      store32(geometry + 32ul, primitive[c]);
    }
    if (instances && lane < count)
       encode_instance(job, lane);
    if (leaf && lane < count) {
+      uint c = first + lane, v0 = vfirst + lane * 3u;
       uint64_t geometry = children + uint64_t(blocks + lane) * 64ul;
-      store32(geometry, 0x40u | triangle_type[lane]);
+      store32(geometry, 0x40u | triangle_type[c]);
       for (uint a = 0; a < 3; ++a)
          for (uint v = 0; v < 4; ++v)
             store32(geometry + uint64_t(4u + a * 16u + v * 4u),
-                    floatBitsToUint(vertices[lane * 3u + min(v, 2u)][a]));
-      store32(geometry + 52ul, geometry_id[lane]);
-      store32(geometry + 56ul, primitive[lane]);
-      store32(geometry + 60ul, primitive[lane]);
+                    floatBitsToUint(vertices[v0 + min(v, 2u)][a]));
+      store32(geometry + 52ul, geometry_id[c]);
+      store32(geometry + 56ul, primitive[c]);
+      store32(geometry + 60ul, primitive[c]);
    }
    if (leaf && lane < blocks) {
       /* Each QTB writer owns all sixteen words, avoiding byte-store races. */
-      uint words[16];
+      uint b = slot * 2u + lane;
       for (uint w = 0; w < 16; ++w)
-         words[w] = 0;
-      words[0] = 6u | (qexp.z << 8) | (floatBitsToUint(qbase.x) & 0xffff0000u);
-      words[1] = (floatBitsToUint(qbase.y) >> 16) |
-                 (floatBitsToUint(qbase.z) & 0xffff0000u);
-      words[2] = qexp.x | (qexp.y << 8);
-      uint first = lane * capacity, n = min(capacity, count - first);
-      const uint order[4] = uint[4](2, 2, 1, 0);
-      for (uint t = 0; t < n; ++t)
-         for (uint v = 0; v < 4; ++v)
-            for (uint a = 0; a < 3; ++a) {
-               /* Power-of-two scaling avoids reciprocal overflow on small
-                * axes, including the minimum normal binary32 exponent. */
-               uint q = quantize_vertex(
-                  vertices[(first + t) * 3u + order[v]][a], qbase[a], qexp[a]);
-               uint byte_offset = 16u + t * 12u + v * 3u + 2u - a;
-               words[byte_offset / 4u] |= q << ((byte_offset % 4u) * 8u);
-            }
-      for (uint w = 0; w < 16; ++w)
-         store32(children + uint64_t(lane * 64u + w * 4u), words[w]);
+         store32(children + uint64_t(lane * 64u + w * 4u), qtb_words[b * 16u + w]);
    }
    if (lane == 0) {
       for (uint w = 0; w < 8; ++w) {
          uint64_t address = uint64_t(job.output_bvh) +
                             uint64_t(job.root_slot) * 64ul + uint64_t(w) * 8ul;
-         store32(address, uint(root[w]));
-         store32(address + 4ul, uint(root[w] >> 32));
+         store32(address, uint(root[first + w]));
+         store32(address + 4ul, uint(root[first + w] >> 32));
       }
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
    }

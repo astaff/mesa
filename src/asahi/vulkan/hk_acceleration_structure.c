@@ -644,7 +644,7 @@ hk_gen1_upload_as_table(struct hk_cmd_buffer *cmd)
 }
 
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
-static_assert(sizeof(struct hk_agx3_leaf_args) == 24, "native node push ABI");
+static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
 static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 
@@ -714,7 +714,8 @@ hk_cmd_encode_agx3_nodes(VkCommandBuffer command_buffer,
       return VK_SUCCESS;
 
    /* The native phase uses eight invocations per independently writable
-    * node. Job planning bounds the count before it reaches this helper. */
+    * node, HK_AGX3_NODE_JOBS_PER_GROUP nodes per workgroup. Job planning
+    * bounds the count before it reaches this helper. */
    assert(args->job_count <= UINT32_MAX / 8);
    VkPipeline pipeline;
    VkPipelineLayout layout;
@@ -820,7 +821,7 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
 
    const struct hk_agx3_leaf_args encode = {
       .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
-      .slot_bias = slot_bias,
+      .slot_bias = slot_bias, .counts = args->state,
    };
    const struct hk_agx3_envelope_args finish = {
       .jobs = args->envelope, .status = envelope_status, .job_count = 1,
@@ -843,7 +844,8 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       if (envelope)
          hk_cmd_dispatch_unaligned(command_buffer, 64, 1, 1);
       else
-         hk_cmd_dispatch_indirect_addr(command_buffer, args->state);
+         hk_cmd_dispatch_indirect_addr(command_buffer,
+                                       args->state + HK_AGX3_PLAN_ENCODE_DISPATCH);
       if (step == 0)
          vk_common_CmdPipelineBarrier(command_buffer,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

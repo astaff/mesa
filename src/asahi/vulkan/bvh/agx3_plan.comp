@@ -351,8 +351,14 @@ finish(uint id)
    job.geometry_type = args.geometry_type;
    job.leaf_bound = args.leaf_bound;
    DEREF(args.envelope) = job;
+   uint jobs = DEREF(args.state).error != 0 ? 0u : DEREF(args.state).job_count;
    if (DEREF(args.state).error != 0)
       DEREF(args.state).job_count = 0;
+   uint64_t dispatch = uint64_t(args.state) + uint64_t(HK_AGX3_PLAN_ENCODE_DISPATCH);
+   DEREF(REF(uint32_t)(dispatch)) =
+      (jobs + HK_AGX3_NODE_JOBS_PER_GROUP - 1u) / HK_AGX3_NODE_JOBS_PER_GROUP;
+   DEREF(REF(uint32_t)(dispatch + 4ul)) = 1u;
+   DEREF(REF(uint32_t)(dispatch + 8ul)) = 1u;
 }
 
 /* Leaf count of a restored plan's node: link_and_count's value, kept in the
