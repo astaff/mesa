@@ -160,7 +160,7 @@ hk_host_as_stage_geometry(VkAccelerationStructureGeometryKHR *g,
          memcpy(&dst[i], instance, sizeof(*dst));
          VK_FROM_HANDLE(vk_acceleration_structure, blas,
                         (VkAccelerationStructureKHR)dst[i].accelerationStructureReference);
-         dst[i].accelerationStructureReference = blas ? libagx_gen1_as_native_address(vk_acceleration_structure_get_va(blas)) : 0;
+         dst[i].accelerationStructureReference = blas ? vk_acceleration_structure_get_va(blas) : 0;
       }
       g->geometry.instances.arrayOfPointers = VK_FALSE;
       g->geometry.instances.data.deviceAddress = va + layout->data;

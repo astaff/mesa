@@ -93,12 +93,6 @@ write_accel_struct_desc(struct hk_descriptor_set *set,
    VK_FROM_HANDLE(vk_acceleration_structure, accel_struct, _accel_struct);
    uint64_t addr =
       accel_struct ? vk_acceleration_structure_get_va(accel_struct) : 0;
-   if (accel_struct) {
-      struct hk_device *dev = container_of(accel_struct->base.device,
-                                             struct hk_device, vk);
-      if (dev->g17p_native_as)
-         addr = ALIGN_POT(addr, UINT64_C(16384));
-   }
 
    write_desc(set, binding, elem, &addr, sizeof(addr));
 }
