@@ -596,6 +596,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_explicit_plane_layout = executable(
+    'hk-vulkan-explicit-plane-layout',
+    files('tests/hk_vulkan_explicit_plane_layout.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   g17p_vulkan_compressed_layer_copy = executable(
     'g17p-vulkan-compressed-layer-copy',
     files('tests/g17p_vulkan_compressed_layer_copy.c'),

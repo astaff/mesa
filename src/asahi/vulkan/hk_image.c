@@ -1426,7 +1426,11 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          }
          image->planes[plane].offset_B = plane_offset_B;
 
-         for (uint8_t prior = 0; prior < plane; prior++) {
+         /* The offset is relative to the image's memory binding, or for a
+          * disjoint image to the plane's own binding, where planes cannot
+          * overlap one another.
+          */
+         for (uint8_t prior = 0; !image->disjoint && prior < plane; prior++) {
             if (hk_image_plane_ranges_overlap(
                    plane_offset_B, image->planes[plane].layout.size_B,
                    image->planes[prior].offset_B,
@@ -1905,14 +1909,19 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
 #endif
       UNREACHABLE("todo");
    } else {
+      /* The plane must lie within the memory object, which may be smaller
+       * than the BO backing it (BOs come page-rounded and from a cache) */
+      const uint64_t mem_size_B =
+         mem->vk.size ? MIN2(mem->bo->size, mem->vk.size) : mem->bo->size;
       uint64_t bo_offset_B;
-      if (!hk_image_plane_binding(
-             mem->bo->va->addr, mem->bo->size, memory_offset_B, plane->offset_B,
-             plane->layout.size_B, &plane->addr, &bo_offset_B))
+      if (!hk_image_plane_binding(mem->bo->va->addr, mem_size_B,
+                                  memory_offset_B, plane->offset_B,
+                                  plane->layout.size_B, &plane->addr,
+                                  &bo_offset_B))
          return false;
 
       plane->map = agx_bo_map(mem->bo) + bo_offset_B;
-      plane->rem = mem->bo->size - bo_offset_B;
+      plane->rem = mem_size_B - bo_offset_B;
    }
 
    return true;

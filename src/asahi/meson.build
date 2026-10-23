@@ -83,4 +83,24 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     depends : [_dev_icd, libvulkan_asahi],
     suite : ['asahi'],
   )
+
+  # Explicit DRM plane layouts: placement, requirements, subresource layouts
+  # and validation, without executing on the GPU.
+  foreach chip : ['g13g', 'g17p']
+    test(
+      'hk-' + chip + '-explicit-plane-layout',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_explicit_plane_layout,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
 endif
