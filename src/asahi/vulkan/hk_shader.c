@@ -914,22 +914,31 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
    nir_def_replace(&intr->def, val);
 }
 
+struct global_load_lowering {
+   bool soft_fault;
+   /* G17P: storage-buffer loads use the soft-fault form as well: load, then
+    * zero the value when the access is out of bounds. */
+   bool storage_result_select;
+};
+
 static bool
 lower_load_global_constant_offset_instr(nir_builder *b,
                                         nir_intrinsic_instr *intrin, void *data)
 {
-   bool *has_soft_fault = data;
+   const struct global_load_lowering *state = data;
 
-   if (intrin->intrinsic == nir_intrinsic_load_global_bounded ||
+   if ((intrin->intrinsic == nir_intrinsic_load_global_bounded &&
+        !(state->soft_fault && state->storage_result_select)) ||
        (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
-        !(*has_soft_fault))) {
+        !state->soft_fault)) {
 
       lower_load_global_bounded(b, intrin);
       return true;
    }
 
    if (intrin->intrinsic != nir_intrinsic_load_global_constant_offset &&
-       intrin->intrinsic != nir_intrinsic_load_global_constant_bounded)
+       intrin->intrinsic != nir_intrinsic_load_global_constant_bounded &&
+       intrin->intrinsic != nir_intrinsic_load_global_bounded)
       return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
@@ -943,19 +952,30 @@ lower_load_global_constant_offset_instr(nir_builder *b,
    unsigned byte_size = bit_size / 8;
    unsigned load_size = byte_size * intrin->num_components;
 
-   if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
+   const bool bounded =
+      intrin->intrinsic == nir_intrinsic_load_global_constant_bounded ||
+      intrin->intrinsic == nir_intrinsic_load_global_bounded;
+   if (bounded) {
       bound = intrin->src[2].ssa;
    }
 
    unsigned align_mul = nir_intrinsic_align_mul(intrin);
    unsigned align_offset = nir_intrinsic_align_offset(intrin);
 
-   nir_def *val = nir_load_global_constant(
-      b, intrin->def.num_components, intrin->def.bit_size,
-      nir_iadd(b, base_addr, nir_u2u64(b, offset)), .align_mul = align_mul,
-      .align_offset = align_offset, .access = nir_intrinsic_access(intrin));
+   nir_def *addr = nir_iadd(b, base_addr, nir_u2u64(b, offset));
+   nir_def *val =
+      intrin->intrinsic == nir_intrinsic_load_global_bounded
+         ? nir_load_global(b, intrin->def.num_components, intrin->def.bit_size,
+                           addr, .align_mul = align_mul,
+                           .align_offset = align_offset,
+                           .access = nir_intrinsic_access(intrin))
+         : nir_load_global_constant(b, intrin->def.num_components,
+                                    intrin->def.bit_size, addr,
+                                    .align_mul = align_mul,
+                                    .align_offset = align_offset,
+                                    .access = nir_intrinsic_access(intrin));
 
-   if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
+   if (bounded) {
       nir_scalar offs = nir_scalar_resolved(offset, 0);
       if (nir_scalar_is_const(offs)) {
          /* Compare the exclusive end against the descriptor's byte size.
@@ -2367,10 +2387,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(progress, nir, nir_opt_sink, opts);
    NIR_PASS(progress, nir, nir_opt_move, opts);
 
-   bool soft_fault = agx_has_soft_fault(&dev->dev);
+   struct global_load_lowering global_loads = {
+      .soft_fault = agx_has_soft_fault(&dev->dev),
+      .storage_result_select = dev->dev.chip == AGX_CHIP_G17P,
+   };
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
-            &soft_fault);
+            &global_loads);
 
    if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,

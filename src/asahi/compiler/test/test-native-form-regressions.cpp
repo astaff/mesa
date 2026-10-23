@@ -620,6 +620,106 @@ TEST(NativeForms, PhiUsesOtherEdgeWhenPreferredRegisterIsLive)
    ralloc_free(mem);
 }
 
+TEST(NativeForms, PhiWithAgreeingInputsIsAssignedBeforeEarlierPhis)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.is_helper = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *left = agx_test_block(b->shader);
+   agx_block *right = agx_test_block(b->shader);
+   agx_block *join = agx_test_block(b->shader);
+   agx_block_add_successor(entry, left);
+   agx_block_add_successor(entry, right);
+   agx_block_add_successor(left, join);
+   agx_block_add_successor(right, join);
+   agx_index incoming[2];
+   for (unsigned side = 0; side < 2; ++side) {
+      b->cursor = agx_after_block(side ? right : left);
+      incoming[side] = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   }
+   b->cursor = agx_after_block(join);
+   /* The constant phi comes first and has no register to follow. */
+   agx_index constant = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *first = agx_phi_to(b, constant, 2);
+   first->src[0] = agx_immediate(1);
+   first->src[1] = agx_immediate(2);
+   agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *phi = agx_phi_to(b, value, 2);
+   phi->src[0] = incoming[0];
+   phi->src[1] = incoming[1];
+   agx_instr *use = agx_unit_test(b, value);
+   agx_instr *constant_use = agx_unit_test(b, constant);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_EQ(use->src[0].value, 2u);
+   EXPECT_NE(constant_use->src[0].value, 2u);
+   unsigned copies = 0;
+   agx_foreach_instr_global(b->shader, I)
+      copies += I->op == AGX_OPCODE_MOV;
+   EXPECT_EQ(copies, 0u);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, PhiFallbackLeavesLaterPhiInputsFree)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.is_helper = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+   b->shader->nir = rzalloc(mem, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_FRAGMENT;
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *header = agx_test_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   agx_block_add_successor(entry, header);
+   agx_block_add_successor(header, body);
+   agx_block_add_successor(header, exit);
+   agx_block_add_successor(body, header);
+   header->loop_header = true;
+   agx_index input = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   b->cursor = agx_after_block(header);
+   /* The counter phi comes first and knows none of its inputs yet. */
+   agx_index counter = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index next_counter = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *count_phi = agx_phi_to(b, counter, 2);
+   count_phi->src[0] = agx_immediate(0);
+   count_phi->src[1] = next_counter;
+   agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index next_value = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *phi = agx_phi_to(b, value, 2);
+   phi->src[0] = input;
+   phi->src[1] = next_value;
+   b->cursor = agx_after_block(body);
+   agx_iadd_to(b, next_value, value, agx_immediate(1), 0);
+   agx_iadd_to(b, next_counter, counter, agx_immediate(1), 0);
+   b->cursor = agx_after_block(exit);
+   agx_instr *use = agx_unit_test(b, value);
+   agx_unit_test(b, counter);
+   agx_ra(b->shader);
+   ASSERT_FALSE(b->shader->ra_failed);
+   EXPECT_EQ(use->src[0].value, 2u);
+   unsigned copies = 0;
+   agx_foreach_instr_global(b->shader, I)
+      copies += I->op == AGX_OPCODE_MOV;
+   EXPECT_EQ(copies, 0u);
+   ralloc_free(mem);
+}
+
 TEST(NativeForms, TransientTextureVectorBecomesScalarBeforeAnyEviction)
 {
    for (unsigned mode = 0; mode < 4; ++mode) {

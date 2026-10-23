@@ -20,6 +20,7 @@ struct nir_def;
 #define AGX_NIR_MEMORY_PACKED_COUNT_MASK (7u << AGX_NIR_MEMORY_PACKED_COUNT_SHIFT)
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices);
 bool agx_nir_scalarize_int64(struct nir_shader *shader);
+bool agx_nir_lower_divmod64(struct nir_shader *shader);
 bool agx_nir_lower_algebraic_late(struct nir_shader *shader);
 bool agx_nir_fold_pixel_coord(struct nir_shader *shader);
 bool agx_nir_fold_extract16_bfe(struct nir_shader *shader);
@@ -45,7 +46,7 @@ struct nir_def *agx_nir_quad_ddy(struct nir_builder *b, struct nir_def *v);
  * run it as early as the optimizer can use it and agx_compile_shader_nir()
  * still guarantees it for any AGX3 target. */
 bool agx_nir_lower_shared_element_index(struct nir_shader *s);
-bool agx_nir_lower_fminmax(struct nir_shader *s);
+bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_atomics(struct nir_shader *s, bool native_fadd);
 
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias);

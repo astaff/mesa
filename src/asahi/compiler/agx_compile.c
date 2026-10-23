@@ -7369,7 +7369,7 @@ static bool agx3_nir_lower_uniform_dma(nir_shader *nir,
 
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
-                 bool byte_indices, bool discard_word,
+                 bool byte_indices, bool discard_word, bool g17p,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
                  struct agx_shader_info *dma_info)
@@ -7487,6 +7487,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    progress = false;
    if (byte_indices)
       NIR_PASS(progress, nir, agx_nir_scalarize_int64);
+   /* G17P: normalized 64-bit division instead of nir_lower_int64's fully
+    * unrolled 64-step division (agx_nir_lower_divmod64.c). */
+   if (g17p)
+      NIR_PASS(progress, nir, agx_nir_lower_divmod64);
    NIR_PASS(progress, nir, nir_lower_int64);
 
    /* If we lowered actual int64 arithmetic (not folded into the address
@@ -7512,7 +7516,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
     * should work on unlowered fmin/fmax.
     */
-   NIR_PASS(_, nir, agx_nir_lower_fminmax);
+   NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p);
 
    /* AGX_G17P_DISCARD_WORD: reduce one-sample coverage-update sources to bit
     * 0 after the algebraic loops and right before preamble formation, so the
@@ -7597,7 +7601,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * GLES.
     */
    NIR_PASS(_, nir, nir_opt_algebraic_late);
-   NIR_PASS(_, nir, agx_nir_lower_fminmax);
+   NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p);
 
    /* The AGX3 byte-address backend cannot encode 64-bit shifted adds.
     * Lower remaining multiplies before fusion turns x * 3 into one; the
@@ -9440,11 +9444,22 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
          (ctx->stage == MESA_SHADER_VERTEX || !ctx->is_preamble)) ||
         (key->g17p_uniform_dma && out->agx3_uniform_dma_count)) &&
        !(agx_compiler_debug & AGX_DBG_NOOPT)) {
+      /* AGX3B main programs use the pressure-aware CSE, which merges only
+       * while the earlier result is still live. Uniform source lowering
+       * copies a uniform into a GPR for each operation that cannot read it in
+       * place, so a value used by a run of selects is copied once per select,
+       * and each copy is read right after it is made. On G17P, also merge
+       * such copies where that keeps the register pressure within the
+       * shader's existing peak. */
       if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
-          ctx->stage != MESA_SHADER_VERTEX)
-         AGX_PASS(ctx, agx_opt_cse_pressure);
-      else
+          ctx->stage != MESA_SHADER_VERTEX) {
+         if (key->dev.chip == AGX_CHIP_G17P)
+            AGX_PASS(ctx, agx_opt_cse_bounded);
+         else
+            AGX_PASS(ctx, agx_opt_cse_pressure);
+      } else {
          AGX_PASS(ctx, agx_opt_cse);
+      }
    }
 
    if (native_cprog && ctx->is_preamble &&
@@ -11917,6 +11932,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    agx_optimize_nir(
       nir, key->dev.soft_fault, uniform_atomics,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
+      key->dev.chip == AGX_CHIP_G17P,
       form_preamble ? &info->push_count : NULL,
       (form_preamble && key->promote_textures) ? &info->texture_state_count
                                               : NULL,
