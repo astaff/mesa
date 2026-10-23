@@ -2162,6 +2162,21 @@ hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
  * Poly's compute variant instead, whose query context is the one TCS, GS and
  * compute queries use, and rasterize its outputs through a passthrough GS.
  */
+/* Whether a GS or TES compiles under the G17P native ray-query profile.
+ * The profile also runs passes on shaders without queries, and a shader
+ * binary must not depend on which features its device enabled: shader
+ * object binaries of one shader from devices with different features must
+ * match. A device that enables no ray-tracing feature therefore compiles
+ * the query-free shaders it can have the way a ray-tracing device does.
+ */
+static bool
+hk_native_rq_profile(const struct hk_device *dev)
+{
+   return dev->gen1_native_rq ||
+          (hk_g17p_rt_enabled(&dev->dev) &&
+           !hk_rt_features_enabled(&dev->vk.enabled_features));
+}
+
 bool
 hk_tes_ray_queries_in_compute(const struct hk_device *dev)
 {
@@ -3742,8 +3757,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          struct agx_gen1_ray_query_layout rq_layout =
             hk_gen1_ray_query_layout(dev, nir, 0);
          if (!hk_nir_lower_tes_variant(nir, hw,
-                                       dev->gen1_native_rq ? &rq_layout
-                                                           : NULL)) {
+                                       hk_native_rq_profile(dev) ? &rq_layout
+                                                                 : NULL)) {
             ralloc_free(nir);
             return vk_errorf(dev, VK_ERROR_UNKNOWN,
                              "Gen1 native TES ray query lowering failed");
@@ -4818,7 +4833,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       rq_layout.graphics_stage = dev->gen1_native_graphics_rq;
       if (!hk_nir_lower_gs(nir, &count, &rast, &pre_gs,
                            &count_variant->info.gs,
-                           dev->gen1_native_rq ? &rq_layout : NULL)) {
+                           hk_native_rq_profile(dev) ? &rq_layout : NULL)) {
          ralloc_free(nir);
          ralloc_free(count);
          ralloc_free(rast);
