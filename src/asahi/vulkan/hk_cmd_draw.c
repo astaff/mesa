@@ -2385,7 +2385,10 @@ hk_g17p_note_first_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint8_t covered = 0;
    for (uint32_t i = 0; i < render->color_att_count; ++i) {
       const struct hk_attachment *att = &render->color_att[i];
+      /* A disabled colour write keeps the attachment (preserve_rt in the
+       * epilog), so it is not covered even when its write mask is full. */
       if (!att->iview || !(gfx->fast_link_fs.color_written & BITFIELD_BIT(i)) ||
+          !(dyn->cb.color_write_enables & BITFIELD_BIT(i)) ||
           dyn->cb.attachments[i].blend_enable)
          continue;
       const unsigned channels = util_format_get_nr_components(
@@ -9759,7 +9762,13 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 /* G17P: a draw whose pre-rasterization shaders may read images orders its
  * render's vertex half after the image barriers before it (HK_SYNC_GFX_IMG).
  * Software tessellation, geometry, task and mesh stages are assumed to
- * read. */
+ * read.
+ *
+ * An image barrier's memory dependency covers only its image, but its
+ * execution dependency covers all work in its stages, so vertex work that
+ * writes memory (stores, atomics, transform feedback) is ordered after it
+ * too: a write after an earlier pass's read of another resource may rely on
+ * that execution dependency alone. */
 static inline void
 hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -9770,6 +9779,7 @@ hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    const struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
    if (!hw_vs || hw_vs->info.reads_images ||
+       hw_vs->info.writes_external_memory || gfx->xfb_enabled ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        gfx->shaders[MESA_SHADER_GEOMETRY] || gfx->shaders[MESA_SHADER_TASK] ||
