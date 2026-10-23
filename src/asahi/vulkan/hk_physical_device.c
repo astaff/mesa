@@ -900,6 +900,11 @@ hk_get_device_features(
       features->sparseBinding = sparse;
       features->sparseResidencyAliased = false;
       features->sparseResidencyImage2D = sparse;
+      /* The sparse binder and SSTT use the same slice layout for 3D images
+       * as for 2D arrays. Report the nonstandard, one-slice block shape rather
+       * than requiring the standard 3D block shape.
+       */
+      features->sparseResidencyImage3D = sparse;
       features->sparseResidencyBuffer = sparse;
       /* The common Honeykrisp lowering duplicates a draw per view, writes
        * ViewIndex through the draw root and routes it through the packed
