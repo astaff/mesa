@@ -582,6 +582,13 @@ enum hk_feature_key {
    HK_FEAT_ROBUST_BUFFER_ACCESS = BITFIELD_BIT(2),
    HK_FEAT_ROBUST_BUFFER_ACCESS_2 = BITFIELD_BIT(3),
    HK_FEAT_PIPELINE_ROBUSTNESS = BITFIELD_BIT(4),
+
+   /* G17P compiles against its native ray-query state only on a device that
+    * enables a ray-tracing feature (hk_rt_features_enabled()). Ray-query
+    * shaders target that state's uniform and SCS layout, and Poly's geometry
+    * and evaluation lowering also runs extra passes with it, query or not.
+    * The bit is never set where ray tracing is not advertised. */
+   HK_FEAT_RAY_TRACING = BITFIELD_BIT(5),
 };
 
 /* What a dynamic-sample-count G17P fragment shader needs to compile its
@@ -640,7 +647,8 @@ hk_make_feature_key(const struct vk_features *feats)
               : 0) |
           (feats->robustBufferAccess ? HK_FEAT_ROBUST_BUFFER_ACCESS : 0) |
           (feats->robustBufferAccess2 ? HK_FEAT_ROBUST_BUFFER_ACCESS_2 : 0) |
-          (feats->pipelineRobustness ? HK_FEAT_PIPELINE_ROBUSTNESS : 0);
+          (feats->pipelineRobustness ? HK_FEAT_PIPELINE_ROBUSTNESS : 0) |
+          (hk_rt_features_enabled(feats) ? HK_FEAT_RAY_TRACING : 0);
 }
 
 /*
@@ -5161,6 +5169,14 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    const uint32_t code_size = blob_read_uint32(blob);
    const uint32_t data_size = blob_read_uint32(blob);
    if (blob->overrun)
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+
+   /* A shader with native ray queries runs against the device's ray-query
+    * state, which a device enabling no ray-tracing feature does not create.
+    * Cache keys keep such binaries apart; refuse one that arrives as an
+    * application-supplied binary from a ray-tracing device. */
+   if ((info.agx3_gen1_fragment_rq || b_info.uses_ray_traversal) &&
+       hk_g17p_rt_enabled(&dev->dev) && !dev->gen1_native_rq)
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    /* A variant that was never compiled (for instance the software
