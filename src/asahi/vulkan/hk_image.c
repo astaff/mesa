@@ -535,9 +535,10 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
  * enable them (and its views cannot reinterpret it). The single-layer/level
  * native read/write packets use the allocator's recovered Gen10 metadata
  * layout, the same layout colour attachments use, so a storage image may also
- * be a colour attachment and a transfer destination: end-of-tile stores,
- * shader image stores, clears and uploads all write it through compressed PBE
- * descriptors. Bits 0-10 select RGBA16F, RG16F, R16F, R32F, RG32F, RGBA32F,
+ * be a colour or input attachment and a transfer destination: end-of-tile
+ * stores, shader image stores, clears and uploads all write it through
+ * compressed PBE descriptors, and an input attachment reads it as a sampled
+ * colour attachment does. Bits 0-10 select RGBA16F, RG16F, R16F, R32F, RG32F, RGBA32F,
  * RGBA8 UNORM, the other RGBA16 formats, the other RG16 formats, the other
  * RGBA8 formats and the other R16 formats, respectively; bit 12 admits
  * mipmapped images, whose levels compress as those of colour attachments
@@ -578,7 +579,8 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
                         VK_IMAGE_USAGE_SAMPLED_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)))
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))
       return false;
 
    unsigned bit;
