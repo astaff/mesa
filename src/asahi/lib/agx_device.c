@@ -934,7 +934,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
-   const char *product = agx_chip_exact_product_name(dev->chip);
+   /* The M4 Pro runs as G17P too; it takes the M-series name below. */
+   const char *product = dev->params.chip_id == 0x8140
+                            ? agx_chip_exact_product_name(dev->chip)
+                            : NULL;
    if (product) {
       /* Match the M-series format with the exact GPU codename and revision. */
       snprintf(dev->name, sizeof(dev->name), "Apple %s (%s %02X)", product,
@@ -1395,7 +1398,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
          goto fail;
       }
 
-      agx3_build_usc_base_page(map, usc_base_size, dev->chip);
+      agx3_build_usc_base_page(map, usc_base_size, dev->chip,
+                               dev->params.num_cores_per_cluster);
       agx_bo_assert_range(usc_base, 0, usc_base_size);
 
    }
