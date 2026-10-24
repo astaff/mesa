@@ -157,9 +157,12 @@ main()
          DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_RANGE;
          return;
       }
-      for (uint i = 0; i < 28; ++i)
-         store32(job.output_bvh + 64ul + uint64_t(i) * 4ul,
-                 i >= 4 && i < 10 ? 0x7fc00000u : 0u);
+      for (uint i = 0; i < 48; ++i)
+         store32(job.output_bvh + uint64_t(i) * 4ul,
+                 i >= 20 && i < 26 ? 0x7fc00000u : 0u);
+      store64(job.output_bvh + 144ul, job.output_bvh);
+      store32(job.output_bvh + 176ul,
+              job.resource_id != 0 ? job.resource_id : 1);
       publish_metadata(job, 192ul);
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
       return;

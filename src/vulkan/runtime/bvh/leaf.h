@@ -158,10 +158,11 @@ build_instance(inout vk_aabb bounds, VOID_REF src_ptr, VOID_REF dst_ptr, uint32_
 
    AccelerationStructureInstance instance = DEREF(REF(AccelerationStructureInstance)(src_ptr));
 
-   /* An inactive instance is one whose acceleration structure handle is VK_NULL_HANDLE. Since the active terminology is
-    * only relevant for BVH updates, which we do not implement, we can also skip instances with mask == 0.
+   /* A null reference is inactive even when retaining updateable topology.
+    * A masked instance remains active and can be unmasked by an update.
     */
-   if (instance.accelerationStructureReference == 0 || instance.custom_instance_and_mask < (1u << 24u))
+   if (instance.accelerationStructureReference == 0 ||
+       (!VK_TEST_BUILD_FLAG_ALWAYS_ACTIVE && instance.custom_instance_and_mask < (1u << 24u)))
       return false;
 
    DEREF(node).base_ptr = instance.accelerationStructureReference;
@@ -190,8 +191,16 @@ build_instance(inout vk_aabb bounds, VOID_REF src_ptr, VOID_REF dst_ptr, uint32_
       bounds = CALCULATE_FINE_INSTANCE_NODE_BOUNDS(instance.accelerationStructureReference, mat3x4(transform));
 #endif
 
-   if (any(isnan(bounds.min)) || any(isnan(bounds.max)))
-      return false;
+   if (any(isnan(bounds.min)) || any(isnan(bounds.max))) {
+      if (!VK_TEST_BUILD_FLAG_ALWAYS_ACTIVE)
+         return false;
+
+      /* An instance of an empty BLAS is degenerate, not inactive. Retain
+       * its origin so an update can replace it with a non-empty BLAS.
+       */
+      bounds.min = vec4(0.0, 0.0, 0.0, 1.0) * mat3x4(transform);
+      bounds.max = bounds.min;
+   }
 
    DEREF(node).base.aabb = bounds;
    DEREF(node).custom_instance_and_mask = instance.custom_instance_and_mask;
@@ -270,7 +279,8 @@ main(void)
       is_active = build_instance(bounds, src_ptr, dst_ptr, global_id);
    }
 
-   if (VK_TEST_BUILD_FLAG_ALWAYS_ACTIVE && in_range)
+   if (VK_TEST_BUILD_FLAG_ALWAYS_ACTIVE && in_range &&
+       geom_data.geometry_type != VK_GEOMETRY_TYPE_INSTANCES_KHR)
       is_active = true;
 
    uint32_t id = is_active ? pack_ir_node_id(dst_offset, node_type) : VK_BVH_INVALID_NODE;
