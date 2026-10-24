@@ -425,16 +425,17 @@ asahi_append_fragment_attachments(struct hk_device *dev,
    }
 }
 
-/* Submit all ordered control streams together up to the kernel's advertised
- * limit.  Splitting every stream into a separate ioctl serializes real games
- * at the queue boundary; keep single-stream submission only as an explicit
- * diagnostic control.
+/* Native AGX3 benefits from submitting ordered control streams together.
+ * G13X already serializes both engines, and separate ioctls let the kernel
+ * start a render while the following compute submission is prepared. This
+ * matters for post-graphics query availability and its CPU round trip.
  */
 static inline unsigned
 max_commands_per_submit(struct hk_device *dev)
 {
    return hk_drm_submit_command_limit(
-      !HK_PERF(dev, NOBATCH), dev->dev.params.max_commands_per_submission);
+      dev->dev.chip != AGX_CHIP_G13X && !HK_PERF(dev, NOBATCH),
+      dev->dev.params.max_commands_per_submission);
 }
 
 static VkResult
