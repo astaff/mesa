@@ -3919,15 +3919,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * fragment program copies only when it forms none. */
    const bool vs_dma = sw_stage == MESA_SHADER_VERTEX && hw &&
                        nir->info.stage == MESA_SHADER_VERTEX;
-   /* An application compute kernel forms no preamble, so without copies
+   /* An ordinary compute pipeline forms no preamble, so without copies
     * every thread loads its push data, dispatch base and descriptors from
     * memory, one dependent load after another. Its launch copies them like
-    * a graphics stage's (hk_g17p_compute_uniform_ranges()). Driver-internal
-    * kernels and compute-stage programs of graphics keep their loads: their
-    * launch paths publish no spans. */
+    * a graphics stage's (hk_g17p_compute_uniform_ranges()), including meta
+    * compute pipelines. Compute-stage programs of graphics keep their own
+    * launch ABI; precompiled library helpers do not use this shader path. */
    const bool cs_dma = sw_stage == MESA_SHADER_COMPUTE &&
-                       nir->info.stage == MESA_SHADER_COMPUTE &&
-                       !nir->info.internal;
+                       nir->info.stage == MESA_SHADER_COMPUTE;
    if (agx_native_graphics(&dev->dev) &&
        ((backend_key.no_preamble && sw_stage == MESA_SHADER_FRAGMENT &&
          nir->info.stage == MESA_SHADER_FRAGMENT) || vs_dma || cs_dma)) {

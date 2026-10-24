@@ -706,9 +706,9 @@ hk_g17p_compute_uniform_ranges(
                                s->info.agx3_indexed_sampler_valid)))
       return false;
 
-   /* Uniform DMA is enabled only for application compute kernels (see
-    * hk_shader.c); geometry, tessellation and other compute-stage programs
-    * of graphics never carry spans. */
+   /* Ordinary compute pipelines, including meta, publish their uniform DMA
+    * spans here. Geometry, tessellation and other compute-stage programs of
+    * graphics never carry spans. */
    const unsigned dma_count = s->b.info.agx3_uniform_dma_count;
    if (dma_count && s->info.stage != MESA_SHADER_COMPUTE)
       return false;
