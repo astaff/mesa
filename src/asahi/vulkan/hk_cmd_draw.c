@@ -9621,10 +9621,6 @@ hk_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer, VkBuffer _buffer,
       .buffer = hk_buffer_addr_range(buffer, offset, size, true),
       .size = agx_translate_index_size(vk_index_type_to_bytes(indexType)),
    };
-
-   /* TODO: check if necessary, blob does this */
-   cmd->state.gfx.index.buffer.range =
-      align(cmd->state.gfx.index.buffer.range, 4);
 }
 
 void
@@ -9886,7 +9882,7 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
       w[n++] = draw.b.count[0];
       w[n++] = draw.b.count[1];
       w[n++] = (uint32_t)(int32_t)draw.index_bias;
-      w[n++] = (uint32_t)(((range_B - offset_B + 3) >> 2) - 1);
+      w[n++] = (uint32_t)(((range_B - offset_B + (ib & 3) + 3) >> 2) - 1);
       w[n++] = (uint32_t)((ib >> 40) & 0xff);
    } else {
       if (!draw.b.count[0])
@@ -11200,7 +11196,8 @@ hk_begin_end_xfb(VkCommandBuffer commandBuffer, uint32_t firstCounterBuffer,
       }
    }
 
-   for (unsigned i = 0; i < counterBufferCount; ++i) {
+   /* pCounterBuffers may be NULL with a non-zero count: no counter buffers. */
+   for (unsigned i = 0; pCounterBuffers && i < counterBufferCount; ++i) {
       if (pCounterBuffers[i] == VK_NULL_HANDLE)
          continue;
 
