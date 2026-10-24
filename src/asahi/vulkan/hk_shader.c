@@ -4102,12 +4102,57 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
 static const struct vk_shader_ops hk_shader_ops;
 
+struct hk_shader *
+hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
+                             struct agx_shader_part *part)
+{
+   struct hk_shader *s = malloc(sizeof(*s));
+   if (!s)
+      return NULL;
+
+   /* Everything but the program and its uniform layout is the API shader's:
+    * the draw still builds link keys, varyings and constant data from it.
+    * The copy shares the API shader's constant data, owns its code and
+    * links nothing itself. */
+   *s = *api;
+   s->b = *part;
+   part->binary = NULL;
+   s->code_ptr = s->b.binary;
+   s->code_size = s->b.info.binary_size;
+   s->bo = NULL;
+   s->bo_offset = 0;
+   s->preamble_addr = 0;
+   memset(&s->linked, 0, sizeof(s->linked));
+   s->only_linked = NULL;
+   s->g17p_mono_nir = NULL;
+   s->g17p_mono_nir_size = 0;
+
+   if (s->b.info.has_preamble || s->b.info.rodata.size_16) {
+      const size_t size = s->b.info.binary_size;
+      s->bo = size ? hk_code_alloc(dev, size, &s->bo_offset) : NULL;
+      if (!s->bo) {
+         free(s->b.binary);
+         free(s);
+         return NULL;
+      }
+      memcpy((uint8_t *)agx_bo_map(s->bo) + s->bo_offset, s->b.binary, size);
+      agx_bo_assert_range(s->bo, s->bo_offset, size);
+      s->preamble_addr = hk_shader_code_va(s) + s->b.info.preamble_offset;
+   }
+   return s;
+}
+
 static void
 hk_destroy_linked_shader(struct hk_device *dev, struct hk_linked_shader *linked)
 {
    hk_g17p_linked_compute_cache_finish(linked);
    hk_g17p_linked_graphics_cache_finish(dev, linked);
    agx_bo_unreference(&dev->dev, linked->b.bo);
+   if (linked->g17p_layout) {
+      free(linked->g17p_layout->b.binary);
+      agx_bo_unreference(&dev->dev, linked->g17p_layout->bo);
+      free(linked->g17p_layout);
+   }
    ralloc_free(linked);
 }
 

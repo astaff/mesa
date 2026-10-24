@@ -3144,6 +3144,10 @@ uint64_t
 hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                     struct hk_linked_shader *linked)
 {
+   /* An inline-blend program with its own constant program launches with
+    * its own uniform layout (hk_linked_shader::g17p_layout). */
+   if (linked && linked->g17p_layout)
+      s = linked->g17p_layout;
    return hk_upload_usc_words_internal(cmd, s, linked);
 }
 
