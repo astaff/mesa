@@ -416,10 +416,10 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       memset((char *)&cmd->state + end, 0, sizeof(cmd->state) - end);
    } else {
       memset(&cmd->state, 0, sizeof(cmd->state));
+      for (unsigned i = 0; i < HK_G17P_BG_EOT_CACHE_ENTRIES; ++i)
+         cmd->g17p_bg_eot_cache[i].valid = false;
+      cmd->g17p_bg_eot_cache_next = 0;
    }
-   for (unsigned i = 0; i < HK_G17P_BG_EOT_CACHE_ENTRIES; ++i)
-      cmd->g17p_bg_eot_cache[i].valid = false;
-   cmd->g17p_bg_eot_cache_next = 0;
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
 }
