@@ -206,6 +206,17 @@ agx_draw_index_range_B(struct agx_draw d)
    return range_B;
 }
 
+/* Bytes of the hardware index fetch window for `span_B` bytes of indices
+ * starting at `ib`. The window is whole dwords from the dword that holds the
+ * first index. The bound range is exact and may end inside a dword, so count
+ * to the dword holding its last byte. With a dword-aligned binding this is
+ * the old rounding of the range itself. */
+static inline uint64_t
+agx_index_fetch_window_B(uint64_t ib, uint64_t span_B)
+{
+   return (span_B + (ib & 3) + 3) & ~(uint64_t)3;
+}
+
 static inline unsigned
 agx_draw_index_range_el(struct agx_draw d)
 {
@@ -234,7 +245,9 @@ agx_draw_indirect_index_buffer_size_word(struct agx_draw d,
 {
    assert(d.indexed && agx_is_indirect(d.b));
 
-   const uint64_t dwords = ((uint64_t)agx_draw_index_range_B(d) + 3) >> 2;
+   const uint64_t dwords = agx_index_fetch_window_B(
+                              agx_draw_index_buffer(d),
+                              agx_draw_index_range_B(d)) >> 2;
    if (dwords == 0 || dwords > (uint64_t)0xffffffffu)
       return false;
 
@@ -293,7 +306,9 @@ agx_vdm_draw_supported(enum agx_chip chip, struct agx_draw draw,
       chip, (uint8_t)topology, draw.indexed, draw.restart,
       (uint8_t)draw.index_size, ib, draw.b.count[0], draw.b.count[1],
       draw.indexed ? draw.index_bias : draw.start,
-      draw.indexed ? (align(agx_draw_index_range_B(draw), 4) >> 2) : 0, &words);
+      draw.indexed ? (uint32_t)(agx_index_fetch_window_B(
+                               ib, agx_draw_index_range_B(draw)) >> 2)
+                         : 0, &words);
 }
 
 static inline GLOBAL uint32_t *
@@ -381,7 +396,9 @@ agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
             chip, (uint8_t)topology, draw.indexed, draw.restart,
             (uint8_t)draw.index_size, ib, draw.b.count[0], draw.b.count[1],
             draw.indexed ? draw.index_bias : draw.start,
-            draw.indexed ? (align(agx_draw_index_range_B(draw), 4) >> 2) : 0,
+            draw.indexed ? (uint32_t)(agx_index_fetch_window_B(
+                               ib, agx_draw_index_range_B(draw)) >> 2)
+                         : 0,
             &words);
          assert(valid);
          if (!valid)
@@ -445,7 +462,8 @@ agx_vdm_draw(GLOBAL uint32_t *out, enum agx_chip chip, struct agx_draw draw,
 
    if (draw.indexed) {
       agx_push(out, INDEX_LIST_BUFFER_SIZE, cfg) {
-         cfg.size = align(agx_draw_index_range_B(draw), 4);
+         cfg.size =
+            agx_index_fetch_window_B(ib, agx_draw_index_range_B(draw));
       }
    }
 

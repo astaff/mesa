@@ -9882,7 +9882,7 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
       w[n++] = draw.b.count[0];
       w[n++] = draw.b.count[1];
       w[n++] = (uint32_t)(int32_t)draw.index_bias;
-      w[n++] = (uint32_t)(((range_B - offset_B + 3) >> 2) - 1);
+      w[n++] = (uint32_t)(((range_B - offset_B + (ib & 3) + 3) >> 2) - 1);
       w[n++] = (uint32_t)((ib >> 40) & 0xff);
    } else {
       if (!draw.b.count[0])
