@@ -548,7 +548,9 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
    assert(oq_index || !occlusion_queries);
 
-   if (occlusion_queries) {
+   /* See hk_oq_submission_done(): only the native AGX3 path needs the
+    * submission point. */
+   if (occlusion_queries && agx_native_graphics(&dev->dev)) {
       pool->oq_submit =
          vk_zalloc2(&dev->vk.alloc, pAllocator,
                     sizeof(*pool->oq_submit) * occlusion_queries, 8,
@@ -722,7 +724,7 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
       uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
       cmd->state.gfx.occlusion.index = oq_index[query];
       cmd->state.gfx.dirty |= HK_DIRTY_OCCLUSION;
-      if (end) {
+      if (end && pool->oq_submit) {
          const struct hk_oq_end oq_end = {.pool = pool, .query = query};
          util_dynarray_append(&cmd->oq_ends, oq_end);
       }
@@ -860,6 +862,11 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
  * 0 that is right shortly after. The kernel signals a submission only
  * after the maintenance of all its renders, so a CPU read of an occlusion
  * result also requires the submission that ended the query.
+ *
+ * This is the native AGX3 firmware path: A18 Pro and M4 Pro both return
+ * early zero counts. G13 and G14 read correct counts as soon as the
+ * availability word is set (0 of 51,200 reads wrong, where the A18 Pro
+ * got 31), so they keep that cheaper and earlier check alone.
  */
 static VkResult
 hk_oq_submission_done(struct hk_device *dev, struct hk_query_pool *pool,
