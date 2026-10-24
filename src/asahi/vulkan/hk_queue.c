@@ -1521,6 +1521,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
     * completed bootstrap point.  QueueWaitIdle transfers from this cursor;
     * reusing point 1 lets it return before the first submit has completed. */
    queue->drm.timeline_value = initial_value;
+   queue->drm.signalled_value = initial_value;
 
    if (dev->dev.chip == AGX_CHIP_G17P &&
        dev->vk.enabled_features.sparseBinding) {
