@@ -427,6 +427,9 @@ hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
       vk_command_buffer_set_error(&cmd->vk, result);
       return (struct agx_ptr){0};
    }
+   bo->stream_only = type == HK_CMD_BO_MAIN &&
+                     uploader == &cmd->uploader.streams;
+
    /* Pick whichever of the current upload BO and the new BO will have more
     * room left to be the BO for the next upload.  If our upload size is
     * bigger than the old offset, we're better off burning the whole new
@@ -750,6 +753,35 @@ hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd)
    }
 }
 
+/* A dedicated stream BO can reserve much more space than the stream wrote.
+ * For an unlinked stream, its current pointer and end delimit the written
+ * records plus the existing prefetch padding. Removed inline-merged streams
+ * are no longer referenced. Linked layouts retain the conservative path. */
+static bool
+hk_cmd_bo_clean_unlinked_streams(struct hk_cmd_buffer *cmd,
+                                 const struct hk_cmd_bo *bo)
+{
+   const uintptr_t base = (uintptr_t)bo->map;
+   if (bo->bo->size > UINTPTR_MAX - base)
+      return false;
+   const uintptr_t limit = base + bo->bo->size;
+
+   list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+      const uintptr_t start = (uintptr_t)cs->start;
+      if (start < base || start >= limit)
+         continue;
+      const uintptr_t current = (uintptr_t)cs->current;
+      const uintptr_t end = (uintptr_t)cs->end;
+      if (current < start || current > end || end > limit)
+         return false;
+      const size_t padding = MIN2(end - current, HK_CS_SPACE_PADDING);
+      const size_t bytes = current - start + padding;
+      if (bytes)
+         util_flush_range_no_fence((void *)start, bytes);
+   }
+   return true;
+}
+
 /* Clean everything recording wrote to CPU-cached command memory (see
  * hk_g17p_cached_cmd_memory()); hk_cmd_buffer_publish_root_uploads() and
  * queue submission fence the cleans. */
@@ -760,8 +792,13 @@ hk_cmd_buffer_publish_cached_uploads(struct hk_cmd_buffer *cmd)
    if (!hk_g17p_cached_cmd_memory(&dev->dev))
       return;
 
+   bool linked_stream = false;
+   list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node)
+      linked_stream |= cs->stream_linked;
+
    /* An uploader's current BO is written up to its offset; a BO it moved
-    * on from may have been written anywhere. */
+    * on from may have been written anywhere. Dedicated unlinked stream BOs
+    * instead have exact written extents, independent of reserved capacity. */
    const struct hk_uploader *current[] = {
       &cmd->uploader.main, &cmd->uploader.streams, &cmd->uploader.usc,
    };
@@ -769,6 +806,9 @@ hk_cmd_buffer_publish_cached_uploads(struct hk_cmd_buffer *cmd)
       struct list_head *bos =
          l == 0 ? &cmd->uploader.main.bos : &cmd->uploader.usc.bos;
       list_for_each_entry(struct hk_cmd_bo, bo, bos, link) {
+         if (bo->stream_only && !linked_stream &&
+             hk_cmd_bo_clean_unlinked_streams(cmd, bo))
+            continue;
          size_t size = bo->bo->size;
          for (unsigned u = 0; u < ARRAY_SIZE(current); ++u) {
             if (current[u]->map == bo->map)
