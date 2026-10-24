@@ -399,7 +399,24 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
    util_dynarray_clear(&cmd->oq_ends);
 
-   memset(&cmd->state, 0, sizeof(cmd->state));
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (dev->dev.params.gpu_generation == 13 ||
+       dev->dev.params.gpu_generation == 14) {
+      /* These native graphics caches are zero-initialized at allocation and
+       * never used on AGX2. Reset the common state on either side without
+       * clearing their 8.5 KiB again for every recording. */
+      const size_t first =
+         offsetof(struct hk_cmd_buffer, state.gfx.g17p_ioto) -
+         offsetof(struct hk_cmd_buffer, state);
+      const size_t end =
+         offsetof(struct hk_cmd_buffer, state.gfx.g17p_spilled_rt_descs) +
+         sizeof(cmd->state.gfx.g17p_spilled_rt_descs) -
+         offsetof(struct hk_cmd_buffer, state);
+      memset(&cmd->state, 0, first);
+      memset((char *)&cmd->state + end, 0, sizeof(cmd->state) - end);
+   } else {
+      memset(&cmd->state, 0, sizeof(cmd->state));
+   }
    for (unsigned i = 0; i < HK_G17P_BG_EOT_CACHE_ENTRIES; ++i)
       cmd->g17p_bg_eot_cache[i].valid = false;
    cmd->g17p_bg_eot_cache_next = 0;

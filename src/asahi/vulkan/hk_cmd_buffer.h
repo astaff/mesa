@@ -885,7 +885,10 @@ struct hk_graphics_state {
       bool reads_tib;
    } fast_link_fs;
 
-   /* Exact last VS/FS loader identities. These are recording-only selectors;
+   /* Keep these four native graphics caches contiguous: AGX2 resets leave
+    * their zero-initialized storage untouched.
+    *
+    * Exact last VS/FS loader identities. These are recording-only selectors;
     * the published programs and every referenced BO remain command-buffer-
     * owned. Submission never mutates or consults this cache. */
    struct hk_g17p_graphics_ioto_cache_entry g17p_ioto[2];
