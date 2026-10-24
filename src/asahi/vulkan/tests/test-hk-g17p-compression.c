@@ -223,8 +223,9 @@ check_minecraft(void)
    CHECK(ELIGIBLE(color));
    CHECK(ELIGIBLE(atlas));
    CHECK(ELIGIBLE(depth));
-   /* Blit-generated RGBA8/BGRA8 UNORM mip chains the application never
-    * renders to stay on the raw compute path; everything else compresses. */
+   /* Small blit-generated RGBA8/BGRA8 UNORM mip chains the application
+    * never renders to stay on the raw compute path; from
+    * HK_G17P_MIP_PBE_MIN_TEXELS texels, and everything else, compresses. */
    const VkImageUsageFlags texture_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
    const VkFormat compute_blit[] = {VK_FORMAT_R8G8B8A8_UNORM,
@@ -237,6 +238,14 @@ check_minecraft(void)
       t.mipLevels = 9;
       t.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
       CHECK(ELIGIBLE(t));
+
+      /* 362x362 is 131,044 texels, just below 2^17; 512x256 is 2^17. */
+      VkImageCreateInfo big = image(compute_blit[f], 362, 362, 9, texture_usage);
+      CHECK(!ELIGIBLE(big));
+      big = image(compute_blit[f], 512, 256, 10, texture_usage);
+      CHECK(ELIGIBLE(big));
+      big = image(compute_blit[f], 4096, 4096, 13, texture_usage);
+      CHECK(ELIGIBLE(big));
    }
    VkImageCreateInfo srgb = image(VK_FORMAT_R8G8B8A8_SRGB, 256, 256, 9,
                                   texture_usage);

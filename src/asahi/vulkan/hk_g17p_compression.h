@@ -4,6 +4,7 @@
  */
 #pragma once
 #include "asahi/lib/agx_chip.h"
+#include "hk_g17p_meta_copy_core.h"
 #include "vulkan/vulkan_core.h"
 #include <stdbool.h>
 #include <string.h>
@@ -182,16 +183,26 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
       return false;
 
    if (hk_g17p_compression_color_format(info->format)) {
-      /* hk_CmdBlitImage2 generates RGBA8/BGRA8 UNORM mip chains with the raw
-       * AIL compute kernels (hk_g17p_compute_blit), which cannot write
-       * compression metadata; a compressed destination falls back to one
-       * render job per level. An image the application never renders to is
-       * written only by uploads and those blits, so keep it on the compute
-       * path. Images that are also attachments stay compressed. */
+      /* An RGBA8/BGRA8 UNORM mip chain the application never renders to is
+       * written only by uploads and mip blits. A plain image takes each
+       * upload as one raw compute copy and each mip level as a raw compute
+       * dispatch (hk_g17p_compute_blit). A compressed one takes each upload
+       * as a render pass, since G17P has no compute store that writes
+       * compressed tiles, and its mips through hk_g17p_compressed_blit.
+       * For small images the render passes dominate: 200 128x128 textures
+       * uploaded and mipmapped in one command buffer took 2.6 times as
+       * long compressed. From the size where a render pass also beats
+       * compute for a mip level (HK_G17P_MIP_PBE_MIN_TEXELS), compression
+       * wins: on the A18 Pro a 2048x2048 texture uploads in 0.55-0.64 of
+       * the time, generates its mips in 0.40-0.57 and samples in
+       * 0.69-0.84. Keep only the small ones plain. Images that are also
+       * attachments are compressed at any size. */
       if ((info->format == VK_FORMAT_R8G8B8A8_UNORM ||
            info->format == VK_FORMAT_B8G8R8A8_UNORM) &&
           info->mipLevels > 1 &&
-          !(info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+          !(info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+          !hk_g17p_mip_level_through_pbe(info->extent.width,
+                                         info->extent.height))
          return false;
       return true;
    }
