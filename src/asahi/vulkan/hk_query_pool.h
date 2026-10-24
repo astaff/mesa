@@ -28,10 +28,11 @@ struct hk_query_pool {
 
    unsigned oq_queries;
 
-   /* Occlusion queries: the queue timeline point of the latest submission
-    * that ended each query, 0 if none since the last host reset. */
+   /* Occlusion queries: the queue and timeline point of the latest
+    * submission that ended each query, point 0 if none since the last host
+    * reset. */
    struct hk_oq_submit {
-      uint32_t syncobj;
+      struct hk_queue *queue;
       uint64_t point;
    } *oq_submit;
 };

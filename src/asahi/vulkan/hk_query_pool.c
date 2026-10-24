@@ -846,11 +846,24 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
 {
    util_dynarray_foreach(&cmd->oq_ends, struct hk_oq_end, e) {
       struct hk_oq_submit *s = &e->pool->oq_submit[e->query];
-      /* Readers check the point again after the syncobj: clear it first so
-       * they never pair this syncobj with the previous point. */
+      /* Readers check the point again after the queue: clear it first so
+       * they never pair this queue with the previous point. */
       p_atomic_set(&s->point, 0);
-      p_atomic_set(&s->syncobj, queue->drm.syncobj);
+      p_atomic_set(&s->queue, queue);
       p_atomic_set(&s->point, point);
+   }
+}
+
+static void
+hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+{
+   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
+   while (seen < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
+      if (prev == seen)
+         break;
+      seen = prev;
    }
 }
 
@@ -870,23 +883,26 @@ hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
  */
 static VkResult
 hk_oq_submission_done(struct hk_device *dev, struct hk_query_pool *pool,
-                      uint32_t query, bool wait, bool *done,
-                      struct hk_oq_submit *known)
+                      uint32_t query, bool wait, bool *done)
 {
    *done = true;
    if (!pool->oq_submit)
       return VK_SUCCESS;
 
-   const struct hk_oq_submit *s = &pool->oq_submit[query];
+   struct hk_oq_submit *s = &pool->oq_submit[query];
    uint64_t point;
-   uint32_t syncobj;
+   struct hk_queue *queue;
    do {
       point = p_atomic_read(&s->point);
-      syncobj = p_atomic_read(&s->syncobj);
+      queue = p_atomic_read(&s->queue);
    } while (point != p_atomic_read(&s->point));
-   /* known: the latest point this read already saw signalled. */
-   if (!point || (syncobj == known->syncobj && point <= known->point))
+   /* Timeline values only grow, so a point at or below one this queue has
+    * been seen to reach is complete: one syncobj wait per submission, not
+    * one per query read. */
+   if (!point || point <= p_atomic_read(&queue->drm.signalled_value))
       return VK_SUCCESS;
+
+   uint32_t syncobj = queue->drm.syncobj;
 
    /* Bounded waits so a lost device is noticed; a hung submission ends in
     * the kernel's own timeout. */
@@ -899,7 +915,7 @@ hk_oq_submission_done(struct hk_device *dev, struct hk_query_pool *pool,
                                        DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
                                        NULL);
       if (ret == 0) {
-         *known = (struct hk_oq_submit){.syncobj = syncobj, .point = point};
+         hk_queue_note_signalled(queue, point);
          return VK_SUCCESS;
       }
       if (ret != -ETIME)
@@ -947,7 +963,6 @@ hk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
       return VK_ERROR_DEVICE_LOST;
 
    VkResult status = VK_SUCCESS;
-   struct hk_oq_submit known = {0};
    for (uint32_t i = 0; i < queryCount; i++) {
       const uint32_t query = firstQuery + i;
 
@@ -963,8 +978,7 @@ hk_GetQueryPoolResults(VkDevice device, VkQueryPool queryPool,
 
       if (available) {
          VkResult done = hk_oq_submission_done(
-            dev, pool, query, flags & VK_QUERY_RESULT_WAIT_BIT, &available,
-            &known);
+            dev, pool, query, flags & VK_QUERY_RESULT_WAIT_BIT, &available);
          if (done != VK_SUCCESS)
             return done;
       }
