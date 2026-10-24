@@ -2119,6 +2119,13 @@ hk_sync_image_class(const struct hk_cmd_buffer *cmd)
 uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
                               const struct hk_shader *s);
 
+struct agx3_ioto_uniform_range;
+bool hk_g17p_dma_ranges(const struct hk_descriptor_state *desc,
+                        const struct hk_shader *s, uint64_t root_ptr,
+                        struct agx3_ioto_uniform_range *ranges,
+                        size_t max_ranges, size_t *count_io,
+                        uint8_t *sources);
+
 uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       struct hk_shader *s,
                                       struct hk_linked_shader *linked, bool object);
