@@ -53,7 +53,9 @@ stage_alu(enum agx_isa_encoding enc, bool fma, uint16_t dest, uint8_t slot,
       KV(9, 5), KV(10, 2), KV(25, 2), KV(26, 2), KV(43, 2),
       KV(60, 2),
    };
-   struct agx3_field_kv fields[24] = {
+   /* Seven base fields, two source hints, six FMA fields, two M5
+    * selectors and eight wait bits: the all-register M5 form needs 25. */
+   struct agx3_field_kv fields[25] = {
       KV(5, dest),
       KV(12, slot),
       KV(18, src[1]),
