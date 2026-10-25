@@ -47,9 +47,13 @@ TEST(AGX3UniformALU, PackedUniformLoadPointerBoundaries)
       b->shader->stage = MESA_SHADER_FRAGMENT;
       agx_index pointer = agx_temp(b->shader, AGX_SIZE_64);
       agx_instr *collect = agx_collect_to(b, pointer, 2);
-      collect->src[0] = agx_uniform(t.low, AGX_SIZE_32);
+      /* Include out-of-domain indices to test rejection by the optimizer.
+       * The checked production constructor correctly rejects those inputs. */
+      collect->src[0] = agx_uniform(0, AGX_SIZE_32);
+      collect->src[0].value = t.low;
       collect->src[0].neg = t.modified;
-      collect->src[1] = agx_uniform(t.high, AGX_SIZE_32);
+      collect->src[1] = agx_uniform(0, AGX_SIZE_32);
+      collect->src[1].value = t.high;
       agx_instr *load = agx_device_load_to(
          b, agx_temp(b->shader, AGX_SIZE_32), pointer, agx_immediate(0),
          AGX_FORMAT_I32, 1, 0, false);
