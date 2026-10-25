@@ -223,13 +223,40 @@ struct hk_agx3_plan_args {
    uint64_t retained_offset;
    uint32_t build_flags;
    uint32_t keep_retained;
+   /* Nonzero to encode sibling triangle leaves that share an edge as one
+    * native record (see hk_agx3_shared_edge); triangle geometry only. */
+   uint32_t pairs;
+   uint32_t padding;
 };
 
 #define HK_AGX3_PLAN_ENCODE_DISPATCH 32u /* bytes after hk_agx3_plan_state */
+/* hk_agx3_plan_node.depth flags of an internal node whose two children are
+ * triangles encoded as one record, and whether that record is opaque. */
+#define HK_AGX3_PLAN_PAIR 0x80000000u
+#define HK_AGX3_PLAN_PAIR_OPAQUE 0x40000000u
+/* Set in a leaf job's triangle offset when it names such an internal node. */
+#define HK_AGX3_LEAF_PAIR_OFFSET 1u
 #define HK_AGX3_PLAN_INDEX 1
 #define HK_AGX3_PLAN_CYCLE 2
 #define HK_AGX3_PLAN_ALLOCATION 4
 #define HK_AGX3_PLAN_SHAPE 8
 #define HK_AGX3_PLAN_EMPTY 16
+
+#ifdef VULKAN
+/* A native triangle record holds two triangles that share an edge with
+ * opposite directions, as neighbours in a consistently wound mesh do. Edge
+ * e of a triangle runs from its vertex e to vertex e + 1. Returns
+ * e_a | e_b << 2 for the first such edge pair, or ~0u when there is none. */
+uint
+hk_agx3_shared_edge(vec3 a[3], vec3 b[3])
+{
+   for (uint ea = 0; ea < 3; ++ea)
+      for (uint eb = 0; eb < 3; ++eb)
+         if (all(equal(a[ea], b[(eb + 1u) % 3u])) &&
+             all(equal(a[(ea + 1u) % 3u], b[eb])))
+            return ea | (eb << 2);
+   return ~0u;
+}
+#endif
 
 #endif /* HK_BVH_BUILD_INTERFACE_H */
