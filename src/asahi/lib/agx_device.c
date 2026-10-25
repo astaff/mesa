@@ -882,15 +882,19 @@ agx_open_device(void *memctx, struct agx_device *dev)
       drmFreeVersion(version);
    }
 
+   memset(&dev->params, 0, sizeof(dev->params));
    params_size = dev->ops.get_params(dev, &dev->params, sizeof(dev->params));
    if (params_size <= 0) {
       fprintf(stderr, "Failed to query AGX device parameters: %m\n");
       goto fail;
    }
-   if ((size_t)params_size < sizeof(dev->params)) {
+   /* Capacity limits are an optional tail; keep accepting the legacy reply. */
+   const size_t required_params_size =
+      offsetof(struct drm_asahi_params_global, memory_limit);
+   if ((size_t)params_size < required_params_size) {
       fprintf(stderr,
               "AGX parameter reply is too short (%zd, expected at least %zu)\n",
-              params_size, sizeof(dev->params));
+              params_size, required_params_size);
       goto fail;
    }
 
