@@ -15,12 +15,14 @@ struct hk_agx3_as_layout {
 };
 
 static inline bool
-hk_agx3_as_layout_init(uint32_t leaves, struct hk_agx3_as_layout *out)
+hk_agx3_as_layout_init_aligned(uint32_t leaves, uint32_t alignment,
+                               struct hk_agx3_as_layout *out)
 {
-   if (!out)
+   if (!out || (alignment != 1024 && alignment != 16384))
       return false;
    if (!leaves) {
-      *out = (struct hk_agx3_as_layout){.slot_bound = 3, .as_bytes = 192};
+      *out = (struct hk_agx3_as_layout){.slot_bound = 3,
+         .as_bytes = 192 + (alignment == 16384 ? 0 : alignment - 1)};
       return true;
    }
    const uint64_t nodes = (uint64_t)leaves + (leaves > 1 ? leaves : 2) - 1;
@@ -40,9 +42,23 @@ hk_agx3_as_layout_init(uint32_t leaves, struct hk_agx3_as_layout *out)
       .nodes = 0, .jobs = jobs, .envelope = envelope, .state = state,
       .node_status = status, .envelope_status = status + nodes * 4,
       .encode_bytes = end, .node_bound = nodes, .slot_bound = slots,
-      .as_bytes = slots * 64 + 184,
+      .as_bytes = slots * 64 + 184 + (alignment == 16384 ? 0 : alignment - 1),
    };
    return true;
+}
+/* The nonempty envelope publishes readiness at native AS byte0xa0. Empty
+ * metadata clears that word and publishes NaN bounds so parent builders
+ * discard references to empty BLAS. This is not a hardware empty-node ABI. */
+static inline bool
+hk_agx3_as_layout_init(uint32_t leaves, struct hk_agx3_as_layout *out)
+{
+   return hk_agx3_as_layout_init_aligned(leaves, 1024, out);
+}
+
+static inline bool
+hk_gen1_as_layout_init(uint32_t leaves, struct hk_agx3_as_layout *out)
+{
+   return hk_agx3_as_layout_init_aligned(leaves, 16384, out);
 }
 
 static inline void

@@ -77,8 +77,8 @@ struct hk_encode_args {
  * so the build planner can select/reorder leaves without copying vertices.
  * Each job owns disjoint root and child regions. Slots are relative to its
  * output AS, not the job or the root. The caller supplies the AS metadata.
- * This covers inner nodes and the opaque, geometry-zero 1..8 leaf form;
- * it is not a complete acceleration-structure build implementation. */
+ * This covers inner nodes, triangle leaf clusters, instance records and
+ * procedural bounding-box leaf clusters. */
 struct hk_agx3_leaf_job {
    VOID_REF intermediate_bvh;
    VOID_REF output_bvh;
@@ -98,7 +98,8 @@ struct hk_agx3_leaf_args {
    REF(uint32_t) status;
    uint32_t job_count;
    /* Slots from the traversal base to output_bvh, added to every child
-    * reference (see libagx/gen1_as.h). Zero when output_bvh is the base. */
+    * reference (see libagx/gen1_as.h). Zero when output_bvh is the base.
+    * M5 uses this ABI word for its diagnostic bounding-box record stride. */
    uint32_t slot_bias;
 };
 
@@ -110,6 +111,7 @@ struct hk_agx3_leaf_args {
 #define HK_AGX3_NODE_LEAF 0
 #define HK_AGX3_NODE_INNER 1
 #define HK_AGX3_NODE_INSTANCES 2
+/* Procedural (AABB) leaf cluster: 48-byte native bounding-box records. */
 #define HK_AGX3_NODE_AABBS 3
 
 /* Finish a single opaque triangle geometry after the node jobs. Bounds name
@@ -190,6 +192,45 @@ struct hk_agx3_plan_args {
    uint64_t retained_offset;
    uint32_t build_flags;
    uint32_t keep_retained;
+};
+
+/* Independent ASs share dispatches, not their writable records. The planner
+ * allocates a dense job map after classification; each encoder workgroup
+ * still owns precisely the same native root/child region as the scalar path. */
+struct hk_agx3_batch_job {
+#ifdef VULKAN
+   hk_agx3_plan_args plan;
+#else
+   struct hk_agx3_plan_args plan;
+#endif
+   REF(uint32_t) node_status;
+   REF(uint32_t) envelope_status;
+   uint32_t single_leaf;
+   uint32_t first_job;
+   uint32_t encode_count;
+   uint32_t reserved;
+};
+struct hk_agx3_batch_map {
+   uint32_t build;
+   uint32_t node;
+};
+struct hk_agx3_batch_dispatch {
+   uint32_t x;
+   uint32_t y;
+   uint32_t z;
+   uint32_t reserved;
+};
+#ifdef VULKAN
+TYPE(hk_agx3_batch_job, 8);
+TYPE(hk_agx3_batch_map, 4);
+TYPE(hk_agx3_batch_dispatch, 4);
+#endif
+struct hk_agx3_batch_args {
+   REF(hk_agx3_batch_job) jobs;
+   REF(hk_agx3_batch_map) map;
+   REF(hk_agx3_batch_dispatch) dispatch;
+   uint32_t job_count;
+   uint32_t phase;
 };
 
 #define HK_AGX3_PLAN_INDEX 1

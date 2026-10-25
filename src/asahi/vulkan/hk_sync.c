@@ -98,6 +98,26 @@ hk_sync_reset(struct hk_cmd_buffer *cmd)
    util_dynarray_clear(&cmd->sync_pass_records);
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(sync_tile_index, "ASAHI_SYNC_TILE_INDEX", true)
+
+#define TILE_BUCKETS 256
+#define TILE_INDEX_NONE UINT32_MAX
+
+/* Buckets only narrow candidates. The full predicate still checks image,
+ * level, layers, preservation and tile overlap after hash collisions. */
+static unsigned
+tile_bucket(const struct hk_sync_footprint *fp)
+{
+   const uintptr_t image = (uintptr_t)fp->image;
+   return ((image >> 4) ^ (image >> 12) ^ (fp->level * 0x9e3779b9u)) &
+          (TILE_BUCKETS - 1);
+}
+
+struct recent_tile_index {
+   uint16_t head[TILE_BUCKETS];
+   uint16_t next[HK_SYNC_RECENT_FOOTPRINTS];
+};
+
 /* Tile hazards: see hk_sync.h. */
 static bool
 footprints_share_tile(const struct hk_sync_footprint *a,
@@ -479,6 +499,38 @@ hk_sync_order_xfer(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    xfer_forget_upto(st, cs->sync.seq);
 }
 
+static void
+barrier_source_dependencies(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
+                            struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+{
+   hk_sync_src_dep(cmd, src_kinds, NULL, dep);
+
+   struct hk_sync_dep pending[HK_SYNC_NUM_SQ];
+   req_for_kinds(cmd, src_kinds, pending);
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
+      dep_max(&dep[sq], &pending[sq]);
+}
+
+static void note_last(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
+/* The latest HK_SYNC_GFX_MEM stream at or before a cut: a prefix wait on it
+ * covers every such stream the cut covers. */
+static struct hk_cs *
+memory_cut(struct hk_cs *cut)
+{
+   return !cut || (cut->sync.kind & HK_SYNC_GFX_MEM) ? cut
+                                                     : cut->sync.prev_mem;
+}
+
+void
+hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   if (cs->sync.kind & HK_SYNC_GFX_MEM)
+      return;
+   cs->sync.kind |= HK_SYNC_GFX_MEM;
+   note_last(cmd, cs);
+}
+
 void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
@@ -495,7 +547,27 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
       xfer_forget_upto(&cmd->sync, UINT32_MAX);
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, NULL, dep);
+   barrier_source_dependencies(cmd, src_kinds, dep);
+
+   /* M5: of the renders this dependency orders pre-rasterization work after,
+    * only those that wrote memory other than their attachments
+    * (HK_SYNC_GFX_MEM) can hand that work anything it reads without an
+    * image. Order the vertex half (HK_SYNC_GFX) after the latest of them;
+    * the fragment half and image-reading vertex work keep the whole
+    * dependency. The compute subqueue's requirement is unchanged: the kernel
+    * orders both halves after compute work either way. */
+   if ((src_kinds & HK_SYNC_GFX) && (dst_kinds & HK_SYNC_GFX) &&
+       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
+      struct hk_sync_dep vtx = dep[HK_SYNC_VDM];
+      vtx.cut = memory_cut(vtx.cut);
+      if (vtx.prior & HK_SYNC_GFX)
+         vtx.prior = (vtx.prior & ~HK_SYNC_GFX) | HK_SYNC_GFX_MEM;
+      const unsigned gfx = util_logbase2(HK_SYNC_GFX);
+      dep_max(&cmd->sync.req[gfx][HK_SYNC_VDM], &vtx);
+      dep_max(&cmd->sync.req[gfx][HK_SYNC_CDM], &dep[HK_SYNC_CDM]);
+      dst_kinds = (dst_kinds & ~HK_SYNC_GFX) | HK_SYNC_GFX_FRAG |
+                  HK_SYNC_GFX_IMG;
+   }
 
    u_foreach_bit(d, dst_kinds) {
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq)
@@ -514,7 +586,7 @@ hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    st->epoch++;
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
-   hk_sync_src_dep(cmd, src_kinds, NULL, dep);
+   barrier_source_dependencies(cmd, src_kinds, dep);
    for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
       /* Neither scope includes work before the pass instance. */
       dep[sq].prior = 0;
@@ -653,6 +725,17 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_cs *gfx = cmd->current_cs.gfx;
    const bool pre_gfx = compute && slot == &cmd->current_cs.pre_gfx && gfx &&
                         gfx != cs;
+   if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
+      cs->anatomy_api_barriers = cmd->anatomy_bar.count;
+      cs->anatomy_api_mem = cmd->anatomy_bar.mem;
+      cs->anatomy_api_buf = cmd->anatomy_bar.buf;
+      cs->anatomy_api_img = cmd->anatomy_bar.img;
+      cs->anatomy_api_src = cmd->anatomy_bar.src;
+      cs->anatomy_api_dst = cmd->anatomy_bar.dst;
+      cs->anatomy_api_src_access = cmd->anatomy_bar.src_access;
+      cs->anatomy_api_dst_access = cmd->anatomy_bar.dst_access;
+      memset(&cmd->anatomy_bar, 0, sizeof(cmd->anatomy_bar));
+   }
    const bool post_gfx = compute && slot == &cmd->current_cs.post_gfx;
    st->epoch++;
 
@@ -668,6 +751,11 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    cs->sync.kind = stream_kind(cmd, slot, compute);
+   if (cs->sync.kind != HK_SYNC_GFX || slot == &cmd->current_cs.pre_gfx ||
+       slot == &cmd->current_cs.post_gfx)
+      cs->sync.kind |= HK_SYNC_GFX_MEM;
+   cs->sync.prev_mem =
+      st->last[util_logbase2(HK_SYNC_GFX_MEM)][hk_sync_sq(cs)];
 
    /* The recorded requirement for this kind of work. A render's vertex half
     * needs only the part whose destination is not fragment-only. */
@@ -806,6 +894,53 @@ cs_reusable(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t kinds)
    return true;
 }
 
+/* Whether the compute stream cs already waits for the render r: directly,
+ * or through the compute prefix it waits on, each stream of which completes
+ * only after the renders it waits on. */
+static bool
+cdm_waits_for_render(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
+                     const struct hk_cs *r)
+{
+   const struct hk_cs *v = cs->sync.dep[HK_SYNC_VDM].cut;
+   if (v && v->sync.seq >= r->sync.seq)
+      return true;
+
+   const struct hk_cs *prefix = cs->sync.dep[HK_SYNC_CDM].cut;
+   if (!prefix || prefix == cs)
+      return false;
+
+   list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
+      if (it->type != HK_CS_CDM || it == cs ||
+          it->sync.seq > prefix->sync.seq)
+         continue;
+      v = it->sync.dep[HK_SYNC_VDM].cut;
+      if (v && v->sync.seq >= r->sync.seq)
+         return true;
+   }
+   return false;
+}
+
+/* M5: whether a requirement on the render subqueue would make the work a
+ * compute stream already holds wait for a render it does not wait for yet.
+ * A requirement recorded after that work (a barrier between two dispatches)
+ * has none of it in its second scope, so the work keeps the requirements it
+ * was recorded under and only later work takes the new one. */
+static bool
+cdm_raise_delays_work(struct hk_cmd_buffer *cmd, const struct hk_cs *cs,
+                      const struct hk_cs *r)
+{
+   return r && cs->stats.cmds &&
+          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+          !cdm_waits_for_render(cmd, cs, r);
+}
+
+bool
+hk_sync_merge_delays(struct hk_cmd_buffer *cmd, const struct hk_cs *into,
+                     const struct hk_cs *from)
+{
+   return cdm_raise_delays_work(cmd, into, from->sync.dep[HK_SYNC_VDM].cut);
+}
+
 void
 hk_sync_check_cs(struct hk_cmd_buffer *cmd)
 {
@@ -820,12 +955,30 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
       return;
    }
 
-   /* The stream absorbs the requirement of the work it now carries. */
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    req_for_kinds(cmd, kinds, dep);
+
+   /* The new work goes into a stream of its own, created under the whole
+    * requirement; a first scope that names compute work orders it after
+    * this stream through last[]. */
+   if (cdm_raise_delays_work(cmd, cs, dep[HK_SYNC_VDM].cut)) {
+      hk_cmd_buffer_end_compute(cmd);
+      return;
+   }
+
+   /* The stream absorbs the requirement of the work it now carries. */
    hk_sync_stream_wait(cs, dep);
    cs->sync.kind |= kinds;
+   if (cs->sync.kind != HK_SYNC_GFX)
+      cs->sync.kind |= HK_SYNC_GFX_MEM;
    note_last(cmd, cs);
+
+   if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
+       cmd->sync.pending_start_ts.handle && !cs->timestamp.start.handle &&
+       !cs->timestamp.end.handle) {
+      cs->timestamp.start = cmd->sync.pending_start_ts;
+      cmd->sync.pending_start_ts = (struct agx_timestamp_req){0};
+   }
 }
 
 struct hk_cs *
@@ -884,7 +1037,8 @@ hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd)
       return;
 
    const bool g17p_start =
-      agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) &&
+      (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
       cs->timestamp.start.handle;
    if (cs->timestamp.end.handle || g17p_start) {
       stamp_carrier_launch(cmd);
@@ -962,6 +1116,7 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    list_for_each_entry(struct hk_cs, it, &cmd->control_streams, node) {
       replace_pointer(&it->sync.dep[sq].cut, cs, prev);
       replace_pointer(&it->sync.dep_ta[sq].cut, cs, prev);
+      replace_pointer(&it->sync.prev_mem, cs, cs->sync.prev_mem);
    }
 
    /* A pre-graphics or continuation stream that was waiting on nothing but
@@ -1032,6 +1187,7 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
       if (it != into && it != from) {
          replace_pointer(&it->sync.dep[sq].cut, from, into);
          replace_pointer(&it->sync.dep_ta[sq].cut, from, into);
+         replace_pointer(&it->sync.prev_mem, from, into);
       }
    }
 }
@@ -1155,6 +1311,8 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    if (!src_kinds) {
       hk_sync_flush_pending_timestamp(cmd);
       st->pending_start_ts = req;
+      if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+         st->cs_check_pending = true;
       return;
    }
 
@@ -1414,7 +1572,7 @@ hk_sync_submit_needs_completed(const struct hk_queue *queue,
 
 static uint8_t
 recent_conflict(const struct hk_sync_queue *q, const struct hk_sync_footprint *fp,
-                uint64_t completed)
+                uint64_t completed, const struct recent_tile_index *index)
 {
    if (!recent_may_run(q, completed))
       return false;
@@ -1422,6 +1580,16 @@ recent_conflict(const struct hk_sync_queue *q, const struct hk_sync_footprint *f
    if (q->evicted > completed)
       return BITFIELD_MASK(HK_SYNC_NUM_SQ);
    uint8_t engines = 0;
+   if (index) {
+      for (uint16_t i = index->head[tile_bucket(fp)]; i != UINT16_MAX;
+           i = index->next[i]) {
+         const uint8_t engine = BITFIELD_BIT(q->recent[i].sq);
+         if (!(engines & engine) &&
+             footprints_share_tile(&q->recent[i].fp, fp))
+            engines |= engine;
+      }
+      return engines;
+   }
    const uint32_t n = MIN2(q->recent_count, HK_SYNC_RECENT_FOOTPRINTS);
    for (uint32_t i = 0; i < n; ++i) {
       if (q->recent[i].point > completed &&
@@ -1458,6 +1626,7 @@ struct submit_footprint {
    struct hk_sync_footprint fp;
    hk_sync_value index;
    enum hk_sync_sq sq;
+   uint32_t next_by_image;
 };
 
 /* The barrier and prior fields of one requirement on subqueue sq, with the
@@ -1508,6 +1677,30 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
          if (queue->sync.submitted[sq] > UINT64_MAX - added[sq])
             return false;
+      }
+   }
+
+   bool indexed = debug_get_option_sync_tile_index();
+   if (indexed) {
+      indexed = false;
+      for (unsigned i = 0; i < count && !indexed; ++i) {
+         indexed = util_dynarray_num_elements(
+            &cmdbufs[i]->sync_pass_records, struct hk_sync_pass_record) != 0;
+      }
+   }
+   struct recent_tile_index recent_index;
+   uint32_t submitted_head[TILE_BUCKETS];
+   if (indexed) {
+      memset(&recent_index, 0xff, sizeof(recent_index));
+      memset(submitted_head, 0xff, sizeof(submitted_head));
+      const struct hk_sync_queue *q = &queue->sync;
+      const uint32_t n = MIN2(q->recent_count, HK_SYNC_RECENT_FOOTPRINTS);
+      for (uint32_t i = 0; i < n; ++i) {
+         if (q->recent[i].point <= completed)
+            continue;
+         const unsigned bucket = tile_bucket(&q->recent[i].fp);
+         recent_index.next[i] = recent_index.head[bucket];
+         recent_index.head[bucket] = i;
       }
    }
 
@@ -1580,11 +1773,24 @@ hk_sync_resolve_submit(struct hk_queue *queue,
          if (!rec->first || !rec->last)
             continue;
          hk_sync_value v[HK_SYNC_NUM_SQ] = {HK_SYNC_NONE, HK_SYNC_NONE};
-         util_dynarray_foreach(&submitted, struct submit_footprint, e) {
-            if (e->index > v[e->sq] && footprints_share_tile(&e->fp, &rec->fp))
-               v[e->sq] = e->index;
+         if (indexed) {
+            for (uint32_t j = submitted_head[tile_bucket(&rec->fp)];
+                 j != TILE_INDEX_NONE;) {
+               const struct submit_footprint *e = util_dynarray_element(
+                  &submitted, struct submit_footprint, j);
+               if (e->index > v[e->sq] &&
+                   footprints_share_tile(&e->fp, &rec->fp))
+                  v[e->sq] = e->index;
+               j = e->next_by_image;
+            }
+         } else {
+            util_dynarray_foreach(&submitted, struct submit_footprint, e) {
+               if (e->index > v[e->sq] && footprints_share_tile(&e->fp, &rec->fp))
+                  v[e->sq] = e->index;
+            }
          }
-         const uint8_t recent = recent_conflict(&queue->sync, &rec->fp, completed);
+         const uint8_t recent = recent_conflict(
+            &queue->sync, &rec->fp, completed, indexed ? &recent_index : NULL);
          for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
             if (v[sq] == HK_SYNC_NONE && (recent & BITFIELD_BIT(sq)))
                v[sq] = 0;
@@ -1596,11 +1802,19 @@ hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_sync_pass_record, rec) {
          if (!rec->last)
             continue;
+         if (indexed && util_dynarray_num_elements(
+               &submitted, struct submit_footprint) >= TILE_INDEX_NONE)
+            indexed = false;
          const struct submit_footprint e = {
             .fp = rec->fp,
             .index = (hk_sync_value)rec->last->sync.index,
             .sq = hk_sync_sq(rec->last),
+            .next_by_image = indexed ? submitted_head[tile_bucket(&rec->fp)]
+                                     : TILE_INDEX_NONE,
          };
+         if (indexed)
+            submitted_head[tile_bucket(&rec->fp)] = util_dynarray_num_elements(
+               &submitted, struct submit_footprint);
          util_dynarray_append(&submitted, e);
       }
 

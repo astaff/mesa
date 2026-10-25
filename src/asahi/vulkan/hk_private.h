@@ -39,6 +39,15 @@
 #define HK_MAX_MULTIVIEW_VIEW_COUNT    32
 
 #define HK_SPARSE_ADDR_SPACE_SIZE (1ull << 39)
+/* M5 fills unbound sparse VA with scratch through the hypervisor's SPTM
+ * provider, which spends one page-table frame of its own heap per 32 MiB of
+ * filled VA and never returns it to the heap. Bound what one device fills.
+ * Interim capability limit: concurrent 4 x 64 GiB fills still reset the
+ * machine (at >= 7930 live table frames) while x1n1's real headroom is
+ * unknown; 16 GiB keeps one device near 1024 frames under the kernel's
+ * 2048-frame budget.
+ */
+#define HK_M5_SPARSE_ADDR_SPACE_SIZE (1ull << 34)
 #define HK_MAX_BUFFER_SIZE        (1ull << 37)
 #define HK_MAX_SHARED_SIZE        (32 * 1024)
 

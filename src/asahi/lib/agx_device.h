@@ -252,6 +252,9 @@ struct agx_device {
       struct u_cnd_monotonic idle_cond;
       thrd_t idle_thread;
       bool idle_started, idle_stop, idle_pending;
+
+      /* First cached object whose purge advice still needs checking. */
+      uint32_t next_unadvised;
    } bo_cache;
 
    struct agxdecode_ctx *agxdecode;
@@ -281,6 +284,16 @@ agx_bo_assert_range(ASSERTED struct agx_bo *bo, ASSERTED size_t offset,
    assert(offset <= bo->size && size <= bo->size - offset);
 }
 
+/* Make CPU writes to a BO range visible to the GPU. Linux DRM mappings are
+ * coherent, so this only checks the range; the M5 sparse/physical paths call
+ * it where a non-coherent winsys would need a flush. Returns 0 on success. */
+static inline int
+agx_bo_sync_for_device(struct agx_bo *bo, size_t offset, size_t size)
+{
+   agx_bo_assert_range(bo, offset, size);
+   return 0;
+}
+
 /*
  * Determine if an address is in the read-only section. See the documentation
  * for sparse_ro_offset.
@@ -295,6 +308,21 @@ agx_addr_is_ro(struct agx_device *dev, uint64_t addr)
  * Convert a read-write address to its read-only shadow address. See the
  * documentation for sparse_ro_offset.
  */
+/* Flags for filling a range with the scratch or zero page. When the kernel
+ * offers DRM_ASAHI_FEATURE_SPARSE_TILES it fills the range from its own
+ * physically contiguous tiles (zero for read-only, a per-VM sink for
+ * writable binds), so each provider operation maps up to 64 pages instead of
+ * one; the BO then only anchors the mapping.
+ */
+static inline uint32_t
+agx_fill_bind_flags(const struct agx_device *dev)
+{
+   return DRM_ASAHI_BIND_SINGLE_PAGE |
+          ((dev->params.features & DRM_ASAHI_FEATURE_SPARSE_TILES)
+              ? DRM_ASAHI_BIND_SPARSE_TILE
+              : 0);
+}
+
 static inline uint64_t
 agx_rw_addr_to_ro(struct agx_device *dev, uint64_t addr)
 {

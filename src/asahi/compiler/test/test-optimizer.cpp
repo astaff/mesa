@@ -520,12 +520,14 @@ TEST_F(Optimizer, G17PDoesNotFoldTheSelectSlotOfAnUntiedFcmpsel)
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 
-TEST_F(Optimizer, G17PPreservesWideningBeforeWidthMatchedIntegerALU)
+TEST_F(Optimizer, NativePreservesWideningBeforeWidthMatchedIntegerALU)
 {
+   for (enum agx_isa_encoding encoding :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
    agx_builder *actual = agx_test_builder(mem_ctx);
    agx_builder *expected = agx_test_builder(mem_ctx);
    struct agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.encoding = encoding;
    actual->shader->key = &key;
    expected->shader->key = &key;
 
@@ -534,6 +536,9 @@ TEST_F(Optimizer, G17PPreservesWideningBeforeWidthMatchedIntegerALU)
    agx_index out = agx_temp(actual->shader, AGX_SIZE_32);
    agx_xor_to(actual, out, widened, wy);
    agx_unit_test(actual, out);
+   agx_index right_out = agx_temp(actual->shader, AGX_SIZE_32);
+   agx_or_to(actual, right_out, wy, widened);
+   agx_unit_test(actual, right_out);
    agx_index selected = agx_temp(actual->shader, AGX_SIZE_32);
    agx_icmpsel_to(actual, selected, widened, wz, wx, wy, AGX_ICOND_ULT);
    agx_unit_test(actual, selected);
@@ -543,12 +548,16 @@ TEST_F(Optimizer, G17PPreservesWideningBeforeWidthMatchedIntegerALU)
    out = agx_temp(expected->shader, AGX_SIZE_32);
    agx_xor_to(expected, out, widened, wy);
    agx_unit_test(expected, out);
+   right_out = agx_temp(expected->shader, AGX_SIZE_32);
+   agx_or_to(expected, right_out, wy, widened);
+   agx_unit_test(expected, right_out);
    selected = agx_temp(expected->shader, AGX_SIZE_32);
    agx_icmpsel_to(expected, selected, widened, wz, wx, wy, AGX_ICOND_ULT);
    agx_unit_test(expected, selected);
 
    agx_optimize_and_dce(actual->shader);
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
 }
 
 TEST_F(Optimizer, FusedFABSNEG)
