@@ -1030,8 +1030,17 @@ TEST(NativeForms, ImageStoreUsesDataTypeAcrossChipsAndFormats)
       {nir_type_float32, PIPE_FORMAT_R32G32B32A32_FLOAT},
       {nir_type_invalid, PIPE_FORMAT_R32_UINT},
    };
+   agx3_encoded_end end;
+   ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
+   /* The store is the program's last instruction before its end. Code around
+    * it may differ by chip (G17P runs its own uniform-copy CSE, which changes
+    * register allocation), so compare only the store. Integer and float data
+    * each select one encoding whatever the format; a typeless store takes its
+    * type from the format. */
+   std::vector<uint8_t> reference[2];
    for (const auto &c : cases) {
-      std::vector<uint8_t> reference;
+      const bool is_float =
+         nir_alu_type_get_base_type(c.type) == nir_type_float;
       for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
          SCOPED_TRACE(::testing::Message() << chip << " " << c.type << " "
                                           << c.format);
@@ -1055,15 +1064,21 @@ TEST(NativeForms, ImageStoreUsesDataTypeAcrossChipsAndFormats)
          ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
          ASSERT_GT(part.info.binary_size, 0u);
          const uint8_t *code = static_cast<const uint8_t *>(part.binary);
-         std::vector<uint8_t> binary(code, code + part.info.binary_size);
-         if (reference.empty())
-            reference = binary;
+         const unsigned size = part.info.binary_size;
+         ASSERT_GE(size, AGX3_IMAGE_WRITE_LENGTH + end.length);
+         EXPECT_EQ(memcmp(code + size - end.length, end.bytes, end.length), 0);
+         const uint8_t *write =
+            code + size - end.length - AGX3_IMAGE_WRITE_LENGTH;
+         std::vector<uint8_t> encoded(write, write + AGX3_IMAGE_WRITE_LENGTH);
+         if (reference[is_float].empty())
+            reference[is_float] = encoded;
          else
-            EXPECT_EQ(binary, reference);
+            EXPECT_EQ(encoded, reference[is_float]);
          free(part.binary);
          ralloc_free(b.shader);
       }
    }
+   EXPECT_NE(reference[0], reference[1]);
 }
 
 TEST(NativeForms, VertexImageLoadRegisterLod)
