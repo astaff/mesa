@@ -1436,6 +1436,34 @@ TEST_F(Optimizer, G17POuterInputProvesCompoundSelectGuard)
    }
 }
 
+TEST_F(Optimizer, G17PSelectGuardImmediateBoundary)
+{
+   for (enum agx_size size : {AGX_SIZE_16, AGX_SIZE_32}) {
+      for (unsigned threshold : {254u, 255u}) {
+         agx_builder *b = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         b->shader->key = &key;
+         agx_index variable = agx_preload(b, agx_register(0, size));
+         agx_index predicate = agx_icmp(
+            b, variable, agx_immediate(threshold), AGX_ICOND_UGT, false);
+         agx_index out = agx_temp(b->shader, AGX_SIZE_16);
+         agx_icmpsel_to(b, out, variable, agx_immediate(threshold), predicate,
+                        agx_zero(), AGX_ICOND_UGT);
+         agx_unit_test(b, out);
+         agx_optimize_and_dce(b->shader);
+         agx_foreach_instr_global(b->shader, I) {
+            agx_foreach_src(I, s) {
+               if (I->src[s].type == AGX_INDEX_IMMEDIATE)
+                  EXPECT_LT(I->src[s].value, 0x100u);
+            }
+         }
+         for (uint32_t input = threshold - 1; input <= threshold + 2; ++input)
+            EXPECT_EQ(select_test_run(b->shader, input), input > threshold);
+      }
+   }
+}
+
 TEST_F(Optimizer, G17PCompoundInnerGuardSemantics)
 {
    const enum agx_icond conditions[] = {
