@@ -987,6 +987,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_scs_indexed_agx:
    case nir_intrinsic_load_scs_uniform_agx:
    case nir_intrinsic_load_scs_base_agx:
+   case nir_intrinsic_load_scs_register_agx:
    case nir_intrinsic_load_scratch:
    case nir_intrinsic_load_scratch_nv:
    case nir_intrinsic_load_scratch_intel:

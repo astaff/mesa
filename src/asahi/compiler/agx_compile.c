@@ -1170,7 +1170,7 @@ agx_emit_zs_word_agx3(agx_builder *b, nir_intrinsic_instr *instr,
          /* Native G17G [[stencil]] and depth+stencil exports put the
           * target mask above the S8 reference: constant 7 stages 0xff07
           * in the high half, while coverage occupies the low half. */
-         s = agx_or(b, s, agx_immediate(0xff00));
+         s = agx_or(b, s, agx_mov_imm(b, 16, 0xff00));
       }
       agx_emit_collect_to(b, word, 2, (agx_index[]){coverage, s});
    } else if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
@@ -1294,7 +1294,7 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
       agx_index sr39 = agx_temp(b->shader, AGX_SIZE_16);
       agx_get_sr_coverage_to(b, sr39, AGX_SR_INPUT_SAMPLE_MASK);
       agx_index covered = agx_and(b, sr39, agx_src_index(&instr->src[0]));
-      agx_index api = agx_and(b, sr39, agx_immediate(0xff00));
+      agx_index api = agx_and(b, sr39, agx_mov_imm(b, 16, 0xff00));
       /* agx_nir_lower_m5_zs_sample_loop clamps the depth before the loop. */
       return agx_emit_zs_word_agx3(b, instr, z, s, base & 7,
                                   agx_or(b, api, covered),
@@ -1310,7 +1310,7 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
       agx_get_sr_coverage_to(b, sr39, AGX_SR_INPUT_SAMPLE_MASK);
       agx_index covered =
          agx_and(b, sr39, agx_immediate(BITFIELD_MASK(samples)));
-      agx_index api = agx_and(b, sr39, agx_immediate(0xff00));
+      agx_index api = agx_and(b, sr39, agx_mov_imm(b, 16, 0xff00));
       return agx_emit_zs_word_agx3(b, instr, z, s, base,
                                   agx_or(b, api, covered), agx_null(), false);
    }
@@ -1340,7 +1340,7 @@ agx_emit_store_zs(agx_builder *b, nir_intrinsic_instr *instr)
             covered = agx_and(b, covered, keep);
          else if (!(mask & BITFIELD_BIT(i)))
             covered = agx_zero();
-         agx_index api = agx_and(b, sr39, agx_immediate(0xff00));
+         agx_index api = agx_and(b, sr39, agx_mov_imm(b, 16, 0xff00));
          last = agx_emit_zs_word_agx3(b, instr, z, s, base,
                                      agx_or(b, api, covered), agx_null(), false);
       }
