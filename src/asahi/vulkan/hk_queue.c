@@ -315,6 +315,18 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->ts_frag.end.handle = cs->timestamp.end.handle;
       c->ts_frag.end.offset = cs->timestamp.end.offset_B;
    }
+
+   /* Occlusion availability (hk_stamp_oq_available()). */
+   struct drm_asahi_timestamp *slots[] = {
+      &c->ts_vtx.start, &c->ts_vtx.end, &c->ts_frag.start, &c->ts_frag.end,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(slots); ++i) {
+      if (cs->oq_stamp[i].handle) {
+         assert(!slots[i]->handle);
+         slots[i]->handle = cs->oq_stamp[i].handle;
+         slots[i]->offset = cs->oq_stamp[i].offset_B;
+      }
+   }
 }
 
 static void

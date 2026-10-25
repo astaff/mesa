@@ -838,6 +838,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_sync_flush_pending_timestamp(cmd);
    hk_cmd_buffer_end_compute(cmd);
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
+   hk_resolve_deferred_oq_available(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (likely(!(dev->dev.debug & AGX_DBG_NOMERGE))) {

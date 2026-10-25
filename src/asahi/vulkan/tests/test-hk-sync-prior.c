@@ -228,6 +228,14 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+bool
+hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
 /* This fixture never records query resets. */
 void
 hk_flush_query_resets(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
