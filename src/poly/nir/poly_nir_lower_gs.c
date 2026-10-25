@@ -243,8 +243,10 @@ collect_output_types(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    unsigned component = nir_intrinsic_component(intr);
    assert(component < ARRAY_SIZE(output->component_types));
    nir_alu_type *type = &output->component_types[component];
-   assert(*type == nir_type_invalid || *type == nir_intrinsic_src_type(intr));
-   *type = nir_intrinsic_src_type(intr);
+   if (*type == nir_type_invalid)
+      *type = nir_intrinsic_src_type(intr);
+   else if (*type != nir_intrinsic_src_type(intr))
+      *type = nir_type_uint | nir_alu_type_get_type_size(*type);
    output->nr_components = MAX2(output->nr_components, component + 1);
 
    return false;
