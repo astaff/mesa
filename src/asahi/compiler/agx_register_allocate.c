@@ -469,13 +469,15 @@ static void
 ssa_bank_range(const struct ra_ctx *rctx, unsigned ssa, unsigned *floor,
                unsigned *limit)
 {
+   const bool agx3b =
+      rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
    *floor = BITSET_TEST(rctx->high_gpr, ssa) ? 16 : 0;
    *limit = ~0u;
-   if (BITSET_TEST(rctx->low_gpr, ssa))
+   if (agx3b && BITSET_TEST(rctx->low_gpr, ssa))
       *limit = MIN2(*limit, rctx->tile_gpr_limit);
    if (BITSET_TEST(rctx->texture_gpr, ssa))
       *limit = MIN2(*limit, 128);
-   if (BITSET_TEST(rctx->log2_gpr, ssa))
+   if (agx3b && BITSET_TEST(rctx->log2_gpr, ssa))
       *limit = MIN2(*limit, 192);
 }
 

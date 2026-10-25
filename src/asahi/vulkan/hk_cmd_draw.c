@@ -12771,7 +12771,8 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
        * its own restart state. */
       cs->current = (void *)agx_vdm_draw((uint32_t *)cs->current,
                                          hk_cmd_buffer_device(cmd)->dev.chip,
-                                         draw, gfx->topology);
+                                         draw, gfx->topology,
+                                         hk_draw_restart_index(cmd, draw));
    }
    hk_g17p_note_layer_zero_draw(cmd, cs);
    hk_note_pre_raster_images(cmd, cs);
