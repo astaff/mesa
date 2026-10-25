@@ -1340,10 +1340,12 @@ hk_get_device_properties(const struct agx_device *dev,
       .independentResolveNone = true,
       .independentResolve = true,
       .driverID = VK_DRIVER_ID_MESA_HONEYKRISP,
-      /* The G16G port has not completed a conformance submission. Keep the
+      /* The M4 ports have not completed a conformance submission. Keep the
        * implemented API/features available without claiming a passed CTS version.
+       * T6040 uses the G17P driver path, so check its physical identity too.
        */
-      .conformanceVersion = dev->chip == AGX_CHIP_G16G
+      .conformanceVersion = (dev->chip == AGX_CHIP_G16G ||
+                             dev->params.chip_id == 0x6040)
                                ? (VkConformanceVersion){0, 0, 0, 0}
                                : (VkConformanceVersion){1, 4, 6, 2},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
