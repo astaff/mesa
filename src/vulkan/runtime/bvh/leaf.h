@@ -290,7 +290,9 @@ main(void)
    if (subgroupElect())
       atomicAdd(DEREF(args.header).active_leaf_count, subgroupBallotBitCount(ballot));
 
-   if (is_active) {
+   /* Uniform-address atomics are issued per lane where the compiler does not
+    * combine them, so a refit, which never reads these bounds, skips them. */
+   if (is_active && !VK_TEST_BUILD_FLAG_NO_HEADER_BOUNDS) {
       atomicMin(DEREF(args.header).min_bounds[0], to_emulated_float(bounds.min.x));
       atomicMin(DEREF(args.header).min_bounds[1], to_emulated_float(bounds.min.y));
       atomicMin(DEREF(args.header).min_bounds[2], to_emulated_float(bounds.min.z));
