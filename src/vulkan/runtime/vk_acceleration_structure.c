@@ -563,10 +563,10 @@ vk_accel_struct_cmd_begin_debug_marker_formatted(VkCommandBuffer commandBuffer, 
    va_list ap;
    va_start(ap, format);
    char *name = NULL;
-   vasprintf(&name, format, ap);
+   int ret = vasprintf(&name, format, ap);
    va_end(ap);
 
-   if (!name)
+   if (ret < 0)
       return;
 
    VkDebugMarkerMarkerInfoEXT marker_info = {
