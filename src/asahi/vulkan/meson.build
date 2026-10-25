@@ -265,7 +265,7 @@ if with_tests
       files('tests/test-hk-query-program.c'),
       include_directories : [inc_include, inc_src],
       dependencies : [
-        idep_nir_headers, idep_libagx, idep_libagx_shaders_h,
+        idep_nir_headers, idep_mesautil, idep_libagx, idep_libagx_shaders_h,
       ],
       link_with : [libasahi_lib],
     ),
