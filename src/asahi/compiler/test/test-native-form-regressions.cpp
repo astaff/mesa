@@ -5069,9 +5069,10 @@ TEST(NativeForms, M5MeshCullDistancesKeepVertexAndClipDomains)
    nir_foreach_block(block, nir_shader_get_entrypoint(s)) nir_foreach_instr(in, block) {
       if (in->type != nir_instr_type_intrinsic) continue;
       nir_intrinsic_instr *i = nir_instr_as_intrinsic(in);
+      if (i->intrinsic != nir_intrinsic_store_per_vertex_output)
+         continue;
       const unsigned slot = nir_intrinsic_io_semantics(i).location;
-      if (i->intrinsic != nir_intrinsic_store_per_vertex_output ||
-          slot < VARYING_SLOT_CULL_PRIMITIVE ||
+      if (slot < VARYING_SLOT_CULL_PRIMITIVE ||
           slot > VARYING_SLOT_CULL_PRIMITIVE + 1)
          continue;
       unsigned c = 4 * (slot - VARYING_SLOT_CULL_PRIMITIVE +
