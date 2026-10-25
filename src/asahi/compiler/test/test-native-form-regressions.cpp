@@ -1014,92 +1014,72 @@ TEST(NativeForms, HalfModifiedMultiplyAndSelect)
    }
 }
 
-static std::vector<uint8_t>
-compile_image_store(agx_chip chip, nir_alu_type type, pipe_format format)
-{
-   SCOPED_TRACE(::testing::Message() << chip << " " << type << " " << format);
-   nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, &agx_nir_options, "image store data type");
-   nir_def *input = agx_test_load_preamble(&b, 4, 32, 4);
-   nir_intrinsic_instr *store = nir_image_store(
-      &b, nir_imm_intN_t(&b, 1, 16), nir_imm_ivec4(&b, 0, 0, 0, 0),
-      nir_imm_intN_t(&b, 0, 16), input, nir_imm_intN_t(&b, 0, 16));
-   nir_intrinsic_set_image_dim(store, GLSL_SAMPLER_DIM_2D);
-   nir_intrinsic_set_format(store, format);
-   nir_intrinsic_set_src_type(store, type);
-   agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-   key.dev.chip = chip;
-   key.no_preamble = true;
-   key.reserved_preamble = 16;
-   agx_preprocess_nir(b.shader);
-   agx_shader_part part = {};
-   std::vector<uint8_t> binary;
-   EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
-   if (part.binary) {
-      const uint8_t *code = static_cast<const uint8_t *>(part.binary);
-      binary.assign(code, code + part.info.binary_size);
-   }
-   EXPECT_FALSE(binary.empty());
-   free(part.binary);
-   ralloc_free(b.shader);
-   return binary;
-}
-
-/* Each chip selects the store's input conversion from the stored data type;
- * the declared format only reaches the PBE descriptor. The binaries are
- * compared within a chip: G17P schedules and allocates registers with its own
- * passes, so whole binaries differ between chips. That the chips pick the
- * same conversion is not checked here: it needs the store decoded. */
 TEST(NativeForms, ImageStoreUsesDataTypeAcrossChipsAndFormats)
 {
-   for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
-      SCOPED_TRACE(chip);
-      const auto uint4 =
-         compile_image_store(chip, nir_type_uint32, PIPE_FORMAT_NONE);
-      const auto int4 =
-         compile_image_store(chip, nir_type_int32, PIPE_FORMAT_NONE);
-      const auto float4 =
-         compile_image_store(chip, nir_type_float32, PIPE_FORMAT_NONE);
-      EXPECT_EQ(int4, uint4);
-      EXPECT_NE(float4, uint4);
-      EXPECT_EQ(compile_image_store(chip, nir_type_uint32,
-                                    PIPE_FORMAT_R32G32B32A32_UINT),
-                uint4);
-      EXPECT_EQ(compile_image_store(chip, nir_type_int32,
-                                    PIPE_FORMAT_R32G32B32A32_SINT),
-                int4);
-      EXPECT_EQ(compile_image_store(chip, nir_type_float32,
-                                    PIPE_FORMAT_R32G32B32A32_FLOAT),
-                float4);
-      EXPECT_EQ(compile_image_store(chip, nir_type_uint32,
-                                    PIPE_FORMAT_R8G8B8A8_UINT),
-                uint4);
-      EXPECT_EQ(compile_image_store(chip, nir_type_int32,
-                                    PIPE_FORMAT_R8G8B8A8_SINT),
-                int4);
-      EXPECT_EQ(compile_image_store(chip, nir_type_float32,
-                                    PIPE_FORMAT_R8G8B8A8_UNORM),
-                float4);
-
-      /* One-channel formats shrink the store, so they compare among
-       * themselves; an untyped store falls back to the format. */
-      const auto uint1 =
-         compile_image_store(chip, nir_type_uint32, PIPE_FORMAT_R32_UINT);
-      const auto float1 =
-         compile_image_store(chip, nir_type_float32, PIPE_FORMAT_R32_FLOAT);
-      EXPECT_EQ(compile_image_store(chip, nir_type_int32,
-                                    PIPE_FORMAT_R32_SINT),
-                compile_image_store(chip, nir_type_int32,
-                                    PIPE_FORMAT_R32_UINT));
-      EXPECT_NE(float1, uint1);
-      EXPECT_EQ(compile_image_store(chip, nir_type_invalid,
-                                    PIPE_FORMAT_R32_UINT),
-                uint1);
-      EXPECT_EQ(compile_image_store(chip, nir_type_invalid,
-                                    PIPE_FORMAT_R32_FLOAT),
-                float1);
+   const struct {
+      nir_alu_type type;
+      pipe_format format;
+   } cases[] = {
+      {nir_type_uint32, PIPE_FORMAT_NONE},
+      {nir_type_uint32, PIPE_FORMAT_R32_UINT},
+      {nir_type_uint32, PIPE_FORMAT_R32G32B32A32_UINT},
+      {nir_type_int32, PIPE_FORMAT_NONE},
+      {nir_type_int32, PIPE_FORMAT_R32_SINT},
+      {nir_type_int32, PIPE_FORMAT_R32G32B32A32_SINT},
+      {nir_type_float32, PIPE_FORMAT_NONE},
+      {nir_type_float32, PIPE_FORMAT_R32_FLOAT},
+      {nir_type_float32, PIPE_FORMAT_R32G32B32A32_FLOAT},
+      {nir_type_invalid, PIPE_FORMAT_R32_UINT},
+   };
+   agx3_encoded_end end;
+   ASSERT_TRUE(agx3_pack_end(AGX_ISA_ENCODING_AGX3B, &end));
+   /* The store is the program's last instruction before its end. Code around
+    * it may differ by chip (G17P runs its own uniform-copy CSE, which changes
+    * register allocation), so compare only the store. Integer and float data
+    * each select one encoding whatever the format; a typeless store takes its
+    * type from the format. */
+   std::vector<uint8_t> reference[2];
+   for (const auto &c : cases) {
+      const bool is_float =
+         nir_alu_type_get_base_type(c.type) == nir_type_float;
+      for (agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G16G}) {
+         SCOPED_TRACE(::testing::Message() << chip << " " << c.type << " "
+                                          << c.format);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "image store data type");
+         nir_def *input = agx_test_load_preamble(&b, 4, 32, 4);
+         nir_intrinsic_instr *store = nir_image_store(
+            &b, nir_imm_intN_t(&b, 1, 16),
+            nir_imm_ivec4(&b, 0, 0, 0, 0), nir_imm_intN_t(&b, 0, 16),
+            input, nir_imm_intN_t(&b, 0, 16));
+         nir_intrinsic_set_image_dim(store, GLSL_SAMPLER_DIM_2D);
+         nir_intrinsic_set_format(store, c.format);
+         nir_intrinsic_set_src_type(store, c.type);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = chip;
+         key.no_preamble = true;
+         key.reserved_preamble = 16;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+         ASSERT_GT(part.info.binary_size, 0u);
+         const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+         const unsigned size = part.info.binary_size;
+         ASSERT_GE(size, AGX3_IMAGE_WRITE_LENGTH + end.length);
+         EXPECT_EQ(memcmp(code + size - end.length, end.bytes, end.length), 0);
+         const uint8_t *write =
+            code + size - end.length - AGX3_IMAGE_WRITE_LENGTH;
+         std::vector<uint8_t> encoded(write, write + AGX3_IMAGE_WRITE_LENGTH);
+         if (reference[is_float].empty())
+            reference[is_float] = encoded;
+         else
+            EXPECT_EQ(encoded, reference[is_float]);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
    }
+   EXPECT_NE(reference[0], reference[1]);
 }
 
 TEST(NativeForms, VertexImageLoadRegisterLod)
