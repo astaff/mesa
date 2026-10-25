@@ -278,6 +278,7 @@ standard_ray_query(unsigned count, bool array, mesa_shader_stage stage)
    struct agx_shader_key key = {
       .dev = {.chip = AGX_CHIP_G17S, .encoding = AGX_ISA_ENCODING_AGX3C},
       .no_preamble = true,
+      .has_scratch = true,
    };
    struct agx_shader_part part = {0};
    bool compiled = agx_compile_shader_nir(b.shader, &key, &part);
@@ -586,6 +587,7 @@ batch_completion_latch(unsigned count)
    struct agx_shader_key key = {
       .dev = {.chip = AGX_CHIP_G17S, .encoding = AGX_ISA_ENCODING_AGX3C},
       .no_preamble = true,
+      .has_scratch = true,
    };
    struct agx_shader_part part = {0};
    assert(agx_compile_shader_nir(b.shader, &key, &part));
