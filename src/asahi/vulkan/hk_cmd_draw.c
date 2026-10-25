@@ -4586,7 +4586,7 @@ hk_upload_tess_params(struct hk_cmd_buffer *cmd, struct poly_tess_params *out,
 
 static struct hk_api_shader *
 hk_build_meta_shader_locked(struct hk_device *dev, struct hk_internal_key *key,
-                            hk_internal_builder_t builder)
+                            hk_internal_builder_t builder, VkResult *result)
 {
    /* Try to get the cached shader */
    struct hash_entry *ent = _mesa_hash_table_search(dev->kernels.ht, key);
@@ -4613,7 +4613,8 @@ hk_build_meta_shader_locked(struct hk_device *dev, struct hk_internal_key *key,
    hk_preprocess_nir_internal(dev->vk.physical, b.shader);
 
    struct hk_api_shader *s;
-   if (hk_compile_shader(dev, &info, NULL, NULL, NULL, &s) != VK_SUCCESS)
+   *result = hk_compile_shader(dev, &info, NULL, NULL, NULL, &s);
+   if (*result != VK_SUCCESS)
       return NULL;
 
    /* ..and cache it before we return. The key is on the stack right now, so
@@ -4627,10 +4628,14 @@ hk_build_meta_shader_locked(struct hk_device *dev, struct hk_internal_key *key,
    return s;
 }
 
+/* On failure returns NULL and sets *result to the compile error, which can be
+ * an out-of-memory error under memory pressure.
+ */
 struct hk_api_shader *
 hk_meta_shader(struct hk_device *dev, hk_internal_builder_t builder, void *data,
-               size_t data_size)
+               size_t data_size, VkResult *result)
 {
+   *result = VK_SUCCESS;
    size_t total_key_size = sizeof(struct hk_internal_key) + data_size;
 
    struct hk_internal_key *key = alloca(total_key_size);
@@ -4642,7 +4647,8 @@ hk_meta_shader(struct hk_device *dev, hk_internal_builder_t builder, void *data,
       memcpy(key->key, data, data_size);
 
    simple_mtx_lock(&dev->kernels.lock);
-   struct hk_api_shader *s = hk_build_meta_shader_locked(dev, key, builder);
+   struct hk_api_shader *s =
+      hk_build_meta_shader_locked(dev, key, builder, result);
    simple_mtx_unlock(&dev->kernels.lock);
 
    return s;
@@ -9420,9 +9426,11 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Binding passthrough GS for%s\n", xfb_outputs ? " XFB" : "");
 
-   gs = hk_meta_shader(dev, hk_nir_passthrough_gs_native, key, key_size);
+   VkResult result;
+   gs = hk_meta_shader(dev, hk_nir_passthrough_gs_native, key, key_size,
+                       &result);
    if (!gs) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      vk_command_buffer_set_error(&cmd->vk, result);
       return;
    }
    gs->is_passthrough = true;
