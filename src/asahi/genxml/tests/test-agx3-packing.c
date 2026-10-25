@@ -582,7 +582,7 @@ test_agx3_live_vdm_draw(void)
          memset(robust_packed, 0xcd, sizeof(robust_packed));
          robust_end = agx_vdm_draw_robust_index(
             robust_packed, chip, empty, (enum agx_primitive)9,
-            UINT32_C(0x48000), true, compact);
+            UINT32_MAX, UINT32_C(0x48000), true, compact);
          CHECK_EQ(robust_end - robust_packed, 2);
          CHECK_EQ(robust_packed[0], UINT32_C(0x8000004a));
          CHECK_EQ(robust_packed[1], UINT32_C(0x12345678));
