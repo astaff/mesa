@@ -32,7 +32,8 @@ hk_agx3_as_layout_init(uint32_t leaves, struct hk_agx3_as_layout *out)
    const uint64_t jobs = nodes * 16;
    const uint64_t envelope = jobs + nodes * 64;
    const uint64_t state = envelope + 48;
-   const uint64_t status = state + 32;
+   /* The plan state, then the node encoding dispatch arguments. */
+   const uint64_t status = state + 48;
    const uint64_t end = (status + nodes * 4 + 4 + 7) & ~UINT64_C(7);
    if (nodes > UINT32_MAX / 8 || slots > UINT32_MAX || end > UINT32_MAX)
       return false;
