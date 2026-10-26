@@ -917,6 +917,8 @@ main(void)
 
    excluded = plain;
    excluded.compressed = true;
+   excluded.extended = true;
+   excluded.acceleration_buffer = UINT64_C(0x100000a0000);
    check_gen9_layer_mode_preserved(excluded);
 
    excluded = plain;

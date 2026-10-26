@@ -511,7 +511,7 @@ check_shared(void)
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_g17p_shared_compression_eligible((enum agx_chip)chip, 0,
                                                 &base) ==
-            (chip == AGX_CHIP_G17P));
+            (chip == AGX_CHIP_G17P || agx_chip_g17_m5((enum agx_chip)chip)));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 1, &base));
    CHECK(!hk_g17p_shared_compression_eligible(AGX_CHIP_G17P, 0, NULL));
 
