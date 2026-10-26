@@ -230,6 +230,43 @@ check_shape(VkFormat format, bool is_zs)
    CHECK(!ELIGIBLE(i));
 }
 
+/* Compression is chosen for the image's whole lifetime. Its first render
+ * pass, attachment slot and neighbouring formats are unknown at allocation.
+ * Cover every admitted colour format, including the smallest ones that can
+ * spill next to wide targets, and input/transient attachment combinations.
+ */
+static void
+check_colour_msaa_spill_policy(void)
+{
+   for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
+      if (!hk_g17p_compression_color_format((VkFormat)f))
+         continue;
+
+      for (unsigned samples = 1; samples <= 4; samples *= 2) {
+         for (unsigned layers = 1; layers <= 4; layers *= 4) {
+            VkImageCreateInfo i = image((VkFormat)f, 64, 64, 1,
+               VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+            i.samples = (VkSampleCountFlagBits)samples;
+            i.arrayLayers = layers;
+            CHECK(ELIGIBLE(i));
+            for (unsigned mask = 0; mask < 4; ++mask) {
+               VkImageCreateInfo attachment = i;
+               attachment.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+               if (mask & 1)
+                  attachment.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+               if (mask & 2)
+                  attachment.usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+               CHECK(ELIGIBLE(attachment) == (samples == 1));
+               attachment.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                                  VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+               CHECK(ELIGIBLE(attachment) == (samples == 1));
+            }
+         }
+      }
+   }
+}
+
 static void
 check_layered_and_msaa(void)
 {
@@ -603,6 +640,7 @@ main(void)
    check_zls_mips();
    check_shape(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
    check_layered_and_msaa();
+   check_colour_msaa_spill_policy();
    check_minecraft();
    check_zink();
    check_shared();
