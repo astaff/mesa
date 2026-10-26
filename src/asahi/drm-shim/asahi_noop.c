@@ -128,6 +128,33 @@ static const struct drm_asahi_params_global params_g16s = {
    .gpu_hal_generation = DRM_ASAHI_GPU_HAL_200,
 };
 
+/* An explicit capability-bearing fixture tests RT exposure and eight queues.
+ * The plain g16s fixture remains a negative control for the kernel RT gate.
+ * Neither fixture is a claim that those commands executed on hardware. */
+static const struct drm_asahi_params_global params_g16s_rt = {
+   .features = DRM_ASAHI_FEATURE_SOFT_FAULTS |
+               DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
+               DRM_ASAHI_FEATURE_RENDER_RAY_QUERY |
+               DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES,
+   .gpu_generation = 16,
+   .gpu_variant = 'S',
+   .gpu_revision = 0x11,
+   .chip_id = 0x6040,
+   .num_dies = 1,
+   .num_clusters_total = 2,
+   .num_cores_per_cluster = 10,
+   .core_masks = {0x3ff, 0x3ff},
+   .vm_start = 0x4000,
+   .vm_end = (1ull << 42) - 0x8000ull,
+   .vm_kernel_min_size = 0x20000000,
+   .max_commands_per_submission = 64,
+   .max_attachments = 16,
+   .max_frequency_khz = 1500000,
+   .command_timestamp_frequency_hz = 1000000000,
+   .usc_generation = 3,
+   .gpu_hal_generation = DRM_ASAHI_GPU_HAL_200,
+};
+
 /*
  * T8140 / A18 Pro, exactly as our G17P kernel adapter reports it
  * (drivers/gpu/drm/asahi/g17_drm.rs:24-27,118-140 and file.rs:295-324): a
@@ -303,6 +330,8 @@ shim_params(void)
       return &params_g13x;
    if (chip && !strcmp(chip, "g14g"))
       return &params_g14g;
+   if (chip && !strcmp(chip, "g16s-rt"))
+      return &params_g16s_rt;
    if (chip && !strcmp(chip, "g16s"))
       return &params_g16s;
    if (chip && !strcmp(chip, "g17p"))
@@ -1264,6 +1293,18 @@ asahi_ioctl_get_param(int fd, unsigned long request, void *arg)
       return asahi_ioctl_vm_status_mirror(fd, gp);
 
    case DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS:
+      if (shim_params() == &params_g16s_rt) {
+         const struct drm_asahi_queue_limits limits = {
+            .max_queues = 8, .max_in_flight_per_queue = 2,
+         };
+         if (gp->size < sizeof(limits)) {
+            errno = EINVAL;
+            return -1;
+         }
+         memcpy((void *)(uintptr_t)gp->pointer, &limits, sizeof(limits));
+         gp->size = sizeof(limits);
+         return 0;
+      }
       if (!shim_g15s() || gp->size < sizeof(queue_limits_g15s)) {
          errno = EINVAL;
          return -1;
@@ -1872,7 +1913,8 @@ drm_shim_driver_init(void)
    const char *chip = getenv("ASAHI_SHIM_CHIP");
    const bool g13x = chip && !strcmp(chip, "g13x");
    const bool g14g = chip && !strcmp(chip, "g14g");
-   const bool g16s = chip && !strcmp(chip, "g16s");
+   const bool g16s = chip &&
+      (!strcmp(chip, "g16s") || !strcmp(chip, "g16s-rt"));
    const bool g17p = chip && !strcmp(chip, "g17p");
    const bool g15s = chip && !strcmp(chip, "g15s");
    const bool g15c = chip && !strcmp(chip, "g15c");
