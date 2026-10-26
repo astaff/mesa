@@ -98,6 +98,10 @@ static const uint32_t agx3_refit_encode_spv[] = {
 #include "bvh/hk_agx3_refit_encode.spv.h"
 };
 
+static const uint32_t agx3_refit_leaf_spv[] = {
+#include "bvh/hk_agx3_refit_leaf.spv.h"
+};
+
 static void hk_flush_buffer_write_cp(VkCommandBuffer);
 static VkResult hk_host_as_init(struct hk_device *dev);
 static void hk_as_phase_begin(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
@@ -107,6 +111,8 @@ static void hk_agx3_refit_save(VkCommandBuffer,
 static void hk_agx3_refit_phase(VkCommandBuffer,
    const struct vk_acceleration_structure_build_state *, unsigned, unsigned);
 static VkResult hk_cmd_refit_agx3(VkCommandBuffer,
+   const struct vk_acceleration_structure_build_state *, bool);
+static bool hk_agx3_refit_skips_leaves(const struct hk_device *,
    const struct vk_acceleration_structure_build_state *);
 
 /* Allow a million distinct BLASes plus a TLAS and the reserved query IDs. */
@@ -1171,14 +1177,19 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
          VK_FROM_HANDLE(vk_acceleration_structure, dst,
                         state->build_info->dstAccelerationStructure);
          if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE) {
-            /* An update keeps the topology: regenerate the leaves, then
+            /* An update keeps the topology: regenerate the leaves, or for
+             * triangles, place them where refit encoding reads them, then
              * encode every node again from the retained jobs. */
-            VkResult result = vk_cmd_build_as_leaves(commandBuffer, device, meta,
-                                                      build_args, state);
-            if (result == VK_SUCCESS) {
-               vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-               result = hk_cmd_refit_agx3(commandBuffer, state);
+            const bool skip_leaves = hk_agx3_refit_skips_leaves(dev, state);
+            VkResult result = VK_SUCCESS;
+            if (!skip_leaves) {
+               result = vk_cmd_build_as_leaves(commandBuffer, device, meta,
+                                               build_args, state);
+               if (result == VK_SUCCESS)
+                  vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
             }
+            if (result == VK_SUCCESS)
+               result = hk_cmd_refit_agx3(commandBuffer, state, skip_leaves);
             if (result != VK_SUCCESS) {
                vk_command_buffer_set_error(&cmd->vk, result);
                return;
@@ -1256,6 +1267,19 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
       hk_encode_as(commandBuffer, &states[i], layout);
 }
 
+/* A triangle update runs its own leaf pass (agx3_refit_leaf.comp) instead of
+ * generating IR leaves: not for indirect builds, whose ranges are on the
+ * device, nor with a vertex table, which is built from the IR leaves. */
+static bool
+hk_agx3_refit_skips_leaves(const struct hk_device *dev,
+                           const struct vk_acceleration_structure_build_state *state)
+{
+   return vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+          (state->config.build_flags & VK_BUILD_FLAG_ALWAYS_ACTIVE) &&
+          !(state->config.build_flags & VK_BUILD_FLAG_HAS_QUADS) &&
+          !state->indirect_addr && !hk_vertex_table_wanted(dev, state);
+}
+
 /* Levels of inner jobs an update encodes a level per dispatch; propagation
  * encodes any deeper. Each level costs a dispatch even when the tree is
  * shallower, so take about as many as the tree is likely to have: at 4K,
@@ -1318,6 +1342,7 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       .status = encode + layout.node_status,
       .levels = prepare && layout.node_bound ? encode + layout.refit_levels : 0,
       .level = level,
+      .no_leaves = prepare && hk_agx3_refit_skips_leaves(dev, state),
    };
    /* One thread per job, per instance pointer, and per retained word that
     * an update into another structure copies. */
@@ -1352,21 +1377,23 @@ hk_agx3_refit_save(VkCommandBuffer commandBuffer,
    hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_LIST_LEVELS, 0);
 }
 
-/* Update a structure whose leaves are in scratch: prepare from its retained
- * jobs, encode the leaf jobs, propagate to the inner jobs past the levels,
- * encode the inner jobs of each level, deepest first, and finish the
- * envelope. */
+/* Update a structure whose leaves are in scratch, or with `skip_leaves`, a
+ * triangle structure whose leaves are still to place: prepare from its
+ * retained jobs, place the triangles, encode the leaf jobs, propagate to
+ * the inner jobs past the levels, encode the inner jobs of each level,
+ * deepest first, and finish the envelope. */
 static VkResult
 hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
-                  const struct vk_acceleration_structure_build_state *state)
+                  const struct vk_acceleration_structure_build_state *state,
+                  bool skip_leaves)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_agx3_as_layout layout;
    if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   VkPipeline pipeline[2];
-   VkPipelineLayout pipeline_layout[2];
+   VkPipeline pipeline[3];
+   VkPipelineLayout pipeline_layout[3];
    VkResult result = get_pipeline_spv(dev, "hk-agx3-refit-encode",
       agx3_refit_encode_spv, sizeof(agx3_refit_encode_spv),
       sizeof(struct hk_agx3_refit_encode_args), &pipeline[0], &pipeline_layout[0]);
@@ -1374,6 +1401,10 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
       result = get_pipeline_spv(dev, "hk-agx3-as-envelope", agx3_envelope_spv,
          sizeof(agx3_envelope_spv), sizeof(struct hk_agx3_envelope_args),
          &pipeline[1], &pipeline_layout[1]);
+   if (result == VK_SUCCESS && skip_leaves)
+      result = get_pipeline_spv(dev, "hk-agx3-refit-leaf", agx3_refit_leaf_spv,
+         sizeof(agx3_refit_leaf_spv), sizeof(struct hk_agx3_refit_leaf_args),
+         &pipeline[2], &pipeline_layout[2]);
    if (result != VK_SUCCESS)
       return result;
 
@@ -1399,12 +1430,42 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
       0, 1, &barrier, 0, NULL, 0, NULL);
 
+   if (skip_leaves) {
+      /* A thread per primitive of each geometry, numbered as leaf generation
+       * numbers them; the triangles take the IR leaves' place. */
+      static_assert(sizeof(struct hk_agx3_refit_triangle) <= sizeof(struct vk_ir_triangle_node),
+                    "placed triangles fit where the IR leaves would be");
+      const VkAccelerationStructureBuildGeometryInfoKHR *info = state->build_info;
+      struct hk_agx3_refit_leaf_args leaf = {
+         .refit = encode + layout.state,
+         .triangles = scratch + state->scratch.ir_offset,
+         .leaf_bound = state->leaf_node_count,
+      };
+      vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[2]);
+      uint32_t first = 0;
+      for (uint32_t j = 0; j < info->geometryCount; ++j) {
+         const VkAccelerationStructureBuildRangeInfoKHR *range = &state->build_range_infos[j];
+         if (!range->primitiveCount)
+            continue;
+         leaf.geometry = vk_fill_geometry_data(info->type, first, j,
+            info->pGeometries ? &info->pGeometries[j] : info->ppGeometries[j], range);
+         leaf.primitive_count = range->primitiveCount;
+         vk_common_CmdPushConstants(commandBuffer, pipeline_layout[2],
+            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leaf), &leaf);
+         hk_cmd_dispatch_unaligned(commandBuffer, range->primitiveCount, 1, 1);
+         first += range->primitiveCount;
+      }
+      vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+   }
+
    const struct hk_agx3_refit_encode_args refit = {
       .refit = encode + layout.state, .bounds = encode + layout.jobs,
       .intermediate_bvh = scratch + state->scratch.ir_offset,
       .output_bvh = hk_as_native_va(dst), .status = encode + layout.node_status,
       .slot_bias = hk_gen1_as_slot_bias(dev, dst),
       .leaf_bound = state->leaf_node_count,
+      .triangles = skip_leaves ? scratch + state->scratch.ir_offset : 0,
    };
    vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[0]);
    vk_common_CmdPushConstants(commandBuffer, pipeline_layout[0],

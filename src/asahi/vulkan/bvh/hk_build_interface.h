@@ -60,6 +60,12 @@ TYPE(libagx_gen1_as_metadata, 8);
  * level, then the jobs of level 0, of level 1, and so on. An update encodes
  * those a level per dispatch, deepest first, with no arrivals; refit
  * propagation encodes any deeper ones.
+ *
+ * Last come the slots of the leaves of a triangle structure: for each IR
+ * leaf, the index of its child offset, or ~0 for a leaf in no leaf job. A
+ * triangle update may skip generating IR leaves: its leaf pass leaves each
+ * triangle (hk_agx3_refit_triangle) at its slot, so that each leaf job
+ * finds its children together.
  */
 struct hk_agx3_retained_state {
    uint32_t job_count;
@@ -67,7 +73,11 @@ struct hk_agx3_retained_state {
    uint32_t end_slot;
    uint32_t depth;
    uint32_t deepest_level;
-   uint32_t reserved[3];
+   /* The full build's active leaves: with updatable structures every
+    * primitive is active (VK_BUILD_FLAG_ALWAYS_ACTIVE), so an update has as
+    * many. */
+   uint32_t active_leaves;
+   uint32_t reserved[2];
 };
 
 struct hk_agx3_retained_job {
@@ -90,11 +100,17 @@ TYPE(hk_agx3_retained_job, 4);
 /* Levels of inner jobs an update encodes level by level. */
 #define HK_AGX3_REFIT_LEVELS 16u
 #define HK_AGX3_RETAINED_LEVEL_BYTES (HK_AGX3_REFIT_LEVELS * 8u)
-/* The retained jobs of a structure with `jobs` jobs and `leaves` leaves:
- * state, records, child offsets, level table and inner jobs by level. */
+/* Where the retained jobs of a structure with `jobs` jobs and `leaves`
+ * leaves keep their child offsets, level table (and the inner jobs by level
+ * after it) and leaf slots, and their size. */
+#define HK_AGX3_RETAINED_OFFSETS(jobs)                                         \
+   (HK_AGX3_RETAINED_STATE_BYTES + (jobs) * HK_AGX3_RETAINED_JOB_BYTES)
+#define HK_AGX3_RETAINED_LEVELS(jobs, leaves)                                  \
+   (HK_AGX3_RETAINED_OFFSETS(jobs) + (leaves) * 4u)
+#define HK_AGX3_RETAINED_SLOTS(jobs, leaves)                                   \
+   (HK_AGX3_RETAINED_LEVELS(jobs, leaves) + HK_AGX3_RETAINED_LEVEL_BYTES + (jobs) * 4u)
 #define HK_AGX3_RETAINED_BYTES(jobs, leaves)                                   \
-   (HK_AGX3_RETAINED_STATE_BYTES + (jobs) * (HK_AGX3_RETAINED_JOB_BYTES + 4u) + \
-    (leaves) * 4u + HK_AGX3_RETAINED_LEVEL_BYTES)
+   (HK_AGX3_RETAINED_SLOTS(jobs, leaves) + (leaves) * 4u)
 
 /* Refit phases. A full build that allows updates saves its jobs, then
  * counts its inner jobs by level and lists them. An update prepares (after
@@ -170,7 +186,8 @@ struct hk_agx3_refit_args {
    /* Prepare and propagate: the levels the update encodes by level; inner:
     * the level to encode. */
    uint32_t level;
-   uint32_t padding;
+   /* Prepare: the update generated no IR leaves, so no active leaf count. */
+   uint32_t no_leaves;
 };
 
 /* Push constants of refit encoding. */
@@ -182,6 +199,35 @@ struct hk_agx3_refit_encode_args {
    REF(uint32_t) status;
    uint32_t slot_bias;
    uint32_t leaf_bound;
+   /* Nonzero when the update's leaf pass left its triangles at their slots
+    * instead of generating IR leaves: triangle leaf jobs read their children
+    * from these hk_agx3_refit_triangles at their child offsets' indices. */
+   VOID_REF triangles;
+};
+
+/* A triangle as an update's leaf pass leaves it, at its leaf's slot: its
+ * vertices, zero for an inactive triangle as updatable structures keep it,
+ * and its geometry and primitive IDs, as an IR triangle leaf has them. */
+struct hk_agx3_refit_triangle {
+   float coords[3][3];
+   uint32_t geometry_id_and_flags;
+   uint32_t triangle_id;
+   uint32_t padding;
+};
+
+#ifdef VULKAN
+TYPE(hk_agx3_refit_triangle, 4);
+#endif
+
+/* Push constants of an update's leaf pass, one dispatch per geometry with
+ * a thread per primitive. */
+struct hk_agx3_refit_leaf_args {
+   /* The refit state, which finds the retained jobs. */
+   VOID_REF refit;
+   REF(hk_agx3_refit_triangle) triangles;
+   vk_bvh_geometry_data geometry;
+   uint32_t leaf_bound;
+   uint32_t primitive_count;
 };
 
 

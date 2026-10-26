@@ -14,7 +14,9 @@
  * Built with HK_AGX3_REFIT for updates: jobs come from the retained jobs
  * (see hk_agx3_retained_job). Each leaf job encodes as above and leaves its
  * bounds for its parent, or NaN bounds when it fails, so that its
- * ancestors fail too; agx3_refit.comp then encodes the inner jobs.
+ * ancestors fail too; agx3_refit.comp then encodes the inner jobs. After a
+ * triangle update's leaf pass (agx3_refit_leaf.comp), leaf jobs read their
+ * children at their slots instead of from IR leaves.
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -218,8 +220,9 @@ main()
       job.root_slot = record.root_slot;
       job.child_slot = record.child_slot;
       job.child_count = record.kind_count & 15u;
+      /* Triangles at their slots need no child offsets. */
       for (uint c = 0; c < 8u; ++c)
-         job.triangle_offsets[c] = c < job.child_count
+         job.triangle_offsets[c] = c < job.child_count && args.triangles == 0ul
             ? DEREF(INDEX(uint32_t, offsets, record.first + c)) : 0u;
       count = job.child_count;
 #else
@@ -271,24 +274,39 @@ main()
          }
       } else {
 #ifndef HK_AGX3_LEAF_PAIRS
-         REF(vk_ir_triangle_node)
-         src = REF(vk_ir_triangle_node)(
-            OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
-         uint geometry_flags = DEREF(src).geometry_id_and_flags;
+         vec3 tri[3];
+         uint geometry_flags;
+#ifdef HK_AGX3_REFIT
+         if (args.triangles != 0ul) {
+            REF(hk_agx3_refit_triangle) src =
+               INDEX(hk_agx3_refit_triangle, args.triangles, record.first + lane);
+            geometry_flags = DEREF(src).geometry_id_and_flags;
+            my_primitive = DEREF(src).triangle_id;
+            for (uint v = 0; v < 3; ++v)
+               for (uint a = 0; a < 3; ++a)
+                  tri[v][a] = DEREF(src).coords[v][a];
+         } else
+#endif
+         {
+            REF(vk_ir_triangle_node)
+            src = REF(vk_ir_triangle_node)(
+               OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
+            geometry_flags = DEREF(src).geometry_id_and_flags;
+            my_primitive = DEREF(src).triangle_id;
+            for (uint v = 0; v < 3; ++v)
+               for (uint a = 0; a < 3; ++a)
+                  tri[v][a] = DEREF(src).coords[v][a];
+         }
          my_geometry_id = geometry_flags & ~VK_GEOMETRY_OPAQUE;
          /* Native Gen1 extractor 0x218e084c4..0x218e087f4 accepts the
           * same triangle record for types8 and16, then compares type8
           * to set the extracted geometry's opaque field. */
          my_type = (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
-         my_primitive = DEREF(src).triangle_id;
          for (uint v = 0; v < 3; ++v) {
-            vec3 p;
-            for (uint a = 0; a < 3; ++a) {
-               p[a] = DEREF(src).coords[v][a];
-               if (!finite(p[a]))
+            for (uint a = 0; a < 3; ++a)
+               if (!finite(tri[v][a]))
                   my_bad |= HK_AGX3_LEAF_NONFINITE;
-            }
-            my_vertices[v] = p;
+            my_vertices[v] = tri[v];
          }
          my_vertices[3] = my_vertices[2];
 #else
