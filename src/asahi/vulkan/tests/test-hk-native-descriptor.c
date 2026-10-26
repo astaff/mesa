@@ -513,7 +513,7 @@ check_compressed_msaa_pbe(void)
       semantic.samples = i ? AGX_SAMPLE_COUNT_4 : AGX_SAMPLE_COUNT_2;
       assert(hk_pack_native_pbe(10, &packed, &semantic));
       assert(!memcmp(&packed, expected[i], sizeof(expected[i])));
-      assert(!hk_pack_native_pbe(9, &packed, &semantic));
+      assert(hk_pack_native_pbe(9, &packed, &semantic));
       const struct AGX_TEXTURE read = {
          AGX_TEXTURE_header,
          .dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED,
@@ -647,10 +647,165 @@ check_sparse_translation(void)
    }
 }
 
+/* Check each field independently of the packer's dimension dispatch. The
+ * colour codec and footprint remain zero for every lossless shape. */
+static void
+check_lossless_layered_packets(void)
+{
+   static const struct {
+      enum agx_texture_dimension dimension;
+      unsigned encoded_dimension;
+      unsigned layers;
+      unsigned samples;
+   } cases[] = {
+      {AGX_TEXTURE_DIMENSION_2D, 2, 1, 1},
+      {AGX_TEXTURE_DIMENSION_2D_ARRAY, 3, 1, 1},
+      {AGX_TEXTURE_DIMENSION_2D_ARRAY, 3, 12, 1},
+      {AGX_TEXTURE_DIMENSION_2D_ARRAY, 3, 65536, 1},
+      {AGX_TEXTURE_DIMENSION_3D, 5, 9, 1},
+      {AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED, 4, 1, 2},
+      {AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED, 4, 1, 4},
+      {AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED, 8, 12, 2},
+      {AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED, 8, 12, 4},
+   };
+   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+      const bool layered = cases[i].encoded_dimension == 3 ||
+                           cases[i].encoded_dimension == 5 ||
+                           cases[i].encoded_dimension == 8;
+      struct AGX_PBE p = {
+         AGX_PBE_header,
+         .dimension = cases[i].dimension,
+         .layout = AGX_LAYOUT_GPU,
+         .channels = AGX_CHANNELS_R8G8B8A8,
+         .type = AGX_TEXTURE_TYPE_UNORM,
+         .swizzle_r = AGX_CHANNEL_R,
+         .swizzle_g = AGX_CHANNEL_G,
+         .swizzle_b = AGX_CHANNEL_B,
+         .swizzle_a = AGX_CHANNEL_A,
+         .width = 16384,
+         .height = 127,
+         .buffer = UINT64_C(0x123456789ab0),
+         .acceleration_buffer = UINT64_C(0x23456789abc0),
+         .layers = cases[i].layers,
+         .samples =
+            cases[i].samples == 4 ? AGX_SAMPLE_COUNT_4 : AGX_SAMPLE_COUNT_2,
+         .compressed = true,
+         .extended = true,
+         .page_aligned_layers = true,
+      };
+      struct hk_native_pbe_descriptor packed;
+      assert(hk_pack_native_pbe(9, &packed, &p));
+      uint64_t w[4];
+      memcpy(w, packed.opaque, sizeof(w));
+      assert((w[0] & 15) == cases[i].encoded_dimension);
+      assert(((w[0] >> 4) & 3) == 2);
+      assert(((w[0] >> 24) & 0x3fff) == p.width - 1);
+      assert(((w[0] >> 38) & 0x3fff) == p.height - 1);
+      assert(((w[0] >> 56) & 3) == (cases[i].samples == 4));
+      assert((w[0] >> 59) == 1);
+      assert((w[1] & ((UINT64_C(1) << 44) - 1)) == p.buffer >> 4);
+      assert(((w[1] >> 44) & 0xffff) == p.layers - 1);
+      assert(((w[1] >> 60) & 1) == layered);
+      assert((w[1] >> 61) == 4);
+      /* GPU-tiled compression has no explicit metadata layer stride and
+       * does not combine the secondary stride and mip-range unions. */
+      assert(w[2] == p.acceleration_buffer >> 4);
+      assert(w[3] == 0);
+      assert(!hk_pack_native_pbe(10, &packed, &p));
+
+      const struct AGX_PBE original = p;
+#define REFUSE(change)                                                         \
+   do {                                                                        \
+      p = original;                                                            \
+      change;                                                                  \
+      memset(&packed, 0xff, sizeof(packed));                                   \
+      assert(!hk_pack_native_pbe(9, &packed, &p));                             \
+      assert(memcmp(&packed, &(struct hk_native_pbe_descriptor){0},            \
+                    sizeof(packed)) == 0);                                     \
+   } while (0)
+      REFUSE(p.acceleration_buffer = 0);
+      REFUSE(p.acceleration_buffer++);
+      REFUSE(p.acceleration_buffer = UINT64_C(1) << 48);
+      REFUSE(p.buffer++);
+      REFUSE(p.buffer = UINT64_C(1) << 48);
+      REFUSE(p.extended = false);
+      REFUSE(p.samples = AGX_SAMPLE_COUNT_8);
+      REFUSE(p.layout = AGX_LAYOUT_TWIDDLED);
+      if (layered) {
+         REFUSE(p.layers = 0);
+         REFUSE(p.layers = 65537);
+         REFUSE(p.levels = 2);
+      }
+#undef REFUSE
+   }
+
+   static const enum agx_texture_dimension dimensions[] = {
+      AGX_TEXTURE_DIMENSION_2D_ARRAY,
+      AGX_TEXTURE_DIMENSION_CUBE,
+      AGX_TEXTURE_DIMENSION_CUBE_ARRAY,
+      AGX_TEXTURE_DIMENSION_3D,
+      AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED,
+      AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED,
+   };
+   for (unsigned i = 0; i < sizeof(dimensions) / sizeof(dimensions[0]); ++i) {
+      const bool ms =
+         dimensions[i] == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED ||
+         dimensions[i] == AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED;
+      struct AGX_TEXTURE t = {
+         AGX_TEXTURE_header,
+         .dimension = dimensions[i],
+         .layout = AGX_LAYOUT_GPU,
+         .channels = AGX_CHANNELS_R8G8B8A8,
+         .type = AGX_TEXTURE_TYPE_UINT,
+         .width = 256,
+         .height = 128,
+         /* Cubes count cubes here; the allocation counts physical faces. */
+         .depth =
+            dimensions[i] == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED ? 1 : 2,
+         .address = UINT64_C(0x123456789ab0),
+         .acceleration_buffer = UINT64_C(0x23456789abc0),
+         .compressed = true,
+         .extended = true,
+         .page_aligned_layers = true,
+         .samples = ms ? AGX_SAMPLE_COUNT_4 : AGX_SAMPLE_COUNT_2,
+      };
+      struct hk_native_texture_descriptor packed;
+      assert(hk_pack_native_texture(9, &packed, &t));
+      struct AGX_TEXTURE_GEN9 read;
+      assert(
+         AGX_TEXTURE_GEN9_unpack(NULL, (const uint8_t *)packed.opaque, &read));
+      assert(read.dimension == t.dimension);
+      assert(read.width == t.width && read.height == t.height);
+      assert(read.depth == t.depth);
+      assert(read.samples == t.samples);
+      assert(read.compressed && read.extended);
+      assert(read.address == t.address);
+      assert(read.acceleration_buffer == t.acceleration_buffer);
+      assert(read.page_aligned_layers);
+      uint64_t w[4];
+      memcpy(w, packed.opaque, sizeof(w));
+      assert(((w[2] >> 60) & 3) == 0 && w[3] == 0);
+      if (ms) {
+         t.samples = AGX_SAMPLE_COUNT_8;
+         assert(!hk_pack_native_texture(9, &packed, &t));
+      } else {
+         t.first_level = 1;
+         t.last_level = 3;
+         t.unk_mipmapped = true;
+         assert(hk_pack_native_texture(9, &packed, &t));
+         memcpy(w, packed.opaque, sizeof(w));
+         assert(((w[2] >> 44) & 0xffff) == 0x31);
+         assert((w[2] & ((UINT64_C(1) << 44) - 1)) ==
+                t.acceleration_buffer >> 4);
+      }
+   }
+}
+
 int
 main(void)
 {
    check_sparse_translation();
+   check_lossless_layered_packets();
    check_buffer_metadata();
    check_layered_multisample_pbe();
    uint64_t atomic_sw = 0;
@@ -926,6 +1081,8 @@ main(void)
    assert(!hk_translate_native_texture_sample_count(10, 1, &samples));
 
    semantic.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+   semantic.compressed = semantic.extended = false;
+   semantic.acceleration_buffer = 0;
    static const struct {
       enum agx_sample_count samples;
       unsigned selector;

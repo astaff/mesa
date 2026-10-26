@@ -1182,7 +1182,10 @@ hk_GetPhysicalDeviceImageFormatProperties2(
             .format = pImageFormatInfo->format,
             .extent = {64, 64, 1},
             .mipLevels = 1,
-            .arrayLayers = 1,
+            .arrayLayers = agx_is_m4_pro(&pdev->dev) &&
+                                 (pImageFormatInfo->flags &
+                                  VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
+                              ? 6 : 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = pImageFormatInfo->tiling,
             .usage = (pImageFormatInfo->usage &
@@ -1313,7 +1316,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
          dev->chip, plane, info, dev->params.features,
          debug_get_option_m5_depth_msaa_compression(),
          debug_get_option_m5_depth_msaa_transfer()) ||
-      m5_storage || hk_g17p_compression_eligible(dev->chip, plane, info) ||
+      m5_storage || hk_hal200_compression_eligible(dev->chip, plane, info,
+                                                  agx_is_m4_pro(dev)) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||
       hk_m5_depth_compression_eligible(dev->chip, plane, info);

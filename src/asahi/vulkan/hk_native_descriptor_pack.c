@@ -75,6 +75,11 @@ hk_pack_native_texture(unsigned generation,
       return false;
 
    if (generation == 9) {
+      if (legacy->compressed &&
+          (!extended || !legacy->acceleration_buffer ||
+           (multisampled && legacy->samples == AGX_SAMPLE_COUNT_8)))
+         return false;
+
       if (!legacy->width || legacy->width > 16384 || !legacy->height ||
           legacy->height > 16384)
          return false;
@@ -251,6 +256,9 @@ hk_pack_native_pbe(unsigned generation,
       (legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED ||
        array_multisample);
    const bool interchange = legacy->layout == AGX_LAYOUT_INTERCHANGE;
+   const bool compressed_gen9 = legacy->compressed && generation == 9 &&
+      (legacy->layout == AGX_LAYOUT_GPU ||
+       (interchange && !layered && !multisample));
    const bool compressed_2d = legacy->compressed &&
       (generation == 9 || generation == 10) &&
       (legacy->dimension == AGX_TEXTURE_DIMENSION_2D ||
@@ -310,14 +318,16 @@ hk_pack_native_pbe(unsigned generation,
                        legacy->samples != AGX_SAMPLE_COUNT_4 &&
                        !(generation == 10 && legacy->samples == AGX_SAMPLE_COUNT_8))
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
-       (legacy->compressed && !compressed_2d && !compressed_msaa_r32_uint &&
+       (legacy->compressed && !compressed_gen9 && !compressed_2d &&
+                          !compressed_msaa_r32_uint &&
                           !compressed_msaa_rgba16 && !compressed_msaa_rgba8) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && legacy->layers != 1) ||
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
                         legacy->unk_mipmapped ||
-                        (legacy->compressed && !compressed_msaa_r32_uint &&
+                        (legacy->compressed && !compressed_gen9 &&
+                          !compressed_msaa_r32_uint &&
                           !compressed_msaa_rgba16 &&
                           !compressed_msaa_rgba8))) ||
        (legacy->extended != legacy->compressed) ||

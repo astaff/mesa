@@ -129,8 +129,8 @@ hk_g17p_compression_depth_format(VkFormat format)
  * compatibility, ail_can_compress, the AGX-wide nocompress debug flag) still
  * apply. */
 static inline bool
-hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
-                             const VkImageCreateInfo *info)
+hk_hal200_compression_eligible(enum agx_chip chip, unsigned plane,
+                               const VkImageCreateInfo *info, bool g16s)
 {
    if (chip != AGX_CHIP_G17P || !info ||
        (plane != 0 && !(plane == 1 &&
@@ -156,6 +156,11 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
 
    VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   if (g16s && info->imageType == VK_IMAGE_TYPE_2D)
+      allowed_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   if (g16s && info->imageType == VK_IMAGE_TYPE_3D)
+      allowed_flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
+                       VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
    /* Zink marks every depth attachment sample-location compatible, including
     * single-sample images. This changes sample-location tracking, not the
     * depth plane's storage class. The one-sample restriction below remains.
@@ -180,14 +185,41 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
    if (hk_g17p_compression_depth_format(info->format))
       allowed_usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
-   if (info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
-       info->arrayLayers != 1 || info->samples != VK_SAMPLE_COUNT_1_BIT ||
-       info->tiling != VK_IMAGE_TILING_OPTIMAL || info->mipLevels < 1 ||
-       (info->flags & ~allowed_flags) || (info->usage & ~allowed_usage) ||
-       info->extent.width < 16 || info->extent.height < 16)
+   const bool multisampled = info->samples != VK_SAMPLE_COUNT_1_BIT;
+   const bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
+   if (!g16s) {
+      if (info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
+          info->arrayLayers != 1 || info->samples != VK_SAMPLE_COUNT_1_BIT ||
+          info->tiling != VK_IMAGE_TILING_OPTIMAL || info->mipLevels < 1 ||
+          (info->flags & ~allowed_flags) || (info->usage & ~allowed_usage) ||
+          info->extent.width < 16 || info->extent.height < 16)
+         return false;
+   } else if ((info->imageType != VK_IMAGE_TYPE_2D && !three_d) ||
+              !info->extent.depth || !info->arrayLayers ||
+              (three_d ? (info->arrayLayers != 1 || multisampled)
+                       : info->extent.depth != 1) ||
+              (multisampled &&
+               ((info->samples != VK_SAMPLE_COUNT_2_BIT &&
+                 info->samples != VK_SAMPLE_COUNT_4_BIT) || info->mipLevels != 1)) ||
+              ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+               (multisampled || info->extent.width != info->extent.height ||
+                info->arrayLayers % 6)) ||
+              info->tiling != VK_IMAGE_TILING_OPTIMAL || info->mipLevels < 1 ||
+              (info->flags & ~allowed_flags) || (info->usage & ~allowed_usage) ||
+              info->extent.width < 16 || info->extent.height < 16) {
       return false;
+   }
 
    if (hk_g17p_compression_color_format(info->format)) {
+      if (g16s && (three_d || info->arrayLayers > 1) && info->mipLevels != 1)
+         return false;
+      /* #66: a legal MRT mix can spill any MSAA colour attachment. Keep
+       * those plain until transient backing has a measured performance case. */
+      if (g16s && multisampled &&
+          (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)))
+         return false;
+
       /* An RGBA8/BGRA8 UNORM mip chain the application never renders to is
        * written only by uploads and mip blits. A plain image takes each
        * upload as one raw compute copy and each mip level as a raw compute
@@ -212,8 +244,23 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
       return true;
    }
 
+   if (g16s) {
+      return (hk_g17p_compression_depth_format(info->format) ||
+              (info->format == VK_FORMAT_S8_UINT && !multisampled)) &&
+             !three_d && info->extent.width <= 16384 &&
+             info->extent.height <= 16384 && info->mipLevels <= 16;
+   }
    return hk_g17p_compression_depth_format(info->format) &&
           info->mipLevels == 1;
+}
+
+/* Preserve the qualified Neo policy for every pre-existing caller. T6040's
+ * extended shapes are selected by physical identity at image allocation. */
+static inline bool
+hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
+                             const VkImageCreateInfo *info)
+{
+   return hk_hal200_compression_eligible(chip, plane, info, false);
 }
 
 /* G17P and M5 colour images shared through

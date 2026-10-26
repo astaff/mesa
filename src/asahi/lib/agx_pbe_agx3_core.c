@@ -237,9 +237,11 @@ pack_layered(uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
        dimension == AGX_PBE_DIMENSION_3D);
    if ((generation != AGX_PBE_AGX3_GENERATION_9 && !m5_layered) || !fields ||
        (fields->compressed &&
-        !(generation == AGX_PBE_AGX3_GENERATION_10 &&
-          dimension == AGX_PBE_DIMENSION_2D_ARRAY && layers == 1 &&
-          level == 0 && levels == 1)) ||
+        !((generation == AGX_PBE_AGX3_GENERATION_9 &&
+           fields->layout == AGX_PBE_LAYOUT_GPU && level == 0 && levels == 1) ||
+          (generation == AGX_PBE_AGX3_GENERATION_10 &&
+           dimension == AGX_PBE_DIMENSION_2D_ARRAY && layers == 1 &&
+           level == 0 && levels == 1))) ||
        fields->layout == AGX_PBE_LAYOUT_LINEAR || layers < 1 ||
        layers > UINT16_MAX + 1u || !levels || levels > 16 ||
        level >= levels ||
@@ -327,7 +329,9 @@ agx_pbe_agx3_2d_multisample_pack(
    if ((generation != AGX_PBE_AGX3_GENERATION_9 &&
         generation != AGX_PBE_AGX3_GENERATION_10) || !fields ||
        (fields->compressed && !compressed_r32_uint && !compressed_rgba16 &&
-        !compressed_rgba8) ||
+        !compressed_rgba8 &&
+        !(generation == AGX_PBE_AGX3_GENERATION_9 &&
+          fields->layout == AGX_PBE_LAYOUT_GPU)) ||
        (samples != 2 && samples != 4 &&
         !(generation == AGX_PBE_AGX3_GENERATION_10 && samples == 8)) ||
        fields->layout == AGX_PBE_LAYOUT_LINEAR ||

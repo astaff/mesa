@@ -293,6 +293,31 @@ if with_tests
   )
 
   test(
+    'hk_g16s_compression',
+    executable(
+      'hk_g16s_compression_test',
+      files('tests/test-hk-g16s-compression.c'),
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk_g17p_zls',
+    executable(
+      'hk_g17p_zls_test',
+      files('tests/test-hk-g17p-zls.c', 'hk_drm_render_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_libagx, idep_libagx_shaders_h,
+                      idep_agx_pack],
+      link_with : [libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_g17p_metadata_grid',
     executable(
       'hk_g17p_metadata_grid_test',
