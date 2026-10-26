@@ -38,42 +38,114 @@ TYPE(hk_bvh_header, 4);
 TYPE(libagx_gen1_as_metadata, 8);
 #endif
 
-/* Retained binary topology for native refits. Only internal nodes and header
- * persist; updated leaf data is read directly from application buffers.
+/* Native refits (updates).
  *
- * After them, at HK_AGX3_RETAINED_PLAN_OFFSET, an updatable structure keeps
- * the native plan of its last full build: the plan state, then one record
- * per encoding job {IR node index, root slot, child slot}. An update keeps
- * the topology, so it restores this plan instead of planning again: refit
- * phase 5 or 6 copies it to scratch and plan phase 4 rebuilds each job from
- * its IR node with the same bounded walk as emit (no root walks or atomics).
- * The walk's leaf counts are kept in the retained internal nodes' bvh_offset
- * field, which nothing else reads after the common build. */
+ * A full build that allows updates keeps its encoding jobs after the image,
+ * at the retained offset: an hk_agx3_retained_state, one hk_agx3_retained_job
+ * per job, then the IR offsets of the children of every leaf job,
+ * concatenated. An update keeps the topology: it regenerates the IR leaves
+ * and re-encodes each leaf job from them, then each inner job as the last of
+ * its children finishes (refit encoding, agx3_leaf.comp built with
+ * HK_AGX3_REFIT). It reads neither IR internal nodes nor a plan.
+ *
+ * A child job hands its bounds to its parent at its position: the parent's
+ * first position plus the child's index. Positions number the children of
+ * all inner jobs, so they run to job_count - 2; the root's is job_count - 1.
+ */
+struct hk_agx3_retained_state {
+   uint32_t job_count;
+   uint32_t root_job;
+   uint32_t end_slot;
+   uint32_t depth;
+   uint32_t reserved[4];
+};
+
+struct hk_agx3_retained_job {
+   uint32_t root_slot;
+   uint32_t child_slot;
+   uint32_t kind_count; /* child count | node kind << 4 */
+   /* A leaf job's first child offset; an inner job's first position. */
+   uint32_t first;
+   uint32_t parent; /* 0xffffffff for the root */
+   uint32_t position;
+};
+
+#ifdef VULKAN
+TYPE(hk_agx3_retained_state, 4);
+TYPE(hk_agx3_retained_job, 4);
+#endif
+
+#define HK_AGX3_RETAINED_STATE_BYTES 32u
+#define HK_AGX3_RETAINED_JOB_BYTES 24u
+/* The retained jobs of a structure with `jobs` jobs and `leaves` leaves. */
+#define HK_AGX3_RETAINED_BYTES(jobs, leaves)                                   \
+   (HK_AGX3_RETAINED_STATE_BYTES + (jobs) * HK_AGX3_RETAINED_JOB_BYTES +       \
+    (leaves) * 4u)
+
+/* Refit phases: save the jobs of a full build that allows updates, and
+ * prepare an update (after its leaves) to encode from them. */
+#define HK_AGX3_REFIT_SAVE 0u
+#define HK_AGX3_REFIT_PREPARE 1u
+
+/* Written by the prepare phase in encode scratch, read by refit encoding. */
+struct hk_agx3_refit_state {
+   /* Refit encoding dispatch (VkDispatchIndirectCommand, workgroups of
+    * HK_AGX3_NODE_JOBS_PER_GROUP jobs). */
+   uint32_t dispatch[3];
+   uint32_t job_count;
+   /* Retained jobs this update encodes from. */
+   uint64_t retained;
+   /* Instance transforms and pointers, relative to the output structure. */
+   uint64_t instance_transforms;
+   uint64_t instance_pointers;
+};
+
+#ifdef VULKAN
+TYPE(hk_agx3_refit_state, 8);
+#endif
+
 struct hk_agx3_refit_args {
+   /* This structure's retained jobs: what the save phase writes, and where
+    * the prepare phase copies the source's when updating into another
+    * structure. */
    VOID_REF retained;
+   /* Prepare: the source's metadata, which finds its retained jobs. */
    VOID_REF metadata;
    VOID_REF intermediate_bvh;
    REF(vk_ir_header) header;
-   VOID_REF parents;
+   /* Save: the plan in encode scratch. */
+   VOID_REF plan_nodes;
+   VOID_REF plan_jobs;
+   VOID_REF plan_state;
+   /* Prepare: refit state, arrival counters, child bounds and the envelope
+    * job, all in encode scratch. */
+   VOID_REF refit;
+   VOID_REF counters;
+   VOID_REF bounds;
+   VOID_REF envelope;
+   VOID_REF output_bvh;
    uint32_t root_offset;
    uint32_t leaf_bound;
    uint32_t node_bound;
    uint32_t phase;
-   /* Phases 4..6: the plan in encode scratch. Phases 5 and 6 leave the job
-    * records in the plan-node array, which an update does not use. */
-   VOID_REF plan_nodes;
-   VOID_REF plan_jobs;
-   VOID_REF plan_state;
+   uint32_t resource_id;
+   uint32_t geometry_type;
+   /* Prepare: the source is another structure. */
+   uint32_t copy;
+   uint32_t padding;
 };
 
-#define HK_AGX3_RETAINED_JOB_WORDS 3u
-#define HK_AGX3_RETAINED_PLAN_STATE_BYTES 32u
-/* Retained-plan offset from the retained base: past the IR header and the
- * internal-node bound, 16-byte aligned. */
-#define HK_AGX3_RETAINED_PLAN_OFFSET(header_bytes, box_bytes, internal_bound) \
-   (((header_bytes) + (internal_bound) * (box_bytes) + 15u) / 16u * 16u)
-#define HK_AGX3_RETAINED_PLAN_BYTES(jobs) \
-   (HK_AGX3_RETAINED_PLAN_STATE_BYTES + (jobs) * (HK_AGX3_RETAINED_JOB_WORDS * 4u))
+/* Push constants of refit encoding. */
+struct hk_agx3_refit_encode_args {
+   VOID_REF refit;
+   VOID_REF counters;
+   VOID_REF bounds;
+   VOID_REF intermediate_bvh;
+   VOID_REF output_bvh;
+   REF(uint32_t) status;
+   uint32_t slot_bias;
+   uint32_t padding;
+};
 
 
 struct hk_encode_args {
@@ -171,7 +243,8 @@ struct hk_agx3_envelope_args {
    uint32_t build_flags;
    uint32_t node_bound;
    uint32_t keep_retained;
-   uint32_t padding;
+   /* A refit: the prepare phase cleared the instance pointers already. */
+   uint32_t refit;
 };
 
 /* Scratch records for parallel binary-to-wide planning. Phases are separate
@@ -193,7 +266,10 @@ struct hk_agx3_plan_state {
    uint32_t next_slot;
    uint32_t depth;
    uint32_t error;
-   uint32_t reserved[2];
+   /* Leaf-job child offsets and positions handed out by the refit save
+    * phase (see hk_agx3_retained_job). */
+   uint32_t saved_offsets;
+   uint32_t saved_positions;
 };
 
 #ifdef VULKAN
@@ -216,9 +292,7 @@ struct hk_agx3_plan_args {
    uint32_t phase;
    uint32_t resource_id;
    uint32_t geometry_type;
-   /* Phases 0..3 were replaced by a restored plan (an update): phase 4
-    * rebuilds the jobs from the records in nodes. */
-   uint32_t plan_restored;
+   uint32_t padding0;
    VOID_REF metadata;
    uint64_t retained_offset;
    uint32_t build_flags;

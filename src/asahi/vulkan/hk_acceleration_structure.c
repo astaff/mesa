@@ -94,12 +94,18 @@ static const uint32_t agx3_refit_spv[] = {
 #include "bvh/hk_agx3_refit.spv.h"
 };
 
+static const uint32_t agx3_refit_encode_spv[] = {
+#include "bvh/hk_agx3_refit_encode.spv.h"
+};
+
 static void hk_flush_buffer_write_cp(VkCommandBuffer);
 static VkResult hk_host_as_init(struct hk_device *dev);
 static void hk_as_phase_begin(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_agx3_refit_phase(VkCommandBuffer,
    const struct vk_acceleration_structure_build_state *, unsigned);
+static VkResult hk_cmd_refit_agx3(VkCommandBuffer,
+   const struct vk_acceleration_structure_build_state *);
 
 /* Allow a million distinct BLASes plus a TLAS and the reserved query IDs. */
 #define HK_GEN1_AS_ID_LIMIT (1u << 21)
@@ -816,16 +822,14 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
    };
-   /* A restored plan (an update) replaces phases 0..3; phase 4 then rebuilds
-    * one job per thread besides finishing the envelope. */
-   for (unsigned phase = args->plan_restored ? 4 : 0; phase < 5; ++phase) {
+   for (unsigned phase = 0; phase < 5; ++phase) {
       struct hk_agx3_plan_args push = *args;
       push.phase = phase;
       vk_common_CmdPushConstants(command_buffer, layout[plan],
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                                 &push);
       hk_cmd_dispatch_unaligned(command_buffer,
-                                phase == 4 && !args->plan_restored ? 1 : args->node_bound,
+                                phase == 4 ? 1 : args->node_bound,
                                 1, 1);
       vk_common_CmdPipelineBarrier(
          command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -945,13 +949,11 @@ hk_get_native_as_size(const struct vk_acceleration_structure_build_state *state)
    struct hk_agx3_as_layout layout;
    if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
       return 0;
-   /* Retained IR, then the retained plan with one record per possible job. */
+   /* The retained jobs, for as many jobs as there can be. */
    if (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)
       return hk_agx3_retained_offset(state) +
-             HK_AGX3_RETAINED_PLAN_OFFSET((uint64_t)sizeof(struct vk_ir_header),
-                                          (uint64_t)sizeof(struct vk_ir_box_node),
-                                          (uint64_t)(layout.node_bound - state->leaf_node_count)) +
-             HK_AGX3_RETAINED_PLAN_BYTES((uint64_t)layout.node_bound);
+             HK_AGX3_RETAINED_BYTES((uint64_t)layout.node_bound,
+                                    (uint64_t)state->leaf_node_count);
    return layout.as_bytes +
       (vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_INSTANCES_KHR
           ? (uint64_t)state->leaf_node_count * 80 : 0);
@@ -1164,37 +1166,27 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
       for (uint32_t i = 0; i < build_count; ++i) {
          const struct vk_acceleration_structure_build_state *state = &states[i];
+         VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                        state->build_info->dstAccelerationStructure);
          if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE) {
-            hk_agx3_refit_phase(commandBuffer, state, 2);
-            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+            /* An update keeps the topology: regenerate the leaves, then
+             * encode every node again from the retained jobs. */
             VkResult result = vk_cmd_build_as_leaves(commandBuffer, device, meta,
                                                       build_args, state);
+            if (result == VK_SUCCESS) {
+               vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+               result = hk_cmd_refit_agx3(commandBuffer, state);
+            }
             if (result != VK_SUCCESS) {
                vk_command_buffer_set_error(&cmd->vk, result);
                return;
             }
-            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-            hk_agx3_refit_phase(commandBuffer, state, 3);
-            /* Leaf generation reused encode scratch; restore the source's
-             * plan there so the update encodes the same nodes again, and
-             * into a separate output so it can be updated in turn. */
-            hk_agx3_refit_phase(commandBuffer, state,
-               state->build_info->srcAccelerationStructure ==
-                  state->build_info->dstAccelerationStructure ? 5 : 6);
-            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+            hk_vertex_table_build(commandBuffer, state, dst);
+            continue;
          }
-         const bool update = state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE;
          const bool allow_update =
             (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0;
-         if (allow_update &&
-             (!update ||
-              state->build_info->srcAccelerationStructure != state->build_info->dstAccelerationStructure)) {
-            hk_agx3_refit_phase(commandBuffer, state, 0);
-            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-         }
 
-         VK_FROM_HANDLE(vk_acceleration_structure, dst,
-                        state->build_info->dstAccelerationStructure);
          struct hk_agx3_as_layout native;
          if (!hk_agx3_as_layout_init(state->leaf_node_count, &native)) {
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -1216,14 +1208,11 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
             .geometry_type = vk_get_as_geometry_type(state->build_info),
             .retained_offset = hk_agx3_retained_offset(state),
             .build_flags = state->build_info->flags,
-            .keep_retained = state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE &&
-                             state->build_info->srcAccelerationStructure == state->build_info->dstAccelerationStructure,
-            .plan_restored = update,
-            /* An update keeps the build's plan, which refits one triangle
-             * per record, so only triangle structures that cannot be
-             * updated pair triangles; and not those preferring a fast
+            /* An update re-encodes the retained jobs, which refit one
+             * triangle per record, so only triangle structures that cannot
+             * be updated pair triangles; and not those preferring a fast
              * build, where finding pairs costs more than it saves. */
-            .pairs = !allow_update && !update &&
+            .pairs = !allow_update &&
                      vk_get_as_geometry_type(state->build_info) ==
                         VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
                      !(state->build_info->flags &
@@ -1240,10 +1229,11 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
             vk_command_buffer_set_error(&cmd->vk, result);
             return;
          }
-         /* Keep a full build's plan for updates (phase 6 of an update into
-          * another structure already copied it there). */
-         if (allow_update && !update)
-            hk_agx3_refit_phase(commandBuffer, state, 4);
+         /* Keep the jobs of a build that can be updated. */
+         if (allow_update) {
+            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+            hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_SAVE);
+         }
          hk_vertex_table_build(commandBuffer, state, dst);
       }
       return;
@@ -1286,37 +1276,118 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       vk_command_buffer_set_error(&cmd->vk, result);
       return;
    }
-   /* Phase 1 restores IR from the source, phases 5 and 6 the plan (both
-    * found through the source's metadata). */
-   VK_FROM_HANDLE(vk_acceleration_structure, retained_as,
-      phase == 1 ? state->build_info->srcAccelerationStructure : state->build_info->dstAccelerationStructure);
+   VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                  state->build_info->dstAccelerationStructure);
    VK_FROM_HANDLE(vk_acceleration_structure, src,
                   state->build_info->srcAccelerationStructure);
-   uint64_t scratch = state->build_info->scratchData.deviceAddress;
+   const bool prepare = phase == HK_AGX3_REFIT_PREPARE;
+   const uint64_t scratch = state->build_info->scratchData.deviceAddress;
    const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
                                      sizeof(struct vk_ir_header), UINT64_C(8));
    struct hk_agx3_refit_args args = {
-      .retained = hk_as_native_va(retained_as) + hk_agx3_retained_offset(state),
-      .metadata = phase == 1 || phase >= 5 ? hk_gen1_as_metadata_addr(cmd, src) : 0,
+      .retained = hk_as_native_va(dst) + hk_agx3_retained_offset(state),
+      /* The source may be a compacted copy: its metadata finds its jobs. */
+      .metadata = prepare ? hk_gen1_as_metadata_addr(cmd, src) : 0,
       .intermediate_bvh = scratch + state->scratch.ir_offset,
       .header = scratch + state->scratch.header_offset,
-      .parents = scratch + state->scratch.size,
+      .plan_nodes = encode + layout.nodes, .plan_jobs = encode + layout.jobs,
+      .plan_state = encode + layout.state,
+      .refit = encode + layout.state, .counters = encode + layout.nodes,
+      .bounds = encode + layout.jobs, .envelope = encode + layout.envelope,
+      .output_bvh = hk_as_native_va(dst),
       .root_offset = state->scratch.internal_node_offset - state->scratch.ir_offset,
       .leaf_bound = state->leaf_node_count,
       .node_bound = layout.node_bound, .phase = phase,
-      .plan_nodes = encode + layout.nodes, .plan_jobs = encode + layout.jobs,
-      .plan_state = encode + layout.state,
+      .resource_id = hk_gen1_as_id(dev, dst),
+      .geometry_type = vk_get_as_geometry_type(state->build_info),
+      .copy = prepare && state->build_info->srcAccelerationStructure !=
+                         state->build_info->dstAccelerationStructure,
    };
-   unsigned count = phase <= 1
-      ? MAX2(layout.node_bound, (sizeof(struct vk_ir_header) +
-               state->internal_node_count * sizeof(struct vk_ir_box_node)) / 4)
-      : phase == 2 ? state->internal_node_count
-      : phase == 3 ? state->leaf_node_count
-      : MAX2(layout.node_bound, HK_AGX3_RETAINED_PLAN_STATE_BYTES / 4);
+   /* One thread per job, per instance pointer, and per retained word that
+    * an update into another structure copies. */
+   uint64_t count = MAX2(layout.node_bound, state->leaf_node_count);
+   if (args.copy)
+      count = MAX2(count, HK_AGX3_RETAINED_BYTES((uint64_t)layout.node_bound,
+                                                 (uint64_t)state->leaf_node_count) / 4);
    vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    vk_common_CmdPushConstants(commandBuffer, pipeline_layout,
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args);
    hk_cmd_dispatch_unaligned(commandBuffer, count, 1, 1);
+}
+
+/* Update a structure whose leaves are in scratch: prepare from its retained
+ * jobs, encode them bottom-up, and finish the envelope. */
+static VkResult
+hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
+                  const struct vk_acceleration_structure_build_state *state)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_agx3_as_layout layout;
+   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   VkPipeline pipeline[2];
+   VkPipelineLayout pipeline_layout[2];
+   VkResult result = get_pipeline_spv(dev, "hk-agx3-refit-encode",
+      agx3_refit_encode_spv, sizeof(agx3_refit_encode_spv),
+      sizeof(struct hk_agx3_refit_encode_args), &pipeline[0], &pipeline_layout[0]);
+   if (result == VK_SUCCESS)
+      result = get_pipeline_spv(dev, "hk-agx3-as-envelope", agx3_envelope_spv,
+         sizeof(agx3_envelope_spv), sizeof(struct hk_agx3_envelope_args),
+         &pipeline[1], &pipeline_layout[1]);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                  state->build_info->dstAccelerationStructure);
+   const uint64_t scratch = state->build_info->scratchData.deviceAddress;
+   const uint64_t encode = ALIGN_POT(scratch + state->scratch.header_offset +
+                                     sizeof(struct vk_ir_header), UINT64_C(8));
+   const uint32_t resource_id = hk_gen1_as_id(dev, dst);
+   const uint64_t metadata = hk_gen1_as_metadata_addr_for_id(cmd, resource_id);
+   if (!metadata)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   const VkMemoryBarrier barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+      .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+      .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+   };
+
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PREPARE);
+   vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+      0, 1, &barrier, 0, NULL, 0, NULL);
+
+   const struct hk_agx3_refit_encode_args refit = {
+      .refit = encode + layout.state, .counters = encode + layout.nodes,
+      .bounds = encode + layout.jobs,
+      .intermediate_bvh = scratch + state->scratch.ir_offset,
+      .output_bvh = hk_as_native_va(dst), .status = encode + layout.node_status,
+      .slot_bias = hk_gen1_as_slot_bias(dev, dst),
+   };
+   vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[0]);
+   vk_common_CmdPushConstants(commandBuffer, pipeline_layout[0],
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(refit), &refit);
+   hk_cmd_dispatch_indirect_addr(commandBuffer, encode + layout.state);
+   vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+
+   const struct hk_agx3_envelope_args finish = {
+      .jobs = encode + layout.envelope, .status = encode + layout.envelope_status,
+      .job_count = 1, .reserved = 2, .metadata = metadata,
+      .ir_header = scratch + state->scratch.header_offset,
+      .retained_offset = hk_agx3_retained_offset(state),
+      .build_flags = state->build_info->flags, .node_bound = layout.node_bound,
+      .keep_retained = state->build_info->srcAccelerationStructure ==
+                       state->build_info->dstAccelerationStructure,
+      .refit = 1,
+   };
+   vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[1]);
+   vk_common_CmdPushConstants(commandBuffer, pipeline_layout[1],
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(finish), &finish);
+   hk_cmd_dispatch_unaligned(commandBuffer, 64, 1, 1);
+   return VK_SUCCESS;
 }
 
 static void
@@ -1337,12 +1408,9 @@ static VkDeviceSize
 hk_update_scratch_size(VkDevice device,
                        const struct vk_acceleration_structure_build_state *state)
 {
-   /* Leaf generation writes sort IDs, which alias native encode scratch.
-    * Keep live refit parent/counter state beyond both workspaces. */
-   struct hk_agx3_as_layout layout;
-   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
-      return 0;
-   return (VkDeviceSize)state->scratch.size + (uint64_t)layout.node_bound * 16;
+   /* Leaf generation, then refit state, counters and child bounds in the
+    * encode scratch, which the leaves' sort IDs alias but no longer need. */
+   return state->scratch.size;
 }
 
 static void
@@ -1350,9 +1418,21 @@ hk_init_update_scratch(VkCommandBuffer commandBuffer,
                        const struct vk_acceleration_structure_build_state *states,
                        uint32_t count)
 {
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct vk_device *device = cmd->vk.base.device;
+   /* Leaf generation counts the active leaves into a fresh header. */
+   struct vk_ir_header header = {
+      .min_bounds = {0x7fffffff, 0x7fffffff, 0x7fffffff},
+      .max_bounds = {0x80000000, 0x80000000, 0x80000000},
+      .dispatch_size_y = 1,
+      .dispatch_size_z = 1,
+   };
    for (unsigned i = 0; i < count; ++i)
       if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
-         hk_agx3_refit_phase(commandBuffer, &states[i], 1);
+         device->write_buffer_cp(commandBuffer,
+                                 states[i].build_info->scratchData.deviceAddress +
+                                    states[i].scratch.header_offset,
+                                 &header, sizeof(header));
 }
 
 static const struct vk_acceleration_structure_build_ops hk_native_as_build_ops = {

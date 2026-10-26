@@ -9,9 +9,15 @@
  * headers, lane zero for the root bounds. Inner nodes read child bounds from
  * the same common build IR. No CPU readback, cross-workgroup
  * synchronization, or global allocator.
+ *
+ * Built with HK_AGX3_REFIT for updates: jobs come from the retained jobs
+ * (see hk_agx3_retained_job). Each leaf job encodes as above and hands its
+ * bounds to its parent; the last child of an inner job to do so encodes that
+ * job's node on one lane, and so on up to the root.
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
@@ -35,7 +41,11 @@
 layout(local_size_x = 8 * JOBS) in;
 layout(push_constant) uniform CONSTS
 {
+#ifdef HK_AGX3_REFIT
+   hk_agx3_refit_encode_args args;
+#else
    hk_agx3_leaf_args args;
+#endif
 };
 
 /* Per job (slot): children at slot * 8 + child, vertices at slot * 8 *
@@ -55,6 +65,9 @@ shared uvec3 root_exponent[JOBS];
 shared vec3 qtb_base[2 * JOBS];
 shared uvec3 qtb_exponent[2 * JOBS];
 shared uint qtb_words[32 * JOBS];
+#ifdef HK_AGX3_REFIT
+shared vec3 root_lower[JOBS], root_upper[JOBS];
+#endif
 
 bool
 finite(float x)
@@ -213,7 +226,8 @@ store64(uint64_t address, uint64_t value)
 }
 
 void
-encode_instance(hk_agx3_leaf_job job, uint lane)
+encode_instance(hk_agx3_leaf_job job, uint lane, uint64_t transforms,
+                uint64_t pointers)
 {
    REF(vk_ir_instance_node) src = REF(vk_ir_instance_node)(
       OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
@@ -221,8 +235,6 @@ encode_instance(hk_agx3_leaf_job job, uint lane)
    uint64_t record_offset = uint64_t(job.child_slot + 2u * lane) * 64ul;
    uint64_t record = job.output_bvh + record_offset;
    uint index = DEREF(src).instance_id;
-   uint64_t transforms = DEREF(REF(uint64_t)(job.output_bvh + 104ul));
-   uint64_t pointers = DEREF(REF(uint64_t)(job.output_bvh + 128ul));
    uint64_t transform = transforms + uint64_t(index) * 64ul;
    mat3x4 otw = DEREF(src).otw_matrix;
    mat3x4 wto = invert_affine(otw);
@@ -253,6 +265,116 @@ encode_instance(hk_agx3_leaf_job job, uint lane)
    store64(job.output_bvh + pointers + 16ul * uint64_t(index) + 8ul, 1ul);
 }
 
+/* Root word t of a node with `count` children: its header bits, then the
+ * bounds of child t (lo, hi) quantized against the node's base and
+ * exponent. Clears `ok` when the bounds do not fit. */
+uint64_t
+root_word(uint t, uint count, uint kind, uint triangle_type0, uint child_slot,
+          vec3 base, uvec3 exponent, vec3 lo, vec3 hi, inout bool ok)
+{
+   bool leaf = kind == HK_AGX3_NODE_LEAF, instances = kind == HK_AGX3_NODE_INSTANCES;
+   bool aabbs = kind == HK_AGX3_NODE_AABBS;
+   uint capacity = max(min(count, 4u), 1u);
+   uint64_t word = uint64_t(0);
+   if (t == 0)
+      word = uint64_t((instances ? 0xe1u : 0xa0u) |
+                      (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
+   else if (t <= 3)
+      word = uint64_t(floatBitsToUint(base[t - 1u]) >> 16);
+   else if (t == 4)
+      word = uint64_t((exponent.y << 8) | exponent.z);
+   else if (t == 5)
+      word = uint64_t((child_slot + args.slot_bias) >> 16);
+   else if (t == 6)
+      word = uint64_t((child_slot + args.slot_bias) & 65535u);
+   else
+      word = instances ? uint64_t(0x1a00u | (count == 8u ? 0x3fu : count << 3))
+             : aabbs ? uint64_t(0x18c0u | (count == 8u ? 0x3fu : count << 3))
+             : leaf ? uint64_t(0x40c0u | (triangle_type0 << 8) |
+                                       (count == 8u ? 0x3fu : count << 3))
+                    : uint64_t(0x1f00u | (count == 8u ? 0u : count));
+   if (t < count) {
+      const uint shifts[6] = uint[6](57, 50, 43, 36, 29, 22);
+      if (leaf || instances || aabbs)
+         word |= uint64_t((t << 16) | (1u << 20));
+      for (uint a = 0; a < 3; ++a) {
+         float s = step(exponent[a]);
+         uint qlo = uint(clamp(floor((lo[a] - base[a]) / s), 0.0, 127.0));
+         uint qhi = uint(clamp(ceil((hi[a] - base[a]) / s), 0.0, 127.0));
+         precise float rlo = base[a] + float(qlo) * s;
+         precise float rhi = base[a] + float(qhi) * s;
+         while (rlo > lo[a] && qlo > 0u) {
+            --qlo;
+            rlo = base[a] + float(qlo) * s;
+         }
+         while (rhi < hi[a] && qhi < 127u) {
+            ++qhi;
+            rhi = base[a] + float(qhi) * s;
+         }
+         if (rlo > lo[a] || rhi < hi[a])
+            ok = false;
+         word |= uint64_t(qlo) << shifts[a];
+         word |= uint64_t(qhi) << shifts[a + 3];
+      }
+   }
+   return word;
+}
+
+#ifdef HK_AGX3_REFIT
+/* Hand `lo`..`hi` to position `position` of `parent`, then, while this was
+ * the parent's last child, encode the parent's node from its children's
+ * bounds and hand those on in turn. One lane; the arrival counter orders
+ * the bounds stores before the reads of whichever child arrives last. */
+void
+refit_parents(uint64_t records, uint parent, uint position, vec3 lo, vec3 hi)
+{
+   for (uint steps = 0; steps < 64u; ++steps) {
+      DEREF(INDEX(vk_aabb, args.bounds, position)).min = lo;
+      DEREF(INDEX(vk_aabb, args.bounds, position)).max = hi;
+      if (parent == 0xffffffffu)
+         return;
+      hk_agx3_retained_job job = DEREF(INDEX(hk_agx3_retained_job, records, parent));
+      uint count = job.kind_count & 15u;
+      uint arrived = atomicAdd(DEREF(INDEX(uint32_t, args.counters, parent)), 1u,
+         gl_ScopeDevice, gl_StorageSemanticsBuffer,
+         gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+      if (arrived + 1u != count)
+         return;
+      vec3 child_lo[8], child_hi[8];
+      lo = vec3(INFINITY);
+      hi = vec3(-INFINITY);
+      uint bad_bits = 0;
+      for (uint c = 0; c < count; ++c) {
+         child_lo[c] = DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).min;
+         child_hi[c] = DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).max;
+         lo = min(lo, child_lo[c]);
+         hi = max(hi, child_hi[c]);
+      }
+      vec3 base;
+      uvec3 exponent;
+      if (count < 1u || count > 8u || !fit_root(lo, hi, base, exponent))
+         bad_bits = HK_AGX3_LEAF_RANGE;
+      uint64_t words[8];
+      bool ok = true;
+      for (uint t = 0; t < 8u && bad_bits == 0u; ++t)
+         words[t] = root_word(t, count, HK_AGX3_NODE_INNER, 0u, job.child_slot, base,
+                              exponent, child_lo[min(t, 7u)], child_hi[min(t, 7u)], ok);
+      if (!ok)
+         bad_bits = HK_AGX3_LEAF_RANGE;
+      if (bad_bits != 0u) {
+         DEREF(INDEX(uint32_t, args.status, parent)) = bad_bits;
+         return;
+      }
+      uint64_t node = args.output_bvh + uint64_t(job.root_slot) * 64ul;
+      for (uint t = 0; t < 8u; ++t)
+         store64(node + uint64_t(t) * 8ul, words[t]);
+      DEREF(INDEX(uint32_t, args.status, parent)) = HK_AGX3_LEAF_SUCCESS;
+      position = job.position;
+      parent = job.parent;
+   }
+}
+#endif
+
 void
 main()
 {
@@ -261,6 +383,32 @@ main()
    uint first = slot * 8u, vfirst = slot * (8u * VERTICES);
    /* Every lane reaches every barrier; a job that has no node to encode, or
     * fails a check, only stops doing work. */
+#ifdef HK_AGX3_REFIT
+   hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
+   uint jobs = refit.job_count;
+   uint64_t records = refit.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+   bool live = id < jobs;
+   hk_agx3_leaf_job job;
+   hk_agx3_retained_job record;
+   uint count = 0;
+   if (live) {
+      /* Inner jobs are encoded by the last of their children. */
+      record = DEREF(INDEX(hk_agx3_retained_job, records, id));
+      job.node_kind = record.kind_count >> 4;
+      live = job.node_kind != HK_AGX3_NODE_INNER;
+   }
+   if (live) {
+      uint64_t offsets = records + uint64_t(jobs) * uint64_t(HK_AGX3_RETAINED_JOB_BYTES);
+      job.intermediate_bvh = args.intermediate_bvh;
+      job.output_bvh = args.output_bvh;
+      job.root_slot = record.root_slot;
+      job.child_slot = record.child_slot;
+      job.child_count = record.kind_count & 15u;
+      for (uint c = 0; c < 8u; ++c)
+         job.triangle_offsets[c] = c < job.child_count
+            ? DEREF(INDEX(uint32_t, offsets, record.first + c)) : 0u;
+      count = job.child_count;
+#else
    uint jobs = args.job_count;
    if (args.counts != 0ul)
       jobs = min(jobs, DEREF(REF(uint32_t)(args.counts)));
@@ -270,6 +418,7 @@ main()
    if (live) {
       job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));
       count = job.child_count;
+#endif
       if (count < 1u || count > 8 || job.node_kind > HK_AGX3_NODE_AABBS) {
          if (lane == 0)
             DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_INVALID_COUNT;
@@ -416,6 +565,10 @@ main()
          root_base[slot] = base;
          root_exponent[slot] = exponent;
       }
+#ifdef HK_AGX3_REFIT
+      root_lower[slot] = lo;
+      root_upper[slot] = hi;
+#endif
    }
    barrier();
    live = live && bad[slot] == 0;
@@ -426,51 +579,12 @@ main()
       vec3 base = root_base[slot];
       uvec3 exponent = root_exponent[slot];
       uint t = lane;
-      uint64_t word = uint64_t(0);
-      if (t == 0)
-         word = uint64_t((instances ? 0xe1u : 0xa0u) |
-                         (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
-      else if (t <= 3)
-         word = uint64_t(floatBitsToUint(base[t - 1u]) >> 16);
-      else if (t == 4)
-         word = uint64_t((exponent.y << 8) | exponent.z);
-      else if (t == 5)
-         word = uint64_t((job.child_slot + args.slot_bias) >> 16);
-      else if (t == 6)
-         word = uint64_t((job.child_slot + args.slot_bias) & 65535u);
-      else
-         word = instances ? uint64_t(0x1a00u | (count == 8u ? 0x3fu : count << 3))
-                : aabbs ? uint64_t(0x18c0u | (count == 8u ? 0x3fu : count << 3))
-                : leaf ? uint64_t(0x40c0u | (triangle_type[first] << 8) |
-                                          (count == 8u ? 0x3fu : count << 3))
-                       : uint64_t(0x1f00u | (count == 8u ? 0u : count));
-      if (t < count) {
-         uint c = first + t;
-         const uint shifts[6] = uint[6](57, 50, 43, 36, 29, 22);
-         if (leaf || instances || aabbs)
-            word |= uint64_t((t << 16) | (1u << 20));
-         for (uint a = 0; a < 3; ++a) {
-            float s = step(exponent[a]);
-            uint qlo =
-               uint(clamp(floor((lower[c][a] - base[a]) / s), 0.0, 127.0));
-            uint qhi =
-               uint(clamp(ceil((upper[c][a] - base[a]) / s), 0.0, 127.0));
-            precise float rlo = base[a] + float(qlo) * s;
-            precise float rhi = base[a] + float(qhi) * s;
-            while (rlo > lower[c][a] && qlo > 0u) {
-               --qlo;
-               rlo = base[a] + float(qlo) * s;
-            }
-            while (rhi < upper[c][a] && qhi < 127u) {
-               ++qhi;
-               rhi = base[a] + float(qhi) * s;
-            }
-            if (rlo > lower[c][a] || rhi < upper[c][a])
-               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
-            word |= uint64_t(qlo) << shifts[a];
-            word |= uint64_t(qhi) << shifts[a + 3];
-         }
-      }
+      bool ok = true;
+      uint64_t word = root_word(t, count, job.node_kind, triangle_type[first],
+                                job.child_slot, base, exponent,
+                                lower[first + min(t, 7u)], upper[first + min(t, 7u)], ok);
+      if (!ok)
+         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
       root[first + t] = word;
       if (leaf && t < count) {
          uint block = t / capacity, in_block = t % capacity;
@@ -523,8 +637,14 @@ main()
       store32(geometry + 28ul, geometry_id[c]);
       store32(geometry + 32ul, primitive[c]);
    }
+#ifdef HK_AGX3_REFIT
    if (instances && lane < count)
-      encode_instance(job, lane);
+      encode_instance(job, lane, refit.instance_transforms, refit.instance_pointers);
+#else
+   if (instances && lane < count)
+      encode_instance(job, lane, DEREF(REF(uint64_t)(job.output_bvh + 104ul)),
+                      DEREF(REF(uint64_t)(job.output_bvh + 128ul)));
+#endif
    if (leaf && lane < count) {
       uint c = first + lane, v0 = vfirst + lane * VERTICES;
       uint64_t geometry = children + uint64_t(blocks + lane) * 64ul;
@@ -555,5 +675,9 @@ main()
          store32(address + 4ul, uint(root[first + w] >> 32));
       }
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
+#ifdef HK_AGX3_REFIT
+      refit_parents(records, record.parent, record.position, root_lower[slot],
+                    root_upper[slot]);
+#endif
    }
 }

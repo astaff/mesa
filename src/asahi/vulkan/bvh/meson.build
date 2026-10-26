@@ -15,6 +15,7 @@ hk_bvh_spv = []
 foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
              ['agx3_leaf.comp', 'hk_agx3_leaf'],
              ['agx3_leaf.comp', 'hk_agx3_leaf_pairs', '-DHK_AGX3_LEAF_PAIRS=1'],
+             ['agx3_leaf.comp', 'hk_agx3_refit_encode', '-DHK_AGX3_REFIT=1'],
              ['agx3_envelope.comp', 'hk_agx3_envelope'],
              ['agx3_plan.comp', 'hk_agx3_plan'],
              ['agx3_plan.comp', 'hk_agx3_plan_pairs', '-DHK_AGX3_PLAN_PAIRS=1'],

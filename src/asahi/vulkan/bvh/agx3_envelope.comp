@@ -103,18 +103,16 @@ publish_metadata(hk_agx3_envelope_job job, uint64_t image_bytes)
    live.retained_offset = 0ul;
    live.retained_bytes = 0ul;
    if (args.keep_retained != 0u) {
-      /* In-place UPDATE did not re-save IR at the build-bound offset. */
+      /* An in-place update keeps the retained jobs where they are. */
       libagx_gen1_as_metadata previous =
          DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
       live.retained_offset = previous.retained_offset;
       live.retained_bytes = previous.retained_bytes;
    } else if ((args.build_flags & 1u) != 0u) { /* Vulkan ALLOW_UPDATE */
-      /* Retained IR, then the plan (refit phase 4) at its bound offset. */
+      /* The retained jobs (refit save, or an update's copy of them). */
       live.retained_offset = args.retained_offset;
-      live.retained_bytes = HK_AGX3_RETAINED_PLAN_OFFSET(
-         uint64_t(SIZEOF(vk_ir_header)), uint64_t(SIZEOF(vk_ir_box_node)),
-         uint64_t(args.node_bound - job.leaf_bound)) +
-         HK_AGX3_RETAINED_PLAN_BYTES(uint64_t(job.node_count));
+      live.retained_bytes =
+         uint64_t(HK_AGX3_RETAINED_BYTES(job.node_count, job.leaf_bound));
    }
    live.storage_bytes = max(image_bytes, live.retained_offset + live.retained_bytes);
    live.build_flags = args.build_flags;
@@ -147,7 +145,8 @@ clear_instance_pointers(uint job_index, uint lane)
 void
 main()
 {
-   for (uint i = gl_WorkGroupID.x; i < args.job_count; i += gl_NumWorkGroups.x)
+   for (uint i = gl_WorkGroupID.x; i < args.job_count && args.refit == 0u;
+        i += gl_NumWorkGroups.x)
       clear_instance_pointers(i, gl_LocalInvocationID.x);
    uint id = gl_GlobalInvocationID.x;
    if (id >= args.job_count)
