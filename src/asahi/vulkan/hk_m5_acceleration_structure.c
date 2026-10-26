@@ -39,6 +39,7 @@
 #include "vk_meta.h"
 
 #include "bvh/hk_build_interface.h"
+#include "hk_agx3_as_format.h"
 
 #include "util/u_math.h"
 
@@ -79,6 +80,20 @@ static const uint32_t agx3_batch_envelope_spv[] = {
 static const uint32_t agx3_refit_spv[] = {
 #include "bvh/hk_agx3_refit.spv.h"
 };
+
+const uint32_t *
+hk_m5_agx3_node_encoder_spirv(bool batch, size_t *size_B)
+{
+   *size_B = batch ? sizeof(agx3_batch_node_spv) : sizeof(agx3_node_spv);
+   return batch ? agx3_batch_node_spv : agx3_node_spv;
+}
+
+const uint32_t *
+hk_m5_agx3_refit_spirv(size_t *size_B)
+{
+   *size_B = sizeof(agx3_refit_spv);
+   return agx3_refit_spv;
+}
 
 static void hk_flush_buffer_write_cp(VkCommandBuffer);
 static void hk_agx3_refit_phase(VkCommandBuffer,
@@ -316,12 +331,25 @@ static_assert(sizeof(struct hk_bvh_aabb_node) == 32, "node format");
 static_assert(sizeof(struct hk_bvh_instance_node) == 120, "node format");
 static_assert(sizeof(struct hk_bvh_box_node) == 56, "node format");
 static_assert(sizeof(struct hk_agx3_leaf_job) == 64, "native node job ABI");
-static_assert(sizeof(struct hk_agx3_leaf_args) == 24, "native node push ABI");
+/* hk_build_interface.h is shared with the GEN1 encoders, whose leaf and plan
+ * arguments end in fields (counts; pairs) that M5 leaves zero and its
+ * encoders never read. */
+static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
 static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 static_assert(sizeof(struct hk_agx3_plan_node) == 16, "native planner node ABI");
 static_assert(sizeof(struct hk_agx3_plan_state) == 32, "native planner state ABI");
-static_assert(sizeof(struct hk_agx3_plan_args) == 112, "native planner push ABI");
+static_assert(sizeof(struct hk_agx3_plan_args) == 120, "native planner push ABI");
+/* The M5 layout: the plan state alone after its scratch offset, 48-byte
+ * bounding-box records within the 64-byte child slots, 1 KiB images, and one
+ * node per 8-lane encoding workgroup (bvh/agx3_leaf.comp). */
+static_assert(HK_AGX3_M5_PLAN_TAIL_B == sizeof(struct hk_agx3_plan_state),
+              "M5 scratch: no node-encoding dispatch arguments");
+static_assert(HK_AGX3_M5_AABB_RECORD_B == 48 &&
+              HK_AGX3_M5_AABB_RECORD_B < HK_AGX3_AS_SLOT_B,
+              "M5 bounding-box records pack below the slot size");
+static_assert(HK_AGX3_M5_IMAGE_ALIGN == 1024, "M5 image alignment");
+static_assert(HK_AGX3_M5_NODE_GROUP_LANES == 8, "M5 encoder workgroup");
 static_assert(sizeof(struct hk_bvh_box_node) == HK_BVH_NODE_PREFETCH_SIZE,
               "the traversal prefetches a whole box node before it knows the "
               "node type, so no node may be larger than one");
@@ -488,7 +516,7 @@ hk_cmd_build_agx3_from_ir_mode(VkCommandBuffer command_buffer,
 
    const struct hk_agx3_leaf_args encode = {
       .jobs = args->jobs, .status = node_status, .job_count = args->node_bound,
-      .slot_bias = args->reserved,
+      .slot_bias = args->m5_aabb_stride,
    };
    const struct hk_agx3_envelope_args finish = {
       .jobs = args->envelope, .status = envelope_status, .job_count = 1,
@@ -718,7 +746,7 @@ hk_encode_as(VkCommandBuffer commandBuffer,
          .geometry_type = vk_get_as_geometry_type(state->build_info),
          /* Native bounding-box records are 48 bytes (record class 4). The
           * 64-byte class-5 slot form is a hardware A/B diagnostic only. */
-         .reserved = debug_get_num_option("ASAHI_M5_AABB_RECORD_STRIDE", 48) == 64
+         .m5_aabb_stride = debug_get_num_option("ASAHI_M5_AABB_RECORD_STRIDE", 48) == 64
                         ? 64 : 48,
       };
       VkResult result = hk_cmd_build_agx3_from_ir_mode(
@@ -880,11 +908,11 @@ hk_cmd_encode_agx3_batch(VkCommandBuffer command_buffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, command_buffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   static_assert(sizeof(struct hk_agx3_plan_args) == 112, "native plan ABI");
-   static_assert(sizeof(struct hk_agx3_batch_job) == 144, "batch array stride");
+   static_assert(sizeof(struct hk_agx3_plan_args) == 120, "native plan ABI");
+   static_assert(sizeof(struct hk_agx3_batch_job) == 152, "batch array stride");
    static_assert(sizeof(struct hk_agx3_batch_args) == 32, "batch push ABI");
    static_assert(sizeof(struct hk_agx3_batch_map) == 8, "dense map stride");
-   static_assert(offsetof(struct hk_agx3_batch_job, first_job) == 132,
+   static_assert(offsetof(struct hk_agx3_batch_job, first_job) == 140,
                  "GPU-written dense offset ABI");
 
    const struct {
@@ -1037,7 +1065,7 @@ hk_native_encode_batch(VkCommandBuffer command_buffer,
                .leaf_bound = s->leaf_node_count, .node_bound = native.node_bound,
                .slot_bound = native.slot_bound, .resource_id = hk_m5_as_id(dev, dst),
                .geometry_type = type,
-               .reserved = debug_get_num_option("ASAHI_M5_AABB_RECORD_STRIDE", 48) == 64 ? 64 : 48,
+               .m5_aabb_stride = debug_get_num_option("ASAHI_M5_AABB_RECORD_STRIDE", 48) == 64 ? 64 : 48,
             },
             .node_status = encode + native.node_status,
             .envelope_status = encode + native.envelope_status,

@@ -5,6 +5,7 @@
 #define HK_AGX3_AS_LAYOUT_H
 #include <stdbool.h>
 #include <stdint.h>
+#include "hk_agx3_as_format.h"
 
 /* Encoding scratch aliases the common builder's finished sort workspace.
  * All offsets are relative to the first byte after vk_ir_header. */
@@ -15,14 +16,15 @@ struct hk_agx3_as_layout {
 };
 
 static inline bool
-hk_agx3_as_layout_init_aligned(uint32_t leaves, uint32_t alignment,
-                               struct hk_agx3_as_layout *out)
+hk_agx3_as_layout_init_format(enum hk_agx3_as_format format, uint32_t leaves,
+                              struct hk_agx3_as_layout *out)
 {
-   if (!out || (alignment != 1024 && alignment != 16384))
+   if (!out)
       return false;
+   const uint32_t alignment = hk_agx3_as_image_align(format);
    if (!leaves) {
       *out = (struct hk_agx3_as_layout){.slot_bound = 3,
-         .as_bytes = 192 + (alignment == 16384 ? 0 : alignment - 1)};
+         .as_bytes = 192 + (alignment == HK_AGX3_GEN1_IMAGE_ALIGN ? 0 : alignment - 1)};
       return true;
    }
    const uint64_t nodes = (uint64_t)leaves + (leaves > 1 ? leaves : 2) - 1;
@@ -34,7 +36,8 @@ hk_agx3_as_layout_init_aligned(uint32_t leaves, uint32_t alignment,
    const uint64_t jobs = nodes * 16;
    const uint64_t envelope = jobs + nodes * 64;
    const uint64_t state = envelope + 48;
-   const uint64_t status = state + 32;
+   /* The plan state, then on GEN1 the node encoding dispatch arguments. */
+   const uint64_t status = state + hk_agx3_as_plan_tail(format);
    const uint64_t end = (status + nodes * 4 + 4 + 7) & ~UINT64_C(7);
    if (nodes > UINT32_MAX / 8 || slots > UINT32_MAX || end > UINT32_MAX)
       return false;
@@ -42,7 +45,8 @@ hk_agx3_as_layout_init_aligned(uint32_t leaves, uint32_t alignment,
       .nodes = 0, .jobs = jobs, .envelope = envelope, .state = state,
       .node_status = status, .envelope_status = status + nodes * 4,
       .encode_bytes = end, .node_bound = nodes, .slot_bound = slots,
-      .as_bytes = slots * 64 + 184 + (alignment == 16384 ? 0 : alignment - 1),
+      .as_bytes = slots * HK_AGX3_AS_SLOT_B + 184 +
+                  (alignment == HK_AGX3_GEN1_IMAGE_ALIGN ? 0 : alignment - 1),
    };
    return true;
 }
@@ -52,13 +56,13 @@ hk_agx3_as_layout_init_aligned(uint32_t leaves, uint32_t alignment,
 static inline bool
 hk_agx3_as_layout_init(uint32_t leaves, struct hk_agx3_as_layout *out)
 {
-   return hk_agx3_as_layout_init_aligned(leaves, 1024, out);
+   return hk_agx3_as_layout_init_format(HK_AGX3_AS_FORMAT_M5, leaves, out);
 }
 
 static inline bool
 hk_gen1_as_layout_init(uint32_t leaves, struct hk_agx3_as_layout *out)
 {
-   return hk_agx3_as_layout_init_aligned(leaves, 16384, out);
+   return hk_agx3_as_layout_init_format(HK_AGX3_AS_FORMAT_GEN1, leaves, out);
 }
 
 static inline void

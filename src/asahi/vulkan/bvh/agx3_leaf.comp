@@ -236,7 +236,7 @@ main()
    args.jobs = entry.plan.jobs;
    args.status = entry.node_status;
    args.job_count = DEREF(entry.plan.state).job_count;
-   args.slot_bias = entry.plan.reserved;
+   args.slot_bias = entry.plan.m5_aabb_stride;
    id = mapping.node;
 #endif
    if (id >= args.job_count)

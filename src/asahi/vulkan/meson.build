@@ -535,6 +535,13 @@ if with_tests and ld_args_gc_sections.length() > 0
       dependencies : [hk_deps],
       link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
         '-Wl,--wrap=util_flush_range']), suite : ['asahi'])
+  test('hk_agx3_as_format', executable('hk_agx3_as_format_test',
+    files('tests/test-hk-agx3-as-format.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args]),
+    suite : ['asahi'])
   test('hk_as_registry', executable('hk_as_registry_test',
     files('tests/test-hk-as-registry.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,

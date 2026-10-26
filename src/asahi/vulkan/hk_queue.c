@@ -328,6 +328,18 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
       c->ts_frag.end.handle = cs->timestamp.end.handle;
       c->ts_frag.end.offset = cs->timestamp.end.offset_B;
    }
+
+   /* Occlusion availability (hk_stamp_oq_available()). */
+   struct drm_asahi_timestamp *slots[] = {
+      &c->ts_vtx.start, &c->ts_vtx.end, &c->ts_frag.start, &c->ts_frag.end,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(slots); ++i) {
+      if (cs->oq_stamp[i].handle) {
+         assert(!slots[i]->handle);
+         slots[i]->handle = cs->oq_stamp[i].handle;
+         slots[i]->offset = cs->oq_stamp[i].offset_B;
+      }
+   }
 }
 
 static void
@@ -1171,15 +1183,21 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    };
 
    /* Independent engines and physical render queues may finish
-    * out of order. Publish API signals from the cumulative queue point after
-    * the ioctl, preserving independent execution while covering earlier work.
+    * out of order. Publish API signals from the cumulative queue point,
+    * preserving independent execution while covering earlier work: on G17P
+    * in the ioctl when the kernel accepts a cumulative output
+    * (DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS), otherwise by a transfer after
+    * the ioctl. M5 always transfers, also for its chunked timelines.
     */
    const bool cumulative_signals =
       dev->dev.chip == AGX_CHIP_G17P ||
       (agx_chip_g17_m5(dev->dev.chip) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
+   const bool kernel_cumulative = dev->dev.chip == AGX_CHIP_G17P &&
+      submit->signal_count > 0 &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS);
    const unsigned kernel_signal_count =
-      cumulative_signals ? 0 : submit->signal_count;
+      cumulative_signals && !kernel_cumulative ? 0 : submit->signal_count;
    const bool chunk_timelines = cumulative_signals &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
       agx_chip_g17_m5(dev->dev.chip) &&
@@ -1231,7 +1249,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
    /* Signal progress on the queue itself */
    syncs[wait_count + kernel_signal_count] = (struct drm_asahi_sync){
-      .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+      .sync_type = kernel_cumulative
+         ? DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE
+         : DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
       .handle = queue->drm.syncobj,
       .timeline_value = queue->drm.timeline_value,
    };
@@ -1625,7 +1645,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                                    queue->drm.virt_ring_idx, prior_base,
                                    chunk_timelines, first_chunk_point, anatomy);
    }
-   if (cumulative_signals) {
+   if (cumulative_signals && !kernel_cumulative) {
       /* The kernel can publish an error fence even when submission fails.
        * Forward it when present, without waiting for a missing queue point
        * or replacing the original submit error with a transfer error. */

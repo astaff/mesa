@@ -1,0 +1,559 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ *
+ * Native M5 Gen3 nodes, derived from the saved 2/4/8/64-triangle AGX
+ * captures and agx_rt_blas_gen3.h. Eight lanes encode one independent node,
+ * and a workgroup encodes HK_AGX3_NODE_JOBS_PER_GROUP of them, so a SIMD
+ * group is not three-quarters idle: one lane per child for its bounds, its
+ * root quantization and its QTB vertex bytes, the first lanes for the QTB
+ * headers, lane zero for the root bounds. Inner nodes read child bounds from
+ * the same common build IR. No CPU readback, cross-workgroup
+ * synchronization, or global allocator.
+ */
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+
+#include "hk_build_interface.h"
+
+#define JOBS HK_AGX3_NODE_JOBS_PER_GROUP
+/* Built twice: HK_AGX3_LEAF_PAIRS encodes jobs whose children may be
+ * triangle pairs (see hk_agx3_plan_args.pairs) and keeps four vertices per
+ * child; the other build serves every other job with three. */
+#ifdef HK_AGX3_LEAF_PAIRS
+#define VERTICES 4u
+#else
+#define VERTICES 3u
+#endif
+layout(local_size_x = 8 * JOBS) in;
+layout(push_constant) uniform CONSTS
+{
+   hk_agx3_leaf_args args;
+};
+
+/* Per job (slot): children at slot * 8 + child, vertices at slot * 8 *
+ * VERTICES: the distinct record vertices of each child. */
+shared vec3 vertices[8 * VERTICES * JOBS];
+shared vec3 lower[8 * JOBS], upper[8 * JOBS];
+shared uint primitive[8 * JOBS];
+#ifdef HK_AGX3_LEAF_PAIRS
+shared uint primitive1[8 * JOBS];
+#endif
+shared uint geometry_id[8 * JOBS];
+shared uint triangle_type[8 * JOBS];
+shared uint bad[JOBS];
+shared uint64_t root[8 * JOBS];
+shared vec3 root_base[JOBS];
+shared uvec3 root_exponent[JOBS];
+shared vec3 qtb_base[2 * JOBS];
+shared uvec3 qtb_exponent[2 * JOBS];
+shared uint qtb_words[32 * JOBS];
+
+bool
+finite(float x)
+{
+   return !isnan(x) && !isinf(x);
+}
+float
+origin_down(float x)
+{
+   uint bits = floatBitsToUint(x);
+   uint upper_bits = bits >> 16;
+   if ((bits & 0x80000000u) != 0 && (bits & 65535u) != 0)
+      ++upper_bits;
+   return uintBitsToFloat(upper_bits << 16);
+}
+
+float
+step(uint exponent)
+{
+   return uintBitsToFloat(exponent << 23);
+}
+
+bool
+fit_root(vec3 lo, vec3 hi, out vec3 base, out uvec3 exponent)
+{
+   for (uint a = 0; a < 3; ++a) {
+      base[a] = origin_down(lo[a]);
+      precise float extent = hi[a] - base[a];
+      if (!finite(base[a]) || !finite(extent))
+         return false;
+      precise float unit = extent / 127.0;
+      uint bits = floatBitsToUint(unit);
+      uint e = (bits >> 23) & 255u;
+      if (e != 0 && (bits & 0x7fffffu) != 0)
+         ++e;
+      e = max(e, 1u);
+      while (e < 255u && ceil(extent / step(e)) > 127.0)
+         ++e;
+      if (e == 255u)
+         return false;
+      exponent[a] = e;
+   }
+   return true;
+}
+
+bool
+fit_qtb(uint first, uint count, out vec3 base, out uvec3 exponent)
+{
+   /* first is a shared child index (slot * 8 + child). */
+   vec3 lo = lower[first], hi = upper[first];
+   for (uint t = first + 1; t < first + count; ++t) {
+      lo = min(lo, lower[t]);
+      hi = max(hi, upper[t]);
+   }
+   for (uint a = 0; a < 3; ++a) {
+      base[a] = origin_down(lo[a]);
+      precise float extent = hi[a] - base[a];
+      if (!finite(base[a]) || !finite(extent))
+         return false;
+      uint e = (floatBitsToUint(extent) >> 23) & 255u;
+      exponent[a] = e > 8u ? e - 7u : 1u;
+   }
+   return true;
+}
+
+/* A triangle record holds four vertices and two primitive words. The
+ * hardware tests triangle A = (v0, v1, v2) and triangle B = (v2, v1, v3),
+ * which shares A's edge v1-v2 with the opposite direction. Bits 30-31 of
+ * each primitive word (above its 30-bit primitive index) give the rotation
+ * of the application's vertex order against that stored order, which the
+ * hardware applies to the barycentrics it reports: 0 for none, 2 when the
+ * original order starts at the stored second vertex, 1 when it starts at
+ * the third. An unpaired record repeats v2 as v3, so B is never hit.
+ *
+ * Store the pair (a, b) sharing edge ea of a and edge eb of b (see
+ * hk_agx3_shared_edge): rotate a so its shared edge becomes v1-v2, then b
+ * is (v2, v1, v3) rotated to start at its own vertex eb. */
+#ifdef HK_AGX3_LEAF_PAIRS
+void
+arrange_pair(inout vec3 p[4], inout uint prim0, out uint prim1, vec3 b[3],
+             uint edges, uint b_id)
+{
+   uint ea = edges & 3u, eb = edges >> 2;
+   vec3 a[3] = vec3[3](p[0], p[1], p[2]);
+   p[0] = a[(ea + 2u) % 3u];
+   p[1] = a[ea];
+   p[2] = a[(ea + 1u) % 3u];
+   p[3] = b[(eb + 2u) % 3u];
+   prim0 |= ((ea + 2u) % 3u) << 30;
+   prim1 = b_id | (eb << 30);
+}
+#endif
+
+void
+store32(uint64_t address, uint value)
+{
+   DEREF(REF(uint32_t)(address)) = value;
+}
+
+uint
+quantize_vertex(float value, float base, uint exponent)
+{
+   /* A binary32 subtraction can round an exact coordinate just below a
+    * grid line onto that line. Retain its residual (TwoDiff) so truncation
+    * agrees with the reference's binary64 arithmetic without shaderFloat64.
+    * All operations must remain separate; contraction/reassociation would
+    * discard the very residual we are recovering. */
+   precise float delta = value - base;
+   precise float virtual_base = value - delta;
+   precise float virtual_value = delta + virtual_base;
+   precise float base_error = virtual_base - base;
+   precise float value_error = value - virtual_value;
+   precise float error = value_error + base_error;
+   precise float q = ldexp(delta, 127 - int(exponent));
+   float whole = floor(q);
+   if (q == whole && error < 0.0)
+      whole -= 1.0;
+   return uint(clamp(whole, 0.0, 255.0));
+}
+
+mat3x4
+invert_affine(mat3x4 otw)
+{
+   vec3 r0 = vec3(otw[0][0], otw[0][1], otw[0][2]);
+   vec3 r1 = vec3(otw[1][0], otw[1][1], otw[1][2]);
+   vec3 r2 = vec3(otw[2][0], otw[2][1], otw[2][2]);
+   vec3 t = vec3(otw[0][3], otw[1][3], otw[2][3]);
+
+   vec3 c0 = cross(r1, r2);
+   vec3 c1 = cross(r2, r0);
+   vec3 c2 = cross(r0, r1);
+
+   float det = dot(r0, c0);
+   /* A singular instance transform is undefined behaviour in Vulkan.  Fall
+    * back to something finite so the traversal cannot fault on a NaN
+    * address computation. */
+   float inv_det = det == 0.0 ? 0.0 : 1.0 / det;
+
+   /* Rows of R^-1 are the columns of the cofactor matrix, scaled. */
+   vec3 i0 = vec3(c0.x, c1.x, c2.x) * inv_det;
+   vec3 i1 = vec3(c0.y, c1.y, c2.y) * inv_det;
+   vec3 i2 = vec3(c0.z, c1.z, c2.z) * inv_det;
+
+   mat3x4 wto;
+   wto[0] = vec4(i0, -dot(i0, t));
+   wto[1] = vec4(i1, -dot(i1, t));
+   wto[2] = vec4(i2, -dot(i2, t));
+   return wto;
+}
+
+void
+store64(uint64_t address, uint64_t value)
+{
+   store32(address, uint(value));
+   store32(address + 4ul, uint(value >> 32));
+}
+
+void
+encode_instance(hk_agx3_leaf_job job, uint lane)
+{
+   REF(vk_ir_instance_node) src = REF(vk_ir_instance_node)(
+      OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
+   uint64_t blas = DEREF(src).base_ptr;
+   uint64_t record_offset = uint64_t(job.child_slot + 2u * lane) * 64ul;
+   uint64_t record = job.output_bvh + record_offset;
+   uint index = DEREF(src).instance_id;
+   uint64_t transforms = DEREF(REF(uint64_t)(job.output_bvh + 104ul));
+   uint64_t pointers = DEREF(REF(uint64_t)(job.output_bvh + 128ul));
+   uint64_t transform = transforms + uint64_t(index) * 64ul;
+   mat3x4 otw = DEREF(src).otw_matrix;
+   mat3x4 wto = invert_affine(otw);
+   for (uint i = 0; i < 32; ++i)
+      store32(record + uint64_t(i) * 4ul, 0);
+   store32(record, 26);
+   store32(record + 4ul, DEREF(REF(uint32_t)(blas + 176ul)));
+   store32(record + 8ul, DEREF(src).sbt_offset_and_flags >> 24);
+   store32(record + 12ul, DEREF(src).custom_instance_and_mask >> 24);
+   for (uint c = 0; c < 4; ++c)
+      for (uint r = 0; r < 3; ++r) {
+         uint offset = 4u * (c * 3u + r);
+         store32(record + 16ul + uint64_t(offset), floatBitsToUint(wto[r][c]));
+         store32(job.output_bvh + transform + uint64_t(offset),
+                 floatBitsToUint(otw[r][c]));
+      }
+   for (uint i = 0; i < 6; ++i)
+      store32(record + 64ul + uint64_t(i) * 4ul,
+              DEREF(REF(uint32_t)(blas + 80ul + uint64_t(i) * 4ul)));
+   store64(record + 88ul, blas);
+   store32(record + 96ul, DEREF(src).custom_instance_and_mask & 0xffffffu);
+   /* Native Metal user_instance_id reads this independent32-bit field. */
+   store32(record + 100ul, index);
+   /* Vulkan-only metadata lives outside the native128-byte instance record. */
+   store32(job.output_bvh + transform + 48ul, DEREF(src).sbt_offset_and_flags);
+   store64(record + 104ul, transform - record_offset);
+   store64(job.output_bvh + pointers + 16ul * uint64_t(index), record_offset + 4ul);
+   store64(job.output_bvh + pointers + 16ul * uint64_t(index) + 8ul, 1ul);
+}
+
+void
+main()
+{
+   uint slot = gl_LocalInvocationID.x / 8u, lane = gl_LocalInvocationID.x % 8u;
+   uint id = gl_WorkGroupID.x * JOBS + slot;
+   uint first = slot * 8u, vfirst = slot * (8u * VERTICES);
+   /* Every lane reaches every barrier; a job that has no node to encode, or
+    * fails a check, only stops doing work. */
+   uint jobs = args.job_count;
+   if (args.counts != 0ul)
+      jobs = min(jobs, DEREF(REF(uint32_t)(args.counts)));
+   bool live = id < jobs;
+   hk_agx3_leaf_job job;
+   uint count = 0;
+   if (live) {
+      job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));
+      count = job.child_count;
+      if (count < 1u || count > 8 || job.node_kind > HK_AGX3_NODE_AABBS) {
+         if (lane == 0)
+            DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_INVALID_COUNT;
+         live = false;
+      }
+   }
+   const bool valid = live;
+   bool leaf = live && job.node_kind == HK_AGX3_NODE_LEAF;
+   bool instances = live && job.node_kind == HK_AGX3_NODE_INSTANCES;
+   bool aabbs = live && job.node_kind == HK_AGX3_NODE_AABBS;
+   uint capacity = max(min(count, 4u), 1u), blocks = (count + capacity - 1u) / capacity;
+   if (lane == 0)
+      bad[slot] = 0;
+   barrier();
+   if (live && lane < count) {
+      uint c = first + lane;
+      if (!leaf) {
+         REF(vk_ir_node)
+         src = REF(vk_ir_node)(
+            OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
+         if (aabbs) {
+            REF(vk_ir_aabb_node) box = REF(vk_ir_aabb_node)(src);
+            geometry_id[c] = DEREF(box).geometry_id_and_flags;
+            primitive[c] = DEREF(box).primitive_id;
+         }
+         lower[c] = DEREF(src).aabb.min;
+         upper[c] = DEREF(src).aabb.max;
+         for (uint a = 0; a < 3; ++a) {
+            if (!finite(lower[c][a]) || !finite(upper[c][a]))
+               atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
+            if (lower[c][a] > upper[c][a])
+               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+         }
+      } else {
+#ifndef HK_AGX3_LEAF_PAIRS
+         REF(vk_ir_triangle_node)
+         src = REF(vk_ir_triangle_node)(
+            OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
+         uint geometry_flags = DEREF(src).geometry_id_and_flags;
+         geometry_id[c] = geometry_flags & ~VK_GEOMETRY_OPAQUE;
+         /* Native Gen1 extractor 0x218e084c4..0x218e087f4 accepts the
+          * same triangle record for types8 and16, then compares type8
+          * to set the extracted geometry's opaque field. */
+         triangle_type[c] =
+            (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
+         primitive[c] = DEREF(src).triangle_id;
+         uint v0 = vfirst + lane * 3u;
+         for (uint v = 0; v < 3; ++v) {
+            vec3 p;
+            for (uint a = 0; a < 3; ++a) {
+               p[a] = DEREF(src).coords[v][a];
+               if (!finite(p[a]))
+                  atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
+            }
+            vertices[v0 + v] = p;
+         }
+         lower[c] = min(vertices[v0], min(vertices[v0 + 1u], vertices[v0 + 2u]));
+         upper[c] = max(vertices[v0], max(vertices[v0 + 1u], vertices[v0 + 2u]));
+#else
+         /* A pair names the internal node over its two triangles. */
+         uint offset = job.triangle_offsets[lane];
+         bool paired = (offset & HK_AGX3_LEAF_PAIR_OFFSET) != 0u;
+         offset &= ~3u;
+         REF(vk_ir_triangle_node)
+         src = REF(vk_ir_triangle_node)(OFFSET(job.intermediate_bvh, offset));
+         REF(vk_ir_triangle_node) second = src;
+         if (paired) {
+            REF(vk_ir_box_node) box =
+               REF(vk_ir_box_node)(OFFSET(job.intermediate_bvh, offset));
+            src = REF(vk_ir_triangle_node)(OFFSET(job.intermediate_bvh,
+               ir_id_to_offset(DEREF(box).children[0])));
+            second = REF(vk_ir_triangle_node)(OFFSET(job.intermediate_bvh,
+               ir_id_to_offset(DEREF(box).children[1])));
+         }
+         uint geometry_flags = DEREF(src).geometry_id_and_flags;
+         geometry_id[c] = geometry_flags & ~VK_GEOMETRY_OPAQUE;
+         triangle_type[c] =
+            (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
+         vec3 p[4];
+         for (uint v = 0; v < 3; ++v)
+            for (uint a = 0; a < 3; ++a)
+               p[v][a] = DEREF(src).coords[v][a];
+         /* An unpaired record repeats its last vertex. */
+         p[3] = p[2];
+         primitive[c] = DEREF(src).triangle_id;
+         primitive1[c] = primitive[c];
+         if (paired) {
+            vec3 a[3] = vec3[3](p[0], p[1], p[2]), b[3];
+            for (uint v = 0; v < 3; ++v)
+               for (uint k = 0; k < 3; ++k)
+                  b[v][k] = DEREF(second).coords[v][k];
+            uint edges = hk_agx3_shared_edge(a, b);
+            if (edges == ~0u)
+               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+            else
+               arrange_pair(p, primitive[c], primitive1[c], b, edges,
+                            DEREF(second).triangle_id);
+         }
+         uint v0 = vfirst + lane * 4u;
+         for (uint v = 0; v < 4; ++v) {
+            for (uint a = 0; a < 3; ++a)
+               if (!finite(p[v][a]))
+                  atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
+            vertices[v0 + v] = p[v];
+         }
+         lower[c] = min(min(p[0], p[1]), min(p[2], p[3]));
+         upper[c] = max(max(p[0], p[1]), max(p[2], p[3]));
+#endif
+      }
+   }
+   barrier();
+   live = live && bad[slot] == 0;
+
+   /* QTB headers (one lane per block) and the root bounds (lane zero). */
+   if (leaf && live && lane < blocks) {
+      vec3 qbase;
+      uvec3 qexp;
+      if (!fit_qtb(first + lane * capacity, min(capacity, count - lane * capacity),
+                   qbase, qexp)) {
+         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+      } else {
+         uint b = slot * 2u + lane;
+         qtb_base[b] = qbase;
+         qtb_exponent[b] = qexp;
+         qtb_words[b * 16u] =
+            6u | (qexp.z << 8) | (floatBitsToUint(qbase.x) & 0xffff0000u);
+         qtb_words[b * 16u + 1u] = (floatBitsToUint(qbase.y) >> 16) |
+                                  (floatBitsToUint(qbase.z) & 0xffff0000u);
+         qtb_words[b * 16u + 2u] = qexp.x | (qexp.y << 8);
+         for (uint w = 3; w < 16; ++w)
+            qtb_words[b * 16u + w] = 0;
+      }
+   }
+   if (live && lane == 0) {
+      vec3 lo = lower[first], hi = upper[first], base;
+      uvec3 exponent;
+      for (uint t = 1; t < count; ++t) {
+         lo = min(lo, lower[first + t]);
+         hi = max(hi, upper[first + t]);
+      }
+      if (!fit_root(lo, hi, base, exponent)) {
+         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+      } else {
+         root_base[slot] = base;
+         root_exponent[slot] = exponent;
+      }
+   }
+   barrier();
+   live = live && bad[slot] == 0;
+
+   /* Root word of child lane: its header bits, then its quantized bounds;
+    * and its triangle's QTB vertex bytes, each in bits of its own. */
+   if (live) {
+      vec3 base = root_base[slot];
+      uvec3 exponent = root_exponent[slot];
+      uint t = lane;
+      uint64_t word = uint64_t(0);
+      if (t == 0)
+         word = uint64_t((instances ? 0xe1u : 0xa0u) |
+                         (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
+      else if (t <= 3)
+         word = uint64_t(floatBitsToUint(base[t - 1u]) >> 16);
+      else if (t == 4)
+         word = uint64_t((exponent.y << 8) | exponent.z);
+      else if (t == 5)
+         word = uint64_t((job.child_slot + args.slot_bias) >> 16);
+      else if (t == 6)
+         word = uint64_t((job.child_slot + args.slot_bias) & 65535u);
+      else
+         word = instances ? uint64_t(0x1a00u | (count == 8u ? 0x3fu : count << 3))
+                : aabbs ? uint64_t(0x18c0u | (count == 8u ? 0x3fu : count << 3))
+                : leaf ? uint64_t(0x40c0u | (triangle_type[first] << 8) |
+                                          (count == 8u ? 0x3fu : count << 3))
+                       : uint64_t(0x1f00u | (count == 8u ? 0u : count));
+      if (t < count) {
+         uint c = first + t;
+         const uint shifts[6] = uint[6](57, 50, 43, 36, 29, 22);
+         if (leaf || instances || aabbs)
+            word |= uint64_t((t << 16) | (1u << 20));
+         for (uint a = 0; a < 3; ++a) {
+            float s = step(exponent[a]);
+            uint qlo =
+               uint(clamp(floor((lower[c][a] - base[a]) / s), 0.0, 127.0));
+            uint qhi =
+               uint(clamp(ceil((upper[c][a] - base[a]) / s), 0.0, 127.0));
+            precise float rlo = base[a] + float(qlo) * s;
+            precise float rhi = base[a] + float(qhi) * s;
+            while (rlo > lower[c][a] && qlo > 0u) {
+               --qlo;
+               rlo = base[a] + float(qlo) * s;
+            }
+            while (rhi < upper[c][a] && qhi < 127u) {
+               ++qhi;
+               rhi = base[a] + float(qhi) * s;
+            }
+            if (rlo > lower[c][a] || rhi < upper[c][a])
+               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+            word |= uint64_t(qlo) << shifts[a];
+            word |= uint64_t(qhi) << shifts[a + 3];
+         }
+      }
+      root[first + t] = word;
+      if (leaf && t < count) {
+         uint block = t / capacity, in_block = t % capacity;
+         uint b = slot * 2u + block;
+         vec3 qbase = qtb_base[b];
+         uvec3 qexp = qtb_exponent[b];
+         /* The QTB holds the record's vertices in reverse order; an
+          * unpaired record repeats v2 as v3. */
+#ifdef HK_AGX3_LEAF_PAIRS
+         const uint order[4] = uint[4](3, 2, 1, 0);
+#else
+         const uint order[4] = uint[4](2, 2, 1, 0);
+#endif
+         for (uint v = 0; v < 4; ++v)
+            for (uint a = 0; a < 3; ++a) {
+               /* Power-of-two scaling avoids reciprocal overflow on small
+                * axes, including the minimum normal binary32 exponent. */
+               uint q = quantize_vertex(
+                  vertices[vfirst + t * VERTICES + order[v]][a], qbase[a], qexp[a]);
+               uint byte_offset = 16u + in_block * 12u + v * 3u + 2u - a;
+               atomicOr(qtb_words[b * 16u + byte_offset / 4u],
+                        q << ((byte_offset % 4u) * 8u));
+            }
+      }
+   }
+   barrier();
+   if (!valid)
+      return;
+   if (bad[slot] != 0) {
+      if (lane == 0)
+         DEREF(INDEX(uint32_t, args.status, id)) = bad[slot];
+      return;
+   }
+
+   uint64_t children =
+      uint64_t(job.output_bvh) + uint64_t(job.child_slot) * 64ul;
+   if (aabbs && lane < count) {
+      /* Native Gen1 marker24 selects the static bounding-box leaf. Its
+       * payload starts at+4: xyz min/max then geometry/primitive words.
+       * Bit31 of the geometry word is opacity; each root child uses64B. */
+      uint c = first + lane;
+      uint64_t geometry = children + uint64_t(lane) * 64ul;
+      for (uint i = 0; i < 16; ++i)
+         store32(geometry + uint64_t(i) * 4ul, 0);
+      store32(geometry, 24);
+      for (uint a = 0; a < 3; ++a) {
+         store32(geometry + 4ul + uint64_t(a) * 4ul, floatBitsToUint(lower[c][a]));
+         store32(geometry + 16ul + uint64_t(a) * 4ul, floatBitsToUint(upper[c][a]));
+      }
+      store32(geometry + 28ul, geometry_id[c]);
+      store32(geometry + 32ul, primitive[c]);
+   }
+   if (instances && lane < count)
+      encode_instance(job, lane);
+   if (leaf && lane < count) {
+      uint c = first + lane, v0 = vfirst + lane * VERTICES;
+      uint64_t geometry = children + uint64_t(blocks + lane) * 64ul;
+      store32(geometry, 0x40u | triangle_type[c]);
+      for (uint a = 0; a < 3; ++a)
+         for (uint v = 0; v < 4; ++v)
+            store32(geometry + uint64_t(4u + a * 16u + v * 4u),
+                    floatBitsToUint(vertices[v0 + min(v, VERTICES - 1u)][a]));
+      store32(geometry + 52ul, geometry_id[c]);
+      store32(geometry + 56ul, primitive[c]);
+#ifdef HK_AGX3_LEAF_PAIRS
+      store32(geometry + 60ul, primitive1[c]);
+#else
+      store32(geometry + 60ul, primitive[c]);
+#endif
+   }
+   if (leaf && lane < blocks) {
+      /* Each QTB writer owns all sixteen words, avoiding byte-store races. */
+      uint b = slot * 2u + lane;
+      for (uint w = 0; w < 16; ++w)
+         store32(children + uint64_t(lane * 64u + w * 4u), qtb_words[b * 16u + w]);
+   }
+   if (lane == 0) {
+      for (uint w = 0; w < 8; ++w) {
+         uint64_t address = uint64_t(job.output_bvh) +
+                            uint64_t(job.root_slot) * 64ul + uint64_t(w) * 8ul;
+         store32(address, uint(root[first + w]));
+         store32(address + 4ul, uint(root[first + w] >> 32));
+      }
+      DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
+   }
+}
