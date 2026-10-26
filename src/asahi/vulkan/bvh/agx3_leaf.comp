@@ -3,11 +3,12 @@
  *
  * Native M5 Gen3 nodes, derived from the saved 2/4/8/64-triangle AGX
  * captures and agx_rt_blas_gen3.h. Eight lanes encode one independent node,
- * and a workgroup encodes HK_AGX3_NODE_JOBS_PER_GROUP of them, so a SIMD
- * group is not three-quarters idle: one lane per child for its bounds, its
- * root quantization and its QTB vertex bytes, the first lanes for the QTB
- * headers, lane zero for the root bounds. Inner nodes read child bounds from
- * the same common build IR. No CPU readback, cross-workgroup
+ * and a workgroup, one 32-lane subgroup, encodes HK_AGX3_NODE_JOBS_PER_GROUP
+ * of them: one lane per child for its bounds, its root word, its record and
+ * its QTB vertex bytes. The eight lanes of a node share its bounds, each QTB
+ * block's bounds and their checks through clustered subgroup operations, so
+ * encoding needs no shared memory or barriers. Inner nodes read child bounds
+ * from the same common build IR. No CPU readback, cross-workgroup
  * synchronization, or global allocator.
  *
  * Built with HK_AGX3_REFIT for updates: jobs come from the retained jobs
@@ -48,36 +49,9 @@ layout(push_constant) uniform CONSTS
 #endif
 };
 
-/* Per job (slot): children at slot * 8 + child, vertices at slot * 8 *
- * VERTICES: the distinct record vertices of each child. */
-shared vec3 vertices[8 * VERTICES * JOBS];
-shared vec3 lower[8 * JOBS], upper[8 * JOBS];
-shared uint primitive[8 * JOBS];
-#ifdef HK_AGX3_LEAF_PAIRS
-shared uint primitive1[8 * JOBS];
-#endif
-shared uint geometry_id[8 * JOBS];
-shared uint triangle_type[8 * JOBS];
-shared uint bad[JOBS];
-shared uint64_t root[8 * JOBS];
-shared vec3 root_base[JOBS];
-shared uvec3 root_exponent[JOBS];
-shared vec3 qtb_base[2 * JOBS];
-shared uvec3 qtb_exponent[2 * JOBS];
-shared uint qtb_words[32 * JOBS];
-#ifdef HK_AGX3_REFIT
-shared vec3 root_lower[JOBS], root_upper[JOBS];
-#endif
-
 bool
-fit_qtb(uint first, uint count, out vec3 base, out uvec3 exponent)
+fit_qtb(vec3 lo, vec3 hi, out vec3 base, out uvec3 exponent)
 {
-   /* first is a shared child index (slot * 8 + child). */
-   vec3 lo = lower[first], hi = upper[first];
-   for (uint t = first + 1; t < first + count; ++t) {
-      lo = min(lo, lower[t]);
-      hi = max(hi, upper[t]);
-   }
    for (uint a = 0; a < 3; ++a) {
       base[a] = origin_down(lo[a]);
       precise float extent = hi[a] - base[a];
@@ -220,9 +194,8 @@ main()
 {
    uint slot = gl_LocalInvocationID.x / 8u, lane = gl_LocalInvocationID.x % 8u;
    uint id = gl_WorkGroupID.x * JOBS + slot;
-   uint first = slot * 8u, vfirst = slot * (8u * VERTICES);
-   /* Every lane reaches every barrier; a job that has no node to encode, or
-    * fails a check, only stops doing work. */
+   /* Every lane reaches every subgroup operation; a job that has no node to
+    * encode, or fails a check, only stops doing work. */
 #ifdef HK_AGX3_REFIT
    hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
    uint jobs = refit.job_count;
@@ -270,27 +243,30 @@ main()
    bool instances = live && job.node_kind == HK_AGX3_NODE_INSTANCES;
    bool aabbs = live && job.node_kind == HK_AGX3_NODE_AABBS;
    uint capacity = max(min(count, 4u), 1u), blocks = (count + capacity - 1u) / capacity;
-   if (lane == 0)
-      bad[slot] = 0;
-   barrier();
-   if (live && lane < count) {
-      uint c = first + lane;
+   /* This lane's child: its bounds, record vertices and words. Lanes past
+    * the last child keep empty bounds, which the reductions ignore. */
+   bool mine = live && lane < count;
+   vec3 my_lo = vec3(INFINITY), my_hi = vec3(-INFINITY);
+   vec3 my_vertices[4];
+   uint my_primitive = 0, my_primitive1 = 0, my_geometry_id = 0, my_type = 0;
+   uint my_bad = 0;
+   if (mine) {
       if (!leaf) {
          REF(vk_ir_node)
          src = REF(vk_ir_node)(
             OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
          if (aabbs) {
             REF(vk_ir_aabb_node) box = REF(vk_ir_aabb_node)(src);
-            geometry_id[c] = DEREF(box).geometry_id_and_flags;
-            primitive[c] = DEREF(box).primitive_id;
+            my_geometry_id = DEREF(box).geometry_id_and_flags;
+            my_primitive = DEREF(box).primitive_id;
          }
-         lower[c] = DEREF(src).aabb.min;
-         upper[c] = DEREF(src).aabb.max;
+         my_lo = DEREF(src).aabb.min;
+         my_hi = DEREF(src).aabb.max;
          for (uint a = 0; a < 3; ++a) {
-            if (!finite(lower[c][a]) || !finite(upper[c][a]))
-               atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
-            if (lower[c][a] > upper[c][a])
-               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+            if (!finite(my_lo[a]) || !finite(my_hi[a]))
+               my_bad |= HK_AGX3_LEAF_NONFINITE;
+            if (my_lo[a] > my_hi[a])
+               my_bad |= HK_AGX3_LEAF_RANGE;
          }
       } else {
 #ifndef HK_AGX3_LEAF_PAIRS
@@ -298,25 +274,22 @@ main()
          src = REF(vk_ir_triangle_node)(
             OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
          uint geometry_flags = DEREF(src).geometry_id_and_flags;
-         geometry_id[c] = geometry_flags & ~VK_GEOMETRY_OPAQUE;
+         my_geometry_id = geometry_flags & ~VK_GEOMETRY_OPAQUE;
          /* Native Gen1 extractor 0x218e084c4..0x218e087f4 accepts the
           * same triangle record for types8 and16, then compares type8
           * to set the extracted geometry's opaque field. */
-         triangle_type[c] =
-            (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
-         primitive[c] = DEREF(src).triangle_id;
-         uint v0 = vfirst + lane * 3u;
+         my_type = (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
+         my_primitive = DEREF(src).triangle_id;
          for (uint v = 0; v < 3; ++v) {
             vec3 p;
             for (uint a = 0; a < 3; ++a) {
                p[a] = DEREF(src).coords[v][a];
                if (!finite(p[a]))
-                  atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
+                  my_bad |= HK_AGX3_LEAF_NONFINITE;
             }
-            vertices[v0 + v] = p;
+            my_vertices[v] = p;
          }
-         lower[c] = min(vertices[v0], min(vertices[v0 + 1u], vertices[v0 + 2u]));
-         upper[c] = max(vertices[v0], max(vertices[v0 + 1u], vertices[v0 + 2u]));
+         my_vertices[3] = my_vertices[2];
 #else
          /* A pair names the internal node over its two triangles. */
          uint offset = job.triangle_offsets[lane];
@@ -334,17 +307,16 @@ main()
                ir_id_to_offset(DEREF(box).children[1])));
          }
          uint geometry_flags = DEREF(src).geometry_id_and_flags;
-         geometry_id[c] = geometry_flags & ~VK_GEOMETRY_OPAQUE;
-         triangle_type[c] =
-            (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
+         my_geometry_id = geometry_flags & ~VK_GEOMETRY_OPAQUE;
+         my_type = (geometry_flags & VK_GEOMETRY_OPAQUE) != 0 ? 8u : 16u;
          vec3 p[4];
          for (uint v = 0; v < 3; ++v)
             for (uint a = 0; a < 3; ++a)
                p[v][a] = DEREF(src).coords[v][a];
          /* An unpaired record repeats its last vertex. */
          p[3] = p[2];
-         primitive[c] = DEREF(src).triangle_id;
-         primitive1[c] = primitive[c];
+         my_primitive = DEREF(src).triangle_id;
+         my_primitive1 = my_primitive;
          if (paired) {
             vec3 a[3] = vec3[3](p[0], p[1], p[2]), b[3];
             for (uint v = 0; v < 3; ++v)
@@ -352,85 +324,48 @@ main()
                   b[v][k] = DEREF(second).coords[v][k];
             uint edges = hk_agx3_shared_edge(a, b);
             if (edges == ~0u)
-               atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
+               my_bad |= HK_AGX3_LEAF_RANGE;
             else
-               arrange_pair(p, primitive[c], primitive1[c], b, edges,
+               arrange_pair(p, my_primitive, my_primitive1, b, edges,
                             DEREF(second).triangle_id);
          }
-         uint v0 = vfirst + lane * 4u;
          for (uint v = 0; v < 4; ++v) {
             for (uint a = 0; a < 3; ++a)
                if (!finite(p[v][a]))
-                  atomicOr(bad[slot], HK_AGX3_LEAF_NONFINITE);
-            vertices[v0 + v] = p[v];
+                  my_bad |= HK_AGX3_LEAF_NONFINITE;
+            my_vertices[v] = p[v];
          }
-         lower[c] = min(min(p[0], p[1]), min(p[2], p[3]));
-         upper[c] = max(max(p[0], p[1]), max(p[2], p[3]));
 #endif
+         my_lo = min(min(my_vertices[0], my_vertices[1]),
+                     min(my_vertices[2], my_vertices[3]));
+         my_hi = max(max(my_vertices[0], my_vertices[1]),
+                     max(my_vertices[2], my_vertices[3]));
       }
    }
-   barrier();
-   live = live && bad[slot] == 0;
 
-   /* QTB headers (one lane per block) and the root bounds (lane zero). */
-   if (leaf && live && lane < blocks) {
-      vec3 qbase;
-      uvec3 qexp;
-      if (!fit_qtb(first + lane * capacity, min(capacity, count - lane * capacity),
-                   qbase, qexp)) {
-         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
-      } else {
-         uint b = slot * 2u + lane;
-         qtb_base[b] = qbase;
-         qtb_exponent[b] = qexp;
-         qtb_words[b * 16u] =
-            6u | (qexp.z << 8) | (floatBitsToUint(qbase.x) & 0xffff0000u);
-         qtb_words[b * 16u + 1u] = (floatBitsToUint(qbase.y) >> 16) |
-                                  (floatBitsToUint(qbase.z) & 0xffff0000u);
-         qtb_words[b * 16u + 2u] = qexp.x | (qexp.y << 8);
-         for (uint w = 3; w < 16; ++w)
-            qtb_words[b * 16u + w] = 0;
-      }
-   }
-   if (live && lane == 0) {
-      vec3 lo = lower[first], hi = upper[first], base;
-      uvec3 exponent;
-      for (uint t = 1; t < count; ++t) {
-         lo = min(lo, lower[first + t]);
-         hi = max(hi, upper[first + t]);
-      }
-      if (!fit_root(lo, hi, base, exponent)) {
-         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
-      } else {
-         root_base[slot] = base;
-         root_exponent[slot] = exponent;
-      }
-#ifdef HK_AGX3_REFIT
-      root_lower[slot] = lo;
-      root_upper[slot] = hi;
-#endif
-   }
-   barrier();
-   live = live && bad[slot] == 0;
+   /* Reductions over the node's eight lanes, and over each QTB block's four
+    * (children 0-3 and 4-7; a node of four or fewer has one block). Every
+    * lane takes part, in uniform control flow. */
+   uint loaded_bad = subgroupClusteredOr(my_bad, 8u);
+   vec3 node_lo = subgroupClusteredMin(my_lo, 8u);
+   vec3 node_hi = subgroupClusteredMax(my_hi, 8u);
+   vec3 block_lo = subgroupClusteredMin(my_lo, 4u);
+   vec3 block_hi = subgroupClusteredMax(my_hi, 4u);
+   uint type0 = subgroupShuffle(my_type, gl_SubgroupInvocationID & ~7u);
 
    /* Root word of child lane: its header bits, then its quantized bounds;
     * and its triangle's QTB vertex bytes, each in bits of its own. */
-   if (live) {
-      vec3 base = root_base[slot];
-      uvec3 exponent = root_exponent[slot];
-      uint t = lane;
-      bool ok = true;
-      uint64_t word = root_word(t, count, job.node_kind, triangle_type[first],
-                                job.child_slot, args.slot_bias, base, exponent,
-                                lower[first + min(t, 7u)], upper[first + min(t, 7u)], ok);
-      if (!ok)
-         atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
-      root[first + t] = word;
-      if (leaf && t < count) {
-         uint block = t / capacity, in_block = t % capacity;
-         uint b = slot * 2u + block;
-         vec3 qbase = qtb_base[b];
-         uvec3 qexp = qtb_exponent[b];
+   vec3 base, qbase;
+   uvec3 exponent, qexp;
+   uint64_t my_root = 0ul;
+   uint packed[3] = uint[3](0u, 0u, 0u);
+   if (live && loaded_bad == 0u) {
+      bool ok = fit_root(node_lo, node_hi, base, exponent);
+      if (ok)
+         my_root = root_word(lane, count, job.node_kind, type0, job.child_slot,
+                             args.slot_bias, base, exponent, my_lo, my_hi, ok);
+      if (ok && leaf && lane < count) {
+         ok = fit_qtb(block_lo, block_hi, qbase, qexp);
          /* The QTB holds the record's vertices in reverse order; an
           * unpaired record repeats v2 as v3. */
 #ifdef HK_AGX3_LEAF_PAIRS
@@ -438,28 +373,26 @@ main()
 #else
          const uint order[4] = uint[4](2, 2, 1, 0);
 #endif
-         /* A triangle's twelve vertex bytes are three whole words of
-          * its block, so it packs them without atomics. */
-         uint packed[3] = uint[3](0u, 0u, 0u);
-         for (uint v = 0; v < 4; ++v)
+         /* A triangle's twelve vertex bytes are three whole words of its
+          * block. */
+         for (uint v = 0; v < 4 && ok; ++v)
             for (uint a = 0; a < 3; ++a) {
                /* Power-of-two scaling avoids reciprocal overflow on small
                 * axes, including the minimum normal binary32 exponent. */
-               uint q = quantize_vertex(
-                  vertices[vfirst + t * VERTICES + order[v]][a], qbase[a], qexp[a]);
+               uint q = quantize_vertex(my_vertices[order[v]][a], qbase[a], qexp[a]);
                uint byte_offset = v * 3u + 2u - a;
                packed[byte_offset / 4u] |= q << ((byte_offset % 4u) * 8u);
             }
-         for (uint w = 0; w < 3u; ++w)
-            qtb_words[b * 16u + 4u + in_block * 3u + w] = packed[w];
       }
+      if (!ok)
+         my_bad |= HK_AGX3_LEAF_RANGE;
    }
-   barrier();
+   uint node_bad = subgroupClusteredOr(my_bad, 8u);
    if (!valid)
       return;
-   if (bad[slot] != 0) {
+   if (node_bad != 0u) {
       if (lane == 0)
-         DEREF(INDEX(uint32_t, args.status, id)) = bad[slot];
+         DEREF(INDEX(uint32_t, args.status, id)) = node_bad;
       return;
    }
 
@@ -469,17 +402,12 @@ main()
       /* Native Gen1 marker24 selects the static bounding-box leaf. Its
        * payload starts at+4: xyz min/max then geometry/primitive words.
        * Bit31 of the geometry word is opacity; each root child uses64B. */
-      uint c = first + lane;
       uint64_t geometry = children + uint64_t(lane) * 64ul;
-      for (uint i = 0; i < 16; ++i)
-         store32(geometry + uint64_t(i) * 4ul, 0);
-      store32(geometry, 24);
-      for (uint a = 0; a < 3; ++a) {
-         store32(geometry + 4ul + uint64_t(a) * 4ul, floatBitsToUint(lower[c][a]));
-         store32(geometry + 16ul + uint64_t(a) * 4ul, floatBitsToUint(upper[c][a]));
-      }
-      store32(geometry + 28ul, geometry_id[c]);
-      store32(geometry + 32ul, primitive[c]);
+      uvec3 lo_bits = floatBitsToUint(my_lo), hi_bits = floatBitsToUint(my_hi);
+      store128(geometry, uvec4(24u, lo_bits));
+      store128(geometry + 16ul, uvec4(hi_bits, my_geometry_id));
+      store128(geometry + 32ul, uvec4(my_primitive, 0u, 0u, 0u));
+      store128(geometry + 48ul, uvec4(0u));
    }
 #ifdef HK_AGX3_REFIT
    if (instances && lane < count) {
@@ -496,39 +424,47 @@ main()
    if (leaf && lane < count) {
       /* The record: its header, the four x, y and z coordinates, then the
        * geometry and the two primitive words, as four 16-byte stores. */
-      uint c = first + lane, v0 = vfirst + lane * VERTICES;
       uint64_t geometry = children + uint64_t(blocks + lane) * 64ul;
-      uvec3 p0 = floatBitsToUint(vertices[v0]);
-      uvec3 p1 = floatBitsToUint(vertices[v0 + 1u]);
-      uvec3 p2 = floatBitsToUint(vertices[v0 + 2u]);
-      uvec3 p3 = floatBitsToUint(vertices[v0 + VERTICES - 1u]);
+      uvec3 p0 = floatBitsToUint(my_vertices[0]);
+      uvec3 p1 = floatBitsToUint(my_vertices[1]);
+      uvec3 p2 = floatBitsToUint(my_vertices[2]);
+      uvec3 p3 = floatBitsToUint(my_vertices[VERTICES - 1u]);
 #ifdef HK_AGX3_LEAF_PAIRS
-      uint second = primitive1[c];
+      uint second = my_primitive1;
 #else
-      uint second = primitive[c];
+      uint second = my_primitive;
 #endif
-      store128(geometry, uvec4(0x40u | triangle_type[c], p0.x, p1.x, p2.x));
+      store128(geometry, uvec4(0x40u | my_type, p0.x, p1.x, p2.x));
       store128(geometry + 16ul, uvec4(p3.x, p0.y, p1.y, p2.y));
       store128(geometry + 32ul, uvec4(p3.y, p0.z, p1.z, p2.z));
-      store128(geometry + 48ul, uvec4(p3.z, geometry_id[c], primitive[c], second));
-   }
-   if (leaf && lane < blocks) {
-      /* Each QTB writer owns all sixteen words, avoiding byte-store races. */
-      uint b = slot * 2u + lane;
-      for (uint q = 0; q < 4u; ++q)
-         store128(children + uint64_t(lane * 64u + q * 16u),
-                  uvec4(qtb_words[b * 16u + q * 4u], qtb_words[b * 16u + q * 4u + 1u],
-                        qtb_words[b * 16u + q * 4u + 2u], qtb_words[b * 16u + q * 4u + 3u]));
+      store128(geometry + 48ul, uvec4(p3.z, my_geometry_id, my_primitive, second));
+
+      /* QTB block: the first lane of a block writes its header and clears
+       * the slots of triangles it does not have; each lane writes its own
+       * triangle's three words. */
+      uint block = lane / capacity, in_block = lane % capacity;
+      uint64_t qtb = children + uint64_t(block) * 64ul;
+      if (in_block == 0u) {
+         store128(qtb, uvec4(6u | (qexp.z << 8) | (floatBitsToUint(qbase.x) & 0xffff0000u),
+                             (floatBitsToUint(qbase.y) >> 16) |
+                                (floatBitsToUint(qbase.z) & 0xffff0000u),
+                             qexp.x | (qexp.y << 8), 0u));
+         uint present = min(capacity, count - block * capacity);
+         for (uint w = 4u + present * 3u; w < 16u; ++w)
+            store32(qtb + uint64_t(w) * 4ul, 0u);
+      }
+      for (uint w = 0; w < 3u; ++w)
+         store32(qtb + 16ul + uint64_t(in_block * 12u + w * 4u), packed[w]);
    }
    /* Every lane stores its own root word, filling one 64-byte line. */
    store_word64(uint64_t(job.output_bvh) + uint64_t(job.root_slot) * 64ul +
-                   uint64_t(lane) * 8ul, root[first + lane]);
+                   uint64_t(lane) * 8ul, my_root);
    if (lane == 0) {
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
 #ifdef HK_AGX3_REFIT
       /* Its parent reads these in refit propagation (agx3_refit.comp). */
-      DEREF(INDEX(vk_aabb, args.bounds, record.position)).min = root_lower[slot];
-      DEREF(INDEX(vk_aabb, args.bounds, record.position)).max = root_upper[slot];
+      DEREF(INDEX(vk_aabb, args.bounds, record.position)).min = node_lo;
+      DEREF(INDEX(vk_aabb, args.bounds, record.position)).max = node_hi;
 #endif
    }
 }
