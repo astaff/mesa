@@ -1454,8 +1454,9 @@ TEST_F(Optimizer, G17PSelectGuardImmediateBoundary)
          agx_optimize_and_dce(b->shader);
          agx_foreach_instr_global(b->shader, I) {
             agx_foreach_src(I, s) {
-               if (I->src[s].type == AGX_INDEX_IMMEDIATE)
+               if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
                   EXPECT_LT(I->src[s].value, 0x100u);
+               }
             }
          }
          for (uint32_t input = threshold - 1; input <= threshold + 2; ++input)

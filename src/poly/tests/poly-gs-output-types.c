@@ -74,9 +74,10 @@ main(void)
    const nir_alu_type types[] = {nir_type_float32, nir_type_uint32,
                                  nir_type_int32};
    for (unsigned a = 0; a < ARRAY_SIZE(types); ++a) {
-      for (unsigned b = 0; b < ARRAY_SIZE(types); ++b)
+      for (unsigned b = 0; b < ARRAY_SIZE(types); ++b) {
          valid &= check_types(types[a], types[b], false);
          valid &= check_types(types[a], types[b], true);
+      }
    }
    glsl_type_singleton_decref();
    return valid ? 0 : 1;
