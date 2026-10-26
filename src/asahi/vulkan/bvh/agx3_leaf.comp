@@ -161,10 +161,24 @@ arrange_pair(inout vec3 p[4], inout uint prim0, out uint prim1, vec3 b[3],
 }
 #endif
 
+/* Stores go through these helpers: glslang's precise propagation runs out
+ * of memory on buffer-reference stores written out in main(). */
 void
 store32(uint64_t address, uint value)
 {
    DEREF(REF(uint32_t)(address)) = value;
+}
+
+void
+store_word64(uint64_t address, uint64_t value)
+{
+   DEREF(REF(uint64_t)(address)) = value;
+}
+
+void
+store128(uint64_t address, uvec4 value)
+{
+   DEREF(REF(uvec4)(address)) = value;
 }
 
 uint
@@ -598,16 +612,20 @@ main()
 #else
          const uint order[4] = uint[4](2, 2, 1, 0);
 #endif
+         /* A triangle's twelve vertex bytes are three whole words of
+          * its block, so it packs them without atomics. */
+         uint packed[3] = uint[3](0u, 0u, 0u);
          for (uint v = 0; v < 4; ++v)
             for (uint a = 0; a < 3; ++a) {
                /* Power-of-two scaling avoids reciprocal overflow on small
                 * axes, including the minimum normal binary32 exponent. */
                uint q = quantize_vertex(
                   vertices[vfirst + t * VERTICES + order[v]][a], qbase[a], qexp[a]);
-               uint byte_offset = 16u + in_block * 12u + v * 3u + 2u - a;
-               atomicOr(qtb_words[b * 16u + byte_offset / 4u],
-                        q << ((byte_offset % 4u) * 8u));
+               uint byte_offset = v * 3u + 2u - a;
+               packed[byte_offset / 4u] |= q << ((byte_offset % 4u) * 8u);
             }
+         for (uint w = 0; w < 3u; ++w)
+            qtb_words[b * 16u + 4u + in_block * 3u + w] = packed[w];
       }
    }
    barrier();
@@ -646,34 +664,36 @@ main()
                       DEREF(REF(uint64_t)(job.output_bvh + 128ul)));
 #endif
    if (leaf && lane < count) {
+      /* The record: its header, the four x, y and z coordinates, then the
+       * geometry and the two primitive words, as four 16-byte stores. */
       uint c = first + lane, v0 = vfirst + lane * VERTICES;
       uint64_t geometry = children + uint64_t(blocks + lane) * 64ul;
-      store32(geometry, 0x40u | triangle_type[c]);
-      for (uint a = 0; a < 3; ++a)
-         for (uint v = 0; v < 4; ++v)
-            store32(geometry + uint64_t(4u + a * 16u + v * 4u),
-                    floatBitsToUint(vertices[v0 + min(v, VERTICES - 1u)][a]));
-      store32(geometry + 52ul, geometry_id[c]);
-      store32(geometry + 56ul, primitive[c]);
+      uvec3 p0 = floatBitsToUint(vertices[v0]);
+      uvec3 p1 = floatBitsToUint(vertices[v0 + 1u]);
+      uvec3 p2 = floatBitsToUint(vertices[v0 + 2u]);
+      uvec3 p3 = floatBitsToUint(vertices[v0 + VERTICES - 1u]);
 #ifdef HK_AGX3_LEAF_PAIRS
-      store32(geometry + 60ul, primitive1[c]);
+      uint second = primitive1[c];
 #else
-      store32(geometry + 60ul, primitive[c]);
+      uint second = primitive[c];
 #endif
+      store128(geometry, uvec4(0x40u | triangle_type[c], p0.x, p1.x, p2.x));
+      store128(geometry + 16ul, uvec4(p3.x, p0.y, p1.y, p2.y));
+      store128(geometry + 32ul, uvec4(p3.y, p0.z, p1.z, p2.z));
+      store128(geometry + 48ul, uvec4(p3.z, geometry_id[c], primitive[c], second));
    }
    if (leaf && lane < blocks) {
       /* Each QTB writer owns all sixteen words, avoiding byte-store races. */
       uint b = slot * 2u + lane;
-      for (uint w = 0; w < 16; ++w)
-         store32(children + uint64_t(lane * 64u + w * 4u), qtb_words[b * 16u + w]);
+      for (uint q = 0; q < 4u; ++q)
+         store128(children + uint64_t(lane * 64u + q * 16u),
+                  uvec4(qtb_words[b * 16u + q * 4u], qtb_words[b * 16u + q * 4u + 1u],
+                        qtb_words[b * 16u + q * 4u + 2u], qtb_words[b * 16u + q * 4u + 3u]));
    }
+   /* Every lane stores its own root word, filling one 64-byte line. */
+   store_word64(uint64_t(job.output_bvh) + uint64_t(job.root_slot) * 64ul +
+                   uint64_t(lane) * 8ul, root[first + lane]);
    if (lane == 0) {
-      for (uint w = 0; w < 8; ++w) {
-         uint64_t address = uint64_t(job.output_bvh) +
-                            uint64_t(job.root_slot) * 64ul + uint64_t(w) * 8ul;
-         store32(address, uint(root[first + w]));
-         store32(address + 4ul, uint(root[first + w] >> 32));
-      }
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
 #ifdef HK_AGX3_REFIT
       refit_parents(records, record.parent, record.position, root_lower[slot],
