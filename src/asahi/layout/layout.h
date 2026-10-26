@@ -585,7 +585,7 @@ ail_formats_compatible(enum pipe_format a, enum pipe_format b)
 }
 
 static inline bool
-ail_is_view_compatible(struct ail_layout *layout, enum pipe_format view)
+ail_is_view_compatible(const struct ail_layout *layout, enum pipe_format view)
 {
    return !layout->compressed || ail_formats_compatible(layout->format, view);
 }

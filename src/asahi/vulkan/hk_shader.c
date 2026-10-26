@@ -4442,9 +4442,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       nir_foreach_function_impl(impl, nir) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
-               if (instr->type == nir_instr_type_intrinsic &&
+               if ((instr->type == nir_instr_type_intrinsic &&
                    nir_instr_as_intrinsic(instr)->intrinsic ==
-                      nir_intrinsic_intersect_ray_gen1_agx ||
+                      nir_intrinsic_intersect_ray_gen1_agx) ||
                    (instr->type == nir_instr_type_intrinsic && dev->m5_native_rq &&
                     nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_intersect_ray_agx))
                   shader->info.agx3_gen1_fragment_rq = true;

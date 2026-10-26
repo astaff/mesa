@@ -1792,12 +1792,16 @@ hk_m5_note_render_resources(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
        gfx->render.m5_attachments_reach_memory)
       hk_sync_note_memory_write(cmd, cs);
    const bool v2 = dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2;
-   struct drm_asahi_render_program_v2 programs[3] = {{0}, {
-      .legacy = {.stage = 1,
-         .threadgroup_bytes = cs->tile_resources.threadgroup_bytes,
-         .imageblock_bytes = cs->tile_resources.imageblock_bytes,
-         .multisample_bytes = cs->tile_resources.multisample_bytes},
-   }};
+   struct drm_asahi_render_program_v2 programs[3] = {
+      [1] = {
+         .legacy = {
+            .stage = 1,
+            .threadgroup_bytes = cs->tile_resources.threadgroup_bytes,
+            .imageblock_bytes = cs->tile_resources.imageblock_bytes,
+            .multisample_bytes = cs->tile_resources.multisample_bytes,
+         },
+      },
+   };
    if (linked_vs) {
       programs[0].legacy.primary_bytes = MAX2(linked_vs->b.scratch_size,
                                                linked_vs->b.agx3_spectpr_scratch_size);

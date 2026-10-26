@@ -127,7 +127,8 @@ hk_m5_as_table_entry(struct hk_device *dev, unsigned id)
                                (uint64_t)next * HK_M5_AS_TABLE_PAGE_SIZE;
       if (agx_bo_bind(&dev->dev, bo, address, HK_M5_AS_TABLE_PAGE_SIZE, 0,
                       DRM_ASAHI_BIND_READ)) {
-         util_dynarray_pop(&dev->m5_as_table_pages, struct agx_bo *);
+         /* The reserved slot is uninitialized; roll it back without reading it. */
+         dev->m5_as_table_pages.size -= sizeof(*slot);
          agx_bo_unreference(&dev->dev, bo);
          return NULL;
       }
@@ -202,7 +203,8 @@ hk_m5_backend_CreateAccelerationStructureKHR(VkDevice device,
                util_post_flush_fence();
                inserted = true;
             } else if (pending) {
-               util_dynarray_pop(&dev->m5_pending_as_ids, uint32_t);
+               /* No ID was stored in the reserved slot. */
+               dev->m5_pending_as_ids.size -= sizeof(*pending_id);
             }
          }
       }
