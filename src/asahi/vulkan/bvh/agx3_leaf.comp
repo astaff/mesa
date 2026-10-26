@@ -13,7 +13,8 @@
  *
  * Built with HK_AGX3_REFIT for updates: jobs come from the retained jobs
  * (see hk_agx3_retained_job). Each leaf job encodes as above and leaves its
- * bounds for its parent; refit propagation then encodes the inner jobs.
+ * bounds for its parent, or NaN bounds when it fails, so that its
+ * ancestors fail too; agx3_refit.comp then encodes the inner jobs.
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -205,9 +206,9 @@ main()
    hk_agx3_retained_job record;
    uint count = 0;
    if (live) {
-      /* Inner jobs are encoded by the last of their children. */
+      /* Inner jobs are encoded from their children's bounds. */
       record = DEREF(INDEX(hk_agx3_retained_job, records, id));
-      job.node_kind = record.kind_count >> 4;
+      job.node_kind = (record.kind_count >> 4) & 15u;
       live = job.node_kind != HK_AGX3_NODE_INNER;
    }
    if (live) {
@@ -391,8 +392,13 @@ main()
    if (!valid)
       return;
    if (node_bad != 0u) {
-      if (lane == 0)
+      if (lane == 0) {
          DEREF(INDEX(uint32_t, args.status, id)) = node_bad;
+#ifdef HK_AGX3_REFIT
+         store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, record.position)),
+                    HK_AGX3_FAILED_BOUNDS, HK_AGX3_FAILED_BOUNDS);
+#endif
+      }
       return;
    }
 
@@ -462,9 +468,8 @@ main()
    if (lane == 0) {
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
 #ifdef HK_AGX3_REFIT
-      /* Its parent reads these in refit propagation (agx3_refit.comp). */
-      DEREF(INDEX(vk_aabb, args.bounds, record.position)).min = node_lo;
-      DEREF(INDEX(vk_aabb, args.bounds, record.position)).max = node_hi;
+      /* Its parent's encoding reads these (agx3_refit.comp). */
+      store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, record.position)), node_lo, node_hi);
 #endif
    }
 }

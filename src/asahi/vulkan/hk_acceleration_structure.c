@@ -102,8 +102,10 @@ static void hk_flush_buffer_write_cp(VkCommandBuffer);
 static VkResult hk_host_as_init(struct hk_device *dev);
 static void hk_as_phase_begin(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
 static void hk_as_phase_end(VkCommandBuffer, struct vk_acceleration_structure_build_marker *);
+static void hk_agx3_refit_save(VkCommandBuffer,
+                               const struct vk_acceleration_structure_build_state *);
 static void hk_agx3_refit_phase(VkCommandBuffer,
-   const struct vk_acceleration_structure_build_state *, unsigned);
+   const struct vk_acceleration_structure_build_state *, unsigned, unsigned);
 static VkResult hk_cmd_refit_agx3(VkCommandBuffer,
    const struct vk_acceleration_structure_build_state *);
 
@@ -1230,10 +1232,8 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
             return;
          }
          /* Keep the jobs of a build that can be updated. */
-         if (allow_update) {
-            vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-            hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_SAVE);
-         }
+         if (allow_update)
+            hk_agx3_refit_save(commandBuffer, state);
          hk_vertex_table_build(commandBuffer, state, dst);
       }
       return;
@@ -1256,10 +1256,22 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
       hk_encode_as(commandBuffer, &states[i], layout);
 }
 
+/* Levels of inner jobs an update encodes a level per dispatch; propagation
+ * encodes any deeper. Each level costs a dispatch even when the tree is
+ * shallower, so take about as many as the tree is likely to have: at 4K,
+ * 64K and 1M triangles the fastest updates took 4-8, 8-12 and 12-16. */
+static unsigned
+hk_agx3_refit_levels(const struct vk_acceleration_structure_build_state *state)
+{
+   const unsigned bits = util_logbase2_ceil(MAX2(state->leaf_node_count, 1));
+   return CLAMP((int)bits - 6, 4, (int)HK_AGX3_REFIT_LEVELS);
+}
+
+/* Run refit phase `phase`; `level` is hk_agx3_refit_args.level. */
 static void
 hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
                     const struct vk_acceleration_structure_build_state *state,
-                    unsigned phase)
+                    unsigned phase, unsigned level)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -1304,6 +1316,8 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
                          state->build_info->dstAccelerationStructure,
       .slot_bias = hk_gen1_as_slot_bias(dev, dst),
       .status = encode + layout.node_status,
+      .levels = prepare && layout.node_bound ? encode + layout.refit_levels : 0,
+      .level = level,
    };
    /* One thread per job, per instance pointer, and per retained word that
     * an update into another structure copies. */
@@ -1317,12 +1331,30 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    if (phase == HK_AGX3_REFIT_PROPAGATE)
       hk_cmd_dispatch_indirect_addr(commandBuffer, args.refit +
                                     HK_AGX3_REFIT_PROPAGATE_DISPATCH);
+   else if (phase == HK_AGX3_REFIT_INNER)
+      hk_cmd_dispatch_indirect_addr(commandBuffer, encode + layout.refit_levels +
+                                    level * 12);
    else
       hk_cmd_dispatch_unaligned(commandBuffer, count, 1, 1);
 }
 
+/* Keep the jobs of a full build that can be updated, with its inner jobs
+ * listed by level. */
+static void
+hk_agx3_refit_save(VkCommandBuffer commandBuffer,
+                   const struct vk_acceleration_structure_build_state *state)
+{
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_SAVE, 0);
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_COUNT_LEVELS, 0);
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_LIST_LEVELS, 0);
+}
+
 /* Update a structure whose leaves are in scratch: prepare from its retained
- * jobs, encode the leaf jobs, propagate to the inner jobs, and finish the
+ * jobs, encode the leaf jobs, propagate to the inner jobs past the levels,
+ * encode the inner jobs of each level, deepest first, and finish the
  * envelope. */
 static VkResult
 hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
@@ -1361,7 +1393,8 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
    };
 
-   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PREPARE);
+   const unsigned levels = hk_agx3_refit_levels(state);
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PREPARE, levels);
    vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
       0, 1, &barrier, 0, NULL, 0, NULL);
@@ -1379,9 +1412,16 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
    hk_cmd_dispatch_indirect_addr(commandBuffer, encode + layout.state);
    vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
-   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PROPAGATE);
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PROPAGATE, levels);
    vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+   if (layout.node_bound) {
+      for (unsigned level = levels; level-- > 0;) {
+         hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_INNER, level);
+         vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+      }
+   }
 
    const struct hk_agx3_envelope_args finish = {
       .jobs = encode + layout.envelope, .status = encode + layout.envelope_status,

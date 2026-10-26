@@ -71,6 +71,16 @@ store128(uint64_t address, uvec4 value)
    DEREF(REF(uvec4)(address)) = value;
 }
 
+void
+store_aabb(uint64_t address, vec3 lo, vec3 hi)
+{
+   DEREF(REF(vk_aabb)(address)).min = lo;
+   DEREF(REF(vk_aabb)(address)).max = hi;
+}
+
+/* Bounds a refit leaves for a job that failed: its ancestors fail too. */
+#define HK_AGX3_FAILED_BOUNDS vec3(uintBitsToFloat(0x7fc00000u))
+
 /* Root word t of a node with `count` children: its header bits, then the
  * bounds of child t (lo, hi) quantized against the node's base and
  * exponent. Clears `ok` when the bounds do not fit. */
