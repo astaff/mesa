@@ -11,9 +11,8 @@
  * synchronization, or global allocator.
  *
  * Built with HK_AGX3_REFIT for updates: jobs come from the retained jobs
- * (see hk_agx3_retained_job). Each leaf job encodes as above and hands its
- * bounds to its parent; the last child of an inner job to do so encodes that
- * job's node on one lane, and so on up to the root.
+ * (see hk_agx3_retained_job). Each leaf job encodes as above and leaves its
+ * bounds for its parent; refit propagation then encodes the inner jobs.
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -28,6 +27,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 
 #include "hk_build_interface.h"
+#include "agx3_node.h"
 
 #define JOBS HK_AGX3_NODE_JOBS_PER_GROUP
 /* Built twice: HK_AGX3_LEAF_PAIRS encodes jobs whose children may be
@@ -68,50 +68,6 @@ shared uint qtb_words[32 * JOBS];
 #ifdef HK_AGX3_REFIT
 shared vec3 root_lower[JOBS], root_upper[JOBS];
 #endif
-
-bool
-finite(float x)
-{
-   return !isnan(x) && !isinf(x);
-}
-float
-origin_down(float x)
-{
-   uint bits = floatBitsToUint(x);
-   uint upper_bits = bits >> 16;
-   if ((bits & 0x80000000u) != 0 && (bits & 65535u) != 0)
-      ++upper_bits;
-   return uintBitsToFloat(upper_bits << 16);
-}
-
-float
-step(uint exponent)
-{
-   return uintBitsToFloat(exponent << 23);
-}
-
-bool
-fit_root(vec3 lo, vec3 hi, out vec3 base, out uvec3 exponent)
-{
-   for (uint a = 0; a < 3; ++a) {
-      base[a] = origin_down(lo[a]);
-      precise float extent = hi[a] - base[a];
-      if (!finite(base[a]) || !finite(extent))
-         return false;
-      precise float unit = extent / 127.0;
-      uint bits = floatBitsToUint(unit);
-      uint e = (bits >> 23) & 255u;
-      if (e != 0 && (bits & 0x7fffffu) != 0)
-         ++e;
-      e = max(e, 1u);
-      while (e < 255u && ceil(extent / step(e)) > 127.0)
-         ++e;
-      if (e == 255u)
-         return false;
-      exponent[a] = e;
-   }
-   return true;
-}
 
 bool
 fit_qtb(uint first, uint count, out vec3 base, out uvec3 exponent)
@@ -160,26 +116,6 @@ arrange_pair(inout vec3 p[4], inout uint prim0, out uint prim1, vec3 b[3],
    prim1 = b_id | (eb << 30);
 }
 #endif
-
-/* Stores go through these helpers: glslang's precise propagation runs out
- * of memory on buffer-reference stores written out in main(). */
-void
-store32(uint64_t address, uint value)
-{
-   DEREF(REF(uint32_t)(address)) = value;
-}
-
-void
-store_word64(uint64_t address, uint64_t value)
-{
-   DEREF(REF(uint64_t)(address)) = value;
-}
-
-void
-store128(uint64_t address, uvec4 value)
-{
-   DEREF(REF(uvec4)(address)) = value;
-}
 
 uint
 quantize_vertex(float value, float base, uint exponent)
@@ -278,116 +214,6 @@ encode_instance(hk_agx3_leaf_job job, uint lane, uint64_t transforms,
    store64(job.output_bvh + pointers + 16ul * uint64_t(index), record_offset + 4ul);
    store64(job.output_bvh + pointers + 16ul * uint64_t(index) + 8ul, 1ul);
 }
-
-/* Root word t of a node with `count` children: its header bits, then the
- * bounds of child t (lo, hi) quantized against the node's base and
- * exponent. Clears `ok` when the bounds do not fit. */
-uint64_t
-root_word(uint t, uint count, uint kind, uint triangle_type0, uint child_slot,
-          vec3 base, uvec3 exponent, vec3 lo, vec3 hi, inout bool ok)
-{
-   bool leaf = kind == HK_AGX3_NODE_LEAF, instances = kind == HK_AGX3_NODE_INSTANCES;
-   bool aabbs = kind == HK_AGX3_NODE_AABBS;
-   uint capacity = max(min(count, 4u), 1u);
-   uint64_t word = uint64_t(0);
-   if (t == 0)
-      word = uint64_t((instances ? 0xe1u : 0xa0u) |
-                      (leaf ? capacity << 1 : 0u) | (exponent.x << 8));
-   else if (t <= 3)
-      word = uint64_t(floatBitsToUint(base[t - 1u]) >> 16);
-   else if (t == 4)
-      word = uint64_t((exponent.y << 8) | exponent.z);
-   else if (t == 5)
-      word = uint64_t((child_slot + args.slot_bias) >> 16);
-   else if (t == 6)
-      word = uint64_t((child_slot + args.slot_bias) & 65535u);
-   else
-      word = instances ? uint64_t(0x1a00u | (count == 8u ? 0x3fu : count << 3))
-             : aabbs ? uint64_t(0x18c0u | (count == 8u ? 0x3fu : count << 3))
-             : leaf ? uint64_t(0x40c0u | (triangle_type0 << 8) |
-                                       (count == 8u ? 0x3fu : count << 3))
-                    : uint64_t(0x1f00u | (count == 8u ? 0u : count));
-   if (t < count) {
-      const uint shifts[6] = uint[6](57, 50, 43, 36, 29, 22);
-      if (leaf || instances || aabbs)
-         word |= uint64_t((t << 16) | (1u << 20));
-      for (uint a = 0; a < 3; ++a) {
-         float s = step(exponent[a]);
-         uint qlo = uint(clamp(floor((lo[a] - base[a]) / s), 0.0, 127.0));
-         uint qhi = uint(clamp(ceil((hi[a] - base[a]) / s), 0.0, 127.0));
-         precise float rlo = base[a] + float(qlo) * s;
-         precise float rhi = base[a] + float(qhi) * s;
-         while (rlo > lo[a] && qlo > 0u) {
-            --qlo;
-            rlo = base[a] + float(qlo) * s;
-         }
-         while (rhi < hi[a] && qhi < 127u) {
-            ++qhi;
-            rhi = base[a] + float(qhi) * s;
-         }
-         if (rlo > lo[a] || rhi < hi[a])
-            ok = false;
-         word |= uint64_t(qlo) << shifts[a];
-         word |= uint64_t(qhi) << shifts[a + 3];
-      }
-   }
-   return word;
-}
-
-#ifdef HK_AGX3_REFIT
-/* Hand `lo`..`hi` to position `position` of `parent`, then, while this was
- * the parent's last child, encode the parent's node from its children's
- * bounds and hand those on in turn. One lane; the arrival counter orders
- * the bounds stores before the reads of whichever child arrives last. */
-void
-refit_parents(uint64_t records, uint parent, uint position, vec3 lo, vec3 hi)
-{
-   for (uint steps = 0; steps < 64u; ++steps) {
-      DEREF(INDEX(vk_aabb, args.bounds, position)).min = lo;
-      DEREF(INDEX(vk_aabb, args.bounds, position)).max = hi;
-      if (parent == 0xffffffffu)
-         return;
-      hk_agx3_retained_job job = DEREF(INDEX(hk_agx3_retained_job, records, parent));
-      uint count = job.kind_count & 15u;
-      uint arrived = atomicAdd(DEREF(INDEX(uint32_t, args.counters, parent)), 1u,
-         gl_ScopeDevice, gl_StorageSemanticsBuffer,
-         gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
-      if (arrived + 1u != count)
-         return;
-      vec3 child_lo[8], child_hi[8];
-      lo = vec3(INFINITY);
-      hi = vec3(-INFINITY);
-      uint bad_bits = 0;
-      for (uint c = 0; c < count; ++c) {
-         child_lo[c] = DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).min;
-         child_hi[c] = DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).max;
-         lo = min(lo, child_lo[c]);
-         hi = max(hi, child_hi[c]);
-      }
-      vec3 base;
-      uvec3 exponent;
-      if (count < 1u || count > 8u || !fit_root(lo, hi, base, exponent))
-         bad_bits = HK_AGX3_LEAF_RANGE;
-      uint64_t words[8];
-      bool ok = true;
-      for (uint t = 0; t < 8u && bad_bits == 0u; ++t)
-         words[t] = root_word(t, count, HK_AGX3_NODE_INNER, 0u, job.child_slot, base,
-                              exponent, child_lo[min(t, 7u)], child_hi[min(t, 7u)], ok);
-      if (!ok)
-         bad_bits = HK_AGX3_LEAF_RANGE;
-      if (bad_bits != 0u) {
-         DEREF(INDEX(uint32_t, args.status, parent)) = bad_bits;
-         return;
-      }
-      uint64_t node = args.output_bvh + uint64_t(job.root_slot) * 64ul;
-      for (uint t = 0; t < 8u; ++t)
-         store64(node + uint64_t(t) * 8ul, words[t]);
-      DEREF(INDEX(uint32_t, args.status, parent)) = HK_AGX3_LEAF_SUCCESS;
-      position = job.position;
-      parent = job.parent;
-   }
-}
-#endif
 
 void
 main()
@@ -595,7 +421,7 @@ main()
       uint t = lane;
       bool ok = true;
       uint64_t word = root_word(t, count, job.node_kind, triangle_type[first],
-                                job.child_slot, base, exponent,
+                                job.child_slot, args.slot_bias, base, exponent,
                                 lower[first + min(t, 7u)], upper[first + min(t, 7u)], ok);
       if (!ok)
          atomicOr(bad[slot], HK_AGX3_LEAF_RANGE);
@@ -656,8 +482,12 @@ main()
       store32(geometry + 32ul, primitive[c]);
    }
 #ifdef HK_AGX3_REFIT
-   if (instances && lane < count)
-      encode_instance(job, lane, refit.instance_transforms, refit.instance_pointers);
+   if (instances && lane < count) {
+      /* As the envelope lays them out after the nodes. */
+      uint64_t transforms = uint64_t(refit.end_slot) * 64ul;
+      encode_instance(job, lane, transforms,
+                      transforms + 64ul * uint64_t(args.leaf_bound));
+   }
 #else
    if (instances && lane < count)
       encode_instance(job, lane, DEREF(REF(uint64_t)(job.output_bvh + 104ul)),
@@ -696,8 +526,9 @@ main()
    if (lane == 0) {
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
 #ifdef HK_AGX3_REFIT
-      refit_parents(records, record.parent, record.position, root_lower[slot],
-                    root_upper[slot]);
+      /* Its parent reads these in refit propagation (agx3_refit.comp). */
+      DEREF(INDEX(vk_aabb, args.bounds, record.position)).min = root_lower[slot];
+      DEREF(INDEX(vk_aabb, args.bounds, record.position)).max = root_upper[slot];
 #endif
    }
 }

@@ -4,6 +4,7 @@
 hk_bvh_include_dir = dir_source_root + '/src/asahi/vulkan/bvh'
 
 hk_bvh_includes = files(
+  'agx3_node.h',
   'hk_build_interface.h',
   '../hk_bvh.h',
 )

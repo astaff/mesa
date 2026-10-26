@@ -1302,6 +1302,8 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       .geometry_type = vk_get_as_geometry_type(state->build_info),
       .copy = prepare && state->build_info->srcAccelerationStructure !=
                          state->build_info->dstAccelerationStructure,
+      .slot_bias = hk_gen1_as_slot_bias(dev, dst),
+      .status = encode + layout.node_status,
    };
    /* One thread per job, per instance pointer, and per retained word that
     * an update into another structure copies. */
@@ -1312,11 +1314,16 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    vk_common_CmdPushConstants(commandBuffer, pipeline_layout,
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args), &args);
-   hk_cmd_dispatch_unaligned(commandBuffer, count, 1, 1);
+   if (phase == HK_AGX3_REFIT_PROPAGATE)
+      hk_cmd_dispatch_indirect_addr(commandBuffer, args.refit +
+                                    HK_AGX3_REFIT_PROPAGATE_DISPATCH);
+   else
+      hk_cmd_dispatch_unaligned(commandBuffer, count, 1, 1);
 }
 
 /* Update a structure whose leaves are in scratch: prepare from its retained
- * jobs, encode them bottom-up, and finish the envelope. */
+ * jobs, encode the leaf jobs, propagate to the inner jobs, and finish the
+ * envelope. */
 static VkResult
 hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
                   const struct vk_acceleration_structure_build_state *state)
@@ -1360,16 +1367,19 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
       0, 1, &barrier, 0, NULL, 0, NULL);
 
    const struct hk_agx3_refit_encode_args refit = {
-      .refit = encode + layout.state, .counters = encode + layout.nodes,
-      .bounds = encode + layout.jobs,
+      .refit = encode + layout.state, .bounds = encode + layout.jobs,
       .intermediate_bvh = scratch + state->scratch.ir_offset,
       .output_bvh = hk_as_native_va(dst), .status = encode + layout.node_status,
       .slot_bias = hk_gen1_as_slot_bias(dev, dst),
+      .leaf_bound = state->leaf_node_count,
    };
    vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline[0]);
    vk_common_CmdPushConstants(commandBuffer, pipeline_layout[0],
       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(refit), &refit);
    hk_cmd_dispatch_indirect_addr(commandBuffer, encode + layout.state);
+   vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_PROPAGATE);
    vk_common_CmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
 

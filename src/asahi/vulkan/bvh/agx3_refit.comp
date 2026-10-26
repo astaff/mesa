@@ -6,7 +6,12 @@
  * thread per job. HK_AGX3_REFIT_PREPARE readies an update, after its leaves:
  * it finds the source's jobs, copies them when updating into another
  * structure, clears the arrival counters and writes the refit state and the
- * envelope job.
+ * envelope job. HK_AGX3_REFIT_PROPAGATE encodes the inner jobs after refit
+ * encoding has encoded the leaf jobs, one thread per job.
+ *
+ * Propagation runs apart from encoding: its device-scope arrivals wait for
+ * the thread's earlier global stores, which in node encoding are a whole
+ * node's.
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -19,7 +24,8 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 #include "hk_build_interface.h"
-layout(local_size_x = 64) in;
+#include "agx3_node.h"
+layout(local_size_x = HK_AGX3_REFIT_GROUP_SIZE) in;
 layout(push_constant) uniform CONSTS { hk_agx3_refit_args args; };
 
 uint
@@ -129,8 +135,10 @@ prepare(uint id)
    refit.dispatch[2] = 1u;
    refit.job_count = jobs;
    refit.retained = args.copy != 0u ? args.retained : source;
-   refit.instance_transforms = transforms;
-   refit.instance_pointers = pointers;
+   refit.propagate[0] = (jobs + HK_AGX3_REFIT_GROUP_SIZE - 1u) / HK_AGX3_REFIT_GROUP_SIZE;
+   refit.propagate[1] = 1u;
+   refit.propagate[2] = 1u;
+   refit.end_slot = saved.end_slot;
    DEREF(REF(hk_agx3_refit_state)(args.refit)) = refit;
 
    uint active_leaves = DEREF(args.header).active_leaf_count;
@@ -150,12 +158,67 @@ prepare(uint id)
    DEREF(REF(hk_agx3_envelope_job)(args.envelope)) = job;
 }
 
+/* From leaf job `id`, whose bounds refit encoding left at its position:
+ * arrive at the parent; while this was the parent's last child, encode the
+ * parent's node from its children's bounds, leave the parent's bounds at
+ * its position and arrive at its parent in turn. The arrival orders the
+ * bounds stores of every child before the reads of the last. */
+void
+propagate(uint id)
+{
+   hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
+   if (id >= refit.job_count)
+      return;
+   uint64_t records = refit.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+   hk_agx3_retained_job leaf = DEREF(INDEX(hk_agx3_retained_job, records, id));
+   if ((leaf.kind_count >> 4) == HK_AGX3_NODE_INNER)
+      return;
+   uint parent = leaf.parent;
+   for (uint steps = 0; parent != 0xffffffffu && steps < 64u; ++steps) {
+      hk_agx3_retained_job job = DEREF(INDEX(hk_agx3_retained_job, records, parent));
+      uint count = job.kind_count & 15u;
+      uint arrived = atomicAdd(DEREF(INDEX(uint32_t, args.counters, parent)), 1u,
+         gl_ScopeDevice, gl_StorageSemanticsBuffer,
+         gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable | gl_SemanticsMakeVisible);
+      if (arrived + 1u != count)
+         return;
+      vec3 child_lo[8], child_hi[8];
+      vec3 lo = vec3(INFINITY), hi = vec3(-INFINITY);
+      for (uint c = 0; c < count && c < 8u; ++c) {
+         child_lo[c] = DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).min;
+         child_hi[c] = DEREF(INDEX(vk_aabb, args.bounds, job.first + c)).max;
+         lo = min(lo, child_lo[c]);
+         hi = max(hi, child_hi[c]);
+      }
+      vec3 base;
+      uvec3 exponent;
+      bool ok = count >= 1u && count <= 8u && fit_root(lo, hi, base, exponent);
+      uint64_t words[8];
+      for (uint t = 0; t < 8u && ok; ++t)
+         words[t] = root_word(t, count, HK_AGX3_NODE_INNER, 0u, job.child_slot,
+                              args.slot_bias, base, exponent, child_lo[t], child_hi[t], ok);
+      if (!ok) {
+         DEREF(INDEX(uint32_t, args.status, parent)) = HK_AGX3_LEAF_RANGE;
+         return;
+      }
+      uint64_t node = args.output_bvh + uint64_t(job.root_slot) * 64ul;
+      for (uint t = 0; t < 8u; ++t)
+         store_word64(node + uint64_t(t) * 8ul, words[t]);
+      DEREF(INDEX(vk_aabb, args.bounds, job.position)).min = lo;
+      DEREF(INDEX(vk_aabb, args.bounds, job.position)).max = hi;
+      DEREF(INDEX(uint32_t, args.status, parent)) = HK_AGX3_LEAF_SUCCESS;
+      parent = job.parent;
+   }
+}
+
 void
 main()
 {
    uint id = gl_GlobalInvocationID.x;
    if (args.phase == HK_AGX3_REFIT_SAVE)
       save(id);
-   else
+   else if (args.phase == HK_AGX3_REFIT_PREPARE)
       prepare(id);
+   else
+      propagate(id);
 }

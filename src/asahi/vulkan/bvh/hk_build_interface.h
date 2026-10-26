@@ -45,8 +45,9 @@ TYPE(libagx_gen1_as_metadata, 8);
  * per job, then the IR offsets of the children of every leaf job,
  * concatenated. An update keeps the topology: it regenerates the IR leaves
  * and re-encodes each leaf job from them, then each inner job as the last of
- * its children finishes (refit encoding, agx3_leaf.comp built with
- * HK_AGX3_REFIT). It reads neither IR internal nodes nor a plan.
+ * its children finishes: refit encoding (agx3_leaf.comp built with
+ * HK_AGX3_REFIT) encodes the leaf jobs, then refit propagation the inner
+ * jobs. It reads neither IR internal nodes nor a plan.
  *
  * A child job hands its bounds to its parent at its position: the parent's
  * first position plus the child's index. Positions number the children of
@@ -82,10 +83,14 @@ TYPE(hk_agx3_retained_job, 4);
    (HK_AGX3_RETAINED_STATE_BYTES + (jobs) * HK_AGX3_RETAINED_JOB_BYTES +       \
     (leaves) * 4u)
 
-/* Refit phases: save the jobs of a full build that allows updates, and
- * prepare an update (after its leaves) to encode from them. */
+/* Refit phases: save the jobs of a full build that allows updates; prepare
+ * an update (after its leaves) to encode from them; and, after refit
+ * encoding, propagate: each leaf job arrives at its parent, and the last
+ * child of an inner job to arrive encodes that job's node and arrives at
+ * its parent in turn. */
 #define HK_AGX3_REFIT_SAVE 0u
 #define HK_AGX3_REFIT_PREPARE 1u
+#define HK_AGX3_REFIT_PROPAGATE 2u
 
 /* Written by the prepare phase in encode scratch, read by refit encoding. */
 struct hk_agx3_refit_state {
@@ -95,10 +100,13 @@ struct hk_agx3_refit_state {
    uint32_t job_count;
    /* Retained jobs this update encodes from. */
    uint64_t retained;
-   /* Instance transforms and pointers, relative to the output structure. */
-   uint64_t instance_transforms;
-   uint64_t instance_pointers;
+   /* Refit propagation dispatch, one thread per job. */
+   uint32_t propagate[3];
+   uint32_t end_slot;
 };
+
+#define HK_AGX3_REFIT_PROPAGATE_DISPATCH 24u /* bytes into hk_agx3_refit_state */
+#define HK_AGX3_REFIT_GROUP_SIZE 64u
 
 #ifdef VULKAN
 TYPE(hk_agx3_refit_state, 8);
@@ -132,19 +140,20 @@ struct hk_agx3_refit_args {
    uint32_t geometry_type;
    /* Prepare: the source is another structure. */
    uint32_t copy;
-   uint32_t padding;
+   /* Propagate: as for node encoding. */
+   uint32_t slot_bias;
+   REF(uint32_t) status;
 };
 
 /* Push constants of refit encoding. */
 struct hk_agx3_refit_encode_args {
    VOID_REF refit;
-   VOID_REF counters;
    VOID_REF bounds;
    VOID_REF intermediate_bvh;
    VOID_REF output_bvh;
    REF(uint32_t) status;
    uint32_t slot_bias;
-   uint32_t padding;
+   uint32_t leaf_bound;
 };
 
 
