@@ -108,10 +108,11 @@ agx3_build_container_constant_program(
                 : sampled_fragment ? sizeof(sampled_fragment_program)
                                    : sizeof(fragment_stop);
 
-   memcpy(image, program, program_size);
-   for (size_t offset = program_size;
-        offset < AGX3_CONTAINER_CONSTANT_PROGRAM_SIZE; offset += 2) {
-      image[offset] = 0x06;
-      image[offset + 1] = 0x00;
+   /* Pad in instruction pairs, keeping both byte stores within the image. */
+   for (size_t pair = program_size / 2;
+        pair < AGX3_CONTAINER_CONSTANT_PROGRAM_SIZE / 2; ++pair) {
+      image[2 * pair] = 0x06;
+      image[2 * pair + 1] = 0x00;
    }
+   memcpy(image, program, program_size);
 }

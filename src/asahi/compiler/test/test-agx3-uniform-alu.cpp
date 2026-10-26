@@ -308,8 +308,9 @@ TEST(AGX3FetchBanks, SplitCoordinatesStageLikeVector)
       /* x and y may live above the seven-bit COPY range; the sample index
        * or layer may not. */
       EXPECT_FALSE(split_test_pack(dim, 200, 150, 60).empty());
-      if (dim != AGX_DIM_2D)
+      if (dim != AGX_DIM_2D) {
          EXPECT_TRUE(split_test_pack(dim, 20, 22, 200).empty());
+      }
    }
    /* A register level stages beside the layer (2D array) or after the
     * coordinates (2D). */

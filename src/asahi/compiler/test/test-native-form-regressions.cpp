@@ -3800,15 +3800,17 @@ TEST(NativeForms, M5MinimumLodOffsetSampleWitnesses)
       uint8_t out[AGX3_TEX_MAX_LENGTH] = {0}, len = 0;
       const bool ok = agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3C, c.d, out, &len);
       EXPECT_TRUE(ok) << c.name;
-      if (ok)
+      if (ok) {
          EXPECT_EQ(std::vector<uint8_t>(out, out + len), c.native) << c.name;
+      }
    }
    for (const auto &c : cases) {
       uint8_t out[AGX3_TEX_MAX_LENGTH] = {0}, len = 0;
       const bool ok = agx3_tex_encode_sample(AGX_ISA_ENCODING_AGX3C, c.d, out, &len);
       EXPECT_TRUE(ok) << c.name;
-      if (ok)
+      if (ok) {
          EXPECT_EQ(std::vector<uint8_t>(out, out + len), c.native) << c.name;
+      }
    }
 }
 
@@ -4339,8 +4341,9 @@ TEST(NativeForms, M5TaskGridFitsFullThreadgroupMemory)
          ASSERT_TRUE(agx_nir_lower_m5_task(b.shader,payload ? 16384 : 0,payload));
          nir_validate_shader(b.shader,"task grid");
          EXPECT_LE(b.shader->info.shared_size,32768u);
-         if (payload)
+         if (payload) {
             EXPECT_EQ(b.shader->info.shared_size,shared==64 ? 128u : 32768u);
+         }
          ralloc_free(b.shader);
       }
    }
@@ -5737,8 +5740,9 @@ TEST(NativeForms, M5MeshPerPrimitiveRefusalsLeaveShaderUntouched)
       nir_shader *s=m5_mesh_per_primitive_shader(false,r.primitives,r.extra);
       struct agx_m5_mesh_varyings v;
       EXPECT_EQ(agx_m5_mesh_gather_varyings(s,&v),r.gather);
-      if (r.gather)
+      if (r.gather) {
          EXPECT_FALSE(agx_nir_lower_m5_mesh(s,&v));
+      }
       EXPECT_EQ(s->info.shared_size,0u);EXPECT_EQ(s->info.mesh.max_vertices_out,4u);
       ralloc_free(s);
    }
@@ -5794,8 +5798,9 @@ TEST(NativeForms, M5MeshFragmentReadsPrimitiveWordsFlat)
       if(i->intrinsic==nir_intrinsic_load_input) {
          flat++;EXPECT_EQ(i->def.bit_size,32u);
          EXPECT_EQ(nir_alu_type_get_type_size(nir_intrinsic_dest_type(i)),32u);
-         if(nir_intrinsic_io_semantics(i).location==VARYING_SLOT_VAR1)
+         if(nir_intrinsic_io_semantics(i).location==VARYING_SLOT_VAR1) {
             EXPECT_EQ(nir_intrinsic_component(i),1u);
+         }
       }
    }
    EXPECT_EQ(flat,4u);EXPECT_EQ(primitive,0u);EXPECT_EQ(narrowed,1u);

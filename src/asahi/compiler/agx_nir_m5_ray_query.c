@@ -524,8 +524,6 @@ m5_trace_instance(nir_builder *b, nir_def *selector, nir_def *id,
        * committed-result slots. This is not Vulkan candidate support. */
       *type_prim = nir_ior_imm(b, count, 0x40000000);
       *bary = first.barycentrics;
-      nir_def *final_status = nir_load_scs_indexed_agx(b, 2, 32, driver, lane,
-         .base = 256, .component = 3);
       *instance = nir_vec4(b, zero, zero, nir_u2u32(b, pending),
                            first.distance);
       *front_face = nir_load_scs_indexed_agx(b, 1, 32, driver, lane,

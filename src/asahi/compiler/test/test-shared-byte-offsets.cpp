@@ -7,7 +7,7 @@ extern "C" {
 }
 
 static void
-check_offset(unsigned bits, unsigned add, unsigned base, uint32_t mask,
+check_offset(unsigned bits, unsigned add, int base, uint32_t mask,
              bool store, bool expected)
 {
    nir_builder b = nir_builder_init_simple_shader(

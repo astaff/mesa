@@ -29,10 +29,12 @@ TEST_F(PrimitiveVaryings, MeshStoresWidenBeforeInterstageOptimization)
                             type == nir_type_int16 ? nir_op_i2i32 : nir_op_u2u32);
       EXPECT_EQ(convert->src[0].src.ssa, value);
       nir_opt_constant_folding(b.shader);
-      if (type == nir_type_int16)
+      if (type == nir_type_int16) {
          EXPECT_EQ(nir_src_as_uint(store->src[0]), 0xfffffc01u);
-      if (type == nir_type_uint16)
+      }
+      if (type == nir_type_uint16) {
          EXPECT_EQ(nir_src_as_uint(store->src[0]), 0xfc01u);
+      }
       ralloc_free(b.shader);
    }
 }

@@ -1081,8 +1081,6 @@ agx_nir_lower_g17g_indexed_reads(nir_shader *shader)
             const bool minimum =
                nir_tex_instr_src_index(tex, nir_tex_src_min_lod) >= 0 ||
                nir_tex_instr_src_index(tex, nir_tex_src_lod_bias_min_agx) >= 0;
-            const bool comparison_or_gather =
-               tex->is_shadow || tex->op == nir_texop_tg4;
             /* Constant offsets are SMP immediates on C as on B: native G17G
              * (texwit3) carries {f43, f51, f141} on 2D, 2D-array, 3D,
              * comparison and gather samples alike. Cubes have no offset. */
