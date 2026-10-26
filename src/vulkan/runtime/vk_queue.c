@@ -254,8 +254,16 @@ vk_queue_submit_signal_dropped(struct vk_queue *queue,
       /* After vk_sync_signal_unwrap, an emulated timeline signal targets the
        * binary sync of a new time point that must also be installed.
        */
-      (void)vk_sync_signal(queue->base.device, sync,
-                           submit->signals[i].signal_value);
+      VkResult result = vk_sync_signal(queue->base.device, sync,
+                                      submit->signals[i].signal_value);
+      if (unlikely(result != VK_SUCCESS))
+         vk_queue_set_lost(queue, "Failed to signal a dropped submission");
+
+      /* Publish the point even if the best-effort CPU signal failed. A
+       * waiter may already be blocked on the timeline's condition variable;
+       * it must reach the underlying sync/device-loss checks. The payload
+       * is untrusted on the lost device, as are all subsequent results.
+       */
       if (submit->_signal_points != NULL &&
           submit->_signal_points[i] != NULL) {
          vk_sync_timeline_point_install(queue->base.device,
