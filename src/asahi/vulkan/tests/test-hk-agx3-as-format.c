@@ -56,7 +56,10 @@ check_layout(enum hk_agx3_as_format format, uint32_t leaves,
    /* GEN1's plan writes the indirect encode dispatch after its state. */
    assert(l->node_status == l->state + tail);
    assert(l->envelope_status == l->node_status + nodes * 4);
-   assert(l->encode_bytes == ((l->envelope_status + 4 + 7) & ~7u));
+   const uint64_t refit_levels = (l->envelope_status + 4 + 7) & ~7u;
+   assert(l->refit_levels == refit_levels);
+   assert(l->encode_bytes == refit_levels +
+          (format == HK_AGX3_AS_FORMAT_GEN1 ? 16 * 12 : 0));
    assert(l->as_bytes == slots * HK_AGX3_AS_SLOT_B + 184 +
                             (align == 16384 ? 0 : align - 1));
 }

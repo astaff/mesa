@@ -190,6 +190,23 @@ struct hk_agx3_refit_args {
    uint32_t no_leaves;
 };
 
+/* The separate M5 backend keeps its qualified IR-topology refit protocol.
+ * GEN1 uses hk_agx3_refit_args and the current retained-job protocol. */
+struct hk_m5_refit_args {
+   VOID_REF retained;
+   VOID_REF metadata;
+   VOID_REF intermediate_bvh;
+   REF(vk_ir_header) header;
+   VOID_REF parents;
+   uint32_t root_offset;
+   uint32_t leaf_bound;
+   uint32_t node_bound;
+   uint32_t phase;
+   VOID_REF plan_nodes;
+   VOID_REF plan_jobs;
+   VOID_REF plan_state;
+};
+
 /* Push constants of refit encoding. */
 struct hk_agx3_refit_encode_args {
    VOID_REF refit;

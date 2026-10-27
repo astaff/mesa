@@ -56,15 +56,15 @@ static const uint32_t write_spv[] = {
 };
 
 static const uint32_t agx3_node_spv[] = {
-#include "bvh/hk_agx3_leaf.spv.h"
+#include "bvh/hk_agx3_m5_legacy_leaf.spv.h"
 };
 
 static const uint32_t agx3_envelope_spv[] = {
-#include "bvh/hk_agx3_envelope.spv.h"
+#include "bvh/hk_agx3_m5_legacy_envelope.spv.h"
 };
 
 static const uint32_t agx3_plan_spv[] = {
-#include "bvh/hk_agx3_plan.spv.h"
+#include "bvh/hk_agx3_m5_legacy_plan.spv.h"
 };
 
 static const uint32_t agx3_batch_plan_spv[] = {
@@ -78,7 +78,7 @@ static const uint32_t agx3_batch_envelope_spv[] = {
 };
 
 static const uint32_t agx3_refit_spv[] = {
-#include "bvh/hk_agx3_refit.spv.h"
+#include "bvh/hk_agx3_m5_legacy_refit.spv.h"
 };
 
 const uint32_t *
@@ -810,7 +810,7 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    VkPipeline pipeline;
    VkPipelineLayout pipeline_layout;
    VkResult result = get_pipeline_spv(dev, "hk-agx3-refit", agx3_refit_spv,
-      sizeof(agx3_refit_spv), sizeof(struct hk_agx3_refit_args), &pipeline, &pipeline_layout);
+      sizeof(agx3_refit_spv), sizeof(struct hk_m5_refit_args), &pipeline, &pipeline_layout);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return;
@@ -818,10 +818,11 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(vk_acceleration_structure, retained_as,
       phase == 1 ? state->build_info->srcAccelerationStructure : state->build_info->dstAccelerationStructure);
    uint64_t scratch = state->build_info->scratchData.deviceAddress;
-   struct hk_agx3_refit_args args = {
+   struct hk_m5_refit_args args = {
       .retained = vk_acceleration_structure_get_va(retained_as) + hk_agx3_retained_offset(state),
       .intermediate_bvh = scratch + state->scratch.ir_offset,
       .header = scratch + state->scratch.header_offset,
+      .parents = scratch + state->scratch.size,
       .root_offset = state->leaf_node_count *
          hk_agx3_ir_leaf_size(vk_get_as_geometry_type(state->build_info)),
       .leaf_bound = state->leaf_node_count,

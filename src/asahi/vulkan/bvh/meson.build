@@ -28,6 +28,10 @@ foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
              ['agx3_plan.comp', 'hk_agx3_plan'],
              ['agx3_refit.comp', 'hk_agx3_refit'],
              ['agx3_refit_leaf.comp', 'hk_agx3_refit_leaf'],
+             ['agx3_m5_legacy_leaf.comp', 'hk_agx3_m5_legacy_leaf'],
+             ['agx3_m5_legacy_envelope.comp', 'hk_agx3_m5_legacy_envelope'],
+             ['agx3_m5_legacy_plan.comp', 'hk_agx3_m5_legacy_plan'],
+             ['agx3_m5_legacy_refit.comp', 'hk_agx3_m5_legacy_refit'],
              ['agx3_gen1_leaf.comp', 'hk_agx3_gen1_leaf'],
              ['agx3_gen1_leaf.comp', 'hk_agx3_gen1_leaf_pairs', '-DHK_AGX3_LEAF_PAIRS=1'],
              ['agx3_gen1_envelope.comp', 'hk_agx3_gen1_envelope'],
@@ -57,9 +61,9 @@ endforeach
 # A dense GPU-built map batches independent native AS node jobs (M5). Reuse
 # each encoder's exact node/envelope arithmetic; only the argument transport
 # differs.
-foreach s : [['agx3_plan.comp', 'hk_agx3_batch_plan'],
-             ['agx3_leaf.comp', 'hk_agx3_batch_leaf'],
-             ['agx3_envelope.comp', 'hk_agx3_batch_envelope']]
+foreach s : [['agx3_m5_legacy_plan.comp', 'hk_agx3_batch_plan'],
+             ['agx3_m5_legacy_leaf.comp', 'hk_agx3_batch_leaf'],
+             ['agx3_m5_legacy_envelope.comp', 'hk_agx3_batch_envelope']]
   command = [prog_glslang, '-V', '-DHK_AGX3_BATCH=1',
     '-I' + vk_bvh_include_dir, '-I' + hk_bvh_include_dir,
     '-I' + dir_source_root + '/src/asahi/vulkan',
