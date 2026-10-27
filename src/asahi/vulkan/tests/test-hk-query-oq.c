@@ -86,9 +86,10 @@ hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
 }
 
 void
-hk_flush_deferred_clears(struct hk_cmd_buffer *cmd)
+hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 {
    (void)cmd;
+   (void)why;
    abort();
 }
 
