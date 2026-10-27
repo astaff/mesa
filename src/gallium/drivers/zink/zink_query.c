@@ -1210,8 +1210,12 @@ zink_get_query_result(struct pipe_context *pctx,
    if (!wait && !zink_screen_usage_check_completion_fast(screen, query->batch_uses)) {
       if (query->result_check_counter++ < NOWAIT_CHECK_THRESHOLD)
          return false;
-      /* simple queries can use the "fast" path which (probably) avoids directly accessing a syncobj */
-      if (query->buffer_count == 1 && get_num_results(query) == 1 && query->type != PIPE_QUERY_TIME_ELAPSED) {
+      /* A single QBO can hold several Vulkan query starts, for example when
+       * an active GL query spans a flush. Reading only the last start loses
+       * the earlier results; those queries need the normal aggregation path.
+       */
+      if (query->buffer_count == 1 && get_num_starts(query) == 1 &&
+          get_num_results(query) == 1 && query->type != PIPE_QUERY_TIME_ELAPSED) {
          struct zink_query_start *start = util_dynarray_top_ptr(&query->starts, struct zink_query_start);
          unsigned query_id = start->vkq[0]->query_id;
          VkResult ret = VKCTX(GetQueryPoolResults)(screen->dev, start->vkq[0]->pool->query_pool, query_id, 1,
