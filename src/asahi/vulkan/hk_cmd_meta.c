@@ -66,6 +66,7 @@ hk_device_init_meta(struct hk_device *dev)
    dev->meta.use_gs_for_layer = false;
    dev->meta.use_layer_output = true;
    dev->meta.use_view_relative_3d_layer = agx_native_graphics(&dev->dev);
+   dev->meta.specialize_single_layer_buffer_upload = agx_is_m4_pro(&dev->dev);
    /* G17P has ordinary fixed-function stencil testing/updates, but its
     * fragment stencil-export operand is not part of the grounded AGX3B ABI.
     * Let common meta lower a stencil blit to eight bit-selective discard
