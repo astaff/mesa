@@ -137,6 +137,14 @@ hk_hal200_compression_eligible(enum agx_chip chip, unsigned plane,
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
 
+   /* Keep depth/stencil on the existing single-level/layer/sample policy.
+    * The expanded G16S ZLS allocation shapes also reach colour-alias transfer
+    * and clear paths; those do not yet support every compressed D/S shape.
+    * Admitting them at allocation makes legal commands fail at EndCommandBuffer.
+    * Colour's layered/MSAA packet support is independent of this restriction.
+    */
+   g16s = g16s && hk_g17p_compression_color_format(info->format);
+
    /* Shared images keep their plain layout contract. Read each header field
     * by copy: the chain's structures have other types, and Mesa builds with
     * strict aliasing (gcc -O2 dropped the stores of a stack chain). Copy pNext

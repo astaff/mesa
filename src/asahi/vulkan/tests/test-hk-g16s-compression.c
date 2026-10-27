@@ -70,7 +70,7 @@ check_formats(void)
       depth += d;
 
       VkImageCreateInfo i = image((VkFormat)f, 64, 64, 1, color_usage);
-      CHECK(ELIGIBLE(i) == (c || d));
+      CHECK(ELIGIBLE(i) == (c || hk_g17p_compression_depth_format((VkFormat)f)));
    }
    CHECK(color == 46);
    CHECK(depth == 4);
@@ -310,67 +310,42 @@ check_layered_and_msaa(void)
    i.format = VK_FORMAT_D32_SFLOAT;
    CHECK(!ELIGIBLE(i));
 
-   i.imageType = VK_IMAGE_TYPE_2D;
-   i.extent.depth = 1;
-   i.arrayLayers = 12;
-   i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-   i.samples = VK_SAMPLE_COUNT_1_BIT;
-   i.usage =
-      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-   CHECK(ELIGIBLE(i));
-   i.flags = 0;
-   for (unsigned samples = 1; samples <= 64; samples <<= 1) {
-      i.samples = (VkSampleCountFlagBits)samples;
-      CHECK(ELIGIBLE(i) == (samples <= 4));
-   }
+
 }
 
+/* Preserve the pre-port depth/stencil policy across the shapes observed in
+ * depth sampling, feedback loops, host copies and transfer clears. Allocation
+ * tests alone did not catch the unsupported colour-alias command paths. */
 static void
-check_zls_mips(void)
+check_legacy_depth_policy(void)
 {
-   static const VkFormat formats[] = {
-      VK_FORMAT_D16_UNORM,
-      VK_FORMAT_D32_SFLOAT,
-      VK_FORMAT_S8_UINT,
-      VK_FORMAT_D32_SFLOAT_S8_UINT,
+   const VkFormat formats[] = { VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT,
+      VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_S8_UINT };
+   const VkImageUsageFlags usages[] = {
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+         VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT,
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
    };
-   for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
-      VkImageCreateInfo i =
-         image(formats[f], 129, 127, 8,
-               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                  VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-      for (unsigned layers = 1; layers <= 12; ++layers) {
-         i.arrayLayers = layers;
-         CHECK(ELIGIBLE(i));
-         CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) ==
-               (formats[f] == VK_FORMAT_D32_SFLOAT_S8_UINT));
+   for (unsigned f = 0; f < 4; ++f) {
+      for (unsigned u = 0; u < 4; ++u) {
+         for (unsigned levels = 1; levels <= 8; levels *= 2) {
+            for (unsigned layers = 1; layers <= 6; ++layers) {
+               for (unsigned samples = 1; samples <= 4; samples *= 2) {
+                  VkImageCreateInfo i = image(formats[f], 128, 128, levels,
+                                               usages[u]);
+                  i.arrayLayers = layers;
+                  i.samples = (VkSampleCountFlagBits)samples;
+                  const bool expected = f < 3 && u < 3 && levels == 1 &&
+                                        layers == 1 && samples == 1;
+                  CHECK(ELIGIBLE(i) == expected);
+                  CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) ==
+                        (expected && f == 2));
+               }
+            }
+         }
       }
-      i.extent.width = i.extent.height = 256;
-      i.mipLevels = 9;
-      i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-      CHECK(ELIGIBLE(i));
-      i.flags = 0;
-      i.samples = VK_SAMPLE_COUNT_2_BIT;
-      CHECK(!ELIGIBLE(i));
-      i.samples = VK_SAMPLE_COUNT_4_BIT;
-      CHECK(!ELIGIBLE(i));
-      i.samples = VK_SAMPLE_COUNT_8_BIT;
-      CHECK(!ELIGIBLE(i));
-      i.samples = VK_SAMPLE_COUNT_1_BIT;
-      i.tiling = VK_IMAGE_TILING_LINEAR;
-      CHECK(!ELIGIBLE(i));
-      i.tiling = VK_IMAGE_TILING_OPTIMAL;
-      i.extent.width = 32768;
-      CHECK(!ELIGIBLE(i));
-      i.extent.width = 16384;
-      i.extent.height = 32768;
-      CHECK(!ELIGIBLE(i));
-      i.extent.height = 16384;
-      i.mipLevels = 15;
-      CHECK(ELIGIBLE(i));
-      i.mipLevels = 17;
-      CHECK(!ELIGIBLE(i));
    }
 }
 
@@ -469,7 +444,7 @@ check_zink(void)
    depth.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
    CHECK(ELIGIBLE(depth));
    depth.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(ELIGIBLE(depth));
+   CHECK(!ELIGIBLE(depth));
    const VkImageCreateInfo d32 = image(VK_FORMAT_D32_SFLOAT, 2408, 1506, 1, ds);
    CHECK(ELIGIBLE(d32));
    /* A host-transfer image keeps the plain layout host copies require. */
@@ -634,11 +609,7 @@ main(void)
    check_shape(VK_FORMAT_B8G8R8A8_SRGB, false);
    check_shape(VK_FORMAT_R16G16B16A16_SFLOAT, false);
    check_shape(VK_FORMAT_R8_UNORM, false);
-   check_shape(VK_FORMAT_D32_SFLOAT, true);
-   check_shape(VK_FORMAT_D16_UNORM, true);
-   check_shape(VK_FORMAT_S8_UINT, true);
-   check_zls_mips();
-   check_shape(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
+   check_legacy_depth_policy();
    check_layered_and_msaa();
    check_colour_msaa_spill_policy();
    check_minecraft();
