@@ -822,7 +822,6 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       .retained = vk_acceleration_structure_get_va(retained_as) + hk_agx3_retained_offset(state),
       .intermediate_bvh = scratch + state->scratch.ir_offset,
       .header = scratch + state->scratch.header_offset,
-      .parents = scratch + state->scratch.size,
       .root_offset = state->leaf_node_count *
          hk_agx3_ir_leaf_size(vk_get_as_geometry_type(state->build_info)),
       .leaf_bound = state->leaf_node_count,
