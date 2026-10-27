@@ -1302,6 +1302,14 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    /* Now setup the command structs */
    struct util_dynarray payload = UTIL_DYNARRAY_INIT;
 
+   /* A small G16S submit otherwise grows the heap allocation once for its
+    * header and again for the command. Keep those payloads on the stack;
+    * util_dynarray moves to the heap if attachments or more commands need
+    * additional space. The ioctl consumes the payload before we return.
+    */
+   if (agx_is_m4_pro(&dev->dev))
+      util_dynarray_init_from_stack(&payload, alloca(1024), 1024);
+
    unsigned nr_vdm = 0, nr_cdm = 0;
 
    if (flush_sstt) {
