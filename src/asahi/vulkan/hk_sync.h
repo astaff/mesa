@@ -365,6 +365,8 @@ struct hk_sync_queue {
     * Retain all writes for a future partial-tile or sparse-layer pass.
     */
    bool precise_tile_evictions;
+   /* A single command buffer already owns the complete footprint list. */
+   bool direct_single_footprints;
    uint64_t last_preserve, evicted_preserve;
 };
 

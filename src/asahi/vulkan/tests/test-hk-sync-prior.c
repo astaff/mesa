@@ -1182,6 +1182,86 @@ test_barrier_chains_without_work(void)
      compute->sync.dep[HK_SYNC_CDM].cut == copy);
 }
 
+/* Differential check of production resolution and history, including ring
+ * wrap, retired points, mixed engines, empty buffers and multi-buffer fallback.
+ * The two queues consume the same immutable recordings in the same order.
+ */
+static void
+test_direct_single_footprints(void)
+{
+   const unsigned sizes[] = {0, 1, 2, HK_SYNC_RECENT_FOOTPRINTS + 1};
+   for (unsigned exact = 0; exact < 2; ++exact) {
+      for (unsigned serialized = 0; serialized < 2; ++serialized) {
+         for (unsigned count = 0; count <= 2; ++count) {
+            for (unsigned s = 0; s < ARRAY_SIZE(sizes); ++s) {
+               struct hk_queue *a = new_queue(exact), *b = new_queue(exact);
+               a->sync.serialize = b->sync.serialize = serialized;
+               a->sync.precise_tile_evictions = b->sync.precise_tile_evictions = true;
+               b->sync.direct_single_footprints = true;
+               struct hk_cmd_buffer *cmds[] = {new_cmd(), new_cmd()};
+               struct hk_cs **streams = test_alloc(
+                  sizeof(*streams) * MAX2(1, 2 * sizes[s]));
+               struct hk_sync_stream *saved = test_alloc(
+                  sizeof(*saved) * MAX2(1, 2 * sizes[s]));
+               unsigned n = 0;
+               for (unsigned c = 0; c < count; ++c) {
+                  for (unsigned p = 0; p < sizes[s]; ++p) {
+                     const void *image = (void *)(uintptr_t)(0x1000 + (p % 3) * 16);
+                     streams[n++] = (p & 1)
+                        ? compute_clear_pass(cmds[c], image, 0, true)
+                        : render_pass(cmds[c], image, 1, p % 3 == 0);
+                  }
+               }
+               bool same = true;
+               const unsigned rounds = sizes[s]
+                  ? HK_SYNC_RECENT_FOOTPRINTS / sizes[s] + 3 : 3;
+               for (unsigned r = 0; r < rounds; ++r) {
+                  a->drm.timeline_value = b->drm.timeline_value = r + 1;
+                  const uint64_t completed = r % 4 ? 0 : r;
+                  const bool flush = r % 7 == 0, chain = r % 3 == 0;
+                  same &= hk_sync_resolve_submit(a, cmds, count, flush, chain, completed);
+                  for (unsigned j = 0; j < n; ++j)
+                     saved[j] = streams[j]->sync;
+                  same &= hk_sync_resolve_submit(b, cmds, count, flush, chain, completed);
+                  for (unsigned j = 0; j < n; ++j) {
+                     same &= saved[j].index == streams[j]->sync.index &&
+                             saved[j].ta_split == streams[j]->sync.ta_split;
+                     for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+                        same &= saved[j].barrier[sq] == streams[j]->sync.barrier[sq] &&
+                                saved[j].prior[sq] == streams[j]->sync.prior[sq] &&
+                                saved[j].barrier_ta[sq] == streams[j]->sync.barrier_ta[sq] &&
+                                saved[j].prior_ta[sq] == streams[j]->sync.prior_ta[sq];
+                     }
+                  }
+                  same &= a->sync.recent_count == b->sync.recent_count &&
+                          a->sync.recent_next == b->sync.recent_next &&
+                          a->sync.recent_max == b->sync.recent_max &&
+                          a->sync.evicted == b->sync.evicted &&
+                          a->sync.last_preserve == b->sync.last_preserve &&
+                          a->sync.evicted_preserve == b->sync.evicted_preserve;
+                  same &= memcmp(a->sync.ever, b->sync.ever, sizeof(a->sync.ever)) == 0 &&
+                          memcmp(a->sync.tail, b->sync.tail, sizeof(a->sync.tail)) == 0 &&
+                          memcmp(a->sync.last_absolute, b->sync.last_absolute,
+                                 sizeof(a->sync.last_absolute)) == 0 &&
+                          memcmp(a->sync.submitted, b->sync.submitted,
+                                 sizeof(a->sync.submitted)) == 0;
+                  for (unsigned j = 0; j < a->sync.recent_count; ++j) {
+                     const struct hk_sync_recent *x = &a->sync.recent[j], *y = &b->sync.recent[j];
+                     same &= x->point == y->point && x->sq == y->sq &&
+                             x->fp.image == y->fp.image && x->fp.level == y->fp.level &&
+                             x->fp.preserve == y->fp.preserve &&
+                             x->fp.layer0 == y->fp.layer0 && x->fp.layer1 == y->fp.layer1 &&
+                             x->fp.cx0 == y->fp.cx0 && x->fp.cx1 == y->fp.cx1 &&
+                             x->fp.cy0 == y->fp.cy0 && x->fp.cy1 == y->fp.cy1;
+                  }
+               }
+               T("direct single-buffer footprint resolution/history matches", same);
+            }
+         }
+      }
+   }
+}
+
 int
 main(void)
 {
@@ -1190,6 +1270,7 @@ main(void)
    if (!test_context)
       return EXIT_FAILURE;
    test_precise_tile_evictions();
+   test_direct_single_footprints();
    test_xfer_write_order();
    test_barrier_chains_without_work();
    test_multiview_layer_preservation();

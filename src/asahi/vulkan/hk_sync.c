@@ -1761,6 +1761,14 @@ hk_sync_resolve_submit(struct hk_queue *queue,
    struct submit_state ss = {.queue = queue};
    struct util_dynarray submitted;
    util_dynarray_init(&submitted, NULL);
+   /* The temporary list orders different command buffers of this submit.
+    * With only one, recorded dependencies already order all its passes.
+    * Publish its original records to queue history after resolving hazards,
+    * avoiding an allocation and a second copy without exposing this submit
+    * as earlier history to itself. Keep other devices on their existing path.
+    */
+   const bool direct_footprints =
+      queue->sync.direct_single_footprints && count == 1;
 
    for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
       for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
@@ -1854,7 +1862,7 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       }
       util_dynarray_foreach(&cmd->sync_pass_records,
                             struct hk_sync_pass_record, rec) {
-         if (!rec->last)
+         if (!rec->last || direct_footprints)
             continue;
          if (indexed && util_dynarray_num_elements(
                &submitted, struct submit_footprint) >= TILE_INDEX_NONE)
@@ -1978,8 +1986,17 @@ hk_sync_resolve_submit(struct hk_queue *queue,
     * timeline point it signals (queue_submit has already advanced it).
     * Serialized queues order the next submission after this one whole. */
    if (!queue->sync.serialize) {
-      util_dynarray_foreach(&submitted, struct submit_footprint, e)
-         recent_add(&queue->sync, &e->fp, queue->drm.timeline_value, e->sq);
+      if (direct_footprints) {
+         util_dynarray_foreach(&cmdbufs[0]->sync_pass_records,
+                               struct hk_sync_pass_record, rec) {
+            if (rec->last)
+               recent_add(&queue->sync, &rec->fp, queue->drm.timeline_value,
+                          hk_sync_sq(rec->last));
+         }
+      } else {
+         util_dynarray_foreach(&submitted, struct submit_footprint, e)
+            recent_add(&queue->sync, &e->fp, queue->drm.timeline_value, e->sq);
+      }
    }
    util_dynarray_fini(&submitted);
 
