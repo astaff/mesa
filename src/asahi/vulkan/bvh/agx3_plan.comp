@@ -10,8 +10,8 @@
  * HK_AGX3_PLAN_PAIRS forms pairs (see hk_agx3_plan_args.pairs).
  * A global atomic allocator compacts jobs/child regions; it never changes
  * traversal order. The five phases are separated by dispatch barriers.
- * An update restores the retained plan instead (see hk_agx3_refit_args) and
- * runs phase 4 alone, which then also rebuilds the jobs.
+ * An update does not plan: it encodes from the retained jobs (see
+ * hk_agx3_retained_job).
  */
 #version 460
 #extension GL_GOOGLE_include_directive : require
@@ -243,8 +243,8 @@ initialize(uint id)
       state.next_slot = 3;
       state.depth = 0;
       state.error = 0;
-      state.reserved[0] = 0;
-      state.reserved[1] = 0;
+      state.saved_offsets = 0;
+      state.saved_positions = 0;
       if (DEREF(args.header).active_leaf_count == 0)
          state.error = HK_AGX3_PLAN_EMPTY;
       if (args.leaf_bound > args.node_bound || args.node_bound > 0xffffffffu / 64u ||
@@ -465,97 +465,6 @@ finish(uint id)
    DEREF(REF(uint32_t)(dispatch + 8ul)) = 1u;
 }
 
-/* Leaf count of a restored plan's node: link_and_count's value, kept in the
- * retained internal node (refit phase 4). */
-uint
-retained_leaf_count(uint index)
-{
-   if (index < args.leaf_bound)
-      return 1;
-   return DEREF(REF(vk_ir_box_node)(
-      OFFSET(args.intermediate_bvh, source_offset(index)))).bvh_offset;
-}
-
-/* Rebuild a job of the retained plan from its record {IR node, root slot,
- * child slot}: the same walk as emit, with the retained leaf counts. Slots
- * stay as allocated by the full build. A record that does not fit leaves a
- * job with no children, which node encoding rejects without writing. */
-void
-restore_job(uint j)
-{
-   if (j >= DEREF(args.state).job_count || j >= args.node_bound)
-      return;
-   uint64_t record =
-      OFFSET(args.nodes, uint64_t(j) * uint64_t(HK_AGX3_RETAINED_JOB_WORDS * 4u));
-   uint id = DEREF(REF(uint32_t)(record));
-   hk_agx3_leaf_job job;
-   job.intermediate_bvh = args.intermediate_bvh;
-   job.output_bvh = args.output_bvh;
-   job.root_slot = DEREF(REF(uint32_t)(record + 4ul));
-   job.child_slot = DEREF(REF(uint32_t)(record + 8ul));
-   job.child_count = 0;
-   job.node_kind = HK_AGX3_NODE_INNER;
-   for (uint i = 0; i < 8; i++)
-      job.triangle_offsets[i] = 0;
-   bool valid = id < args.leaf_bound + DEREF(args.header).ir_internal_node_count &&
-                id < args.node_bound;
-   uint own = valid ? retained_leaf_count(id) : 0u;
-   valid = valid && own != 0 && own <= 9;
-   bool leaf = own <= 8;
-   uint stack[9], level[9], selected[8], sp = 1, count = 0, steps = 0;
-   stack[0] = id;
-   level[0] = 0;
-   while (valid && sp != 0) {
-      if (++steps > args.node_bound * 2u) {
-         valid = false;
-         break;
-      }
-      uint current = stack[--sp], d = level[sp];
-      bool end = leaf ? current < args.leaf_bound
-                      : current != id &&
-                           (retained_leaf_count(current) <= 8 || d == 3);
-      if (end) {
-         if (count == 8) {
-            valid = false;
-            break;
-         }
-         selected[count++] = current;
-      } else if (current < args.leaf_bound) {
-         valid = false;
-      } else {
-         uvec2 pair = children(current);
-         for (int c = 1; c >= 0; c--)
-            if (pair[c] != VK_BVH_INVALID_NODE) {
-               uint child = source_index(pair[c]);
-               if (child == 0xffffffffu || sp == 9) {
-                  valid = false;
-                  break;
-               }
-               stack[sp] = child;
-               level[sp++] = d + 1;
-            }
-      }
-   }
-   uint slots = leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
-                           ? 2u * count
-                           : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                              ? count : count + (count + 3u) / 4u) : count;
-   if (valid && count != 0 && (!leaf || count == own) &&
-       slots <= args.slot_bound && job.child_slot <= args.slot_bound - slots &&
-       job.root_slot < args.slot_bound) {
-      job.child_count = count;
-      job.node_kind =
-         leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
-                    ? HK_AGX3_NODE_INSTANCES
-                    : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                       ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF)
-              : HK_AGX3_NODE_INNER;
-      for (uint c = 0; c < count; c++)
-         job.triangle_offsets[c] = source_offset(selected[c]);
-   }
-   DEREF(INDEX(hk_agx3_leaf_job, args.jobs, j)) = job;
-}
-
 void
 main()
 {
@@ -565,8 +474,6 @@ main()
       return;
    }
    if (args.phase == 4) {
-      if (args.plan_restored != 0u)
-         restore_job(id);
       finish(id);
       return;
    }
