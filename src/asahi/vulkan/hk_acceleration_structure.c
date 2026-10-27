@@ -2266,10 +2266,13 @@ hk_cmd_build_acceleration_structures(
          bool triangles =
             pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
             (!geometry || geometry->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR);
-         bool aabbs = dev->gen1_rq_candidates && geometry &&
+         /* Native AS construction supports all three geometry kinds without
+          * intersectors. Traversal state gates query execution, not building
+          * the AABB records or the TLAS instance records it will later read. */
+         bool aabbs = geometry &&
             pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
             geometry->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR;
-         bool instances = dev->gen1_rq_instances && geometry &&
+         bool instances = geometry &&
             pInfos[i].geometryCount == 1 &&
             pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR &&
             geometry->geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR;
