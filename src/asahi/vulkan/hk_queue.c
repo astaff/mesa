@@ -1758,6 +1758,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
    }
 
    queue->vk.driver_submit = hk_queue_submit;
+   queue->sync.precise_tile_evictions = agx_is_m4_pro(&dev->dev);
    queue->sync.serialize = dev->dev.params.gpu_generation >= 13 &&
                            dev->dev.params.gpu_generation <= 14;
    /* A serialized queue orders every command after both engines' complete

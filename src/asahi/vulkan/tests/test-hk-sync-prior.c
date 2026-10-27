@@ -320,6 +320,83 @@ render_pass(struct hk_cmd_buffer *cmd, const void *image, uint32_t layers,
 }
 
 
+static void
+test_precise_tile_evictions(void)
+{
+   const void *image = (void *)0x9876;
+   struct hk_cmd_buffer *full = new_cmd(), *partial = new_cmd();
+   struct hk_cs *write = render_pass(full, image, 1, false);
+   struct hk_cs *preserve = render_pass(partial, image, 1, true);
+   struct hk_cmd_buffer *one[] = {full};
+   struct hk_queue *q = new_queue(true);
+   q->sync.precise_tile_evictions = true;
+   bool no_query = true, no_barrier = true, resolved = true;
+   for (unsigned i = 1; i <= HK_SYNC_RECENT_FOOTPRINTS + 2; ++i) {
+      q->drm.timeline_value = i;
+      no_query &= !hk_sync_submit_needs_completed(q, one, 1);
+      resolved &= submit(q, full);
+      no_barrier &= write->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE;
+   }
+   T("complete writes skip retirement query through ring wrap", no_query);
+   T("complete writes keep overlap through ring wrap", resolved && no_barrier);
+   T("complete history retained for later partial pass",
+     q->sync.recent_count == HK_SYNC_RECENT_FOOTPRINTS && q->sync.evicted > 0 &&
+     q->sync.last_preserve == 0 && q->sync.evicted_preserve == 0);
+   struct hk_cmd_buffer *p[] = {partial};
+   T("later preserving pass queries complete history",
+     hk_sync_submit_needs_completed(q, p, 1));
+   const uint64_t point = ++q->drm.timeline_value;
+   T("later preserving pass resolves", submit(q, partial));
+   T("later preserving pass waits on evicted complete writes",
+     preserve->sync.barrier[HK_SYNC_VDM] == 0 && q->sync.last_preserve == point);
+   T("complete pass queries preserving history",
+     hk_sync_submit_needs_completed(q, one, 1));
+   ++q->drm.timeline_value;
+   T("complete pass resolves against preserving history", submit(q, full));
+   T("complete pass waits on live preserving pass",
+     write->sync.barrier[HK_SYNC_VDM] == 0);
+
+   /* Evict the preserving entry, then retire only through that entry. Later
+    * complete writes still run. They must remain independent of a full write,
+    * while a new partial write must wait for those same complete writes. */
+   for (unsigned i = 0; i < HK_SYNC_RECENT_FOOTPRINTS; ++i) {
+      ++q->drm.timeline_value;
+      resolved &= submit(q, full);
+   }
+   T("preserving eviction tracked separately from complete writes",
+     resolved && q->sync.evicted_preserve == point && q->sync.evicted > point);
+   ++q->drm.timeline_value;
+   T("retired preserving pass allows complete write",
+     hk_sync_resolve_submit(q, one, 1, false, false, point) &&
+     write->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE);
+   ++q->drm.timeline_value;
+   T("partial pass still waits on live evicted complete writes",
+     hk_sync_resolve_submit(q, p, 1, false, false, point) &&
+     preserve->sync.barrier[HK_SYNC_VDM] == 0);
+
+   q = new_queue(true);
+   q->sync.precise_tile_evictions = true;
+   q->drm.timeline_value = 1;
+   struct hk_cmd_buffer *pair[] = {partial, full};
+   T("partial then full in one submit retains dependency",
+     hk_sync_resolve_submit(q, pair, 2, false, false, 0) &&
+     write->sync.barrier[HK_SYNC_VDM] == preserve->sync.index);
+   q = new_queue(true);
+   q->sync.precise_tile_evictions = true;
+   q->drm.timeline_value = 1;
+   struct hk_cmd_buffer *reverse[] = {full, partial};
+   T("full then partial in one submit retains dependency",
+     hk_sync_resolve_submit(q, reverse, 2, false, false, 0) &&
+     preserve->sync.barrier[HK_SYNC_VDM] == write->sync.index);
+
+   q = new_queue(true);
+   q->drm.timeline_value = 1;
+   T("other-device complete history resolves", submit(q, full));
+   T("other devices retain retirement query policy",
+     hk_sync_submit_needs_completed(q, one, 1));
+}
+
+
 /* Transfer one range [lo, hi) into a new compute stream, as the G17P
  * transfer entry points and hk_cmd_buffer_get_cs_general() do. */
 static struct hk_cs *
@@ -1112,6 +1189,7 @@ main(void)
    test_classic_submission_order();
    if (!test_context)
       return EXIT_FAILURE;
+   test_precise_tile_evictions();
    test_xfer_write_order();
    test_barrier_chains_without_work();
    test_multiview_layer_preservation();

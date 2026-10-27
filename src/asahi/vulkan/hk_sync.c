@@ -1572,6 +1572,23 @@ recent_may_run(const struct hk_sync_queue *q, uint64_t completed)
    return q->recent_count && q->recent_max > completed;
 }
 
+/* Complete writes only need tile-hazard ordering against a pass preserving
+ * pixels/layers. Keep the full footprints: a future preserving pass must
+ * still wait for complete writes that have not retired.
+ */
+static bool
+submit_preserves_tiles(struct hk_cmd_buffer *const *cmdbufs, unsigned count)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      util_dynarray_foreach(&cmdbufs[i]->sync_pass_records,
+                            struct hk_sync_pass_record, rec) {
+         if (rec->fp.preserve)
+            return true;
+      }
+   }
+   return false;
+}
+
 bool
 hk_sync_submit_needs_completed(const struct hk_queue *queue,
                                struct hk_cmd_buffer *const *cmdbufs,
@@ -1581,6 +1598,9 @@ hk_sync_submit_needs_completed(const struct hk_queue *queue,
    /* A serialized queue never overlaps two commands, so no earlier
     * submission can share a tile with this one while it runs. */
    if (q->serialize || !q->recent_count)
+      return false;
+   if (q->precise_tile_evictions && !q->last_preserve &&
+       !submit_preserves_tiles(cmdbufs, count))
       return false;
    for (unsigned i = 0; i < count; ++i) {
       if (util_dynarray_num_elements(&cmdbufs[i]->sync_pass_records,
@@ -1596,8 +1616,15 @@ recent_conflict(const struct hk_sync_queue *q, const struct hk_sync_footprint *f
 {
    if (!recent_may_run(q, completed))
       return false;
-   /* A dropped entry may still be running: assume it shares the tile. */
-   if (q->evicted > completed)
+   if (q->precise_tile_evictions && !fp->preserve && !q->last_preserve)
+      return false;
+   /* A dropped entry may still be running: assume it shares the tile.
+    * When this pass is a complete write, only an evicted preserving pass
+    * can conflict. A preserving pass still considers every evicted write.
+    */
+   const uint64_t evicted = q->precise_tile_evictions && !fp->preserve
+      ? q->evicted_preserve : q->evicted;
+   if (evicted > completed)
       return BITFIELD_MASK(HK_SYNC_NUM_SQ);
    uint8_t engines = 0;
    if (index) {
@@ -1624,8 +1651,13 @@ recent_add(struct hk_sync_queue *q, const struct hk_sync_footprint *fp,
            uint64_t point, enum hk_sync_sq sq)
 {
    struct hk_sync_recent *slot = &q->recent[q->recent_next];
-   if (q->recent_count >= HK_SYNC_RECENT_FOOTPRINTS)
+   if (q->recent_count >= HK_SYNC_RECENT_FOOTPRINTS) {
       q->evicted = MAX2(q->evicted, slot->point);
+      if (q->precise_tile_evictions && slot->fp.preserve)
+         q->evicted_preserve = MAX2(q->evicted_preserve, slot->point);
+   }
+   if (q->precise_tile_evictions && fp->preserve)
+      q->last_preserve = MAX2(q->last_preserve, point);
    *slot = (struct hk_sync_recent){.fp = *fp, .point = point, .sq = sq};
    q->recent_next = (q->recent_next + 1) % HK_SYNC_RECENT_FOOTPRINTS;
    q->recent_count = MIN2(q->recent_count + 1, HK_SYNC_RECENT_FOOTPRINTS);
@@ -1700,7 +1732,9 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       }
    }
 
-   bool indexed = debug_get_option_sync_tile_index();
+   bool indexed = debug_get_option_sync_tile_index() &&
+      (!queue->sync.precise_tile_evictions || queue->sync.last_preserve ||
+       submit_preserves_tiles(cmdbufs, count));
    if (indexed) {
       indexed = false;
       for (unsigned i = 0; i < count && !indexed; ++i) {

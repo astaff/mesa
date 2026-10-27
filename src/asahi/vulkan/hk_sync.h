@@ -360,6 +360,12 @@ struct hk_sync_queue {
    struct hk_sync_recent recent[HK_SYNC_RECENT_FOOTPRINTS];
    uint32_t recent_next, recent_count;
    uint64_t recent_max, evicted;
+   /* G16S: complete writes need no preservation query against other
+    * complete writes, including entries evicted from the bounded ring.
+    * Retain all writes for a future partial-tile or sparse-layer pass.
+    */
+   bool precise_tile_evictions;
+   uint64_t last_preserve, evicted_preserve;
 };
 
 void hk_sync_reset(struct hk_cmd_buffer *cmd);
