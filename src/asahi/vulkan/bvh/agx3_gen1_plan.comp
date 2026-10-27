@@ -243,8 +243,8 @@ initialize(uint id)
       state.next_slot = 3;
       state.depth = 0;
       state.error = 0;
-      state.reserved[0] = 0;
-      state.reserved[1] = 0;
+      state.saved_offsets = 0;
+      state.saved_positions = 0;
       if (DEREF(args.header).active_leaf_count == 0)
          state.error = HK_AGX3_PLAN_EMPTY;
       if (args.leaf_bound > args.node_bound || args.node_bound > 0xffffffffu / 64u ||
