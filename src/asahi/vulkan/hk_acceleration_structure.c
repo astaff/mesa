@@ -93,7 +93,7 @@ static const uint32_t agx3_plan_spv[] = {
 };
 
 static const uint32_t agx3_refit_spv[] = {
-#include "bvh/hk_agx3_gen1_refit.spv.h"
+#include "bvh/hk_agx3_refit.spv.h"
 };
 
 static const uint32_t agx3_refit_encode_spv[] = {
@@ -1464,7 +1464,7 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_agx3_as_layout layout;
-   if (!hk_agx3_as_layout_init(state->leaf_node_count, &layout))
+   if (!hk_gen1_as_layout_init(state->leaf_node_count, &layout))
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    VkPipeline pipeline[3];
    VkPipelineLayout pipeline_layout[3];

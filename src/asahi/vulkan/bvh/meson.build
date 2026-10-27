@@ -33,7 +33,6 @@ foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
              ['agx3_gen1_envelope.comp', 'hk_agx3_gen1_envelope'],
              ['agx3_gen1_plan.comp', 'hk_agx3_gen1_plan'],
              ['agx3_gen1_plan.comp', 'hk_agx3_gen1_plan_pairs', '-DHK_AGX3_PLAN_PAIRS=1'],
-             ['agx3_gen1_refit.comp', 'hk_agx3_gen1_refit'],
              ['vertex_table.comp', 'hk_vertex_table']]
   command = [
     prog_glslang, '-V',
