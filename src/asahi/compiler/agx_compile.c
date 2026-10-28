@@ -10988,10 +10988,11 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    NIR_PASS(_, nir, nir_lower_alu);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false);
-   /* G17P lowers sin/cos in agx_compile_shader_nir, after the explicit-RTE
-    * FMA repair, so the repair covers the shader's own FMAs only. */
-   if (!g17p)
-      NIR_PASS(_, nir, agx_lower_sincos, native_fragment_depth ? 2 : 0);
+   /* When the explicit-RTE FMA repair applies, G17P lowers sin/cos in
+    * agx_compile_shader_nir after it, so the repair covers the shader's own
+    * FMAs only. Other shaders keep the lowering here. */
+   if (!g17p || !agx_nir_fma_rte_applies(nir))
+      NIR_PASS(_, nir, agx_lower_sincos, g17p ? 1 : native_fragment_depth ? 2 : 0);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_lower_front_face,
             nir_metadata_control_flow, NULL);
    if (g17p)
@@ -12968,10 +12969,10 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    if (key->dev.chip == AGX_CHIP_G17P)
       NIR_PASS(_, nir, agx_nir_lower_fma_rte);
 
-   /* Sin/cos left by agx_preprocess_nir_g17p. Their reduction FMAs serve an
-    * absolute-error bound, which a tininess repair of at most 2^-126 cannot
-    * affect, so they are lowered after it. Every other preprocess path has
-    * already lowered them. */
+   /* Sin/cos that agx_preprocess_nir_g17p left for an explicit-RTE shader.
+    * Their reduction FMAs serve an absolute-error bound, which a tininess
+    * repair of at most 2^-126 cannot affect, so they are lowered after it.
+    * Every other shader has already lowered them. */
    NIR_PASS(_, nir, agx_lower_sincos, 1);
 
    /* Late VBO lowering creates constant udiv instructions */
