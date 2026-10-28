@@ -4,9 +4,9 @@
 #include "compiler/nir/nir_builder.h"
 #include "agx_nir.h"
 
-nir_def *
-agx_nir_fma_rte_fixup(nir_builder *b, nir_def *a, nir_def *c, nir_def *z,
-                      nir_def *native)
+static nir_def *
+repair_tininess(nir_builder *b, nir_def *a, nir_def *c, nir_def *z,
+                nir_def *native)
 {
    /* G17P detects FMA tininess before rounding. Repair only a flushed result
     * whose exact magnitude lies in [2^-126 - 2^-150, 2^-126). RTE rounds that
@@ -85,6 +85,24 @@ agx_nir_fma_rte_fixup(nir_builder *b, nir_def *a, nir_def *c, nir_def *z,
    nir_def *normal =
       nir_ior_imm(b, nir_iand_imm(b, sign, 0x80000000u), 0x800000);
    return nir_bcsel(b, fix, normal, native);
+}
+
+nir_def *
+agx_nir_fma_rte_fixup(nir_builder *b, nir_def *a, nir_def *c, nir_def *z,
+                      nir_def *native)
+{
+   /* The repair only changes a flushed zero. Keep its multiword integer
+    * arithmetic off the normal-result path, particularly for shaders which
+    * explicitly request RTE for every FP32 operation. A select would execute
+    * that arithmetic for every FMA even when the native result is normal.
+    */
+   nir_def *is_zero =
+      nir_ieq_imm(b, nir_iand_imm(b, native, 0x7fffffff), 0);
+   nir_if *repair = nir_push_if(b, is_zero);
+   nir_def *fixed = repair_tininess(b, a, c, z, native);
+   nir_push_else(b, repair);
+   nir_pop_if(b, repair);
+   return nir_if_phi(b, fixed, native);
 }
 
 static bool
