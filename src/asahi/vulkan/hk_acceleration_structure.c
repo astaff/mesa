@@ -96,6 +96,14 @@ static const uint32_t agx3_refit_spv[] = {
 #include "bvh/hk_agx3_refit.spv.h"
 };
 
+/* The update phases that run per level or per job, each on its own. */
+static const uint32_t agx3_refit_propagate_spv[] = {
+#include "bvh/hk_agx3_refit_propagate.spv.h"
+};
+static const uint32_t agx3_refit_inner_spv[] = {
+#include "bvh/hk_agx3_refit_inner.spv.h"
+};
+
 static const uint32_t agx3_refit_encode_spv[] = {
 #include "bvh/hk_agx3_refit_encode.spv.h"
 };
@@ -1397,8 +1405,22 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    }
    VkPipeline pipeline;
    VkPipelineLayout pipeline_layout;
-   VkResult result = get_pipeline_spv(dev, "hk-agx3-refit", agx3_refit_spv,
-      sizeof(agx3_refit_spv), sizeof(struct hk_agx3_refit_args), &pipeline, &pipeline_layout);
+   VkResult result =
+      phase == HK_AGX3_REFIT_INNER
+         ? get_pipeline_spv(dev, "hk-agx3-refit-inner", agx3_refit_inner_spv,
+                            sizeof(agx3_refit_inner_spv),
+                            sizeof(struct hk_agx3_refit_args), &pipeline,
+                            &pipeline_layout)
+      : phase == HK_AGX3_REFIT_PROPAGATE
+         ? get_pipeline_spv(dev, "hk-agx3-refit-propagate",
+                            agx3_refit_propagate_spv,
+                            sizeof(agx3_refit_propagate_spv),
+                            sizeof(struct hk_agx3_refit_args), &pipeline,
+                            &pipeline_layout)
+         : get_pipeline_spv(dev, "hk-agx3-refit", agx3_refit_spv,
+                            sizeof(agx3_refit_spv),
+                            sizeof(struct hk_agx3_refit_args), &pipeline,
+                            &pipeline_layout);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return;
