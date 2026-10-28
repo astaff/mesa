@@ -1613,7 +1613,10 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
 }
 
 struct hk_g17p_bg_eot_cache_key {
-   struct agx_tilebuffer_layout tib;
+   /* 8-byte aligned so the size is a whole number of words on 32-bit x86
+    * too, where uint64_t members only need 4-byte alignment.
+    */
+   _Alignas(8) struct agx_tilebuffer_layout tib;
    struct {
       uint64_t image_view;
       uint64_t resolve_image_view;
