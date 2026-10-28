@@ -38,42 +38,197 @@ TYPE(hk_bvh_header, 4);
 TYPE(libagx_gen1_as_metadata, 8);
 #endif
 
-/* Retained binary topology for native refits. Only internal nodes and header
- * persist; updated leaf data is read directly from application buffers.
+/* Native refits (updates).
  *
- * After them, at HK_AGX3_RETAINED_PLAN_OFFSET, an updatable structure keeps
- * the native plan of its last full build: the plan state, then one record
- * per encoding job {IR node index, root slot, child slot}. An update keeps
- * the topology, so it restores this plan instead of planning again: refit
- * phase 5 or 6 copies it to scratch and plan phase 4 rebuilds each job from
- * its IR node with the same bounded walk as emit (no root walks or atomics).
- * The walk's leaf counts are kept in the retained internal nodes' bvh_offset
- * field, which nothing else reads after the common build. */
+ * A full build that allows updates keeps its encoding jobs after the image,
+ * at the retained offset: an hk_agx3_retained_state, one hk_agx3_retained_job
+ * per job, then the IR offsets of the children of every leaf job,
+ * concatenated. An update keeps the topology: it regenerates the IR leaves
+ * and re-encodes each leaf job from them, then each inner job from its
+ * children's bounds: refit encoding (agx3_leaf.comp built with
+ * HK_AGX3_REFIT) encodes the leaf jobs, then agx3_refit.comp the inner
+ * jobs. It reads neither IR internal nodes nor a plan.
+ *
+ * A child job hands its bounds to its parent at its position: the parent's
+ * first position plus the child's index. Positions number the children of
+ * all inner jobs, so they run to job_count - 2; the root's is job_count - 1.
+ *
+ * Inner jobs have levels, a third of the binary depth of the job's IR node:
+ * an inner job's inner children are one level deeper. After the child
+ * offsets (room for every leaf) come the inner jobs of the first
+ * HK_AGX3_REFIT_LEVELS levels by level: a count and a fill cursor per
+ * level, then the jobs of level 0, of level 1, and so on. An update encodes
+ * those a level per dispatch, deepest first, with no arrivals; refit
+ * propagation encodes any deeper ones.
+ *
+ * Last come the slots of the leaves of a triangle structure: for each IR
+ * leaf, the index of its child offset, or ~0 for a leaf in no leaf job. A
+ * triangle update may skip generating IR leaves: its leaf pass leaves each
+ * triangle (hk_agx3_refit_triangle) at its slot, so that each leaf job
+ * finds its children together.
+ */
+struct hk_agx3_retained_state {
+   uint32_t job_count;
+   uint32_t root_job;
+   uint32_t end_slot;
+   uint32_t depth;
+   uint32_t deepest_level;
+   /* The full build's active leaves: with updatable structures every
+    * primitive is active (VK_BUILD_FLAG_ALWAYS_ACTIVE), so an update has as
+    * many. */
+   uint32_t active_leaves;
+   uint32_t reserved[2];
+};
+
+struct hk_agx3_retained_job {
+   uint32_t root_slot;
+   uint32_t child_slot;
+   uint32_t kind_count; /* child count | node kind << 4 | inner level << 8 */
+   /* A leaf job's first child offset; an inner job's first position. */
+   uint32_t first;
+   uint32_t parent; /* 0xffffffff for the root */
+   uint32_t position;
+};
+
+#ifdef VULKAN
+TYPE(hk_agx3_retained_state, 4);
+TYPE(hk_agx3_retained_job, 4);
+#endif
+
+#define HK_AGX3_RETAINED_STATE_BYTES 32u
+#define HK_AGX3_RETAINED_JOB_BYTES 24u
+/* Levels of inner jobs an update encodes level by level. */
+#define HK_AGX3_REFIT_LEVELS 16u
+#define HK_AGX3_RETAINED_LEVEL_BYTES (HK_AGX3_REFIT_LEVELS * 8u)
+/* Where the retained jobs of a structure with `jobs` jobs and `leaves`
+ * leaves keep their child offsets, level table (and the inner jobs by level
+ * after it) and leaf slots, and their size. */
+#define HK_AGX3_RETAINED_OFFSETS(jobs)                                         \
+   (HK_AGX3_RETAINED_STATE_BYTES + (jobs) * HK_AGX3_RETAINED_JOB_BYTES)
+#define HK_AGX3_RETAINED_LEVELS(jobs, leaves)                                  \
+   (HK_AGX3_RETAINED_OFFSETS(jobs) + (leaves) * 4u)
+#define HK_AGX3_RETAINED_SLOTS(jobs, leaves)                                   \
+   (HK_AGX3_RETAINED_LEVELS(jobs, leaves) + HK_AGX3_RETAINED_LEVEL_BYTES + (jobs) * 4u)
+#define HK_AGX3_RETAINED_BYTES(jobs, leaves)                                   \
+   (HK_AGX3_RETAINED_SLOTS(jobs, leaves) + (leaves) * 4u)
+
+/* Refit phases. A full build that allows updates saves its jobs, then
+ * counts its inner jobs by level and lists them. An update prepares (after
+ * its leaves) to encode from them. After refit encoding has encoded the
+ * leaf jobs, propagation encodes the inner jobs of the levels past those
+ * the update encodes by level: each leaf job below them arrives at its
+ * parent, and the last child of an inner job to arrive encodes that job's
+ * node and arrives at its parent in turn. Then the update encodes the
+ * inner jobs of one level per dispatch, deepest first (inner). */
+#define HK_AGX3_REFIT_SAVE 0u
+#define HK_AGX3_REFIT_PREPARE 1u
+#define HK_AGX3_REFIT_PROPAGATE 2u
+#define HK_AGX3_REFIT_COUNT_LEVELS 3u
+#define HK_AGX3_REFIT_LIST_LEVELS 4u
+#define HK_AGX3_REFIT_INNER 5u
+
+/* Written by the prepare phase in encode scratch, read by refit encoding. */
+struct hk_agx3_refit_state {
+   /* Refit encoding dispatch (VkDispatchIndirectCommand, workgroups of
+    * HK_AGX3_NODE_JOBS_PER_GROUP jobs). */
+   uint32_t dispatch[3];
+   uint32_t job_count;
+   /* Retained jobs this update encodes from. */
+   uint64_t retained;
+   /* Refit propagation dispatch, one thread per job. */
+   uint32_t propagate[3];
+   uint32_t end_slot;
+};
+
+#define HK_AGX3_REFIT_PROPAGATE_DISPATCH 24u /* bytes into hk_agx3_refit_state */
+#define HK_AGX3_REFIT_GROUP_SIZE 64u
+
+#ifdef VULKAN
+TYPE(hk_agx3_refit_state, 8);
+#endif
+
 struct hk_agx3_refit_args {
+   /* This structure's retained jobs: what the save phase writes, and where
+    * the prepare phase copies the source's when updating into another
+    * structure. */
    VOID_REF retained;
+   /* Prepare: the source's metadata, which finds its retained jobs. */
    VOID_REF metadata;
    VOID_REF intermediate_bvh;
    REF(vk_ir_header) header;
-   VOID_REF parents;
+   /* Save: the plan in encode scratch. */
+   VOID_REF plan_nodes;
+   VOID_REF plan_jobs;
+   VOID_REF plan_state;
+   /* Prepare: refit state, arrival counters, child bounds and the envelope
+    * job, all in encode scratch. */
+   VOID_REF refit;
+   VOID_REF counters;
+   VOID_REF bounds;
+   VOID_REF envelope;
+   VOID_REF output_bvh;
    uint32_t root_offset;
    uint32_t leaf_bound;
    uint32_t node_bound;
    uint32_t phase;
-   /* Phases 4..6: the plan in encode scratch. Phases 5 and 6 leave the job
-    * records in the plan-node array, which an update does not use. */
-   VOID_REF plan_nodes;
-   VOID_REF plan_jobs;
-   VOID_REF plan_state;
+   uint32_t resource_id;
+   uint32_t geometry_type;
+   /* Prepare: the source is another structure. */
+   uint32_t copy;
+   /* Propagate and inner: as for node encoding. */
+   uint32_t slot_bias;
+   /* Propagate and inner: as for node encoding. Save: each job's level, in
+    * the node statuses, which node encoding has finished with. */
+   REF(uint32_t) status;
+   /* Prepare: the level dispatches (VkDispatchIndirectCommands, workgroups
+    * of HK_AGX3_REFIT_GROUP_SIZE / 8 jobs) to write. */
+   VOID_REF levels;
+   /* Prepare and propagate: the levels the update encodes by level; inner:
+    * the level to encode. */
+   uint32_t level;
+   /* Prepare: the update generated no IR leaves, so no active leaf count. */
+   uint32_t no_leaves;
 };
 
-#define HK_AGX3_RETAINED_JOB_WORDS 3u
-#define HK_AGX3_RETAINED_PLAN_STATE_BYTES 32u
-/* Retained-plan offset from the retained base: past the IR header and the
- * internal-node bound, 16-byte aligned. */
-#define HK_AGX3_RETAINED_PLAN_OFFSET(header_bytes, box_bytes, internal_bound) \
-   (((header_bytes) + (internal_bound) * (box_bytes) + 15u) / 16u * 16u)
-#define HK_AGX3_RETAINED_PLAN_BYTES(jobs) \
-   (HK_AGX3_RETAINED_PLAN_STATE_BYTES + (jobs) * (HK_AGX3_RETAINED_JOB_WORDS * 4u))
+/* Push constants of refit encoding. */
+struct hk_agx3_refit_encode_args {
+   VOID_REF refit;
+   VOID_REF bounds;
+   VOID_REF intermediate_bvh;
+   VOID_REF output_bvh;
+   REF(uint32_t) status;
+   uint32_t slot_bias;
+   uint32_t leaf_bound;
+   /* Nonzero when the update's leaf pass left its triangles at their slots
+    * instead of generating IR leaves: triangle leaf jobs read their children
+    * from these hk_agx3_refit_triangles at their child offsets' indices. */
+   VOID_REF triangles;
+};
+
+/* A triangle as an update's leaf pass leaves it, at its leaf's slot: its
+ * vertices, zero for an inactive triangle as updatable structures keep it,
+ * and its geometry and primitive IDs, as an IR triangle leaf has them. */
+struct hk_agx3_refit_triangle {
+   float coords[3][3];
+   uint32_t geometry_id_and_flags;
+   uint32_t triangle_id;
+   uint32_t padding;
+};
+
+#ifdef VULKAN
+TYPE(hk_agx3_refit_triangle, 4);
+#endif
+
+/* Push constants of an update's leaf pass, one dispatch per geometry with
+ * a thread per primitive. */
+struct hk_agx3_refit_leaf_args {
+   /* The refit state, which finds the retained jobs. */
+   VOID_REF refit;
+   REF(hk_agx3_refit_triangle) triangles;
+   vk_bvh_geometry_data geometry;
+   uint32_t leaf_bound;
+   uint32_t primitive_count;
+};
 
 
 struct hk_encode_args {
@@ -173,7 +328,8 @@ struct hk_agx3_envelope_args {
    uint32_t build_flags;
    uint32_t node_bound;
    uint32_t keep_retained;
-   uint32_t padding;
+   /* A refit: the prepare phase cleared the instance pointers already. */
+   uint32_t refit;
 };
 
 /* Scratch records for parallel binary-to-wide planning. Phases are separate
@@ -195,7 +351,10 @@ struct hk_agx3_plan_state {
    uint32_t next_slot;
    uint32_t depth;
    uint32_t error;
-   uint32_t reserved[2];
+   /* Leaf-job child offsets and positions handed out by the refit save
+    * phase (see hk_agx3_retained_job). */
+   uint32_t saved_offsets;
+   uint32_t saved_positions;
 };
 
 #ifdef VULKAN

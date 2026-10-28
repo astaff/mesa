@@ -16,23 +16,11 @@
 
 #include "hk_build_interface.h"
 
-#ifndef HK_AGX3_GEN1
-#define HK_AGX3_GEN1 0
-#endif
-
 layout(local_size_x = 64) in;
-#ifdef HK_AGX3_BATCH
-layout(push_constant) uniform CONSTS
-{
-   hk_agx3_batch_args batch;
-};
-hk_agx3_envelope_args args;
-#else
 layout(push_constant) uniform CONSTS
 {
    hk_agx3_envelope_args args;
 };
-#endif
 
 void
 store32(uint64_t address, uint value)
@@ -76,10 +64,9 @@ reciprocal_rte(float value)
    int estimate_exponent = int((estimate_bits >> 23) & 255u);
    uint estimate_mantissa = 0x800000u | (estimate_bits & 0x7fffffu);
    int estimate_shift = 150 - numerator_bit - estimate_exponent;
-   /* An exact power-of-two mantissa has a reciprocal exponent one higher
-    * than the other mantissas. Scale left in that case: a negative right
-    * shift otherwise loses the estimate and makes correction take millions
-    * of iterations (or wrap), hanging the envelope dispatch. */
+   /* M5 C54: exact power-of-two mantissas require a left shift. A negative
+    * right shift loses the estimate and makes correction run for millions
+    * of iterations, potentially hanging the envelope dispatch. */
    uint quotient = estimate_shift < 0
                       ? estimate_mantissa << uint(-estimate_shift)
                       : estimate_mantissa >> uint(estimate_shift);
@@ -116,15 +103,16 @@ publish_metadata(hk_agx3_envelope_job job, uint64_t image_bytes)
    live.retained_offset = 0ul;
    live.retained_bytes = 0ul;
    if (args.keep_retained != 0u) {
-      /* In-place UPDATE did not re-save IR at the build-bound offset. */
+      /* An in-place update keeps the retained jobs where they are. */
       libagx_gen1_as_metadata previous =
          DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
       live.retained_offset = previous.retained_offset;
       live.retained_bytes = previous.retained_bytes;
    } else if ((args.build_flags & 1u) != 0u) { /* Vulkan ALLOW_UPDATE */
+      /* The retained jobs (refit save, or an update's copy of them). */
       live.retained_offset = args.retained_offset;
-      live.retained_bytes = uint64_t(SIZEOF(vk_ir_header)) +
-         uint64_t(DEREF(args.ir_header).ir_internal_node_count) * uint64_t(SIZEOF(vk_ir_box_node));
+      live.retained_bytes =
+         uint64_t(HK_AGX3_RETAINED_BYTES(job.node_count, job.leaf_bound));
    }
    live.storage_bytes = max(image_bytes, live.retained_offset + live.retained_bytes);
    live.build_flags = args.build_flags;
@@ -157,41 +145,32 @@ clear_instance_pointers(uint job_index, uint lane)
 void
 main()
 {
-   if (HK_AGX3_GEN1 != 0)
-   for (uint i = gl_WorkGroupID.x; i < args.job_count; i += gl_NumWorkGroups.x)
+   for (uint i = gl_WorkGroupID.x; i < args.job_count && args.refit == 0u;
+        i += gl_NumWorkGroups.x)
       clear_instance_pointers(i, gl_LocalInvocationID.x);
    uint id = gl_GlobalInvocationID.x;
-#ifdef HK_AGX3_BATCH
-   if (id >= batch.job_count)
-      return;
-   hk_agx3_batch_job entry = DEREF(INDEX(hk_agx3_batch_job, batch.jobs, id));
-   args.jobs = entry.plan.envelope;
-   args.status = entry.envelope_status;
-   args.job_count = 1;
-   args.reserved = 0;
-   args.metadata = 0ul;
-   id = 0;
-#endif
    if (id >= args.job_count)
       return;
    hk_agx3_envelope_job job = DEREF(INDEX(hk_agx3_envelope_job, args.jobs, id));
    if (job.primitive_count == 0 &&
        job.opaque_build_word == HK_AGX3_PLAN_EMPTY) {
-      if (job.output_bvh == 0 || (job.output_bvh & (HK_AGX3_GEN1 != 0 ? 63ul : 1023ul)) != 0 ||
+      if (job.output_bvh == 0 || (job.output_bvh & 63ul) != 0 ||
           job.output_bvh >= (1ul << 48) - 192ul) {
          DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_RANGE;
          return;
       }
-      for (uint i = 0; i < 28; ++i)
-         store32(job.output_bvh + 64ul + uint64_t(i) * 4ul,
-                 i >= 4 && i < 10 ? 0x7fc00000u : 0u);
+      for (uint i = 0; i < 48; ++i)
+         store32(job.output_bvh + uint64_t(i) * 4ul,
+                 i >= 20 && i < 26 ? 0x7fc00000u : 0u);
+      store64(job.output_bvh + 144ul, job.output_bvh);
+      store32(job.output_bvh + 176ul,
+              job.resource_id != 0 ? job.resource_id : 1);
       publish_metadata(job, 192ul);
       DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
       return;
    }
    uint64_t tail = uint64_t(job.end_slot) * 64ul;
    bool instances = job.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
-   bool aabbs = job.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR;
    uint64_t transform_offset = tail;
    uint64_t pointer_offset = tail + 64ul * uint64_t(job.leaf_bound);
    uint64_t descriptor_offset = instances
@@ -211,7 +190,7 @@ main()
          status |= HK_AGX3_LEAF_NONFINITE;
       if (lo[a] > hi[a])
          status |= HK_AGX3_LEAF_RANGE;
-      if (HK_AGX3_GEN1 != 0 && extent[a] == 0.0) {
+      if (extent[a] == 0.0) {
          hi[a] = lo[a] + max(abs(lo[a]), 1.0) * 1.52587890625e-05;
          extent[a] = hi[a] - lo[a];
       }
@@ -232,7 +211,7 @@ main()
    for (uint i = 0; i < 32; ++i)
       store32(h + uint64_t(i) * 4ul, 0);
    store64(h, (instances ? 0x080000008000f032ul : 0x080000002000f032ul) |
-               (uint64_t(HK_AGX3_GEN1 != 0 && args.reserved == 2 ? 2 : 3) << 24));
+               (uint64_t(args.reserved == 2 ? 2 : 3) << 24));
    store64(h + 8ul, size);
    for (uint a = 0; a < 3; ++a) {
       store32(h + 16ul + uint64_t(a) * 4ul, floatBitsToUint(lo[a]));
@@ -256,16 +235,6 @@ main()
                10, 0, 0, 0, 0, 0, inverse_bits, 0x01000000, 0x01000000,
                0x00000101, 0x00010000, 0x00010000, 0x00ff0001, 0x02000000,
                0x01000005, 0x03000000, 1, 0, 0x3f800000, 0, 0, 0, 0, 0, 0);
-   if (aabbs && HK_AGX3_GEN1 == 0) {
-      /* Descriptor word 16 selects the native geometry class: Apple's
-       * extractor maps 4 to BVHGeometryBoundingBox (8 is the instance class
-       * and 0/2/10 the triangle classes). Word 20 mirrors word 16 in both
-       * captured triangle and instance descriptors; the remaining words keep
-       * the triangle values, which no native bounding-box capture has yet
-       * confirmed or refuted. */
-      descriptor[16] = 4;
-      descriptor[20] = 4;
-   }
    if (instances) {
       const uint template_words[46] = uint[46](
          0,0,0,0,0,0,0,0,1,0,0,0,0,0x3f800000,0,0,
