@@ -123,11 +123,17 @@ lower(nir_builder *b, nir_instr *instr, void *data)
 }
 
 bool
-agx_nir_lower_fma_rte(nir_shader *shader)
+agx_nir_fma_rte_applies(const nir_shader *shader)
 {
    unsigned mode = shader->info.float_controls_execution_mode;
-   if (!(mode & FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32) ||
-       (mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32))
+   return (mode & FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32) &&
+          !(mode & FLOAT_CONTROLS_DENORM_PRESERVE_FP32);
+}
+
+bool
+agx_nir_lower_fma_rte(nir_shader *shader)
+{
+   if (!agx_nir_fma_rte_applies(shader))
       return false;
    return nir_shader_lower_instructions(shader, filter, lower, NULL);
 }
