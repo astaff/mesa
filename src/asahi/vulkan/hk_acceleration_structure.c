@@ -963,8 +963,14 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                 envelope ? sizeof(finish) : sizeof(encode),
                                 envelope ? (const void *)&finish : (const void *)&encode);
+      /* A TLAS envelope also clears a pointer per instance: spread that
+       * over a thread per instance rather than one workgroup. */
       if (envelope)
-         hk_cmd_dispatch_unaligned(command_buffer, 64, 1, 1);
+         hk_cmd_dispatch_unaligned(command_buffer,
+                                   instances ? CLAMP(ALIGN_POT(args->leaf_bound, 64),
+                                                     64, 65536)
+                                             : 64,
+                                   1, 1);
       else
          hk_cmd_dispatch_indirect_addr(command_buffer,
                                        args->state + HK_AGX3_PLAN_ENCODE_DISPATCH);
