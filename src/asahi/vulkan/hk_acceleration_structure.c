@@ -96,8 +96,26 @@ static const uint32_t agx3_refit_spv[] = {
 #include "bvh/hk_agx3_refit.spv.h"
 };
 
+/* The update phases that run per level or per job, each on its own. */
+static const uint32_t agx3_refit_propagate_spv[] = {
+#include "bvh/hk_agx3_refit_propagate.spv.h"
+};
+static const uint32_t agx3_refit_inner_spv[] = {
+#include "bvh/hk_agx3_refit_inner.spv.h"
+};
+
 static const uint32_t agx3_refit_encode_spv[] = {
 #include "bvh/hk_agx3_refit_encode.spv.h"
+};
+
+/* The refit encoder for triangle structures only. */
+static const uint32_t agx3_refit_encode_triangles_spv[] = {
+#include "bvh/hk_agx3_refit_encode_triangles.spv.h"
+};
+
+/* The node encoder for instance structures only. */
+static const uint32_t agx3_node_instances_spv[] = {
+#include "bvh/hk_agx3_gen1_leaf_instances.spv.h"
 };
 
 static const uint32_t agx3_refit_leaf_spv[] = {
@@ -864,15 +882,23 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
    if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX3C &&
        !dev->g17p_native_as)
       return VK_ERROR_FEATURE_NOT_PRESENT;
-   const struct {
+   struct stage {
       const char *name;
       const uint32_t *code;
       size_t size;
       unsigned push_size;
-   } stages[] = {
+   };
+   /* A TLAS encodes only inner and instance nodes. */
+   const bool instances = args->geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
+   const struct stage node_encode = instances
+      ? (struct stage){"hk-agx3-node-encode-instances", agx3_node_instances_spv,
+                       sizeof(agx3_node_instances_spv),
+                       sizeof(struct hk_agx3_leaf_args)}
+      : (struct stage){"hk-agx3-node-encode", agx3_node_spv,
+                       sizeof(agx3_node_spv), sizeof(struct hk_agx3_leaf_args)};
+   const struct stage stages[] = {
       {"hk-agx3-plan", agx3_plan_spv, sizeof(agx3_plan_spv), sizeof(*args)},
-      {"hk-agx3-node-encode", agx3_node_spv, sizeof(agx3_node_spv),
-       sizeof(struct hk_agx3_leaf_args)},
+      node_encode,
       {"hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
        sizeof(struct hk_agx3_envelope_args)},
       /* Planning and node encoding that pair triangles. */
@@ -927,7 +953,6 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       .build_flags = args->build_flags, .node_bound = args->node_bound,
       .keep_retained = args->keep_retained,
    };
-   const bool instances = args->geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR;
    for (unsigned step = 0; step < 2; ++step) {
       bool envelope = instances ? step == 0 : step == 1;
       unsigned stage = envelope ? 2
@@ -938,8 +963,14 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                 envelope ? sizeof(finish) : sizeof(encode),
                                 envelope ? (const void *)&finish : (const void *)&encode);
+      /* A TLAS envelope also clears a pointer per instance: spread that
+       * over a thread per instance rather than one workgroup. */
       if (envelope)
-         hk_cmd_dispatch_unaligned(command_buffer, 64, 1, 1);
+         hk_cmd_dispatch_unaligned(command_buffer,
+                                   instances ? CLAMP(ALIGN_POT(args->leaf_bound, 64),
+                                                     64, 65536)
+                                             : 64,
+                                   1, 1);
       else
          hk_cmd_dispatch_indirect_addr(command_buffer,
                                        args->state + HK_AGX3_PLAN_ENCODE_DISPATCH);
@@ -1380,8 +1411,22 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
    }
    VkPipeline pipeline;
    VkPipelineLayout pipeline_layout;
-   VkResult result = get_pipeline_spv(dev, "hk-agx3-refit", agx3_refit_spv,
-      sizeof(agx3_refit_spv), sizeof(struct hk_agx3_refit_args), &pipeline, &pipeline_layout);
+   VkResult result =
+      phase == HK_AGX3_REFIT_INNER
+         ? get_pipeline_spv(dev, "hk-agx3-refit-inner", agx3_refit_inner_spv,
+                            sizeof(agx3_refit_inner_spv),
+                            sizeof(struct hk_agx3_refit_args), &pipeline,
+                            &pipeline_layout)
+      : phase == HK_AGX3_REFIT_PROPAGATE
+         ? get_pipeline_spv(dev, "hk-agx3-refit-propagate",
+                            agx3_refit_propagate_spv,
+                            sizeof(agx3_refit_propagate_spv),
+                            sizeof(struct hk_agx3_refit_args), &pipeline,
+                            &pipeline_layout)
+         : get_pipeline_spv(dev, "hk-agx3-refit", agx3_refit_spv,
+                            sizeof(agx3_refit_spv),
+                            sizeof(struct hk_agx3_refit_args), &pipeline,
+                            &pipeline_layout);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
       return;
@@ -1468,9 +1513,18 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer,
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    VkPipeline pipeline[3];
    VkPipelineLayout pipeline_layout[3];
-   VkResult result = get_pipeline_spv(dev, "hk-agx3-refit-encode",
-      agx3_refit_encode_spv, sizeof(agx3_refit_encode_spv),
-      sizeof(struct hk_agx3_refit_encode_args), &pipeline[0], &pipeline_layout[0]);
+   const bool triangles =
+      vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+   VkResult result = triangles
+      ? get_pipeline_spv(dev, "hk-agx3-refit-encode-triangles",
+                         agx3_refit_encode_triangles_spv,
+                         sizeof(agx3_refit_encode_triangles_spv),
+                         sizeof(struct hk_agx3_refit_encode_args),
+                         &pipeline[0], &pipeline_layout[0])
+      : get_pipeline_spv(dev, "hk-agx3-refit-encode", agx3_refit_encode_spv,
+                         sizeof(agx3_refit_encode_spv),
+                         sizeof(struct hk_agx3_refit_encode_args),
+                         &pipeline[0], &pipeline_layout[0]);
    if (result == VK_SUCCESS)
       result = get_pipeline_spv(dev, "hk-agx3-as-envelope", agx3_envelope_spv,
          sizeof(agx3_envelope_spv), sizeof(struct hk_agx3_envelope_args),
