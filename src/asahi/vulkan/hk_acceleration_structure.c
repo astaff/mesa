@@ -682,7 +682,7 @@ static_assert(sizeof(struct hk_agx3_leaf_args) == 32, "native node push ABI");
 static_assert(sizeof(struct hk_agx3_envelope_job) == 48, "native envelope job ABI");
 static_assert(sizeof(struct hk_agx3_envelope_args) == 64, "native envelope push ABI");
 /* The GEN1 layout: the plan state, then the node encoding dispatch arguments
- * the plan writes for the indirect encode (bvh/agx3_gen1_plan.comp), a
+ * the plan writes for the indirect encode (bvh/agx3_plan.comp), a
  * 64-byte record slot per child including bounding boxes, 16 KiB images,
  * and four 8-lane node jobs per encoding workgroup. */
 static_assert(HK_AGX3_PLAN_ENCODE_DISPATCH == sizeof(struct hk_agx3_plan_state) &&
