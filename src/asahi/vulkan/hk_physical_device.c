@@ -1339,15 +1339,12 @@ hk_get_device_properties(const struct agx_device *dev,
                                       VK_RESOLVE_MODE_MAX_BIT,
       .independentResolveNone = true,
       .independentResolve = true,
-      .driverID = VK_DRIVER_ID_MESA_HONEYKRISP,
-      /* The M4 ports have not completed a conformance submission. Keep the
-       * implemented API/features available without claiming a passed CTS version.
-       * T6040 uses the G17P driver path, so check its physical identity too.
+      .driverID = VK_DRIVER_ID_AURORA_BOREALIS,
+      /* Conformance is submitted per driver ID. Borealis has not made a
+       * submission under its own ID yet, so it claims no CTS version on any
+       * chip, including the ones Honeykrisp is conformant on.
        */
-      .conformanceVersion = (dev->chip == AGX_CHIP_G16G ||
-                             dev->params.chip_id == 0x6040)
-                               ? (VkConformanceVersion){0, 0, 0, 0}
-                               : (VkConformanceVersion){1, 4, 6, 2},
+      .conformanceVersion = (VkConformanceVersion){0, 0, 0, 0},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
