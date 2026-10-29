@@ -373,15 +373,18 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
    if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
       return false;
 
+   /* Read the chain as hk_g17p_compression_eligible() does: copy each
+    * sType, and copy pNext straight into next. */
    for (const void *next = info->pNext; next;) {
-      VkBaseInStructure ext;
-      memcpy(&ext, next, sizeof(ext));
-      if (ext.sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+      VkStructureType type;
+      memcpy(&type, next, sizeof(type));
+      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
           ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
          return false;
-      if (ext.sType == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
          return false;
-      next = ext.pNext;
+      memcpy(&next, (const char *)next + offsetof(VkBaseInStructure, pNext),
+             sizeof(next));
    }
 
    const VkImageCreateFlags allowed_flags =
@@ -440,11 +443,12 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
       return false;
 
    for (const void *next = info->pNext; next;) {
-      VkBaseInStructure ext;
-      memcpy(&ext, next, sizeof(ext));
-      if (ext.sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)
+      VkStructureType type;
+      memcpy(&type, next, sizeof(type));
+      if (type != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)
          return false;
-      next = ext.pNext;
+      memcpy(&next, (const char *)next + offsetof(VkBaseInStructure, pNext),
+             sizeof(next));
    }
 
    return !(info->flags & ~VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
@@ -489,15 +493,18 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
 
+   /* Read the chain as hk_g17p_compression_eligible() does: copy each
+    * sType, and copy pNext straight into next. */
    for (const void *next = info->pNext; next;) {
-      VkBaseInStructure ext;
-      memcpy(&ext, next, sizeof(ext));
-      if (ext.sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+      VkStructureType type;
+      memcpy(&type, next, sizeof(type));
+      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
           ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
          return false;
-      if (ext.sType == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+      if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
          return false;
-      next = ext.pNext;
+      memcpy(&next, (const char *)next + offsetof(VkBaseInStructure, pNext),
+             sizeof(next));
    }
 
    const VkImageCreateFlags allowed_flags =
