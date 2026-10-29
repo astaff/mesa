@@ -152,14 +152,19 @@ hk_hal200_compression_eligible(enum agx_chip chip, unsigned plane,
     * points-to analysis loses the chain and drops its stores again. */
    for (const void *next = info->pNext; next;) {
       VkStructureType type;
+      const void *following;
       memcpy(&type, next, sizeof(type));
-      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
-          ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
-         return false;
+      memcpy(&following, (const char *)next + offsetof(VkBaseInStructure, pNext),
+             sizeof(following));
+      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+         VkExternalMemoryImageCreateInfo external;
+         memcpy(&external, next, sizeof(external));
+         if (external.handleTypes)
+            return false;
+      }
       if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
          return false;
-      memcpy(&next, (const char *)next + offsetof(VkBaseInStructure, pNext),
-             sizeof(next));
+      next = following;
    }
 
    VkImageCreateFlags allowed_flags =
@@ -373,18 +378,22 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
    if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
       return false;
 
-   /* Read the chain as hk_g17p_compression_eligible() does: copy each
-    * sType, and copy pNext straight into next. */
+   /* Read the chain as hk_g17p_compression_eligible() does. */
    for (const void *next = info->pNext; next;) {
       VkStructureType type;
+      const void *following;
       memcpy(&type, next, sizeof(type));
-      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
-          ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
-         return false;
+      memcpy(&following, (const char *)next + offsetof(VkBaseInStructure, pNext),
+             sizeof(following));
+      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+         VkExternalMemoryImageCreateInfo external;
+         memcpy(&external, next, sizeof(external));
+         if (external.handleTypes)
+            return false;
+      }
       if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
          return false;
-      memcpy(&next, (const char *)next + offsetof(VkBaseInStructure, pNext),
-             sizeof(next));
+      next = following;
    }
 
    const VkImageCreateFlags allowed_flags =
@@ -493,18 +502,22 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
 
-   /* Read the chain as hk_g17p_compression_eligible() does: copy each
-    * sType, and copy pNext straight into next. */
+   /* Read the chain as hk_g17p_compression_eligible() does. */
    for (const void *next = info->pNext; next;) {
       VkStructureType type;
+      const void *following;
       memcpy(&type, next, sizeof(type));
-      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
-          ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
-         return false;
+      memcpy(&following, (const char *)next + offsetof(VkBaseInStructure, pNext),
+             sizeof(following));
+      if (type == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
+         VkExternalMemoryImageCreateInfo external;
+         memcpy(&external, next, sizeof(external));
+         if (external.handleTypes)
+            return false;
+      }
       if (type == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
          return false;
-      memcpy(&next, (const char *)next + offsetof(VkBaseInStructure, pNext),
-             sizeof(next));
+      next = following;
    }
 
    const VkImageCreateFlags allowed_flags =
