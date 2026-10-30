@@ -16,6 +16,7 @@ struct agx_va_interval {
 static const struct agx_va_interval g17p_kernel_reserved[] = {
    {AGX_G17_RUNTIME_GRAPH_VA_START, AGX_G17_RUNTIME_GRAPH_VA_END},
    {AGX_G17P_RENDER_AUX_ALIAS_START, AGX_G17P_RENDER_AUX_ALIAS_END},
+   {UINT64_C(0x7100000000), UINT64_C(0x7300000000)},
 };
 
 bool

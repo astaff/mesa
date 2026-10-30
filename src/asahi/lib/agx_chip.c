@@ -6,6 +6,8 @@
 #include "agx_chip.h"
 
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 enum agx_chip
 agx_chip_from_params(const struct drm_asahi_params_global *params)
@@ -67,7 +69,17 @@ agx_chip_from_params(const struct drm_asahi_params_global *params)
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200)
             return AGX_CHIP_G17P;
          return AGX_CHIP_G16S;
-      case 'C': return AGX_CHIP_G16C;
+      case 'C':
+      case 'X':
+         if (params->chip_id == 0x6041 &&
+             params->usc_generation == AGX_ISA_AGX3 &&
+             params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200) {
+            const char *profile = getenv("ASAHI_T6041_PROFILE");
+            if (profile && !strcmp(profile, "g16g"))
+               return AGX_CHIP_G16G;
+            return AGX_CHIP_G17P;
+         }
+         return params->gpu_variant == 'C' ? AGX_CHIP_G16C : AGX_CHIP_UNKNOWN;
       default: return AGX_CHIP_UNKNOWN;
       }
    case 17:
@@ -294,7 +306,9 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
       /* M4 Pro: two clusters (a binned part keeps two). */
       const bool m4_pro =
          params->chip_id == 0x6040 && params->num_clusters_total == 2;
-      return (a18_pro || m4_pro) && params->num_dies == 1 &&
+      const bool m4_max =
+         params->chip_id == 0x6041 && params->num_clusters_total == 4;
+      return (a18_pro || m4_pro || m4_max) && params->num_dies == 1 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
    }
@@ -314,13 +328,31 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
    case AGX_CHIP_G16G:
-      return params->chip_id == 0x8132 && params->num_dies == 1 &&
-             params->num_clusters_total == 1 &&
+      return ((params->chip_id == 0x8132 && params->num_clusters_total == 1) ||
+              (params->chip_id == 0x6041 && params->num_clusters_total == 4)) &&
+             params->num_dies == 1 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
    default:
       return true;
    }
+}
+
+bool
+agx_params_fixup_upstream_uapi(struct drm_asahi_params_global *params)
+{
+   if (!params || params->usc_generation != 0)
+      return false;
+
+   params->features &= DRM_ASAHI_FEATURE_SOFT_FAULTS;
+
+   if (params->chip_id == 0x6041 && params->gpu_generation == 16 &&
+       params->gpu_hal_generation == 0) {
+      params->usc_generation = AGX_ISA_AGX3;
+      params->gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
+   }
+
+   return true;
 }
 
 const char *

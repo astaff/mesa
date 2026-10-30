@@ -6,6 +6,7 @@
 #include "agx_pbe_agx3_core.h"
 #include "agx_bytes.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #define AGX_PBE_DIMENSION_2D 2u
@@ -21,6 +22,29 @@
  * per row (HAL200 PBEStateEncoderGen9::StateFields handles layouts 0 and 3 on
  * one path; Texture::getStride returns macroblocks for Interchange). */
 #define AGX_PBE_LAYOUT_INTERCHANGE 3u
+
+#define AGX_PBE_LINEAR_STRIDE_BIAS 4u
+#define AGX_PBE_INTERCHANGE_STRIDE_BIAS 16u
+
+static uint32_t
+linear_stride_bias(void)
+{
+   static int bias = -1;
+   if (bias < 0) {
+      const char *env = getenv("ASAHI_G17P_LINEAR_PBE_STRIDE_BIAS");
+      const unsigned long value = env ? strtoul(env, NULL, 0) : AGX_PBE_LINEAR_STRIDE_BIAS;
+      bias = (value == 4 || value == 16) ? (int)value : (int)AGX_PBE_LINEAR_STRIDE_BIAS;
+   }
+   return (uint32_t)bias;
+}
+
+static uint32_t
+stride_bias(uint32_t generation, uint8_t layout)
+{
+   return generation == AGX_PBE_AGX3_GENERATION_9 &&
+          layout == AGX_PBE_LAYOUT_LINEAR ? linear_stride_bias()
+                                         : AGX_PBE_INTERCHANGE_STRIDE_BIAS;
+}
 
 static bool
 channel_is_uncompressed(uint8_t channels)
@@ -83,7 +107,7 @@ fields_valid(uint32_t generation,
    const bool strided = linear || interchange;
    const bool stride_valid =
       strided ? fields->stride_B >= 16 && !(fields->stride_B & 0xf) &&
-                   fields->stride_B - 16 <
+                   fields->stride_B - stride_bias(generation, fields->layout) <
                       (UINT32_C(1) <<
                        (generation == AGX_PBE_AGX3_GENERATION_10 ? 20 : 21))
               : fields->stride_B == 0;
@@ -155,7 +179,8 @@ agx_pbe_agx3_2d_pack(uint32_t generation,
    uint64_t word1 = fields->buffer >> 4;
    if (fields->layout == AGX_PBE_LAYOUT_LINEAR ||
        fields->layout == AGX_PBE_LAYOUT_INTERCHANGE)
-      word1 |= (uint64_t)(fields->stride_B - 16) << 40;
+      word1 |= (uint64_t)(fields->stride_B -
+                         stride_bias(generation, fields->layout)) << 40;
    else
       word1 |= (uint64_t)layer_flag << 60;
 
@@ -463,7 +488,9 @@ agx_pbe_agx3_2d_unpack(uint32_t generation, const void *bytes, size_t size,
       fields->acceleration_buffer = word2 << 4;
    if (layout == AGX_PBE_LAYOUT_LINEAR || layout == AGX_PBE_LAYOUT_INTERCHANGE) {
       fields->buffer = (word1 & ((UINT64_C(1) << 40) - 1)) << 4;
-      fields->stride_B = ((word1 >> 40) & ((UINT64_C(1) << 21) - 1)) + 16;
+      fields->stride_B =
+         ((word1 >> 40) & ((UINT64_C(1) << 21) - 1)) +
+         stride_bias(generation, layout);
    } else {
       fields->buffer = (word1 & ((UINT64_C(1) << 44) - 1)) << 4;
       fields->page_aligned_layers = (word1 >> 60) & 1;

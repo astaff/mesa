@@ -1077,6 +1077,54 @@ test_gen9_uncompressed_dimensions(void)
    }
 }
 
+static void
+test_agx3_linear_pbe_stride(void)
+{
+   struct AGX_PBE rt = render_target_pbe();
+   rt.layout = AGX_LAYOUT_LINEAR;
+   rt.width = 3456;
+   rt.height = 2160;
+   rt.stride = 3456 * 4 - 4;
+   struct agx_gallium_pbe_descriptor native;
+   CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native, &rt));
+   uint64_t word1;
+   memcpy(&word1, (const uint8_t *)native.opaque + 8, sizeof(word1));
+   CHECK(((word1 >> 40) & ((UINT64_C(1) << 21) - 1)) == 3456 * 4 - 4);
+   CHECK((word1 & ((UINT64_C(1) << 40) - 1)) == rt.buffer >> 4);
+   struct agx_pbe_agx3_2d_fields fields;
+   CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_9, native.opaque,
+                                AGX_PBE_AGX3_DESCRIPTOR_LENGTH, &fields));
+   CHECK(fields.layout == AGX_LAYOUT_LINEAR && fields.stride_B == 3456 * 4 &&
+         fields.width == 3456 && fields.height == 2160);
+
+   for (uint32_t pitch = 16; pitch <= (UINT32_C(1) << 20); pitch = pitch * 3 + 16) {
+      rt.width = 4;
+      rt.height = 8;
+      rt.stride = (pitch & ~UINT32_C(15)) - 4;
+      if (rt.stride + 4 < 16)
+         continue;
+      CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native, &rt));
+      CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_9, native.opaque,
+                                   AGX_PBE_AGX3_DESCRIPTOR_LENGTH, &fields));
+      CHECK(fields.stride_B == rt.stride + 4);
+   }
+
+   rt.stride = 3456 * 4 - 4;
+   CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native, &rt));
+   struct agx_pbe_agx3_descriptor gen10;
+   fields.stride_B = 3456 * 4;
+   CHECK(agx_pbe_agx3_2d_pack(AGX_PBE_AGX3_GENERATION_10, &fields, &gen10));
+   memcpy(&word1, gen10.bytes + 8, sizeof(word1));
+   CHECK(((word1 >> 40) & ((UINT64_C(1) << 20) - 1)) == 3456 * 4 - 16);
+   CHECK(agx_pbe_agx3_2d_unpack(AGX_PBE_AGX3_GENERATION_10, gen10.bytes,
+                                AGX_PBE_AGX3_DESCRIPTOR_LENGTH, &fields));
+   CHECK(fields.stride_B == 3456 * 4);
+
+   fields.stride_B = (UINT32_C(1) << 20) + 16;
+   CHECK(!agx_pbe_agx3_2d_pack(AGX_PBE_AGX3_GENERATION_10, &fields, &gen10));
+   CHECK(agx_pbe_agx3_2d_pack(AGX_PBE_AGX3_GENERATION_9, &fields, &gen10));
+}
+
 int
 main(void)
 {
@@ -1090,6 +1138,7 @@ main(void)
    test_gen9_uncompressed_dimensions();
    test_native_packers();
    test_agx3_pbe();
+   test_agx3_linear_pbe_stride();
    test_g17p_compressed_render_target();
    test_g17p_image_atomic_sw();
    printf("Gallium AGX native descriptors: %u checks passed\n", checks);
