@@ -1339,7 +1339,9 @@ hk_get_device_properties(const struct agx_device *dev,
                                       VK_RESOLVE_MODE_MAX_BIT,
       .independentResolveNone = true,
       .independentResolve = true,
-      .driverID = VK_DRIVER_ID_AURORA_BOREALIS,
+      .driverID = instance->drirc.misc.report_honeykrisp_driver_id
+                     ? VK_DRIVER_ID_MESA_HONEYKRISP
+                     : VK_DRIVER_ID_AURORA_BOREALIS,
       /* Conformance is submitted per driver ID. Borealis has not made a
        * submission under its own ID yet, so it claims no CTS version on any
        * chip, including the ones Honeykrisp is conformant on.

@@ -14,6 +14,11 @@ from M1 to M5 and the A18 Pro, with the driver ID
 Silicon. Borealis has not made a conformance submission under that ID yet, so
 it reports a ``conformanceVersion`` of 0.0.0.0.
 
+DXVK and vkd3d-proton pick their tiler handling by driver ID and do not know
+the Borealis ID yet, so Borealis reports ``VK_DRIVER_ID_MESA_HONEYKRISP`` to
+them. The ``hk_report_honeykrisp_driver_id`` driconf option does this, and can
+be set for other applications that need it.
+
 The sources stay in ``src/asahi/vulkan`` with the ``hk_`` prefix, and the
 library is still ``libvulkan_asahi.so``, so packaging and upstream syncs keep
 working as before.
