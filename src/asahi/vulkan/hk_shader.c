@@ -3025,7 +3025,9 @@ agx_nir_lower_custom_border(nir_shader *nir)
  * clamp-to-0 index c is not negative, i.e. `if (c >= 0)`, with tex_0 sampling
  * c without its integer-border bit (hk_nir_lower_descriptors()). */
 static bool
-hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
+hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0,
+                          bool has_unbiased_sampler,
+                          unsigned descriptor_generation)
 {
    const int s = nir_tex_instr_src_index(tex_0, nir_tex_src_sampler_handle);
    if (s < 0)
@@ -3053,10 +3055,10 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
       return false;
    if (nir_scalar_equal(tested, c))
       return true;
-   if (!g17p)
+   if (!has_unbiased_sampler)
       return false;
    const struct hk_sampled_image_descriptor_layout native =
-      hk_sampled_image_descriptor_layout(9);
+      hk_sampled_image_descriptor_layout(descriptor_generation);
    return hk_nir_border_indices_same_descriptor(
       tested, c,
       native.clamp_0_sampler_index - native.sampler -
@@ -3069,7 +3071,9 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
  * emulation, unless every clamp-to-0 sample sits directly in the then-list
  * of its branch (hk_is_border_emulation_if()). */
 static bool
-hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
+hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs,
+                         bool has_unbiased_sampler,
+                         unsigned descriptor_generation)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -3088,7 +3092,9 @@ hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
             foreach_list_typed(nir_cf_node, node, node, &nif->then_list)
                in_then |= node == &block->cf_node;
             if (!in_then ||
-                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p)) {
+                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr),
+                                           has_unbiased_sampler,
+                                           descriptor_generation)) {
                return false;
             }
 
@@ -3663,7 +3669,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             lookup_ycbcr_conversion, &ycbcr_state);
    NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
             lower_ycbcr_chroma_blend, nir_metadata_none, (void *)&ycbcr_state);
-   if (agx_chip_native_agx3(dev->dev.chip)) {
+   if (agx_chip_has_packed_ycbcr(dev->dev.chip)) {
       NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
                lower_ycbcr_plane_range, nir_metadata_control_flow,
                (void *)&ycbcr_state);
@@ -3802,13 +3808,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    else if (agx_chip_agx3_path(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, agx_nir_lower_g17p_texture_early,
                support_lod_bias,
-               agx_chip_sampler_has_lod_bias(dev->dev.chip) ||
-                  agx_chip_hal300_path(dev->dev.chip));
+               agx_chip_sampler_has_lod_bias(dev->dev.chip));
    else
       NIR_PASS(lowered_complex, nir, agx_nir_lower_texture_early,
                support_lod_bias);
 
-   if (agx_chip_native_agx3(dev->dev.chip) &&
+   if (agx_chip_native_or_m5(dev->dev.chip) &&
        agx_chip_sampler_has_lod_bias(dev->dev.chip))
       NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
                hk_lower_g17p_sampler_bias, nir_metadata_control_flow, NULL);
@@ -5130,7 +5135,7 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
 /* This deliberately accepts only direct constant-offset push loads. The root
  * access set is unchanged when their arithmetic moves into a constant program. */
 static bool
-hk_m5_push_colour_load(const nir_intrinsic_instr *load)
+hk_push_colour_load(const nir_intrinsic_instr *load)
 {
    if (load->intrinsic != nir_intrinsic_load_global_constant ||
        load->def.bit_size != 32 || load->def.num_components > 4)
@@ -5162,7 +5167,7 @@ hk_m5_push_colour_load(const nir_intrinsic_instr *load)
 /* Keep straight-line uniform RT0 exports without descriptors or hidden effects.
  * The clone retains the original clamps and floating-point controls. */
 static bool
-hk_m5_uniform_colour(nir_shader *nir)
+hk_uniform_colour(nir_shader *nir)
 {
    if (nir->info.stage != MESA_SHADER_FRAGMENT || nir->info.internal ||
        nir->info.writes_memory || nir->info.fs.uses_discard ||
@@ -5195,7 +5200,7 @@ hk_m5_uniform_colour(nir_shader *nir)
                return false;
             break;
          case nir_intrinsic_load_global_constant:
-            if (!hk_m5_push_colour_load(intr))
+            if (!hk_push_colour_load(intr))
                return false;
             break;
          default:
@@ -5653,10 +5658,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       xfb_info = &shader->info.xfb_info;
    }
 
-   /* Only G17P's backend keeps an array comparison's constant level or bias
-    * in a register (agx_optimizer_inline_imm), so only G17P admits one to
-    * the sampler lowerings below. */
-   const bool g17p = dev->dev.chip == AGX_CHIP_G17P;
+   /* AGX3B native backends keep an array comparison's constant level or bias
+    * in a register (agx_optimizer_inline_imm), so native AGX3 chips admit one
+    * to the sampler lowerings below. */
+   const bool native_agx3 = agx_chip_native_agx3(dev->dev.chip);
    if (agx_chip_native_or_g18g(dev->dev.chip) &&
        nir->info.stage == MESA_SHADER_VERTEX) {
       /* Software vertex variants feed geometry/tessellation through CDM.
@@ -5664,7 +5669,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * as hardware VS variants; legacy descriptor-base/index operands do
        * not encode as native G17P texture fetches. Lower before changing the
        * NIR stage so both variants retain the vertex preamble convention. */
-      if (agx_nir_lower_g17p_indexed_samplers(nir, g17p)) {
+      if (agx_nir_lower_g17p_indexed_samplers(nir, native_agx3)) {
          shader->info.agx3_indexed_sampler_valid = true;
 
          /* Native G17P publishes texture/sampler heap pointers in halves
@@ -5694,7 +5699,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * the same register-operand SMP form selected after this rewrite. The
        * VDM-launched mesh program takes the heaps in uniform halves 0..7 like
        * the vertex program (hk_g17p_graphics_uniform_ranges()). */
-      if (agx_nir_lower_g17p_indexed_samplers(nir, g17p))
+      if (agx_nir_lower_g17p_indexed_samplers(nir, native_agx3))
          shader->info.agx3_indexed_sampler_valid = true;
    } else if (agx_chip_native_or_g18g(dev->dev.chip) &&
               nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -5703,12 +5708,13 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       nir_shader *candidate =
          !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
                !(features & HK_FEAT_DESCRIPTOR_BUFFER) &&
-               agx_nir_g17p_combined_sampler_candidate(nir, g17p)
+               agx_nir_g17p_combined_sampler_candidate(nir, native_agx3)
             ? nir_shader_clone(NULL, nir)
             : NULL;
       struct agx_g17p_combined_sampler_binding binding;
       if (candidate &&
-          agx_nir_lower_g17p_combined_sampler(candidate, &binding, g17p)) {
+          agx_nir_lower_g17p_combined_sampler(candidate, &binding,
+                                              native_agx3)) {
          ralloc_free(nir);
          nir = candidate;
          shader->info.agx3_combined_sampler_valid = true;
@@ -5721,7 +5727,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          set_count = 0;
       } else {
          ralloc_free(candidate);
-         if (agx_nir_lower_g17p_indexed_samplers(nir, g17p))
+         if (agx_nir_lower_g17p_indexed_samplers(nir, native_agx3))
             shader->info.agx3_indexed_sampler_valid = true;
       }
    } else if (dev->dev.chip == AGX_CHIP_G18G &&
@@ -5779,7 +5785,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          } else if (ops.has_tex || ops.has_bindless_image_read) {
             nir_shader *c = nir_shader_clone(NULL, nir);
             shader->info.agx3_indexed_sampler_valid = hk_g18g_keep_lowered(
-               &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c, g17p));
+               &nir, c, c && agx_nir_lower_g17p_indexed_samplers(c, native_agx3));
          }
       }
       shader->info.g18_unlowered_image =
@@ -5829,12 +5835,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
 
       if (!lowered && record_time_sets && !sampled_uab && ops.has_tex &&
-          agx_nir_g17p_combined_sampler_candidate(nir, g17p)) {
+          agx_nir_g17p_combined_sampler_candidate(nir, native_agx3)) {
          nir_shader *candidate = nir_shader_clone(NULL, nir);
          struct agx_g17p_combined_sampler_binding sampled_binding;
          if (candidate &&
-             agx_nir_lower_g17p_combined_sampler(candidate,
-                                                 &sampled_binding, g17p)) {
+             agx_nir_lower_g17p_combined_sampler(candidate, &sampled_binding,
+                                                 native_agx3)) {
             ralloc_free(nir);
             nir = candidate;
             shader->info.agx3_combined_sampler_valid = true;
@@ -5851,7 +5857,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       if (!lowered && (ops.has_tex || ops.has_bindless_image_read)) {
          nir_shader *candidate = nir_shader_clone(NULL, nir);
          if (candidate &&
-             agx_nir_lower_g17p_indexed_samplers(candidate, g17p)) {
+             agx_nir_lower_g17p_indexed_samplers(candidate, native_agx3)) {
             /* Keep the storage image BINDLESS alongside indexed
              * samplers.
              *
@@ -6275,9 +6281,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * every driver-synthesized root load while trimming unused push-constant,
     * dynamic-buffer and trailing tail bytes. Round up for native
     * uniform/global load granularity. */
-   if (agx_chip_native_hal200(dev->dev.chip))
+   const bool trimmed_root =
+      agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip);
+   if (trimmed_root)
       shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
-   if (agx_chip_native_hal200(dev->dev.chip) &&
+   if (trimmed_root &&
        (sw_stage == MESA_SHADER_COMPUTE ||
         sw_stage == MESA_SHADER_FRAGMENT ||
         (sw_stage == MESA_SHADER_VERTEX &&
@@ -6472,14 +6480,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    assert(nir->info.io_lowered);
 
-   /* Preserve NIR for optional native inline blending, M5 uniform-colour
+   /* Preserve NIR for optional native inline blending, uniform-colour
     * blending and mandatory M5 sample shading whose split exports exceed the
     * register file. Native AGX3 inline blending captures the shader's
     * pre-preamble NIR during the standalone compile below so fast-link does
     * not repeat the pre-preamble optimization pipeline. */
    const bool preserve_raw_mono =
-      (agx_chip_g17_m5(dev->dev.chip) && sw_stage == MESA_SHADER_FRAGMENT &&
-       hk_m5_uniform_colour(nir)) ||
+      (sw_stage == MESA_SHADER_FRAGMENT &&
+       (agx_chip_g17_m5(dev->dev.chip) ||
+        agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2) &&
+       hk_uniform_colour(nir)) ||
       (sw_stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.m5_inline_sample_shading);
    const bool capture_g17p_preopt_mono =
@@ -7162,6 +7172,7 @@ hk_nir_scan_input_attachments(const nir_shader *nir,
    }
 
    bool eligible = true;
+   unsigned other_samples = 0;
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
@@ -7285,11 +7296,13 @@ hk_nir_scan_input_attachments(const nir_shader *nir,
          }
 
          out->ia_mask |= BITFIELD_BIT(ia_idx);
-         if (ms_by_sample_id)
-            out->ms_mask |= BITFIELD_BIT(ia_idx);
+         if (!ms_by_sample_id)
+            other_samples |= BITFIELD_BIT(ia_idx);
       }
    }
 
+   /* Every access to a multisample input must refer to the current sample. */
+   out->ms_mask = out->ia_mask & ~other_samples;
    if (!eligible || !out->ia_mask) {
       memset(out, 0, sizeof(*out));
       return false;
@@ -7387,7 +7400,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    if (!nir)
       return;
 
-   if (!agx_chip_local_read_tilebuffer(dev->dev.chip) || nir->info.internal ||
+   if (!hk_local_read_tilebuffer(dev->dev.chip) || nir->info.internal ||
        (key && key->fs.zs_self_dep) || hk_nir_has_ray_query(nir) ||
        (nir->info.outputs_written &
         (BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
@@ -7397,12 +7410,16 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
       return;
    }
 
+   const bool agx2 = agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
+   const bool force_samples = key && key->fs.force_sample_shading;
+   const bool sample_rate = nir->info.fs.uses_sample_shading || (agx2 && force_samples);
    const unsigned native_samples =
       key ? hk_native_fs_samples(dev->dev.chip, &key->fs) : 0;
-   const unsigned lr_samples =
-      native_samples ? native_samples
-                     : (nir->info.fs.uses_sample_shading ? 0 : 1);
-   if (lr_samples == 0) {
+   /* An AGX2 sample-rate program gets its loop bound from the draw's epilog
+    * key after its tile loads and stores have been combined into one shader. */
+   const bool dynamic_samples = agx2 && sample_rate;
+   const unsigned lr_samples = native_samples ? native_samples : (sample_rate ? 0 : 1);
+   if (!lr_samples && !dynamic_samples) {
       ralloc_free(nir);
       return;
    }
@@ -7416,7 +7433,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
       return;
    }
 
-   nir->info.fs.uses_sample_shading |= key && key->fs.force_sample_shading;
+   nir->info.fs.uses_sample_shading |= force_samples;
    if (lr_samples == 1)
       NIR_PASS(_, nir, agx_nir_lower_g17p_1x_sample_shading);
    if (agx_chip_g17_m5(dev->dev.chip) && lr_samples > 4)
@@ -7424,7 +7441,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    else
       NIR_PASS(_, nir, agx_nir_lower_sample_intrinsics, false);
 
-   if (lr_samples > 1 && nir->info.fs.uses_sample_shading &&
+   if (lr_samples != 1 && nir->info.fs.uses_sample_shading &&
        nir->info.fs.uses_discard) {
       ralloc_free(nir);
       return;
@@ -7485,7 +7502,8 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    }
 
    NIR_PASS(_, nir, agx_nir_apply_api_mask_to_force_early, dev->dev.chip);
-   NIR_PASS(_, nir, agx_nir_specialize_sample_count, lr_samples);
+   if (lr_samples)
+      NIR_PASS(_, nir, agx_nir_specialize_sample_count, lr_samples);
 
    if (!nir->info.fs.uses_sample_shading)
       NIR_PASS(_, nir, agx_nir_lower_fs_active_samples_to_register);
@@ -7680,13 +7698,6 @@ hk_compile_fs_sample_variant(struct hk_device *dev,
    return result;
 }
 
-static VkResult hk_deserialize_shader(struct hk_device *dev,
-                                      struct blob_reader *blob,
-                                      struct hk_shader *shader, bool absent,
-                                      bool cache_candidate);
-static void hk_shader_serialize(struct vk_device *vk_dev,
-                                const struct hk_shader *shader,
-                                struct blob *blob);
 
 /* A multisample variant is built at its first draw, after its shader object
  * went into the pipeline cache, so the cached object never holds it and every
@@ -7820,6 +7831,21 @@ hk_fs_sample_variant_store(struct hk_device *dev,
       disk_cache_put(hk_device_physical(dev)->vk.disk_cache, key, blob.data,
                      blob.size, NULL);
    blob_finish(&blob);
+}
+
+bool
+hk_fs_sample_variant_ready(const struct hk_api_shader *obj, unsigned idx)
+{
+   if (!obj || idx >= hk_api_num_variants(obj))
+      return false;
+
+   const struct hk_fs_sample_source *src = obj->sample_source;
+   if (src) {
+      if (!(p_atomic_read(&src->ready_mask) & BITFIELD_BIT(idx)))
+         return false;
+   }
+
+   return obj->variants[idx].compiled;
 }
 
 VkResult
@@ -8820,7 +8846,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          const bool lr_ok =
             hk_nir_scan_input_attachments(nir, &lr_info, &scanned_ia);
          has_ia |= scanned_ia;
-         if (lr_ok && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+         if (lr_ok && hk_local_read_tilebuffer(dev->dev.chip) &&
              !mesh_fs && !nir->info.internal) {
             lr_nir = nir_shader_clone(NULL, nir);
             if (lr_nir) {
@@ -8883,8 +8909,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       struct hk_physical_device *pdev = hk_device_physical(dev);
       struct util_dynarray ifs;
       util_dynarray_init(&ifs, NULL);
-      const bool border_g17p = dev->dev.chip == AGX_CHIP_G17P;
-      if (hk_find_border_emulation(nir, &ifs, border_g17p) &&
+      const bool unbiased = agx_chip_sampler_has_lod_bias(dev->dev.chip);
+      const unsigned desc_gen = agx_chip_descriptor_generation(dev->dev.chip);
+      if (hk_find_border_emulation(nir, &ifs, unbiased, desc_gen) &&
           ifs.size) {
          if (twin_of || p_atomic_read(&pdev->border_emulation)) {
             border_emulating = true;
@@ -8908,7 +8935,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (lr_nir && !border_emulating) {
          struct util_dynarray lr_ifs;
          util_dynarray_init(&lr_ifs, NULL);
-         if (hk_find_border_emulation(lr_nir, &lr_ifs, border_g17p) &&
+         if (hk_find_border_emulation(lr_nir, &lr_ifs, unbiased, desc_gen) &&
              lr_ifs.size)
             hk_drop_border_emulation(&lr_ifs);
          util_dynarray_fini(&lr_ifs);
@@ -10173,13 +10200,16 @@ hk_compile_compute_alt_nir(struct hk_device *dev,
                            const struct vk_shader_compile_info *info,
                            const VkAllocationCallbacks *allocator,
                            enum hk_feature_key features,
-                           nir_shader *nir)
+                           nir_shader *nir,
+                           const struct hk_pack_loop_bound *loop_bound)
 {
    struct hk_shader *alternate = calloc(1, sizeof(*alternate));
    if (!alternate) {
       ralloc_free(nir);
       return NULL;
    }
+   if (loop_bound)
+      alternate->pack_loop_bound = *loop_bound;
 
    hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
                 info->set_layout_count, info->set_layouts, features);
@@ -10348,7 +10378,7 @@ hk_compute_pair_fadd_producer_create(struct hk_device *dev,
    p->dev = dev;
    simple_mtx_init(&p->lock, mtx_plain);
    p->info.role = HK_COMPUTE_PAIR_FADD;
-   p->info.fadd_push_bytes = push_bytes;
+   p->info.fadd.push_bytes = push_bytes;
    p->variants[0] = (struct hk_compute_pair_variant){
       .shader = fadd_dual,
       .alt_kind = HK_COMPUTE_PAIR_ALT_LINEAR_FADD,
@@ -10363,22 +10393,41 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                      struct hk_compute_pair_producer *prod,
                                      const struct hk_nir_clamp_epilogue *epilogue,
                                      enum hk_compute_pair_alt_kind alt_kind,
-                                     enum hk_compute_pair_dual_write dual_write)
+                                     enum hk_compute_pair_dual_write dual_write,
+                                     const struct hk_nir_fadd_epilogue *fadd_ep,
+                                     bool im2col_a,
+                                     const struct hk_nir_dw_a_cfg *dw_a,
+                                     const struct hk_nir_dw_a_cfg *gemm_dw)
 {
    if (!dev || !prod)
       return NULL;
    if (prod->info.role == HK_COMPUTE_PAIR_FADD) {
-      if (epilogue || alt_kind != HK_COMPUTE_PAIR_ALT_LINEAR_FADD ||
+      if (epilogue || fadd_ep || im2col_a || dw_a || gemm_dw ||
+          alt_kind != HK_COMPUTE_PAIR_ALT_LINEAR_FADD ||
           dual_write != HK_COMPUTE_PAIR_DUAL_COPY)
          return NULL;
       return prod->variant_count ? prod->variants[0].shader : NULL;
    }
    if (!prod->nir)
       return NULL;
-   if (!epilogue && dual_write == HK_COMPUTE_PAIR_DUAL_NONE &&
+   if ((im2col_a && dw_a) || (gemm_dw && (im2col_a || dw_a)))
+      return NULL;
+   if ((dual_write == HK_COMPUTE_PAIR_DUAL_GEMM_DW) != (gemm_dw != NULL))
+      return NULL;
+   if (!epilogue && dual_write == HK_COMPUTE_PAIR_DUAL_NONE && !im2col_a && !dw_a &&
        !hk_compute_pair_alt_is_gemm_unguarded(alt_kind))
       return NULL;
    if (epilogue && !hk_nir_clamp_epilogue_valid(epilogue))
+      return NULL;
+   if (dw_a && dw_a->has_epilogue && !hk_nir_clamp_epilogue_valid(&dw_a->epilogue))
+      return NULL;
+   if (gemm_dw && gemm_dw->has_epilogue &&
+       !hk_nir_clamp_epilogue_valid(&gemm_dw->epilogue))
+      return NULL;
+   if (hk_compute_pair_dual_is_fadd_ep(dual_write) != (fadd_ep != NULL))
+      return NULL;
+   if (hk_compute_pair_dual_is_fadd(dual_write) &&
+       (im2col_a || dw_a || gemm_dw))
       return NULL;
    if (prod->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
        prod->info.role != HK_COMPUTE_PAIR_GEMM)
@@ -10392,18 +10441,56 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
         !prod->info.gemm.cmat_valid ||
         !agx_chip_cooperative_matrix_supported(dev->dev.chip)))
       return NULL;
+   if (im2col_a && !hk_compute_pair_alt_is_gemm_cmat(alt_kind))
+      return NULL;
+   if ((dw_a || gemm_dw) &&
+       !hk_compute_pair_alt_is_gemm_unguarded_for(alt_kind,
+                                                  prod->info.gemm.is_guarded))
+      return NULL;
    if (dual_write != HK_COMPUTE_PAIR_DUAL_NONE &&
        alt_kind == HK_COMPUTE_PAIR_ALT_NONE)
       return NULL;
 
    const bool has_ep = epilogue != NULL;
-   simple_mtx_lock(&prod->lock);
-   for (uint32_t i = 0; i < prod->variant_count; ++i) {
+   const bool has_fadd = fadd_ep != NULL;
+   const bool has_dw_a = dw_a != NULL;
+   const bool has_gemm_dw = gemm_dw != NULL;
+
+   /* Lock-free fast path: prod->variants[] is append-only under prod->lock and
+    * published with release semantics on prod->variant_count. */
+   const uint32_t fast_count =
+      __atomic_load_n(&prod->variant_count, __ATOMIC_ACQUIRE);
+   for (uint32_t i = 0; i < fast_count; ++i) {
       const struct hk_compute_pair_variant *v = &prod->variants[i];
       if (v->alt_kind == alt_kind &&
           v->dual_write == dual_write &&
+          v->im2col_a == im2col_a &&
+          v->has_dw_a == has_dw_a &&
+          (!has_dw_a || hk_nir_dw_a_cfg_equal(&v->dw_a, dw_a)) &&
+          v->has_gemm_dw == has_gemm_dw &&
+          (!has_gemm_dw || hk_nir_dw_a_cfg_equal(&v->gemm_dw, gemm_dw)) &&
           v->has_epilogue == has_ep &&
-          (!has_ep || hk_nir_clamp_epilogue_equal(&v->epilogue, epilogue))) {
+          (!has_ep || hk_nir_clamp_epilogue_equal(&v->epilogue, epilogue)) &&
+          v->has_fadd == has_fadd &&
+          (!has_fadd || hk_nir_fadd_epilogue_equal(&v->fadd, fadd_ep))) {
+         return v->shader;
+      }
+   }
+
+   simple_mtx_lock(&prod->lock);
+   for (uint32_t i = fast_count; i < prod->variant_count; ++i) {
+      const struct hk_compute_pair_variant *v = &prod->variants[i];
+      if (v->alt_kind == alt_kind &&
+          v->dual_write == dual_write &&
+          v->im2col_a == im2col_a &&
+          v->has_dw_a == has_dw_a &&
+          (!has_dw_a || hk_nir_dw_a_cfg_equal(&v->dw_a, dw_a)) &&
+          v->has_gemm_dw == has_gemm_dw &&
+          (!has_gemm_dw || hk_nir_dw_a_cfg_equal(&v->gemm_dw, gemm_dw)) &&
+          v->has_epilogue == has_ep &&
+          (!has_ep || hk_nir_clamp_epilogue_equal(&v->epilogue, epilogue)) &&
+          v->has_fadd == has_fadd &&
+          (!has_fadd || hk_nir_fadd_epilogue_equal(&v->fadd, fadd_ep))) {
          struct hk_shader *cached = v->shader;
          simple_mtx_unlock(&prod->lock);
          return cached;
@@ -10417,19 +10504,26 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
    nir_shader *fused_nir = NULL;
    const enum hk_compute_pair_dual_write base_dual =
       hk_compute_pair_dual_is_fadd(dual_write) ? HK_COMPUTE_PAIR_DUAL_NONE : dual_write;
+   struct hk_pack_loop_bound fused_loop_bound = {0};
    if (alt_kind == HK_COMPUTE_PAIR_ALT_DEPTHWISE_VEC4) {
       if (hk_compute_pair_dual_is_fadd(dual_write))
          fused_nir = NULL;
       else
          fused_nir = hk_nir_build_depthwise_vec4(prod->nir, &prod->info.depthwise,
                                                  epilogue, dual_write);
+      if (fused_nir)
+         hk_nir_bind_depthwise_loop_bounds(fused_nir, &prod->info.depthwise,
+                                           &fused_loop_bound);
    } else if (hk_compute_pair_alt_is_gemm_cmat(alt_kind)) {
       struct hk_nir_gemm_output gemm_info = prod->info.gemm;
       if (hk_compute_pair_alt_is_gemm_unguarded(alt_kind))
          gemm_info.is_guarded = false;
-      fused_nir = hk_nir_build_gemm_cmat(prod->nir, &gemm_info,
-                                         hk_compute_pair_alt_gemm_tile_n(alt_kind),
-                                         epilogue, base_dual);
+      fused_nir = hk_nir_build_gemm_cmat_tiled_with_bound(
+         prod->nir, &gemm_info,
+         hk_compute_pair_alt_gemm_tile_m(alt_kind),
+         hk_compute_pair_alt_gemm_tile_n(alt_kind),
+         epilogue, base_dual, fadd_ep, im2col_a, dw_a, gemm_dw,
+         &fused_loop_bound);
    } else if (has_ep) {
       const struct hk_nir_clamp_buffer out_buf =
          prod->info.role == HK_COMPUTE_PAIR_DEPTHWISE ? prod->info.depthwise.output
@@ -10455,18 +10549,31 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
          .robustness = &prod->robustness,
       };
       shader = hk_compile_compute_alt_nir(dev, &synth, &dev->vk.alloc,
-                                          prod->features, fused_nir);
+                                          prod->features, fused_nir,
+                                          &fused_loop_bound);
    }
 
    struct hk_compute_pair_variant var = {
       .has_epilogue = has_ep,
+      .has_fadd = has_fadd,
+      .im2col_a = im2col_a,
+      .has_dw_a = has_dw_a,
+      .has_gemm_dw = has_gemm_dw,
       .alt_kind = alt_kind,
       .dual_write = dual_write,
       .shader = shader,
    };
    if (has_ep)
       var.epilogue = *epilogue;
-   prod->variants[prod->variant_count++] = var;
+   if (has_fadd)
+      var.fadd = *fadd_ep;
+   if (has_dw_a)
+      var.dw_a = *dw_a;
+   if (has_gemm_dw)
+      var.gemm_dw = *gemm_dw;
+   const uint32_t slot = prod->variant_count;
+   prod->variants[slot] = var;
+   __atomic_store_n(&prod->variant_count, slot + 1u, __ATOMIC_RELEASE);
    simple_mtx_unlock(&prod->lock);
    return shader;
 }
@@ -10499,9 +10606,10 @@ hk_compile_identity_copy4(struct hk_device *dev,
    struct hk_identity_copy4 path = {0};
    nir_shader *copy = hk_nir_copy_identity4(candidate, &path);
    nir_shader *im2col4 = NULL;
+   struct hk_pack_loop_bound im2col4_lb = {0};
    nir_shader *fadd_dual_nir = NULL;
    if (copy && path.kind == HK_IDENTITY_COPY4_IM2COL_1X1 && path.im2col_vec4_ok)
-      im2col4 = hk_nir_im2col_vec4(candidate);
+      im2col4 = hk_nir_im2col_vec4_with_bound(candidate, &im2col4_lb);
    if (copy && path.kind == HK_IDENTITY_COPY4_LINEAR_FADD &&
        hk_dual_write_push_offset(path.push_bytes) +
           sizeof(struct hk_dual_copy_push) <= HK_MAX_PUSH_SIZE) {
@@ -10516,7 +10624,7 @@ hk_compile_identity_copy4(struct hk_device *dev,
    }
 
    struct hk_shader *alternate =
-      hk_compile_compute_alt_nir(dev, info, allocator, features, copy);
+      hk_compile_compute_alt_nir(dev, info, allocator, features, copy, NULL);
    if (!alternate) {
       ralloc_free(im2col4);
       ralloc_free(fadd_dual_nir);
@@ -10525,10 +10633,10 @@ hk_compile_identity_copy4(struct hk_device *dev,
 
    if (im2col4)
       *im2col_vec4_out =
-         hk_compile_compute_alt_nir(dev, info, allocator, features, im2col4);
+         hk_compile_compute_alt_nir(dev, info, allocator, features, im2col4, &im2col4_lb);
    if (fadd_dual_nir)
       *fadd_dual_out =
-         hk_compile_compute_alt_nir(dev, info, allocator, features, fadd_dual_nir);
+         hk_compile_compute_alt_nir(dev, info, allocator, features, fadd_dual_nir, NULL);
 
    *path_out = path;
    return alternate;
@@ -10569,7 +10677,7 @@ hk_compile_tensor_op(struct hk_device *dev,
    }
 
    struct hk_shader *primary =
-      hk_compile_compute_alt_nir(dev, info, allocator, features, primary_nir);
+      hk_compile_compute_alt_nir(dev, info, allocator, features, primary_nir, NULL);
    if (!primary) {
       ralloc_free(secondary_nir);
       return NULL;
@@ -10577,7 +10685,7 @@ hk_compile_tensor_op(struct hk_device *dev,
 
    if (secondary_nir) {
       struct hk_shader *secondary =
-         hk_compile_compute_alt_nir(dev, info, allocator, features, secondary_nir);
+         hk_compile_compute_alt_nir(dev, info, allocator, features, secondary_nir, NULL);
       if (!secondary) {
          hk_shader_destroy(dev, primary, true);
          free(primary);
@@ -10606,6 +10714,10 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    nir_shader *gemm_cmat16_nir = NULL;
    nir_shader *gemm_cmat32_nir = NULL;
    nir_shader *gemm_cmat64_nir = NULL;
+   struct hk_pack_loop_bound depthwise_vec4_lb = {0};
+   struct hk_pack_loop_bound gemm_cmat16_lb = {0};
+   struct hk_pack_loop_bound gemm_cmat32_lb = {0};
+   struct hk_pack_loop_bound gemm_cmat64_lb = {0};
    struct hk_shader *identity_copy4 = NULL;
    struct hk_shader *im2col_vec4 = NULL;
    struct hk_shader *fadd_dual = NULL;
@@ -10709,7 +10821,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       if (nir->info.stage == MESA_SHADER_FRAGMENT) {
          const bool lr_ok =
             hk_nir_scan_input_attachments(nir, &lr_infos[i], &has_ias[i]);
-         if (lr_ok && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+         if (lr_ok && hk_local_read_tilebuffer(dev->dev.chip) &&
              !is_multiview && !has_mesh && !nir->info.internal) {
             lr_nirs[i] = nir_shader_clone(NULL, nir);
             if (lr_nirs[i]) {
@@ -10767,15 +10879,22 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    pair.depthwise.vec4_valid) {
                   depthwise_vec4_nir =
                      hk_nir_build_depthwise_vec4(nir, &pair.depthwise, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
+                  if (depthwise_vec4_nir)
+                     hk_nir_bind_depthwise_loop_bounds(depthwise_vec4_nir,
+                                                       &pair.depthwise,
+                                                       &depthwise_vec4_lb);
                } else if (pair.role == HK_COMPUTE_PAIR_GEMM &&
                           pair.gemm.cmat_valid &&
                           agx_chip_cooperative_matrix_supported(dev->dev.chip)) {
-                  gemm_cmat16_nir =
-                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 16, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
-                  gemm_cmat32_nir =
-                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 32, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
-                  gemm_cmat64_nir =
-                     hk_nir_build_gemm_cmat(nir, &pair.gemm, 64, NULL, HK_COMPUTE_PAIR_DUAL_NONE);
+                  gemm_cmat16_nir = hk_nir_build_gemm_cmat_with_bound(
+                     nir, &pair.gemm, 16, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+                     NULL, false, NULL, NULL, &gemm_cmat16_lb);
+                  gemm_cmat32_nir = hk_nir_build_gemm_cmat_with_bound(
+                     nir, &pair.gemm, 32, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+                     NULL, false, NULL, NULL, &gemm_cmat32_lb);
+                  gemm_cmat64_nir = hk_nir_build_gemm_cmat_with_bound(
+                     nir, &pair.gemm, 64, NULL, HK_COMPUTE_PAIR_DUAL_NONE,
+                     NULL, false, NULL, NULL, &gemm_cmat64_lb);
                }
             }
          }
@@ -11076,19 +11195,23 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          const enum hk_feature_key hk_features = hk_make_feature_key(features);
          if (depthwise_vec4_nir) {
             obj->depthwise_vec4 = hk_compile_compute_alt_nir(
-               dev, info, pAllocator, hk_features, depthwise_vec4_nir);
+               dev, info, pAllocator, hk_features, depthwise_vec4_nir,
+               &depthwise_vec4_lb);
          }
          if (gemm_cmat16_nir) {
             obj->gemm_cmat16 = hk_compile_compute_alt_nir(
-               dev, info, pAllocator, hk_features, gemm_cmat16_nir);
+               dev, info, pAllocator, hk_features, gemm_cmat16_nir,
+               &gemm_cmat16_lb);
          }
          if (gemm_cmat32_nir) {
             obj->gemm_cmat32 = hk_compile_compute_alt_nir(
-               dev, info, pAllocator, hk_features, gemm_cmat32_nir);
+               dev, info, pAllocator, hk_features, gemm_cmat32_nir,
+               &gemm_cmat32_lb);
          }
          if (gemm_cmat64_nir) {
             obj->gemm_cmat64 = hk_compile_compute_alt_nir(
-               dev, info, pAllocator, hk_features, gemm_cmat64_nir);
+               dev, info, pAllocator, hk_features, gemm_cmat64_nir,
+               &gemm_cmat64_lb);
          }
       } else {
          hk_compute_pair_producer_unref(compute_pair_producer);
@@ -11148,7 +11271,78 @@ enum hk_serialized_variant {
    HK_SERIALIZED_ABSENT = 2,
 };
 
-static VkResult
+/* Compute shaders on the chips that compile compute alternates carry the
+ * bound their loops were proven to (hk_compile_compute_alt_nir()). */
+static bool
+hk_shader_has_pack_loop_bound(enum agx_chip chip, mesa_shader_stage stage)
+{
+   return stage == MESA_SHADER_COMPUTE && agx_chip_native_or_m5(chip);
+}
+
+static void
+hk_pack_loop_ops_serialize(struct blob *blob,
+                           const struct hk_pack_loop_op *ops, unsigned count)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      blob_write_uint8(blob, ops[i].kind);
+      blob_write_uint8(blob, ops[i].lhs);
+      blob_write_uint8(blob, ops[i].rhs);
+      blob_write_uint32(blob, ops[i].imm);
+   }
+}
+
+static void
+hk_pack_loop_ops_deserialize(struct blob_reader *blob,
+                             struct hk_pack_loop_op *ops, unsigned count)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      ops[i].kind = blob_read_uint8(blob);
+      ops[i].lhs = blob_read_uint8(blob);
+      ops[i].rhs = blob_read_uint8(blob);
+      ops[i].imm = blob_read_uint32(blob);
+   }
+}
+
+static void
+hk_pack_loop_bound_serialize(struct blob *blob,
+                             const struct hk_pack_loop_bound *lb)
+{
+   blob_write_uint8(blob, lb->valid);
+   blob_write_uint8(blob, lb->count);
+   hk_pack_loop_ops_serialize(blob, lb->ops, lb->count);
+   blob_write_uint8(blob, lb->work_valid);
+   blob_write_uint8(blob, lb->work_count);
+   blob_write_uint32(blob, lb->static_nir_ops);
+   hk_pack_loop_ops_serialize(blob, lb->work_ops, lb->work_count);
+}
+
+static bool
+hk_pack_loop_bound_deserialize(struct blob_reader *blob,
+                               struct hk_pack_loop_bound *lb)
+{
+   memset(lb, 0, sizeof(*lb));
+   const uint8_t valid = blob_read_uint8(blob);
+   const uint8_t count = blob_read_uint8(blob);
+   if (blob->overrun || valid > 1 || count > HK_PACK_LOOP_MAX_OPS)
+      return false;
+   lb->valid = valid;
+   lb->count = count;
+   hk_pack_loop_ops_deserialize(blob, lb->ops, count);
+
+   const uint8_t work_valid = blob_read_uint8(blob);
+   const uint8_t work_count = blob_read_uint8(blob);
+   const uint32_t static_nir_ops = blob_read_uint32(blob);
+   if (blob->overrun || work_valid > 1 ||
+       work_count > HK_PACK_LOOP_WORK_MAX_OPS)
+      return false;
+   lb->work_valid = work_valid;
+   lb->work_count = work_count;
+   lb->static_nir_ops = static_nir_ops;
+   hk_pack_loop_ops_deserialize(blob, lb->work_ops, work_count);
+   return !blob->overrun;
+}
+
+VkResult
 hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
                       struct hk_shader *shader, bool absent,
                       bool cache_candidate)
@@ -11156,7 +11350,9 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
    const uint32_t root_descriptor_size =
-      agx_chip_native_hal200(dev->dev.chip) ? blob_read_uint32(blob) : 0;
+      (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
+         ? blob_read_uint32(blob)
+         : 0;
    uint8_t mesh_primitive_comps[64] = {0};
    if (dev->dev.chip == AGX_CHIP_G17P && info.stage == MESA_SHADER_MESH)
       blob_copy_bytes(blob, mesh_primitive_comps, sizeof(mesh_primitive_comps));
@@ -11167,6 +11363,11 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    struct agx_vdm_state_update_program_info agx3_vdm_state_update;
    if (!hk_agx3_vdm_program_cache_deserialize(blob,
                                                &agx3_vdm_state_update))
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+
+   struct hk_pack_loop_bound pack_loop_bound = {0};
+   if (hk_shader_has_pack_loop_bound(dev->dev.chip, info.stage) &&
+       !hk_pack_loop_bound_deserialize(blob, &pack_loop_bound))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    const uint32_t code_size = blob_read_uint32(blob);
@@ -11205,6 +11406,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
       memcpy(shader->g17p_mesh_primitive_comps, mesh_primitive_comps,
              sizeof(mesh_primitive_comps));
       shader->agx3_vdm_state_update = agx3_vdm_state_update;
+      shader->pack_loop_bound = pack_loop_bound;
       shader->b.info.binary_size = 0;
       return VK_SUCCESS;
    }
@@ -11227,6 +11429,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    memcpy(shader->g17p_mesh_primitive_comps, mesh_primitive_comps,
           sizeof(mesh_primitive_comps));
    shader->agx3_vdm_state_update = agx3_vdm_state_update;
+   shader->pack_loop_bound = pack_loop_bound;
    hk_shader_init_vdm_no_cprog(dev->dev.chip, shader);
    shader->code_size = code_size;
    shader->data_size = data_size;
@@ -11549,8 +11752,15 @@ hk_identity_copy4_serialize(struct blob *blob,
       blob_write_uint32(blob, info->pad_idx[i]);
    for (unsigned i = 0; i < 3; ++i)
       blob_write_uint16(blob, info->local[i]);
+   const bool has_fadd_meta = info->kind == HK_IDENTITY_COPY4_LINEAR_FADD &&
+                              info->fadd_meta_valid;
    blob_write_uint8(blob, (info->im2col_vec4_ok ? 1 : 0) |
-                             (has_fadd_dual ? 2 : 0));
+                             (has_fadd_dual ? 2 : 0) |
+                             (has_fadd_meta ? 4 : 0));
+   if (has_fadd_meta) {
+      blob_write_uint32(blob, info->fadd_fp_math_ctrl);
+      blob_write_uint32(blob, info->fadd_float_controls_execution_mode);
+   }
 }
 
 static void
@@ -11594,6 +11804,11 @@ hk_identity_copy4_deserialize(struct blob_reader *blob,
    const uint8_t flags = blob_read_uint8(blob);
    info->im2col_vec4_ok = (flags & 1) != 0;
    *has_fadd_dual_out = (flags & 2) != 0;
+   info->fadd_meta_valid = (flags & 4) != 0;
+   if (info->fadd_meta_valid) {
+      info->fadd_fp_math_ctrl = blob_read_uint32(blob);
+      info->fadd_float_controls_execution_mode = blob_read_uint32(blob);
+   }
 }
 
 static void
@@ -11732,9 +11947,9 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
        (has_stencil_2d && stage != MESA_SHADER_COMPUTE) ||
        (has_compute_opt && stage != MESA_SHADER_COMPUTE) ||
        (has_local_read && (stage != MESA_SHADER_FRAGMENT ||
-                           !agx_chip_local_read_tilebuffer(dev->dev.chip))) ||
+                           !hk_local_read_tilebuffer(dev->dev.chip))) ||
        (has_sample_lr && (!has_source || stage != MESA_SHADER_FRAGMENT ||
-                          !agx_chip_local_read_tilebuffer(dev->dev.chip))) ||
+                          !hk_local_read_tilebuffer(dev->dev.chip))) ||
        (has_preamble_nir && (stage != MESA_SHADER_VERTEX ||
                              !agx_chip_native_or_m5(dev->dev.chip))) ||
        (has_source && !sample_variants) ||
@@ -11745,7 +11960,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
                                 ? !m5_sample_variants
                                 : !agx_chip_native_or_g18g(dev->dev.chip)))) ||
        (has_mono && (stage != MESA_SHADER_FRAGMENT ||
-                     !agx_chip_native_or_m5(dev->dev.chip))))
+                     (!agx_chip_native_or_m5(dev->dev.chip) &&
+                      agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX2))))
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    /* Compiled with a custom-border emulation that this GPU, with no sampler
@@ -11966,7 +12182,11 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          const void *mono_key =
             blob_read_bytes(blob, sizeof(shader->g17p_mono_key));
          const uint8_t mono_preopt = blob_read_uint8(blob);
-         const bool bad_blob = blob->overrun || mono_preopt > 1;
+         /* AGX2 saves the raw uniform-colour shader. Only the native
+          * compiler path captures a preoptimized monolithic shader. */
+         const bool bad_blob =
+            blob->overrun || mono_preopt > 1 ||
+            (mono_preopt && agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2);
          shader->g17p_mono_nir = bad_blob ? NULL : malloc(mono_size);
          if (!shader->g17p_mono_nir) {
             const VkResult result = bad_blob
@@ -12559,13 +12779,13 @@ hk_deserialize_api_shader(struct vk_device *vk_dev, struct blob_reader *blob,
    return result;
 }
 
-static void
+void
 hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
                     struct blob *blob)
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
-   if (agx_chip_native_hal200(dev->dev.chip))
+   if (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
       blob_write_uint32(blob, shader->root_descriptor_size);
    if (dev->dev.chip == AGX_CHIP_G17P &&
        shader->info.stage == MESA_SHADER_MESH)
@@ -12575,6 +12795,8 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
    if (!hk_agx3_vdm_program_cache_serialize(
           blob, &shader->agx3_vdm_state_update))
       return;
+   if (hk_shader_has_pack_loop_bound(dev->dev.chip, shader->info.stage))
+      hk_pack_loop_bound_serialize(blob, &shader->pack_loop_bound);
 
    blob_write_uint32(blob, shader->code_size);
    blob_write_uint32(blob, shader->data_size);

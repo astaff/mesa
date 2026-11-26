@@ -58,6 +58,12 @@
 
 #include <stdio.h>
 
+/* Largest per-thread scratch frame of a kernel that may overlap the
+ * application dispatches around it. 64 unordered dispatches of 4096 threads
+ * take as long as ordered ones with 512 bytes per thread and five times as
+ * long with 1 KB. */
+#define HK_M5_OVERLAP_MAX_SCRATCH_B 512
+
 void *hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
@@ -591,6 +597,7 @@ struct hk_descriptor_state {
    uint32_t uploaded_root_size;
    uint64_t uploaded_root_generation;
    uint8_t uploaded_dynamic_buffer_end;
+   bool uploaded_root_cpu_cached;
 
    /* One past the highest root.dynamic_buffers entry any bind wrote. Later
     * entries are unread by every bound layout and stay out of uploads. */
@@ -789,6 +796,7 @@ struct hk_rendering_state {
 
    /* The main G17P EOT writes the single-sample resolve target directly. */
    bool g17p_direct_color_resolve;
+   uint8_t agx2_resolve_mask;
 
    /* Exact admission result for the current physical tilebuffer layout.
     * The layout is immutable after BeginRendering except for the one
@@ -1025,6 +1033,10 @@ struct hk_graphics_state {
    struct hk_root_fragment_snapshot fs_root_fragment_snapshot;
    const struct hk_root_descriptor_table *root_fragment_snapshot_cpu;
    const struct hk_root_descriptor_table *fs_root_fragment_snapshot_cpu;
+   /* Whether root_cpu / fs_root_cpu point into CPU write-back (AGX_BO_WRITEBACK)
+    * command-pool BOs that can be compared directly without shadow snapshots. */
+   bool root_cpu_cached;
+   bool fs_root_cpu_cached;
 
    uint64_t draw_params;
    uint64_t draw_id_ptr;
@@ -1354,16 +1366,13 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
    gfx->fs_root = gfx->root;
    gfx->fs_root_cpu = gfx->root_cpu;
    gfx->fs_root_size = gfx->root_size;
+   gfx->fs_root_cpu_cached = gfx->root_cpu_cached;
    return gfx->root;
 }
 
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
-   /* vkCmdPipelineBarrier2 dependency not yet consumed by a CDM launch.
-    * Lives on the command buffer so it survives CS splits and
-    * merge_control_streams. */
-   bool cdm_barrier_pending;
 };
 
 /*
@@ -1464,6 +1473,10 @@ struct hk_cs {
    /* M5: patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
     * which a merge moves with its bytes. */
    uint32_t alias_sites;
+
+   /* AGX2: sparse patch sites recorded in this stream
+    * (hk_cmd_buffer::sparse_sites), which a merge moves with its bytes. */
+   uint32_t sparse_sites;
 
    /* AGX3 CDM: the value of current just after a standalone barrier that is
     * the stream's *first* record. Apple's emitter only opens a stream with a
@@ -1912,6 +1925,11 @@ void hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd,
                                     const void *from, const void *from_end,
                                     uint8_t *to, size_t skip);
 
+/* As hk_cmd_buffer_move_alias_sites(), for the AGX2 sparse patch sites. */
+void hk_cmd_buffer_move_sparse_sites(struct hk_cmd_buffer *cmd,
+                                     const void *from, const void *from_end,
+                                     uint8_t *to, size_t skip);
+
 /*
  * Helper to merge two compute control streams, concatenating the second control
  * stream, up to b_current, to the first one. Must sync with hk_cs.
@@ -1983,6 +2001,9 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       if (b->alias_sites && a->cmd == b->cmd)
          hk_cmd_buffer_move_alias_sites(a->cmd, b->start, b_current, dst,
                                         b_skip);
+      if (b->sparse_sites && a->cmd == b->cmd)
+         hk_cmd_buffer_move_sparse_sites(a->cmd, b->start, b_current, dst,
+                                         b_skip);
 
       /* These markers point just past an emitted barrier. Preserve them in
        * the destination root so another adjacent merge still has an exact
@@ -2020,6 +2041,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
    }
 
    a->alias_sites += b->alias_sites;
+   a->sparse_sites += b->sparse_sites;
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->gen1_native_rq |= b->gen1_native_rq;
    a->as_build |= b->as_build;
@@ -2152,6 +2174,9 @@ struct hk_uploader {
 
    /* VDM uploader only: low alias of base (its hk_vdm_allocation's alias). */
    uint64_t vdm_alias;
+
+   /* Current backing BO is mapped CPU write-back (AGX_BO_WRITEBACK). */
+   bool cpu_cached;
 };
 
 /*
@@ -2436,6 +2461,11 @@ struct hk_cmd_buffer {
    uint32_t alias_patched;
    uint32_t alias_registered;
    struct list_head alias_link;
+
+   /* AGX2 reduced-word CDM barrier records emitted while no sparse resource
+    * existed (struct hk_sparse_site), upgraded to the full word at submit
+    * when dev->sparse_used is set (hk_submit_patch_sparse_sites()). */
+   struct util_dynarray sparse_sites;
 };
 
 /* A patch site: the stream word of a barrier record an application
@@ -2448,6 +2478,15 @@ struct hk_cmd_buffer {
  * dispatch after it no longer drops it, and a merge that folds a leading
  * barrier over it writes a barrier. */
 struct hk_alias_site {
+   uint32_t *word;
+   uint32_t value;
+};
+
+/* A patch site: the stream word of an AGX2 barrier record emitted with the
+ * reduced flag word while the device held no sparse resource. `value` is
+ * the full-word record, written at submit when a sparse resource exists by
+ * then (hk_submit_patch_sparse_sites()). */
+struct hk_sparse_site {
    uint32_t *word;
    uint32_t value;
 };
@@ -2466,6 +2505,16 @@ void hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 /* Writes the command buffer's patch sites, once. Callers ensure no reset
  * runs concurrently; two writers write the same words. */
 void hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd);
+
+/* Records the just-emitted reduced-word AGX2 barrier record at `word` as a
+ * sparse patch site in cs's stream (hk_cdm_flush()). */
+void hk_cdm_note_sparse_site(struct hk_cs *cs, uint32_t *word);
+
+/* Writes each submitted command buffer's sparse patch sites, once
+ * dev->sparse_used is set: an upgrade only strengthens the record. */
+void hk_submit_patch_sparse_sites(struct hk_device *dev,
+                                  struct vk_command_buffer *const *cmds,
+                                  unsigned count);
 
 /* Transfer entry points bracket their recording so the streams they create
  * belong to the transfer stage class (VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT and
@@ -2686,6 +2735,12 @@ struct agx_ptr hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
                                        uint32_t size, uint32_t alignment,
                                        enum hk_cmd_bo_type type);
 
+struct agx_ptr hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
+                                              struct hk_uploader *uploader,
+                                              uint32_t size, uint32_t alignment,
+                                              enum hk_cmd_bo_type type,
+                                              bool *cpu_cached_out);
+
 /* Bump allocation from the uploader's current BO; a new BO or a large
  * allocation takes hk_pool_alloc_from_slow(). */
 static inline struct agx_ptr
@@ -2705,6 +2760,28 @@ hk_pool_alloc_from(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
    }
 
    return hk_pool_alloc_from_slow(cmd, uploader, size, alignment, type);
+}
+
+static inline struct agx_ptr
+hk_pool_alloc_from_cached(struct hk_cmd_buffer *cmd,
+                          struct hk_uploader *uploader, uint32_t size,
+                          uint32_t alignment, enum hk_cmd_bo_type type,
+                          bool *cpu_cached_out)
+{
+   assert(alignment > 0);
+   const uint32_t offset = align(uploader->offset, alignment);
+   if (likely(uploader->map != NULL && offset <= uploader->capacity &&
+              size <= uploader->capacity - offset)) {
+      uploader->offset = offset + size;
+      *cpu_cached_out = uploader->cpu_cached;
+      return (struct agx_ptr){
+         .gpu = uploader->base + offset,
+         .cpu = uploader->map + offset,
+      };
+   }
+
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment, type,
+                                         cpu_cached_out);
 }
 
 struct agx_ptr hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
@@ -3037,6 +3114,21 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->g17p_bind_tail_memo.viewport_valid = false;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
+}
+
+static inline struct hk_api_shader *
+hk_bound_fs_obj(struct hk_graphics_state *gfx)
+{
+   if (gfx->mesh_fs)
+      return gfx->mesh_fs;
+   return gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
+}
+
+static inline struct hk_shader *
+hk_bound_fs(struct hk_cmd_buffer *cmd)
+{
+   return hk_fs_variant(hk_bound_fs_obj(&cmd->state.gfx),
+                        cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
 static inline size_t

@@ -247,7 +247,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = true,
       .KHR_shader_non_semantic_info = true,
-      .KHR_shader_quad_control = true,
+      .KHR_shader_quad_control = agx_chip_has_shader_quad_control(dev->chip),
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = true,
@@ -286,9 +286,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
       /* Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table on
-       * AGX2 and native AGX3; HAL300 PPP admission still rejects negative-one
-       * depth clip. */
-      .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
+       * AGX2, native AGX3, and AGX3C/HAL300 (M5: G17G/G17S/G17C); other HAL300
+       * encodings such as AGX3D (G18G) stay off until qualified. */
+      .EXT_depth_clip_control = agx_chip_has_depth_clip_control(dev->chip),
       .EXT_depth_clip_enable = true,
       /* Descriptor buffers use AGX_CAP_DESCRIPTOR_BUFFER (agx_chip_caps.h):
        * AGX2, native AGX3, and M5 are qualified; G18G still uses AGX2-biased
@@ -305,7 +305,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_host_import(dev),
-      .EXT_fragment_shader_interlock = agx_chip_native_agx3(dev->chip),
+      .EXT_fragment_shader_interlock = agx_chip_native_or_m5(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -661,7 +661,6 @@ hk_get_device_features(
 
       /* VK_KHR_maintenance9 */
       .maintenance9 = true,
-      .maintenance10 = true,
 
       /* VK_KHR_maintenance10 */
       .maintenance10 = true,
@@ -703,7 +702,7 @@ hk_get_device_features(
       .shaderMaximalReconvergence = true,
 
       /* VK_KHR_shader_quad_control */
-      .shaderQuadControl = true,
+      .shaderQuadControl = supported_extensions->KHR_shader_quad_control,
 
       /* VK_KHR_shader_subgroup_rotate */
       .shaderSubgroupRotate = true,
@@ -789,13 +788,8 @@ hk_get_device_features(
        * layout, and push descriptors keep their own command-buffer storage.
        */
       .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
-      /* M5 storage buffer descriptors embed the residency map page of a
-       * sparse buffer (hk_buffer_address::sparse_map_page), and capture/
-       * replay keeps the buffer's VA but not its map's: a replayed
-       * descriptor would name a stale map. */
       .descriptorBufferCaptureReplay =
-         supported_extensions->EXT_descriptor_buffer &&
-         !agx_chip_g17_m5(dev->chip),
+         supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferImageLayoutIgnored =
          supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferPushDescriptors =
@@ -1072,11 +1066,6 @@ hk_get_device_features(
        * layer/viewport UVS scalar.  The public bit is backed by the exact
        * two-instance/two-layer image qualification. */
       features->shaderOutputLayer = true;
-      /* G17P uses the common reconvergence and subgroup lowering with AGX3
-       * quad encodings. The execution modes also select helper-capable
-       * fragment entry and prevent merging triangles across derivative quads.
-       */
-      features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
    }
 
    /* Compute derivatives lower in NIR to quad swaps and explicit-gradient
@@ -2258,11 +2247,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */
    supported_extensions.EXT_sampler_filter_minmax =
       agx_chip_sampler_generation(pdev->dev.chip) == AGX_SAMPLER_GENERATION_GEN5;
-
-   if (agx_chip_native_agx3(pdev->dev.chip)) {
-      supported_extensions.KHR_shader_quad_control =
-         pdev->dev.chip == AGX_CHIP_G17P;
-   }
 
    struct vk_features supported_features;
    /* G17P runs mesh shaders natively and task shaders in software. */

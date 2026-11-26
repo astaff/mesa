@@ -185,9 +185,18 @@ for T, sizes, one in [('f', [16, 32], 1.0),
 # pick up patterns like b2f32(iand(...))
 opt_selects = [
         # Direct condition dominance in nested selects (only when the
-        # inner select becomes dead, avoiding live-range extension).
+        # rewritten intermediate select becomes dead, avoiding live-range
+        # extension).
         (('bcsel', a, ('bcsel(is_used_once)', a, b, c), d), ('bcsel', a, b, d)),
         (('bcsel', a, b, ('bcsel(is_used_once)', a, c, d)), ('bcsel', a, b, d)),
+        (('bcsel', a, c, ('bcsel(is_used_once)', b, ('bcsel', a, 'x', d), e)),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', a, c, ('bcsel(is_used_once)', b, d, ('bcsel', a, 'x', e))),
+         ('bcsel', a, c, ('bcsel', b, d, e))),
+        (('bcsel', a, ('bcsel(is_used_once)', b, ('bcsel', a, c, 'x'), d), e),
+         ('bcsel', a, ('bcsel', b, c, d), e)),
+        (('bcsel', a, ('bcsel(is_used_once)', b, d, ('bcsel', a, c, 'x')), e),
+         ('bcsel', a, ('bcsel', b, d, c), e)),
 
         # Collapse selects whose boolean condition (ior/iand or boolean bcsel)
         # shares a predicate with an arm select, provided every use of the
@@ -613,6 +622,14 @@ fold_ubyte_to_float = [
 ]
 
 # |a - b| of two unsigned bytes: their 16-bit differences a - b and b - a are
+# opt_selects hoists single-use negations out of select trees so the final
+# negation can fold into a downstream add, but it runs after
+# nir_opt_algebraic_late, which is what forms isub. Fold it here: a separate
+# ineg costs a zero and a subtract on AGX3, the isub is one instruction.
+fold_ineg_add = [
+    (('iadd', a, ('ineg', b)), ('isub', a, b)),
+]
+
 # |a - b| and 2^16 - |a - b| > 255 (or both 0), so the smaller one is the
 # magnitude. Two independent 16-bit subtracts and an unsigned minimum replace
 # the widened subtract, its negation and the signed maximum.
@@ -814,6 +831,8 @@ agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
                                       opt_selects).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_pixel_coord",
                                       fold_pixel_coord).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_ineg_add",
+                                      fold_ineg_add).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_extract16_bfe",
                                       fold_extract16_bfe).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_doubled_add",

@@ -546,9 +546,11 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           ((s == 0 && I->src[1].neg) || (s == 1 && I->src[0].neg)))
          continue;
 
-      /* G17P has no iadd of two immediates. The ushr count copy
-       * `iadd #0, count` must keep its register count. */
-      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      /* No AGX3 encoding has an iadd of two immediates: the G17P, M5 and
+       * G18G packers all refuse it. The ushr count copy `iadd #0, count`
+       * must keep its register count, and so must the sign extension
+       * `iadd d32, h16, #0` of a compare that folded to a constant. */
+      if (ctx->key && agx_isa_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_IADD && I->nr_srcs == 2 &&
           I->src[1 - s].type == AGX_INDEX_IMMEDIATE)
          continue;
@@ -631,14 +633,14 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
             (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
              I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS)))
          continue;
-      /* A G17P array comparison without an offset stages its level or bias
+      /* An AGX3B array comparison without an offset stages its level or bias
        * beside the layer from a register; an immediate would share SMP's
        * operand with that layer, which agx3_emit_texture_sample() refuses.
        * A zero level or bias, and an explicit level in a stage the packer
        * treats as vertex_explicit_lod, encode as immediates and keep them. */
       if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 1 && I->shadow &&
           !I->offset && I->dim == AGX_DIM_2D_ARRAY &&
-          ctx->key->dev.chip == AGX_CHIP_G17P &&
+          ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           (def->dest[0].size == AGX_SIZE_16 ? _mesa_half_to_float(def->imm)
                                             : uif(def->imm)) != 0.0f &&
           !(I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
@@ -1071,21 +1073,35 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
           * element width and component mask and reads any four-half-aligned
           * low-file uniform directly. Keep the compute, non-internal,
           * non-secondary, non-coherent scope so vertex/fragment fixed-shape
-          * paths remain unchanged, and widen to 16-bit and 32-bit scalar or
-          * vector loads (in addition to W8). */
+          * paths remain unchanged, and match agx3_translate_mem destination
+          * and mask invariants across I8/I16/F16/I32. */
+         const bool agx3b_fmt_ok =
+            (I->format == AGX_FORMAT_I8 &&
+             ((!I->memory_is_packed && I->mask == 0x1 &&
+               (I->dest[0].size == AGX_SIZE_32 ||
+                I->dest[0].size == AGX_SIZE_16) &&
+               agx_channels(I->dest[0]) == 1) ||
+              (I->memory_is_packed && I->dest[0].size == AGX_SIZE_32 &&
+               agx_channels(I->dest[0]) == 1 &&
+               I->mask >= 0x1 && I->mask <= 0xf))) ||
+            ((I->format == AGX_FORMAT_I16 || I->format == AGX_FORMAT_F16) &&
+             !I->memory_is_packed &&
+             (I->dest[0].size == AGX_SIZE_16 ||
+              I->dest[0].size == AGX_SIZE_32) &&
+             I->mask >= 0x1 && I->mask <= 0xf &&
+             util_last_bit(I->mask) <= agx_channels(I->dest[0])) ||
+            (I->format == AGX_FORMAT_I32 &&
+             !I->memory_is_packed &&
+             I->dest[0].size == AGX_SIZE_32 &&
+             I->mask >= 0x1 && I->mask <= 0xf &&
+             util_last_bit(I->mask) <= agx_channels(I->dest[0]));
+
          const bool agx3b_uniform_base =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
             ctx->nir && !ctx->nir->info.internal && !ctx->key->secondary &&
-            !I->coherent &&
-            I->nr_dests == 1 &&
-            ((I->format == AGX_FORMAT_I8 && I->dest[0].size == AGX_SIZE_32 &&
-              agx_channels(I->dest[0]) == 1 &&
-              ((!I->memory_is_packed && I->mask == 0x1) ||
-               (I->memory_is_packed && I->mask == 0xf))) ||
-             ((I->format == AGX_FORMAT_I16 || I->format == AGX_FORMAT_I32) &&
-              (I->dest[0].size == AGX_SIZE_16 ||
-               I->dest[0].size == AGX_SIZE_32))) &&
+            !I->coherent && I->nr_dests == 1 && !I->dest[0].memory &&
+            agx3b_fmt_ok &&
             !src.kill && !src.cache && !src.discard &&
             !lo.kill && !lo.cache && !lo.discard &&
             !hi.kill && !hi.cache && !hi.discard;
@@ -1388,7 +1404,7 @@ bool
 agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond, agx_index x,
                          agx_index y, bool *result)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        x.type != AGX_INDEX_IMMEDIATE || y.type != AGX_INDEX_IMMEDIATE ||
        x.neg || y.neg)
       return false;
@@ -1584,7 +1600,7 @@ agx_select_compare_cut(const void *a, const void *b)
 static void
 agx_optimizer_select_guard(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        I->op != AGX_OPCODE_ICMPSEL || I->saturate || I->invert_cond ||
        agx_channels(I->dest[0]) != 1)
       return;
@@ -1988,6 +2004,72 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
    }
 }
 
+/* The constant operand of a bitwise operation, as an immediate or through
+ * the mov_imm that materialized it. */
+static bool
+agx_bitop_constant(agx_instr **defs, agx_index src, uint64_t *value)
+{
+   if (src.abs || src.neg || src.memory)
+      return false;
+   if (src.type == AGX_INDEX_IMMEDIATE) {
+      *value = src.value;
+      return true;
+   }
+   if (src.type != AGX_INDEX_NORMAL)
+      return false;
+   const agx_instr *def = defs[src.value];
+   if (!def || def->op != AGX_OPCODE_MOV_IMM)
+      return false;
+   *value = def->imm;
+   return true;
+}
+
+/* x & c2 where x = y & c1 is x itself when c1 sets no bit that c2 clears.
+ * AGX3B meets it whenever a byte that u2u8 has already masked is masked
+ * again, as agx_pack_integer_8_agx3 does for each even channel of a packed
+ * 8-bit store. Returns the move that replaces I, or NULL. */
+static agx_instr *
+agx_optimizer_redundant_and(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_BITOP || I->truth_table != UTIL_LUT2(a & b) ||
+       I->nr_dests != 1 || I->nr_srcs != 2 || I->saturate ||
+       I->dest[0].type != AGX_INDEX_NORMAL || agx_channels(I->dest[0]) != 1)
+      return NULL;
+
+   const unsigned bits = agx_size_align_16(I->dest[0].size) * 16;
+   const uint64_t width = bits >= 64 ? UINT64_MAX : BITFIELD64_MASK(bits);
+
+   for (unsigned s = 0; s < 2; ++s) {
+      const agx_index val = I->src[s];
+      uint64_t c2;
+      if (val.type != AGX_INDEX_NORMAL || val.abs || val.neg || val.memory ||
+          val.size != I->dest[0].size || agx_channels(val) != 1 ||
+          !agx_bitop_constant(defs, I->src[1 - s], &c2))
+         continue;
+
+      const agx_instr *def = defs[val.value];
+      if (!def || def->op != AGX_OPCODE_BITOP ||
+          def->truth_table != UTIL_LUT2(a & b) || def->nr_dests != 1 ||
+          def->nr_srcs != 2 || def->saturate ||
+          def->dest[0].size != val.size)
+         continue;
+
+      for (unsigned t = 0; t < 2; ++t) {
+         uint64_t c1;
+         if (agx_bitop_constant(defs, def->src[t], &c1) &&
+             (c1 & ~c2 & width) == 0) {
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_instr *mov = agx_mov_to(&b, I->dest[0], val);
+            agx_remove_instruction(I);
+            return mov;
+         }
+      }
+   }
+
+   return NULL;
+}
+
 /*
  * Fuse sign-extends into addition-like instructions.
  */
@@ -2082,6 +2164,9 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_ballot(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_BITOP) {
          agx_optimizer_bitop(ctx, defs, I);
+         agx_instr *mov = agx_optimizer_redundant_and(ctx, defs, I);
+         if (mov)
+            defs[mov->dest[0].value] = mov;
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(ctx, defs, I);
       }
@@ -2366,4 +2451,242 @@ agx_opt_pack_bool_or_branch(agx_context *ctx)
    free(defs);
    free(def_blocks);
    free(use_count);
+}
+
+struct cold_cmp_use {
+   uint32_t ssa;
+   agx_block *block;
+};
+
+static bool
+agx_block_has_cold_sink_succ(agx_block *block)
+{
+   if (!block->successors[0] || !block->successors[1] ||
+       block->successors[0] == block->successors[1])
+      return false;
+
+   for (unsigned s = 0; s < 2; ++s) {
+      agx_block *succ = block->successors[s];
+      if (succ != block && !succ->loop_header &&
+          agx_num_predecessors(succ) == 1)
+         return true;
+   }
+   return false;
+}
+
+static void
+agx_compute_reach_avoiding(agx_context *ctx, agx_block *start,
+                           agx_block *avoid, BITSET_WORD *reach,
+                           agx_block **queue)
+{
+   memset(reach, 0, BITSET_WORDS(ctx->num_blocks) * sizeof(*reach));
+   if (!start || start == avoid || start->index >= ctx->num_blocks)
+      return;
+
+   unsigned head = 0, tail = 0;
+   BITSET_SET(reach, start->index);
+   queue[tail++] = start;
+
+   while (head < tail) {
+      agx_block *cur = queue[head++];
+      agx_foreach_successor(cur, succ) {
+         if (succ == avoid || succ->index >= ctx->num_blocks ||
+             BITSET_TEST(reach, succ->index))
+            continue;
+         BITSET_SET(reach, succ->index);
+         queue[tail++] = succ;
+      }
+   }
+}
+
+/*
+ * Move I to the start of dest's body: after the preload, else_icmp/else_fcmp
+ * and phi instructions that agx_validate_block_form() requires at the head of
+ * a block. An else block must start with its else_* so the sunk instruction
+ * runs under the else execution mask.
+ */
+static void
+agx_sink_instr_to_block_head(agx_instr *I, agx_block *dest)
+{
+   struct list_head *after = &dest->instructions;
+   agx_foreach_instr_in_block(dest, head) {
+      if (head->op != AGX_OPCODE_PRELOAD && head->op != AGX_OPCODE_ELSE_ICMP &&
+          head->op != AGX_OPCODE_ELSE_FCMP && head->op != AGX_OPCODE_PHI)
+         break;
+      after = &head->link;
+   }
+   list_del(&I->link);
+   list_add(&I->link, after);
+}
+
+/*
+ * A sunk compare must read only SSA values, uniforms and immediates. A
+ * pre-coloured register or memory operand could be overwritten between the
+ * original position and the head of the successor.
+ */
+static bool
+agx_cold_cmp_srcs_sinkable(const agx_instr *I)
+{
+   agx_foreach_src(I, s) {
+      if (I->src[s].type == AGX_INDEX_REGISTER || I->src[s].memory)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * Sink pure FCMP/ICMP instructions whose remaining SSA uses all lie inside a
+ * single-predecessor conditional branch successor (for example, compares that
+ * CSE shared between a hot FCMPSEL selection tree and a cold branch body after
+ * agx_optimizer_forward fused the hot-path select).
+ */
+void
+agx_opt_sink_cold_cmp(agx_context *ctx)
+{
+   const unsigned alloc = ctx->alloc;
+   if (!alloc || ctx->num_blocks < 2)
+      return;
+
+   agx_block **cand_def_block = calloc(alloc, sizeof(*cand_def_block));
+   bool any_cand = false;
+
+   agx_foreach_block(ctx, block) {
+      if (!agx_block_has_cold_sink_succ(block))
+         continue;
+      agx_foreach_instr_in_block(block, I) {
+         if ((I->op != AGX_OPCODE_FCMP && I->op != AGX_OPCODE_ICMP) ||
+             I->nr_dests != 1 || I->saturate ||
+             I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].memory ||
+             I->dest[0].value >= alloc || !agx_cold_cmp_srcs_sinkable(I))
+            continue;
+         cand_def_block[I->dest[0].value] = block;
+         any_cand = true;
+      }
+   }
+
+   if (!any_cand) {
+      free(cand_def_block);
+      return;
+   }
+
+   uint32_t *use_count = calloc(alloc, sizeof(*use_count));
+   agx_block **single_use_blk = calloc(alloc, sizeof(*single_use_blk));
+   BITSET_WORD *multi_use_blk = BITSET_CALLOC(alloc);
+   struct util_dynarray cand_uses = UTIL_DYNARRAY_INIT;
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_PHI) {
+            agx_foreach_predecessor(block, pred) {
+               unsigned s = agx_predecessor_index(block, *pred);
+               if (s >= I->nr_srcs || I->src[s].type != AGX_INDEX_NORMAL)
+                  continue;
+               unsigned v = I->src[s].value;
+               if (v >= alloc || !cand_def_block[v])
+                  continue;
+               agx_block *ub = *pred;
+               if (ub == cand_def_block[v]) {
+                  cand_def_block[v] = NULL;
+                  continue;
+               }
+               use_count[v]++;
+               if (!single_use_blk[v])
+                  single_use_blk[v] = ub;
+               else if (single_use_blk[v] != ub)
+                  BITSET_SET(multi_use_blk, v);
+               struct cold_cmp_use u = {v, ub};
+               util_dynarray_append(&cand_uses, u);
+            }
+            continue;
+         }
+
+         agx_foreach_ssa_src(I, s) {
+            unsigned v = I->src[s].value;
+            if (v >= alloc || !cand_def_block[v])
+               continue;
+            if (block == cand_def_block[v]) {
+               cand_def_block[v] = NULL;
+               continue;
+            }
+            use_count[v]++;
+            if (!single_use_blk[v])
+               single_use_blk[v] = block;
+            else if (single_use_blk[v] != block)
+               BITSET_SET(multi_use_blk, v);
+            struct cold_cmp_use u = {v, block};
+            util_dynarray_append(&cand_uses, u);
+         }
+      }
+   }
+
+   BITSET_WORD *reach[2] = {NULL, NULL};
+   agx_block **queue = NULL;
+
+   agx_foreach_block(ctx, block) {
+      if (!agx_block_has_cold_sink_succ(block))
+         continue;
+
+      bool reach_valid[2] = {false, false};
+
+      list_for_each_entry_safe_rev(agx_instr, I, &block->instructions, link) {
+         if ((I->op != AGX_OPCODE_FCMP && I->op != AGX_OPCODE_ICMP) ||
+             I->nr_dests != 1 || I->dest[0].type != AGX_INDEX_NORMAL ||
+             I->dest[0].value >= alloc)
+            continue;
+
+         unsigned v = I->dest[0].value;
+         if (cand_def_block[v] != block || use_count[v] == 0)
+            continue;
+
+         agx_block *target = NULL;
+         for (unsigned s = 0; s < 2; ++s) {
+            agx_block *succ = block->successors[s];
+            if (succ == block || succ->loop_header ||
+                agx_num_predecessors(succ) != 1)
+               continue;
+
+            if (!BITSET_TEST(multi_use_blk, v) && single_use_blk[v] == succ) {
+               target = succ;
+               break;
+            }
+
+            if (!reach_valid[s]) {
+               if (!reach[s])
+                  reach[s] = BITSET_CALLOC(ctx->num_blocks);
+               if (!queue)
+                  queue = malloc(ctx->num_blocks * sizeof(*queue));
+               agx_compute_reach_avoiding(ctx, block->successors[1 - s], block,
+                                          reach[s], queue);
+               reach_valid[s] = true;
+            }
+
+            bool all_dominated = true;
+            util_dynarray_foreach(&cand_uses, struct cold_cmp_use, u) {
+               if (u->ssa != v)
+                  continue;
+               if (u->block->index >= ctx->num_blocks ||
+                   BITSET_TEST(reach[s], u->block->index)) {
+                  all_dominated = false;
+                  break;
+               }
+            }
+            if (all_dominated) {
+               target = succ;
+               break;
+            }
+         }
+
+         if (target)
+            agx_sink_instr_to_block_head(I, target);
+      }
+   }
+
+   free(reach[0]);
+   free(reach[1]);
+   free(queue);
+   util_dynarray_fini(&cand_uses);
+   free(multi_use_blk);
+   free(single_use_blk);
+   free(use_count);
+   free(cand_def_block);
 }

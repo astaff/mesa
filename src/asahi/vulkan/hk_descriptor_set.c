@@ -383,7 +383,8 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
           * image plane. G17P consumes the native heap index directly. */
          desc[plane].sw.sampler_index = hk_sampler_descriptor_index(
             set->layout, sampler->planes[sampler_plane].hw->index);
-         if (set->layout->descriptor_generation == 9)
+         if (set->layout->descriptor_generation == 9 ||
+             set->layout->descriptor_generation == 10)
             write_g17p_sampler_bias(&desc[plane].sw, sampler, sampler_plane);
          else
             desc[plane].sw.sampler = sampler->planes[sampler_plane].hw->key;
@@ -554,7 +555,7 @@ get_buffer_address(const VkDescriptorBufferInfo *const info, bool read_only)
    if (!read_only && buffer && buffer->sparse_map &&
        agx_chip_g17_m5(
           ((const struct hk_device *)buffer->vk.base.device)->dev.chip)) {
-      const uint64_t map_addr = buffer->sparse_map->va->addr;
+      const uint64_t map_addr = hk_buffer_sparse_map_addr(buffer);
       assert((map_addr % AIL_PAGESIZE) == 0);
       assert((map_addr / AIL_PAGESIZE) <= UINT32_MAX);
       sparse_map_page = map_addr / AIL_PAGESIZE;
@@ -980,6 +981,7 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
                 layout->non_variable_descriptor_buffer_size,
                 sizeof(push_set->data));
       push_set->size = 0;
+      hk_push_descriptor_set_reset_upload(push_set);
       return false;
    }
 
@@ -1185,10 +1187,8 @@ hk_CreateDescriptorPool(VkDevice _device,
        * the recording core. */
       pool->cpu_cached = hk_g17p_cached_cmd_memory(&dev->dev);
       const enum agx_bo_flags pool_flags =
-         agx_chip_native_agx3(dev->dev.chip)
-            ? AGX_BO_ZERO_ON_REUSE |
-                 (pool->cpu_cached ? AGX_BO_WRITEBACK : 0)
-            : 0;
+         (agx_chip_native_agx3(dev->dev.chip) ? AGX_BO_ZERO_ON_REUSE : 0) |
+         (pool->cpu_cached ? AGX_BO_WRITEBACK : 0);
       pool->bo =
          agx_bo_create(&dev->dev, bo_size, 0, pool_flags, "Descriptor pool");
       if (!pool->bo) {

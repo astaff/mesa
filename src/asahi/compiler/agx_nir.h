@@ -67,6 +67,7 @@ bool agx_nir_cleanup_amul(struct nir_shader *shader);
 bool agx_nir_fuse_lea(struct nir_shader *shader);
 bool agx_nir_lower_lea(struct nir_shader *shader);
 bool agx_nir_fuse_selects(struct nir_shader *shader);
+bool agx_nir_fold_ineg_add(struct nir_shader *shader);
 bool agx_nir_m5_split_or_selects(struct nir_shader *shader);
 bool agx_nir_opt_select_load(struct nir_shader *shader);
 bool agx_nir_opt_narrow_subword_loads(struct nir_shader *shader);
@@ -76,6 +77,7 @@ bool agx_nir_opt_sink_conditional_loads(struct nir_shader *shader);
 bool agx_nir_opt_merge_nested_early_exits(struct nir_shader *shader);
 bool agx_nir_hoist_loop_invariant_guard_bits(struct nir_shader *shader);
 bool agx_nir_opt_guard_chains(struct nir_shader *shader);
+bool agx_nir_opt_pack_byte_lut_select(struct nir_shader *shader);
 bool agx_nir_opt_factor_loop_mac(struct nir_shader *shader);
 bool agx_nir_opt_flatten_short_circuit_uniform_loads(struct nir_shader *shader);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
@@ -118,9 +120,13 @@ bool agx_nir_opt_shared_byte_offsets(struct nir_shader *s);
 bool agx_nir_reassociate_loop_invariant_eq(struct nir_shader *shader);
 bool agx_nir_opt_licm(struct nir_shader *shader, unsigned budget,
                       bool cap_rt_compute);
+bool agx_nir_opt_licm_agx2_integer(struct nir_shader *shader, unsigned budget);
+bool agx_nir_opt_licm_direct_sfu(struct nir_shader *shader, unsigned budget);
 bool agx_nir_opt_dw_conv_3x3(struct nir_shader *shader);
 bool agx_nir_opt_monotonic_bit_insert(struct nir_shader *shader);
 bool agx_nir_opt_iv_divmod(struct nir_shader *shader);
+bool agx_nir_opt_const_loop_unroll(struct nir_shader *shader,
+                                   unsigned max_factor, unsigned *widest);
 bool agx_nir_lower_fminmax(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_fminmax_signed_zero(struct nir_shader *s, bool ftz_only);
 bool agx_nir_lower_word_bounds(struct nir_shader *s);
@@ -423,6 +429,7 @@ bool agx_nir_opt_uniform_stride_chains(struct nir_shader *shader,
 bool agx_nir_opt_unswitch_affine_bounds(struct nir_shader *shader);
 
 bool agx_nir_merge_global_words(struct nir_shader *shader);
+bool agx_nir_hoist_readonly_loop_loads(struct nir_shader *shader);
 bool agx_nir_narrow_single_subgroup_barriers(struct nir_shader *shader);
 bool agx_nir_narrow_subgroup0_barriers(struct nir_shader *shader);
 bool agx_nir_opt_uniform_stride(struct nir_shader *shader);

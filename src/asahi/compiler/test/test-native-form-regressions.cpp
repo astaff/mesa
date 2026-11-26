@@ -6877,22 +6877,33 @@ TEST(NativeForms, G17PSignExtendRetainsZeroExtendedWord)
  * section, so it survives in a fragment shader with no tile access. */
 TEST(NativeForms, InterlockWaitSurvivesUnreadPixelWaitMerge)
 {
-   void *mem = ralloc_context(NULL);
-   agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-   key.dev.chip = AGX_CHIP_G17P;
-   agx_builder *b = agx_test_builder(mem);
-   b->shader->key = &key;
-   b->shader->stage = MESA_SHADER_FRAGMENT;
-   b->shader->any_interlock = true;
-   agx_instr *wait = agx_wait_pix(b, 0xc);
-   agx_stop(b);
-   EXPECT_FALSE(agx3_merge_unread_pixel_waits(b->shader));
-   unsigned waits = 0;
-   agx_foreach_instr_global(b->shader, I)
-      waits += I == wait && I->writeout == 0xc;
-   EXPECT_EQ(waits, 1u);
-   ralloc_free(mem);
+   struct {
+      enum agx_isa_encoding encoding;
+      enum agx_chip chip;
+   } cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C},
+   };
+
+   for (const auto &c : cases) {
+      SCOPED_TRACE(c.chip);
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      key.dev.chip = c.chip;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      b->shader->any_interlock = true;
+      agx_instr *wait = agx_wait_pix(b, 0xc);
+      agx_stop(b);
+      EXPECT_FALSE(agx3_merge_unread_pixel_waits(b->shader));
+      unsigned waits = 0;
+      agx_foreach_instr_global(b->shader, I)
+         waits += I == wait && I->writeout == 0xc;
+      EXPECT_EQ(waits, 1u);
+      ralloc_free(mem);
+   }
 }
 
 /* G13 and G14 hit the same fold: before #232 an abs (zero-extend) source on a
@@ -7346,11 +7357,11 @@ TEST(NativeForms, CooperativeMatrixDefaultsFollowTheImplementedEncoding)
    EXPECT_FALSE(agx_chip_cooperative_matrix_supported(AGX_CHIP_G18G));
 }
 
-/* A G17P 2D-array comparison keeps a nonzero constant level or bias in a
+/* An AGX3B 2D-array comparison keeps a nonzero constant level or bias in a
  * register, since agx3_emit_texture_sample() refuses that immediate. Every
  * form the packer already encoded keeps its immediate, so no shader that
  * compiled before compiles differently. */
-TEST(NativeForms, G17PArrayShadowConstantLodKeepsEncodableImmediates)
+TEST(NativeForms, AGX3BArrayShadowConstantLodKeepsEncodableImmediates)
 {
    struct {
       mesa_shader_stage stage;
@@ -7380,9 +7391,17 @@ TEST(NativeForms, G17PArrayShadowConstantLodKeepsEncodableImmediates)
        AGX_CHIP_G17P, true},
       {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, true,
        AGX_CHIP_G17P, true},
-      /* Other chips are unchanged. */
+      /* Other AGX3B chips (G16G, G15G) follow the same staging rule. */
       {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, false,
+       AGX_CHIP_G16G, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_AUTO_LOD_BIAS, 0x3800, false,
+       AGX_CHIP_G16G, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x0000, false,
        AGX_CHIP_G16G, true},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x4000, false,
+       AGX_CHIP_G15G, false},
+      {MESA_SHADER_FRAGMENT, AGX_LOD_MODE_LOD_MIN, 0x0000, false,
+       AGX_CHIP_G15G, true},
    };
    for (const auto &c : cases) {
       SCOPED_TRACE(::testing::Message()
@@ -8362,4 +8381,52 @@ TEST(NativeForms, Agx3bCanonicalMinmaxSkipsFlushUnlessDenormPreserve)
    unsigned preserve_instrs = compile_minmax(true);
    EXPECT_GT(ftz_instrs, 0u);
    EXPECT_LT(ftz_instrs, preserve_instrs);
+}
+
+TEST(NativeForms, BoundsPassesClearMetadataAcrossPreambleAndMain)
+{
+   /* Both agx_nir_share_bounds (transforms main) and agx_nir_lower_word_bounds
+    * (transforms preamble) run via NIR_PASS after agx_nir_opt_preamble creates
+    * a preamble function. When either pass reports progress, NIR debug
+    * validation checks that every nir_function_impl in shader->functions
+    * cleared its metadata validation flag. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "bounds passes metadata");
+
+   /* Populate the preamble with >= 2 word-aligned constant bounds past 255B so
+    * agx_nir_lower_word_bounds makes progress. */
+   nir_function_impl *pre_impl = nir_shader_get_preamble(b.shader);
+   nir_builder pb = nir_builder_at(nir_before_impl(pre_impl));
+   nir_def *paddr = nir_load_preamble(&pb, 1, 64, .base = 0);
+   nir_def *psize = nir_load_preamble(&pb, 1, 32, .base = 4);
+   nir_def *p0 = nir_load_global(&pb, 1, 32, paddr, .align_mul = 4);
+   nir_def *p1 = nir_load_global(&pb, 1, 32, nir_iadd_imm(&pb, paddr, 4),
+                                 .align_mul = 4);
+   nir_def *c0 = nir_bounds_agx(&pb, p0, nir_imm_int(&pb, 260), psize);
+   nir_def *c1 = nir_bounds_agx(&pb, p1, nir_imm_int(&pb, 264), psize);
+   nir_store_preamble(&pb, nir_iadd(&pb, c0, c1), .base = 8);
+
+   /* Populate main with two aligned robust reads sharing a base offset so
+    * agx_nir_share_bounds makes progress. */
+   nir_def *addr = agx_test_load_preamble(&b, 1, 64, 0);
+   nir_def *size = agx_test_load_preamble(&b, 1, 32, 4);
+   nir_def *raw = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+   nir_def *idx = nir_ishl_imm(&b, raw, 4);
+   nir_def *end0 = nir_uadd_sat(&b, idx, nir_imm_int(&b, 4));
+   nir_def *end1 = nir_uadd_sat(&b, nir_uadd_sat(&b, idx, nir_imm_int(&b, 8)),
+                                nir_imm_int(&b, 4));
+   nir_def *v0 = nir_bounds_agx(&b, raw, end0, size);
+   nir_def *v1 = nir_bounds_agx(&b, raw, end1, size);
+   nir_store_global(&b, nir_iadd(&b, v0, v1), nir_iadd_imm(&b, addr, 16),
+                    .write_mask = 1, .align_mul = 4);
+
+   bool word_progress = false;
+   NIR_PASS(word_progress, b.shader, agx_nir_lower_word_bounds);
+   EXPECT_TRUE(word_progress);
+
+   bool share_progress = false;
+   NIR_PASS(share_progress, b.shader, agx_nir_share_bounds, true);
+   EXPECT_TRUE(share_progress);
+
+   ralloc_free(b.shader);
 }

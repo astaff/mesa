@@ -22,6 +22,7 @@
 #include "hk_device_memory.h"
 #include "hk_identity_copy4.h"
 #include "hk_nir_tensor_ops.h"
+#include "hk_pack_loop_bound.h"
 #include "hk_private.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -33,6 +34,14 @@
 #include "nir_defines.h"
 
 #include "vk_shader.h"
+
+static inline bool
+hk_local_read_tilebuffer(enum agx_chip chip)
+{
+   return agx_chip_local_read_tilebuffer(chip) ||
+          (agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
+           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2);
+}
 
 struct hk_physical_device;
 struct hk_compute_pair_info;
@@ -307,6 +316,8 @@ struct hk_shader {
     * stripped, used when the vertex preamble is hoisted into a PREGFX compute
     * dispatch for multi-draw batches. */
    struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
+
+   struct hk_pack_loop_bound pack_loop_bound;
 
    const void *code_ptr;
    uint32_t code_size;
@@ -630,6 +641,11 @@ VkResult hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
 VkResult hk_fs_build_sample_variant(struct hk_device *dev,
                                     struct hk_api_shader *obj,
                                     unsigned samples);
+
+/* Whether variant `idx` of a fragment shader has been completely published
+ * and is safe to read locklessly (acquire-loads sample_source->ready_mask
+ * when lazy sample variants are present). */
+bool hk_fs_sample_variant_ready(const struct hk_api_shader *obj, unsigned idx);
 
 void hk_shader_binary_cache_finish(struct hk_device *dev);
 bool hk_shader_ensure_link_ht_locked(struct hk_shader *shader);
@@ -1127,3 +1143,12 @@ bool hk_nir_merge_buffer_words(nir_shader *nir);
  * or compilation fails. */
 struct hk_shader *hk_shader_get_preamble_cs(struct hk_device *dev,
                                             struct hk_shader *vs);
+
+struct blob;
+struct blob_reader;
+
+void hk_shader_serialize(struct vk_device *vk_dev,
+                         const struct hk_shader *shader, struct blob *blob);
+VkResult hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
+                               struct hk_shader *shader, bool absent,
+                               bool cache_candidate);
